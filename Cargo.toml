@@ -3,7 +3,7 @@ name = "alice-llm"
 version = "1.0.0"
 edition = "2021"
 authors = ["Moroya Sakamoto"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "ALICE LLM inference engine: tokenizer, KV cache, attention, RoPE, quantization, sampling, batch inference"
 
 [lib]
