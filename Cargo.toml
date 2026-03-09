@@ -1,0 +1,10 @@
+[package]
+name = "alice-llm"
+version = "1.0.0"
+edition = "2021"
+authors = ["Moroya Sakamoto"]
+license = "MIT"
+description = "ALICE LLM inference engine: tokenizer, KV cache, attention, RoPE, quantization, sampling, batch inference"
+
+[lib]
+crate-type = ["rlib"]
