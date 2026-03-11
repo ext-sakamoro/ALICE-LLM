@@ -8,3 +8,25 @@ description = "ALICE LLM inference engine: tokenizer, KV cache, attention, RoPE,
 
 [lib]
 crate-type = ["rlib"]
+
+[features]
+default = ["std"]
+std = []
+gguf = ["dep:memmap2"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+memmap2 = { version = "0.9", optional = true }
+rayon = { version = "1.10", optional = true }
+
+[[example]]
+name = "elyza_gguf"
+required-features = ["gguf"]
+
+[[example]]
+name = "logits_compare"
+required-features = ["gguf"]
+
+[[example]]
+name = "bench_70b_sparse"
+required-features = ["gguf"]
