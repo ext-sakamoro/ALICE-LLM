@@ -473,4 +473,12 @@ Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer —
 
 ## License
 
-MIT OR Apache-2.0
+**Dual-Licensed: AGPL-3.0+ OR Commercial**
+
+ALICE-LLM is open-source and free to use under the **GNU Affero General Public License v3.0 or later (AGPL-3.0+)**.
+This ensures that any modifications or network-based SaaS deployments using this engine contribute back to the open-source community.
+
+**Commercial License**
+If you intend to use ALICE-LLM in a proprietary SaaS environment, cloud infrastructure, or closed-source commercial product without disclosing your backend source code, you must obtain a **Commercial License**.
+
+For commercial licensing inquiries and enterprise support, contact: licensing@alicelaw.net
