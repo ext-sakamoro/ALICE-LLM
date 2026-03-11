@@ -1138,15 +1138,20 @@ impl<'a> Llama3Model<'a> {
         }
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
-        // Decode with speculation
+        // Decode with probabilistic speculative sampling
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut total_drafted: usize = 0;
         let mut total_accepted: usize = 0;
+        let mut rng = Rng64::new(42);
 
         while generated.len() < max_new_tokens {
             // Sample from current logits
-            let next_token = sample_token(&logits, temperature, top_k);
+            let next_token = if temperature > 0.0 {
+                sample_from_probs(&softmax(&logits), rng.next_f32())
+            } else {
+                argmax(&logits)
+            };
             if next_token == tokenizer.eos_id {
                 break;
             }
@@ -1155,48 +1160,82 @@ impl<'a> Llama3Model<'a> {
 
             let remaining = max_new_tokens - generated.len();
             if remaining == 0 {
-                // No more tokens needed, skip draft
                 logits = self.forward(next_token);
                 continue;
             }
 
             let k = spec_k.min(remaining);
 
-            // --- Draft phase ---
+            // --- Draft phase: store logits for probabilistic acceptance ---
             let saved_pos = self.kv_cache.seq_len();
             let mut draft_tokens = Vec::with_capacity(k);
+            let mut draft_logits_all = Vec::with_capacity(k);
             let mut draft_input = next_token;
             for _ in 0..k {
-                let draft_logits = self.forward_draft(draft_input, draft_layers);
-                draft_input = argmax(&draft_logits);
+                let dl = self.forward_draft(draft_input, draft_layers);
+                draft_input = argmax(&dl);
                 draft_tokens.push(draft_input);
+                draft_logits_all.push(dl);
             }
             total_drafted += draft_tokens.len();
 
             // --- Rollback ---
             self.kv_cache.rollback_to(saved_pos);
 
-            // --- Verify phase ---
+            // --- Verify phase: probabilistic speculative sampling ---
             logits = self.forward(next_token);
 
+            let mut all_accepted = true;
             for i in 0..draft_tokens.len() {
-                let verified = sample_token(&logits, temperature, top_k);
-                if verified == draft_tokens[i] {
-                    // Draft accepted
+                let p = softmax(&logits);
+                let q = softmax(&draft_logits_all[i]);
+                let x = draft_tokens[i] as usize;
+
+                let p_x = if x < p.len() { p[x] } else { 0.0 };
+                let q_x = if x < q.len() { q[x] } else { 1e-10 };
+                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+
+                let r = rng.next_f32();
+                if r < accept_prob {
+                    // Accepted by probabilistic criterion
                     generated.push(draft_tokens[i]);
                     tokens.push(draft_tokens[i]);
                     total_accepted += 1;
                     logits = self.forward(draft_tokens[i]);
                 } else {
-                    // Draft rejected — use verified token
-                    if verified == tokenizer.eos_id {
-                        // Stop generation, don't push EOS
+                    // Rejected: resample from max(0, p(x) - q(x))
+                    let mut adjusted = vec![0.0f32; p.len()];
+                    let mut adj_sum = 0.0f32;
+                    for j in 0..p.len() {
+                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adj_sum += adjusted[j];
+                    }
+                    let resampled = if adj_sum > 0.0 {
+                        let inv = 1.0 / adj_sum;
+                        for a in &mut adjusted { *a *= inv; }
+                        sample_from_probs(&adjusted, rng.next_f32())
+                    } else {
+                        sample_from_probs(&p, rng.next_f32())
+                    };
+                    if resampled == tokenizer.eos_id {
+                        all_accepted = false;
                         break;
                     }
-                    generated.push(verified);
-                    tokens.push(verified);
-                    logits = self.forward(verified);
+                    generated.push(resampled);
+                    tokens.push(resampled);
+                    logits = self.forward(resampled);
+                    all_accepted = false;
                     break;
+                }
+            }
+
+            // If all K drafts accepted, sample one more from the final verify logits
+            if all_accepted && generated.len() < max_new_tokens {
+                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                if bonus != tokenizer.eos_id {
+                    generated.push(bonus);
+                    tokens.push(bonus);
+                    logits = self.forward(bonus);
                 }
             }
         }
@@ -1571,14 +1610,19 @@ impl<'a> Llama3Model<'a> {
         }
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
-        // Decode with speculation
+        // Decode with probabilistic speculative sampling
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut total_drafted: usize = 0;
         let mut total_accepted: usize = 0;
+        let mut rng = Rng64::new(42);
 
         while generated.len() < max_new_tokens {
-            let next_token = sample_token(&logits, temperature, top_k);
+            let next_token = if temperature > 0.0 {
+                sample_from_probs(&softmax(&logits), rng.next_f32())
+            } else {
+                argmax(&logits)
+            };
             if next_token == tokenizer.eos_id {
                 break;
             }
@@ -1593,38 +1637,75 @@ impl<'a> Llama3Model<'a> {
 
             let k = spec_k.min(remaining);
 
-            // --- Draft phase ---
+            // --- Draft phase: store logits for probabilistic acceptance ---
             let saved_pos = self.kv_cache.seq_len();
             let mut draft_tokens = Vec::with_capacity(k);
+            let mut draft_logits_all = Vec::with_capacity(k);
             let mut draft_input = next_token;
             for _ in 0..k {
-                let draft_logits = self.forward_sparse_ternary_draft(draft_input, draft_layers);
-                draft_input = argmax(&draft_logits);
+                let dl = self.forward_sparse_ternary_draft(draft_input, draft_layers);
+                draft_input = argmax(&dl);
                 draft_tokens.push(draft_input);
+                draft_logits_all.push(dl);
             }
             total_drafted += draft_tokens.len();
 
             // --- Rollback ---
             self.kv_cache.rollback_to(saved_pos);
 
-            // --- Verify phase ---
+            // --- Verify phase: probabilistic speculative sampling ---
             logits = self.forward_sparse_ternary(next_token);
 
+            let mut all_accepted = true;
             for i in 0..draft_tokens.len() {
-                let verified = sample_token(&logits, temperature, top_k);
-                if verified == draft_tokens[i] {
+                let p = softmax(&logits);
+                let q = softmax(&draft_logits_all[i]);
+                let x = draft_tokens[i] as usize;
+
+                let p_x = if x < p.len() { p[x] } else { 0.0 };
+                let q_x = if x < q.len() { q[x] } else { 1e-10 };
+                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+
+                let r = rng.next_f32();
+                if r < accept_prob {
                     generated.push(draft_tokens[i]);
                     tokens.push(draft_tokens[i]);
                     total_accepted += 1;
                     logits = self.forward_sparse_ternary(draft_tokens[i]);
                 } else {
-                    if verified == tokenizer.eos_id {
+                    // Rejected: resample from max(0, p(x) - q(x))
+                    let mut adjusted = vec![0.0f32; p.len()];
+                    let mut adj_sum = 0.0f32;
+                    for j in 0..p.len() {
+                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adj_sum += adjusted[j];
+                    }
+                    let resampled = if adj_sum > 0.0 {
+                        let inv = 1.0 / adj_sum;
+                        for a in &mut adjusted { *a *= inv; }
+                        sample_from_probs(&adjusted, rng.next_f32())
+                    } else {
+                        sample_from_probs(&p, rng.next_f32())
+                    };
+                    if resampled == tokenizer.eos_id {
+                        all_accepted = false;
                         break;
                     }
-                    generated.push(verified);
-                    tokens.push(verified);
-                    logits = self.forward_sparse_ternary(verified);
+                    generated.push(resampled);
+                    tokens.push(resampled);
+                    logits = self.forward_sparse_ternary(resampled);
+                    all_accepted = false;
                     break;
+                }
+            }
+
+            // If all K drafts accepted, sample one more from final verify logits
+            if all_accepted && generated.len() < max_new_tokens {
+                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                if bonus != tokenizer.eos_id {
+                    generated.push(bonus);
+                    tokens.push(bonus);
+                    logits = self.forward_sparse_ternary(bonus);
                 }
             }
         }
@@ -1839,6 +1920,55 @@ fn argmax(logits: &[f32]) -> u32 {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .map(|(idx, _)| idx as u32)
         .unwrap_or(0)
+}
+
+/// Convert logits to probability distribution via softmax.
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_val).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for p in &mut probs {
+            *p *= inv;
+        }
+    }
+    probs
+}
+
+/// Sample a token index from a probability distribution using the provided RNG value.
+/// `rand_val` should be uniform in [0, 1).
+fn sample_from_probs(probs: &[f32], rand_val: f32) -> u32 {
+    let mut cumsum = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if rand_val < cumsum {
+            return i as u32;
+        }
+    }
+    (probs.len() - 1) as u32
+}
+
+/// Simple xorshift64 PRNG for speculative sampling.
+struct Rng64 {
+    state: u64,
+}
+
+impl Rng64 {
+    fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed } }
+    }
+
+    /// Returns a uniform f32 in [0, 1).
+    fn next_f32(&mut self) -> f32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        // Use upper 24 bits for mantissa
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    }
 }
 
 // ─── Generation result ──────────────────────────────────────────────────────
