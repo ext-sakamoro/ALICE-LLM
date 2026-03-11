@@ -30,8 +30,8 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ## Features
 
 - **GGUF v3 parser** — zero-copy mmap weight loading
-- **Q4_K / Q6_K / Q8_0 / F16 / F32** quantization
-- **llama.cpp-compatible** — Q4_K×Q8_K integer dot product (matches `ggml_vec_dot_q4_K_q8_K`, ±0.03 logits)
+- **Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32** quantization (all GGML K-quant types)
+- **llama.cpp-compatible** — Q2_K–Q6_K×Q8_K integer dot product (matches `ggml_vec_dot_q*_K_q8_K`, ±0.03 logits)
 - **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), auto-detected
 - **Tied embeddings** — Llama-3.2-1B/3B output projection via quantized `token_embd.weight` (Q6_K matvec)
 - **BPE tokenizer** — GPT-2 byte encoding from GGUF metadata
@@ -48,7 +48,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
 src/
 ├── lib.rs       — BPE tokenizer, KV cache, attention, RoPE, sampling
-├── gguf.rs      — GGUF v3 parser, Q4_K/Q6_K/Q8_K quantization, fused matvec,
+├── gguf.rs      — GGUF v3 parser, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K quantization, fused matvec,
 │                  ternary/sparse-ternary matrices, LLVM auto-vectorized SDOT kernels
 ├── llama3.rs    — Multi-arch forward pass, model loading, speculative decoding (layer-skip + dual-model),
 │                  paged KV cache, continuous batching, tied embeddings, RoPE freq scaling
