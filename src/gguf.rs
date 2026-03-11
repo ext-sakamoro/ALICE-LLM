@@ -1643,10 +1643,15 @@ pub struct SparseTernaryMatrix {
     /// Flat buffer: [row0_active, row0_sign, row1_active, row1_sign, ...]
     /// Each row has `blocks_per_row` u16 active masks followed by `blocks_per_row` u16 sign masks.
     mask_buf: Vec<u16>,
-    /// Packed 2-bit weights for LUT expansion: 4 weights per byte.
+    /// Packed 2-bit weights for LUT expansion: 4 weights per byte (row-major, for scalar/tail).
     /// Layout: contiguous [row0_blk0(4B), row0_blk1(4B), ..., row1_blk0(4B), ...]
     /// Encoding: 00=0, 01=+1, 11=-1 per 2-bit field.
     packed_2bit: Vec<u8>,
+    /// Block-packed 2-bit weights for 4-row micro-kernel (TLB-friendly).
+    /// Layout: groups of 4 rows, each group interleaved by block:
+    /// [g0_r0_b0(4B), g0_r1_b0, g0_r2_b0, g0_r3_b0, g0_r0_b1, g0_r1_b1, ...]
+    /// +16 padding for safe vld1q_u8 over-read.
+    packed_blocked: Vec<u8>,
     /// Per-row scale factors (contiguous).
     scales: Vec<f32>,
     pub num_rows: usize,
@@ -1775,7 +1780,28 @@ impl SparseTernaryMatrix {
             }
         }
 
-        Self { mask_buf, packed_2bit, scales, num_rows, num_cols, blocks_per_row, target_sparsity }
+        // Build block-packed layout: groups of 4 rows, interleaved by block.
+        // For 4-row micro-kernel: sequential memory access eliminates TLB misses.
+        let num_groups = (num_rows + 3) / 4;
+        let group_bytes = 4 * blocks_per_row * bytes_per_block; // 4 rows × all blocks
+        let mut packed_blocked = vec![0u8; num_groups * group_bytes + 16]; // +16 padding
+
+        for g in 0..num_groups {
+            let r_base = g * 4;
+            for blk in 0..blocks_per_row {
+                for lane in 0..4 {
+                    let r = r_base + lane;
+                    if r < num_rows {
+                        let src_off = r * blocks_per_row * bytes_per_block + blk * bytes_per_block;
+                        let dst_off = g * group_bytes + blk * 4 * bytes_per_block + lane * bytes_per_block;
+                        packed_blocked[dst_off..dst_off + bytes_per_block]
+                            .copy_from_slice(&packed_2bit[src_off..src_off + bytes_per_block]);
+                    }
+                }
+            }
+        }
+
+        Self { mask_buf, packed_2bit, packed_blocked, scales, num_rows, num_cols, blocks_per_row, target_sparsity }
     }
 
     /// Convert a dense TernaryMatrix to sparse, enforcing N:M structured sparsity.
@@ -1845,9 +1871,9 @@ impl SparseTernaryMatrix {
         total
     }
 
-    /// Estimated memory in bytes (masks + packed_2bit + scales).
+    /// Estimated memory in bytes (masks + packed_2bit + packed_blocked + scales).
     pub fn memory_bytes(&self) -> usize {
-        self.mask_buf.len() * 2 + self.packed_2bit.len() + self.scales.len() * 4
+        self.mask_buf.len() * 2 + self.packed_2bit.len() + self.packed_blocked.len() + self.scales.len() * 4
     }
 }
 
@@ -2075,12 +2101,12 @@ unsafe fn sparse_ternary_dot_sdot(
     row_scale * act_scale * (sum_i32 as f32)
 }
 
-/// Branchless 4-row sdot micro-kernel (Register Blocking + LUT Expansion + Integer Dot Product).
+/// Branchless 4-row sdot micro-kernel (Block-Packed + LUT + SDOT).
+/// - Block-packed layout: 4 rows' data for each block are contiguous in memory → TLB-friendly
 /// - i8 quantized activation loaded ONCE per block, shared across 4 rows
-/// - Packed 2-bit weights expanded via vqtbl1q_s8 LUT (~6 ops vs 14 ops mask-based)
-/// - sdot: 16 × i8×i8 multiplied and accumulated in 1 instruction
+/// - Packed 2-bit weights expanded via vqtbl1q_s8 LUT (~6 ops)
+/// - sdot: 16 × i8×i8 → 4 × i32 in 1 instruction
 /// - ZERO branches in inner loop
-/// - 4 i32 accumulators + 1 shared activation + 4 LUT constants = ~9 registers
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn sparse_ternary_microkernel_4row_sdot(
@@ -2107,31 +2133,31 @@ unsafe fn sparse_ternary_microkernel_4row_sdot(
     let shift_amounts = vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
     let mask_03 = vdupq_n_u8(0x03);
 
-    // Packed weight pointers for 4 rows
-    let packed0 = matrix.packed_weights(row_start);
-    let packed1 = matrix.packed_weights(row_start + 1);
-    let packed2 = matrix.packed_weights(row_start + 2);
-    let packed3 = matrix.packed_weights(row_start + 3);
+    // Block-packed pointer: group's data is contiguous
+    // Layout: [r0_b0(4B), r1_b0(4B), r2_b0(4B), r3_b0(4B), r0_b1, r1_b1, ...]
+    let group = row_start / 4;
+    let group_bytes = 4 * blocks * bytes_per_block;
+    let group_ptr = matrix.packed_blocked.as_ptr().add(group * group_bytes);
+    let stride_4 = 4 * bytes_per_block; // 16 bytes per block-group (4 rows × 4 bytes)
 
     for blk in 0..blocks {
         // 1. Load i8 activation ONCE — shared across 4 rows
         let aq = vld1q_s8(act_i8.as_ptr().add(blk * SPARSE_BLOCK));
-        let off = blk * bytes_per_block;
 
-        // 2. Row 0: LUT expand packed 2-bit → i8 weights → sdot
-        let w0 = expand_packed_2bit_lut(packed0.as_ptr().add(off), lut, replicate_idx, shift_amounts, mask_03);
+        // Block-packed: all 4 rows for this block are at contiguous addresses
+        let blk_base = group_ptr.add(blk * stride_4);
+
+        // 2-5. Sequential loads from contiguous memory (1 cache line = 64B covers 4 blocks)
+        let w0 = expand_packed_2bit_lut(blk_base, lut, replicate_idx, shift_amounts, mask_03);
         acc0 = sdot_s32(acc0, w0, aq);
 
-        // 3. Row 1
-        let w1 = expand_packed_2bit_lut(packed1.as_ptr().add(off), lut, replicate_idx, shift_amounts, mask_03);
+        let w1 = expand_packed_2bit_lut(blk_base.add(bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
         acc1 = sdot_s32(acc1, w1, aq);
 
-        // 4. Row 2
-        let w2 = expand_packed_2bit_lut(packed2.as_ptr().add(off), lut, replicate_idx, shift_amounts, mask_03);
+        let w2 = expand_packed_2bit_lut(blk_base.add(2 * bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
         acc2 = sdot_s32(acc2, w2, aq);
 
-        // 5. Row 3
-        let w3 = expand_packed_2bit_lut(packed3.as_ptr().add(off), lut, replicate_idx, shift_amounts, mask_03);
+        let w3 = expand_packed_2bit_lut(blk_base.add(3 * bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
         acc3 = sdot_s32(acc3, w3, aq);
     }
 
