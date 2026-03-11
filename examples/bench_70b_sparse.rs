@@ -204,4 +204,48 @@ fn main() {
         let est_tps = bw / data_per_token_gb;
         println!("  {:30} {:>7.0} GB/s {:>7.1}", name, bw, est_tps);
     }
+
+    // Speculative decoding projections
+    println!();
+    println!("=== Speculative Decoding Projections ===");
+    println!("  (Layer-skip draft: first N layers, verify: all {NUM_LAYERS} layers)");
+    println!();
+
+    // Simulate different draft configurations
+    // Draft cost = (draft_layers / NUM_LAYERS) * token_ms per draft token
+    // Verify cost = token_ms per verification step (all layers)
+    // With acceptance rate α: effective tokens per cycle = 1 + α*k
+    // Cycle cost = token_ms (verify the accepted token) + k * draft_ms + token_ms (verify k drafts)
+    // But accepted drafts skip verify → amortized:
+    //   Per cycle: 1 verify + k drafts + verify-rejections
+    //   Expected accepted = k*α, total output = 1 + k*α
+    //   Cost = token_ms + k * draft_ms + token_ms (for verification)
+    //   → effective_tok_s = (1 + k*α) / (token_ms + k*draft_ms + token_ms) * 1000
+
+    let configs = [
+        (4, 8, 0.6),   // spec_k=4, draft_layers=8 (10%), acceptance=60%
+        (4, 16, 0.5),  // spec_k=4, draft_layers=16 (20%), acceptance=50%
+        (3, 8, 0.7),   // spec_k=3, draft_layers=8 (10%), acceptance=70%
+        (4, 8, 0.8),   // spec_k=4, draft_layers=8 (10%), acceptance=80% (optimistic)
+    ];
+
+    println!("  {:>6} {:>12} {:>10} {:>12} {:>10}", "spec_k", "draft_layers", "accept_α", "eff. tok/s", "speedup");
+    println!("  {:>6} {:>12} {:>10} {:>12} {:>10}", "------", "------------", "--------", "----------", "-------");
+    for (k, draft_layers, alpha) in &configs {
+        let draft_ms = token_ms * (*draft_layers as f64) / (NUM_LAYERS as f64);
+        // Per speculation cycle:
+        // 1. Process current token (verify, full forward): token_ms
+        // 2. Draft k tokens: k * draft_ms
+        // 3. Verify: re-run full forward for accepted token, then next reject → ~(1 + α*k) verifies
+        //    Simplified: cost = token_ms (initial) + k * draft_ms + token_ms (for verification batch)
+        // Output tokens = 1 + k * α (on average)
+        let cycle_cost_ms = token_ms + (*k as f64) * draft_ms + token_ms;
+        let output_tokens = 1.0 + (*k as f64) * alpha;
+        let eff_tps = output_tokens / cycle_cost_ms * 1000.0;
+        let speedup = eff_tps / tok_per_sec;
+        println!("  {:>6} {:>12} {:>10.0}% {:>10.2} {:>9.1}x", k, draft_layers, alpha * 100.0, eff_tps, speedup);
+    }
+
+    println!();
+    println!("  Baseline (no speculation): {tok_per_sec:.2} tok/s");
 }
