@@ -1834,11 +1834,125 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
     }
 }
 
-/// Zero-multiply dot product for one row of a flat-buffer SparseTernaryMatrix.
-/// Separates positive and negative masks, then accumulates with pure add/sub.
-/// No float multiplication in the inner loop — only at the end (scale).
+/// Dispatch to NEON or scalar implementation.
 #[inline]
 fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is always available on aarch64 (mandatory since ARMv8).
+        // We only read from valid matrix/input memory within bounds.
+        unsafe { sparse_ternary_dot_neon(matrix, row, input) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sparse_ternary_dot_scalar(matrix, row, input)
+    }
+}
+
+/// NEON-optimized branchless sparse ternary dot product.
+/// Processes 16 elements per block using 4×4-wide NEON lanes.
+/// Zero branches in the inner loop — mask bits are expanded to f32 via
+/// bit shifts and NEON bitwise select (vbslq_f32).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn sparse_ternary_dot_neon(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let active = matrix.active_masks(row);
+    let signs = matrix.sign_masks(row);
+    let scale = matrix.scales[row];
+    let blocks = matrix.blocks_per_row;
+
+    // 4 accumulators for 16 elements (4 lanes × 4 groups)
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+
+    let neg_one = vdupq_n_f32(-1.0);
+    let pos_one = vdupq_n_f32(1.0);
+    let zero = vdupq_n_f32(0.0);
+
+    for blk in 0..blocks {
+        let a = active[blk];
+        if a == 0 {
+            continue; // Only branch: skip entire zero blocks
+        }
+        let s = signs[blk];
+        let base = blk * SPARSE_BLOCK;
+        let inp = input.as_ptr().add(base);
+
+        // Load 16 floats as 4 NEON registers
+        let v0 = vld1q_f32(inp);
+        let v1 = vld1q_f32(inp.add(4));
+        let v2 = vld1q_f32(inp.add(8));
+        let v3 = vld1q_f32(inp.add(12));
+
+        // Expand 16-bit active mask to 4×4 u32 masks
+        // For bits 0-3: shift a >> 0..3, mask with 1, compare != 0
+        let a0 = expand_mask_4(a, 0);
+        let a1 = expand_mask_4(a, 4);
+        let a2 = expand_mask_4(a, 8);
+        let a3 = expand_mask_4(a, 12);
+
+        // Expand 16-bit sign mask to 4×4 u32 masks
+        let s0 = expand_mask_4(s, 0);
+        let s1 = expand_mask_4(s, 4);
+        let s2 = expand_mask_4(s, 8);
+        let s3 = expand_mask_4(s, 12);
+
+        // weight = active ? (sign ? -1.0 : +1.0) : 0.0
+        // = vbsl(active_mask, vbsl(sign_mask, -1, +1), 0)
+        let w0 = vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero);
+        let w1 = vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero);
+        let w2 = vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero);
+        let w3 = vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero);
+
+        // Accumulate: acc += weight * input (but weight ∈ {-1,0,+1}, so this is add/sub/nop)
+        acc0 = vfmaq_f32(acc0, w0, v0);
+        acc1 = vfmaq_f32(acc1, w1, v1);
+        acc2 = vfmaq_f32(acc2, w2, v2);
+        acc3 = vfmaq_f32(acc3, w3, v3);
+    }
+
+    // Horizontal reduction: sum all 16 lanes
+    let sum01 = vaddq_f32(acc0, acc1);
+    let sum23 = vaddq_f32(acc2, acc3);
+    let sum = vaddq_f32(sum01, sum23);
+    let result = vaddvq_f32(sum);
+
+    scale * result
+}
+
+/// Expand 4 consecutive bits from a 16-bit mask into a NEON uint32x4 mask.
+/// Bit `offset+i` of `mask` → lane `i` of result (all 1s if set, all 0s if not).
+/// Uses NEON compare-against-zero to avoid scalar bit extraction.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn expand_mask_4(mask: u16, offset: usize) -> std::arch::aarch64::uint32x4_t {
+    use std::arch::aarch64::*;
+
+    // Broadcast the 4-bit nibble to all 4 lanes as u32
+    let nibble = ((mask >> offset) & 0xF) as u32;
+    let bcast = vdupq_n_u32(nibble);
+
+    // Each lane tests a different bit: lane i tests bit i
+    // bit_select = [1, 2, 4, 8]
+    let bit_select = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+
+    // AND: lane i has (nibble & (1<<i)), which is 0 or non-zero
+    let anded = vandq_u32(bcast, bit_select);
+
+    // Compare > 0: produces 0xFFFFFFFF if bit was set, 0x00000000 if not
+    let zero = vdupq_n_u32(0);
+    vcgtq_u32(anded, zero)
+}
+
+/// Scalar fallback for non-aarch64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn sparse_ternary_dot_scalar(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     let active = matrix.active_masks(row);
     let signs = matrix.sign_masks(row);
     let scale = matrix.scales[row];
@@ -1853,11 +1967,9 @@ fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f3
         let s = signs[blk];
         let base = blk * SPARSE_BLOCK;
 
-        // Split into positive (active & !sign) and negative (active & sign) masks
         let pos_mask = a & !s;
         let neg_mask = a & s;
 
-        // Accumulate positive contributions (additions only)
         let mut m = pos_mask;
         while m != 0 {
             let bit = m.trailing_zeros() as usize;
@@ -1865,7 +1977,6 @@ fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f3
             m &= m - 1;
         }
 
-        // Accumulate negative contributions (subtractions only)
         m = neg_mask;
         while m != 0 {
             let bit = m.trailing_zeros() as usize;
