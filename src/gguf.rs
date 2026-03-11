@@ -1813,10 +1813,33 @@ impl SparseTernaryMatrix {
     }
 }
 
+/// Quantize f32 activation vector to i8 with a single global scale.
+/// Returns (quantized_i8, scale) where original ≈ quantized * scale.
+/// Padding to SPARSE_BLOCK alignment is applied for safe NEON loads.
+fn quantize_activation_i8(input: &[f32]) -> (Vec<i8>, f32) {
+    let abs_max = input.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    if abs_max == 0.0 {
+        let padded = ((input.len() + SPARSE_BLOCK - 1) / SPARSE_BLOCK) * SPARSE_BLOCK;
+        return (vec![0i8; padded], 1.0);
+    }
+    let inv_scale = 127.0 / abs_max;
+    let scale = abs_max / 127.0;
+    let padded_len = ((input.len() + SPARSE_BLOCK - 1) / SPARSE_BLOCK) * SPARSE_BLOCK;
+    let mut quant = vec![0i8; padded_len];
+    for (i, &val) in input.iter().enumerate() {
+        quant[i] = (val * inv_scale).round().max(-127.0).min(127.0) as i8;
+    }
+    (quant, scale)
+}
+
 /// Sparse ternary matvec: output = SparseTernaryMatrix × input.
-/// On aarch64: branchless 4-row NEON micro-kernel with shared input loads.
-/// Uses vtstq_u16 bulk mask expansion (40→11 ops per 16-bit mask).
+/// On aarch64 with dotprod: i8 dynamic quantization + vdotq_s32 (16 elements/instruction).
+/// Branchless 4-row micro-kernel with shared activation loads.
 pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output: &mut [f32]) {
+    // Quantize activation to i8 once (shared across all rows)
+    #[cfg(target_arch = "aarch64")]
+    let (act_i8, act_scale) = quantize_activation_i8(input);
+
     #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
     {
         use rayon::prelude::*;
@@ -1826,13 +1849,18 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
             .for_each(|(chunk_idx, chunk)| {
                 let row_start = chunk_idx * 4;
                 if chunk.len() == 4 {
-                    // SAFETY: NEON mandatory on aarch64, output chunk is disjoint
                     unsafe {
-                        sparse_ternary_microkernel_4row(matrix, input, chunk, row_start);
+                        sparse_ternary_microkernel_4row_sdot(
+                            matrix, &act_i8, act_scale, chunk, row_start,
+                        );
                     }
                 } else {
                     for (i, out) in chunk.iter_mut().enumerate() {
-                        *out = sparse_ternary_dot_flat(matrix, row_start + i, input);
+                        unsafe {
+                            *out = sparse_ternary_dot_sdot(
+                                matrix, &act_i8, act_scale, row_start + i,
+                            );
+                        }
                     }
                 }
             });
@@ -1844,12 +1872,16 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
         let mut r = 0;
         while r + 4 <= rows {
             unsafe {
-                sparse_ternary_microkernel_4row(matrix, input, &mut output[r..r + 4], r);
+                sparse_ternary_microkernel_4row_sdot(
+                    matrix, &act_i8, act_scale, &mut output[r..r + 4], r,
+                );
             }
             r += 4;
         }
         while r < rows {
-            output[r] = sparse_ternary_dot_flat(matrix, r, input);
+            unsafe {
+                output[r] = sparse_ternary_dot_sdot(matrix, &act_i8, act_scale, r);
+            }
             r += 1;
         }
     }
@@ -1875,86 +1907,73 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
     }
 }
 
-/// Dispatch to NEON or scalar implementation for single-row dot product.
+/// Scalar fallback dispatch for single-row dot product (non-aarch64).
 #[inline]
 fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sparse_ternary_dot_neon_single(matrix, row, input) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        sparse_ternary_dot_scalar(matrix, row, input)
-    }
+    sparse_ternary_dot_scalar(matrix, row, input)
 }
 
-/// Single-row NEON dot product using expand_mask_16.
-/// Used for tail rows that don't fill a 4-row micro-kernel.
+/// Single-row sdot-based dot product for tail rows.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn sparse_ternary_dot_neon_single(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
+unsafe fn sparse_ternary_dot_sdot(
+    matrix: &SparseTernaryMatrix,
+    act_i8: &[i8],
+    act_scale: f32,
+    row: usize,
+) -> f32 {
     use std::arch::aarch64::*;
 
     let active = matrix.active_masks(row);
     let signs = matrix.sign_masks(row);
-    let scale = matrix.scales[row];
+    let row_scale = matrix.scales[row];
     let blocks = matrix.blocks_per_row;
 
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
+    // i32 accumulator — single register, sdot adds 16 products at once
+    let mut acc = vdupq_n_s32(0);
 
-    let neg_one = vdupq_n_f32(-1.0);
-    let pos_one = vdupq_n_f32(1.0);
-    let zero_f = vdupq_n_f32(0.0);
+    // Mask expansion constants
+    let bit_pattern = vld1q_u8(
+        [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr(),
+    );
+    let zero_u8 = vdupq_n_u8(0);
+    let pos_one_i8 = vdupq_n_s8(1);
+    let neg_one_i8 = vdupq_n_s8(-1);
+    let zero_i8 = vdupq_n_s8(0);
 
-    // Bit-test vectors loaded once outside loop
-    let bits_lo = vld1q_u16([1u16, 2, 4, 8, 16, 32, 64, 128].as_ptr());
-    let bits_hi = vld1q_u16([256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768].as_ptr());
-    let zero_u16 = vdupq_n_u16(0);
-
-    // Completely branchless — no zero-check, FMA with 0 weight is harmless
+    // Branchless loop
     for blk in 0..blocks {
-        let base = blk * SPARSE_BLOCK;
-        let inp = input.as_ptr().add(base);
+        // Load i8 quantized activation (1 instruction for 16 elements!)
+        let aq = vld1q_s8(act_i8.as_ptr().add(blk * SPARSE_BLOCK));
 
-        let v0 = vld1q_f32(inp);
-        let v1 = vld1q_f32(inp.add(4));
-        let v2 = vld1q_f32(inp.add(8));
-        let v3 = vld1q_f32(inp.add(12));
+        // Expand u16 masks → i8 weight vector
+        let w = expand_masks_to_i8(
+            active[blk], signs[blk],
+            bit_pattern, zero_u8, pos_one_i8, neg_one_i8, zero_i8,
+        );
 
-        let (a0, a1, a2, a3) = expand_mask_16(active[blk], bits_lo, bits_hi, zero_u16);
-        let (s0, s1, s2, s3) = expand_mask_16(signs[blk], bits_lo, bits_hi, zero_u16);
-
-        let w0 = vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f);
-        let w1 = vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f);
-        let w2 = vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f);
-        let w3 = vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f);
-
-        acc0 = vfmaq_f32(acc0, w0, v0);
-        acc1 = vfmaq_f32(acc1, w1, v1);
-        acc2 = vfmaq_f32(acc2, w2, v2);
-        acc3 = vfmaq_f32(acc3, w3, v3);
+        // sdot: accumulate 16 × (weight_i8 × activation_i8) → 4 × i32
+        acc = sdot_s32(acc, w, aq);
     }
 
-    let sum01 = vaddq_f32(acc0, acc1);
-    let sum23 = vaddq_f32(acc2, acc3);
-    let sum = vaddq_f32(sum01, sum23);
-    scale * vaddvq_f32(sum)
+    // Horizontal sum of 4 i32 lanes → single i32 → f32
+    let sum_i32 = vaddvq_s32(acc);
+    row_scale * act_scale * (sum_i32 as f32)
 }
 
-/// Branchless 4-row NEON micro-kernel (Register Blocking).
-/// - Input block loaded ONCE, reused across 4 rows (4× less memory traffic)
-/// - expand_mask_16 for bulk mask expansion (vtstq_u16 based)
-/// - ZERO branches in inner loop — pipeline never stalls
-/// - 16 accumulators + 4 shared input + 5 constants = 25 registers (fits in 32)
+/// Branchless 4-row sdot micro-kernel (Register Blocking + Integer Dot Product).
+/// - i8 quantized activation loaded ONCE per block, shared across 4 rows
+/// - u16 masks expanded to i8 weights via byte-level NEON (vandq_u8 + vcgtq_u8 + vbslq_s8)
+/// - vdotq_s32: 16 × i8×i8 multiplied and accumulated in 1 instruction
+/// - ZERO branches in inner loop
+/// - 4 i32 accumulators + 1 shared activation + 5 constants = ~10 registers
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn sparse_ternary_microkernel_4row(
+unsafe fn sparse_ternary_microkernel_4row_sdot(
     matrix: &SparseTernaryMatrix,
-    input: &[f32],
+    act_i8: &[i8],
+    act_scale: f32,
     output: &mut [f32],
     row_start: usize,
 ) {
@@ -1962,133 +1981,134 @@ unsafe fn sparse_ternary_microkernel_4row(
 
     let blocks = matrix.blocks_per_row;
 
-    // 4 rows × 4 accumulators = 16 NEON registers
-    let mut r0a0 = vdupq_n_f32(0.0); let mut r0a1 = vdupq_n_f32(0.0);
-    let mut r0a2 = vdupq_n_f32(0.0); let mut r0a3 = vdupq_n_f32(0.0);
-    let mut r1a0 = vdupq_n_f32(0.0); let mut r1a1 = vdupq_n_f32(0.0);
-    let mut r1a2 = vdupq_n_f32(0.0); let mut r1a3 = vdupq_n_f32(0.0);
-    let mut r2a0 = vdupq_n_f32(0.0); let mut r2a1 = vdupq_n_f32(0.0);
-    let mut r2a2 = vdupq_n_f32(0.0); let mut r2a3 = vdupq_n_f32(0.0);
-    let mut r3a0 = vdupq_n_f32(0.0); let mut r3a1 = vdupq_n_f32(0.0);
-    let mut r3a2 = vdupq_n_f32(0.0); let mut r3a3 = vdupq_n_f32(0.0);
+    // 4 × i32 accumulators (one int32x4_t per row)
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    let mut acc2 = vdupq_n_s32(0);
+    let mut acc3 = vdupq_n_s32(0);
 
-    // Constants — loaded once, live in registers for entire loop
-    let neg_one = vdupq_n_f32(-1.0);
-    let pos_one = vdupq_n_f32(1.0);
-    let zero_f = vdupq_n_f32(0.0);
-    let bits_lo = vld1q_u16([1u16, 2, 4, 8, 16, 32, 64, 128].as_ptr());
-    let bits_hi = vld1q_u16([256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768].as_ptr());
-    let zero_u16 = vdupq_n_u16(0);
+    // Constants for mask expansion — live in registers
+    let bit_pattern = vld1q_u8(
+        [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr(),
+    );
+    let zero_u8 = vdupq_n_u8(0);
+    let pos_one_i8 = vdupq_n_s8(1);
+    let neg_one_i8 = vdupq_n_s8(-1);
+    let zero_i8 = vdupq_n_s8(0);
 
-    // Mask slices for all 4 rows (pointers into flat buffer)
-    let act0 = matrix.active_masks(row_start);
-    let act1 = matrix.active_masks(row_start + 1);
-    let act2 = matrix.active_masks(row_start + 2);
-    let act3 = matrix.active_masks(row_start + 3);
-    let sgn0 = matrix.sign_masks(row_start);
-    let sgn1 = matrix.sign_masks(row_start + 1);
-    let sgn2 = matrix.sign_masks(row_start + 2);
-    let sgn3 = matrix.sign_masks(row_start + 3);
+    // Mask slices for 4 rows
+    let act_r0 = matrix.active_masks(row_start);
+    let act_r1 = matrix.active_masks(row_start + 1);
+    let act_r2 = matrix.active_masks(row_start + 2);
+    let act_r3 = matrix.active_masks(row_start + 3);
+    let sgn_r0 = matrix.sign_masks(row_start);
+    let sgn_r1 = matrix.sign_masks(row_start + 1);
+    let sgn_r2 = matrix.sign_masks(row_start + 2);
+    let sgn_r3 = matrix.sign_masks(row_start + 3);
 
-    // COMPLETELY BRANCHLESS inner loop
-    // No zero-checks, no skips — OoO execution engine fires at full throughput.
-    // FMA with weight=0 is harmless (adds 0) and costs 1 cycle vs 5-15 cycle
-    // branch misprediction penalty.
     for blk in 0..blocks {
-        // 1. Load input block ONCE — shared across all 4 rows
-        let base = blk * SPARSE_BLOCK;
-        let inp = input.as_ptr().add(base);
-        let v0 = vld1q_f32(inp);
-        let v1 = vld1q_f32(inp.add(4));
-        let v2 = vld1q_f32(inp.add(8));
-        let v3 = vld1q_f32(inp.add(12));
+        // 1. Load i8 activation ONCE — shared across 4 rows
+        let aq = vld1q_s8(act_i8.as_ptr().add(blk * SPARSE_BLOCK));
 
-        // 2. Row 0: expand masks → weights → FMA
-        let (a0, a1, a2, a3) = expand_mask_16(act0[blk], bits_lo, bits_hi, zero_u16);
-        let (s0, s1, s2, s3) = expand_mask_16(sgn0[blk], bits_lo, bits_hi, zero_u16);
-        r0a0 = vfmaq_f32(r0a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
-        r0a1 = vfmaq_f32(r0a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
-        r0a2 = vfmaq_f32(r0a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
-        r0a3 = vfmaq_f32(r0a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+        // 2. Row 0: expand masks → i8 weights → sdot
+        let w0 = expand_masks_to_i8(
+            act_r0[blk], sgn_r0[blk],
+            bit_pattern, zero_u8, pos_one_i8, neg_one_i8, zero_i8,
+        );
+        acc0 = sdot_s32(acc0, w0, aq);
 
         // 3. Row 1
-        let (a0, a1, a2, a3) = expand_mask_16(act1[blk], bits_lo, bits_hi, zero_u16);
-        let (s0, s1, s2, s3) = expand_mask_16(sgn1[blk], bits_lo, bits_hi, zero_u16);
-        r1a0 = vfmaq_f32(r1a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
-        r1a1 = vfmaq_f32(r1a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
-        r1a2 = vfmaq_f32(r1a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
-        r1a3 = vfmaq_f32(r1a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+        let w1 = expand_masks_to_i8(
+            act_r1[blk], sgn_r1[blk],
+            bit_pattern, zero_u8, pos_one_i8, neg_one_i8, zero_i8,
+        );
+        acc1 = sdot_s32(acc1, w1, aq);
 
         // 4. Row 2
-        let (a0, a1, a2, a3) = expand_mask_16(act2[blk], bits_lo, bits_hi, zero_u16);
-        let (s0, s1, s2, s3) = expand_mask_16(sgn2[blk], bits_lo, bits_hi, zero_u16);
-        r2a0 = vfmaq_f32(r2a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
-        r2a1 = vfmaq_f32(r2a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
-        r2a2 = vfmaq_f32(r2a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
-        r2a3 = vfmaq_f32(r2a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+        let w2 = expand_masks_to_i8(
+            act_r2[blk], sgn_r2[blk],
+            bit_pattern, zero_u8, pos_one_i8, neg_one_i8, zero_i8,
+        );
+        acc2 = sdot_s32(acc2, w2, aq);
 
         // 5. Row 3
-        let (a0, a1, a2, a3) = expand_mask_16(act3[blk], bits_lo, bits_hi, zero_u16);
-        let (s0, s1, s2, s3) = expand_mask_16(sgn3[blk], bits_lo, bits_hi, zero_u16);
-        r3a0 = vfmaq_f32(r3a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
-        r3a1 = vfmaq_f32(r3a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
-        r3a2 = vfmaq_f32(r3a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
-        r3a3 = vfmaq_f32(r3a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+        let w3 = expand_masks_to_i8(
+            act_r3[blk], sgn_r3[blk],
+            bit_pattern, zero_u8, pos_one_i8, neg_one_i8, zero_i8,
+        );
+        acc3 = sdot_s32(acc3, w3, aq);
     }
 
-    // Horizontal reduction + scale
-    let s0 = matrix.scales[row_start];
-    let s1 = matrix.scales[row_start + 1];
-    let s2 = matrix.scales[row_start + 2];
-    let s3 = matrix.scales[row_start + 3];
+    // Horizontal reduction: i32 → f32, apply scales
+    let s0 = matrix.scales[row_start] * act_scale;
+    let s1 = matrix.scales[row_start + 1] * act_scale;
+    let s2 = matrix.scales[row_start + 2] * act_scale;
+    let s3 = matrix.scales[row_start + 3] * act_scale;
 
-    output[0] = s0 * vaddvq_f32(vaddq_f32(vaddq_f32(r0a0, r0a1), vaddq_f32(r0a2, r0a3)));
-    output[1] = s1 * vaddvq_f32(vaddq_f32(vaddq_f32(r1a0, r1a1), vaddq_f32(r1a2, r1a3)));
-    output[2] = s2 * vaddvq_f32(vaddq_f32(vaddq_f32(r2a0, r2a1), vaddq_f32(r2a2, r2a3)));
-    output[3] = s3 * vaddvq_f32(vaddq_f32(vaddq_f32(r3a0, r3a1), vaddq_f32(r3a2, r3a3)));
+    output[0] = s0 * (vaddvq_s32(acc0) as f32);
+    output[1] = s1 * (vaddvq_s32(acc1) as f32);
+    output[2] = s2 * (vaddvq_s32(acc2) as f32);
+    output[3] = s3 * (vaddvq_s32(acc3) as f32);
 }
 
-/// Expand all 16 bits of a mask into 4 × uint32x4 using vtstq_u16.
-/// Replaces 8 × expand_mask_4 (40 ops) with a single bulk expansion (~11 ops).
-/// `bits_lo` = [1,2,4,8,16,32,64,128], `bits_hi` = [256..32768], `zero` = 0.
-/// These are passed as parameters to keep them in registers across the loop.
+/// SDOT via inline assembly: acc.4s += a.16b · b.16b
+/// Processes 16 × i8×i8 → 4 × i32 accumulation in 1 instruction.
+/// Uses inline asm because vdotq_s32 is unstable in Rust's std::arch.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn expand_mask_16(
-    mask: u16,
-    bits_lo: std::arch::aarch64::uint16x8_t,
-    bits_hi: std::arch::aarch64::uint16x8_t,
-    zero: std::arch::aarch64::uint16x8_t,
-) -> (std::arch::aarch64::uint32x4_t, std::arch::aarch64::uint32x4_t,
-      std::arch::aarch64::uint32x4_t, std::arch::aarch64::uint32x4_t) {
-    use std::arch::aarch64::*;
-
-    // Broadcast mask to all 8 lanes
-    let mask_vec = vdupq_n_u16(mask);
-
-    // AND with bit patterns, then compare > 0
-    let lo = vandq_u16(mask_vec, bits_lo);
-    let hi = vandq_u16(mask_vec, bits_hi);
-    let test_lo = vcgtq_u16(lo, zero);   // bits 0-7:  8 × u16 (0xFFFF or 0)
-    let test_hi = vcgtq_u16(hi, zero);   // bits 8-15: 8 × u16 (0xFFFF or 0)
-
-    // Widen u16 → u32 (zero-extend preserves 0xFFFF→0x0000FFFF, but vbslq
-    // only checks MSB per lane so we need sign-extend. Use vmovl which is
-    // unsigned widen — but 0xFFFF widened is 0x0000FFFF whose bit 31 = 0.
-    // Fix: reinterpret as signed and use vmovl_s16 for sign extension.)
-    let test_lo_s = vreinterpretq_s16_u16(test_lo);
-    let test_hi_s = vreinterpretq_s16_u16(test_hi);
-
-    let r0 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(test_lo_s)));   // bits 0-3
-    let r1 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(test_lo_s)));  // bits 4-7
-    let r2 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(test_hi_s)));   // bits 8-11
-    let r3 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(test_hi_s)));  // bits 12-15
-
-    (r0, r1, r2, r3)
+unsafe fn sdot_s32(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut result = acc;
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) result,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(nostack, preserves_flags),
+    );
+    result
 }
 
-/// Scalar fallback for non-aarch64 targets.
-#[cfg(not(target_arch = "aarch64"))]
+/// Expand u16 active + sign masks into a single int8x16_t weight vector.
+/// Each element: active ? (sign ? -1 : +1) : 0.
+/// Uses byte-level NEON: vandq_u8 + vcgtq_u8 for bit expansion, vbslq_s8 for select.
+/// All constants passed as parameters to keep them in registers.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn expand_masks_to_i8(
+    active: u16,
+    sign: u16,
+    bit_pattern: std::arch::aarch64::uint8x16_t,
+    zero_u8: std::arch::aarch64::uint8x16_t,
+    pos_one_i8: std::arch::aarch64::int8x16_t,
+    neg_one_i8: std::arch::aarch64::int8x16_t,
+    zero_i8: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int8x16_t {
+    use std::arch::aarch64::*;
+
+    // Expand active mask: broadcast lo/hi bytes, AND with bit pattern, compare > 0
+    let act_lo = vdup_n_u8((active & 0xFF) as u8);
+    let act_hi = vdup_n_u8((active >> 8) as u8);
+    let act_vec = vcombine_u8(act_lo, act_hi);
+    let act_mask = vcgtq_u8(vandq_u8(act_vec, bit_pattern), zero_u8);
+
+    // Expand sign mask: same approach
+    let sgn_lo = vdup_n_u8((sign & 0xFF) as u8);
+    let sgn_hi = vdup_n_u8((sign >> 8) as u8);
+    let sgn_vec = vcombine_u8(sgn_lo, sgn_hi);
+    let sgn_mask = vcgtq_u8(vandq_u8(sgn_vec, bit_pattern), zero_u8);
+
+    // weight = active ? (sign ? -1 : +1) : 0
+    // vbslq_s8(mask: uint8x16_t, a: int8x16_t, b: int8x16_t)
+    // sgn_mask and act_mask are already uint8x16_t from vcgtq_u8
+    let sign_weight = vbslq_s8(sgn_mask, neg_one_i8, pos_one_i8);
+    vbslq_s8(act_mask, sign_weight, zero_i8)
+}
+
+/// Scalar fallback (used on non-aarch64 and as reference implementation).
 #[inline]
 fn sparse_ternary_dot_scalar(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     let active = matrix.active_masks(row);
@@ -2453,9 +2473,11 @@ mod tests {
         sparse_ternary_matvec(&sparse, &input, &mut sparse_out);
 
         // With n_keep=16 (all), sparse should match dense
+        // Tolerance widened for i8 activation quantization (~2% relative error)
         for i in 0..num_rows {
+            let tol = dense_out[i].abs().max(0.01) * 0.05;
             assert!(
-                (dense_out[i] - sparse_out[i]).abs() < 1e-4,
+                (dense_out[i] - sparse_out[i]).abs() < tol,
                 "row {i}: dense={} sparse={}", dense_out[i], sparse_out[i]
             );
         }
@@ -2501,9 +2523,10 @@ mod tests {
         sparse_ternary_matvec(&matrix, &input_test, &mut output);
 
         // Expected: scale * (10.0 - 7.0) = scale * 3.0
+        // Tolerance widened for i8 activation quantization (~0.5% error)
         let expected = scale * 3.0;
         assert!(
-            (output[0] - expected).abs() < 1e-4,
+            (output[0] - expected).abs() < expected.abs() * 0.05,
             "result={}, expected={expected}", output[0]
         );
     }
