@@ -2268,6 +2268,30 @@ fn sparse_ternary_dot_scalar(matrix: &SparseTernaryMatrix, row: usize, input: &[
     scale * sum
 }
 
+/// Dequantize a single row of quantized weight data to f32.
+/// Public API for use by model loading (sparse ternary conversion etc.).
+pub fn dequantize_weight_row(data: &[u8], qtype: GgmlType, out: &mut [f32]) {
+    match qtype {
+        GgmlType::Q4_K => dequantize_row_q4k(data, out),
+        GgmlType::Q6_K => dequantize_row_q6k(data, out),
+        GgmlType::Q8_0 => dequantize_row_q8_0(data, out),
+        GgmlType::F16 => {
+            for i in 0..out.len() {
+                let off = i * 2;
+                out[i] = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+            }
+        }
+        GgmlType::F32 => {
+            for i in 0..out.len() {
+                out[i] = f32::from_le_bytes([
+                    data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3],
+                ]);
+            }
+        }
+        _ => out.fill(0.0),
+    }
+}
+
 /// Dequantize a single Q4_K row to f32.
 fn dequantize_row_q4k(data: &[u8], out: &mut [f32]) {
     let blocks = out.len() / QK_K;

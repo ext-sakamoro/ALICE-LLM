@@ -4,7 +4,7 @@
 //! (Logit Softcapping). Performs inference directly on Q4_K_M/Q8_0
 //! quantized data via fused dequantize+matvec.
 
-use crate::gguf::{quantized_matvec, quantized_matvec_preq, quantize_row_q8_k, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, TernaryMatrix, ternary_matvec};
+use crate::gguf::{quantized_matvec, quantized_matvec_preq, quantize_row_q8_k, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, TernaryMatrix, ternary_matvec, SparseTernaryMatrix, sparse_ternary_matvec};
 use std::time::Instant;
 
 // ─── Model architecture ─────────────────────────────────────────────────────
@@ -573,6 +573,22 @@ impl<'a> WeightRef<'a> {
     fn matvec_preq(&self, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
         quantized_matvec_preq(self.data, self.qtype, self.rows, self.cols, q8_blocks, output);
     }
+
+    /// Dequantize all weights to f32 (row-major, rows × cols).
+    fn dequantize_all(&self, rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        let mut row_buf = vec![0.0f32; cols];
+        let elems_per_block = self.qtype.elements_per_block();
+        let bytes_per_block = self.qtype.block_bytes();
+        let blocks_per_row = cols / elems_per_block;
+        let row_bytes = blocks_per_row * bytes_per_block;
+        for r in 0..rows {
+            let row_data = &self.data[r * row_bytes..(r + 1) * row_bytes];
+            crate::gguf::dequantize_weight_row(row_data, self.qtype, &mut row_buf);
+            out[r * cols..(r + 1) * cols].copy_from_slice(&row_buf);
+        }
+        out
+    }
 }
 
 /// Layer weight references (zero-copy from GGUF).
@@ -710,6 +726,19 @@ struct TernaryLayerWeights {
     down_proj: TernaryMatrix,
 }
 
+/// Sparse ternary layer weights (N:M structured sparsity + block-packed).
+struct SparseTernaryLayerWeights {
+    attn_norm: Vec<f32>,
+    q_proj: SparseTernaryMatrix,
+    k_proj: SparseTernaryMatrix,
+    v_proj: SparseTernaryMatrix,
+    o_proj: SparseTernaryMatrix,
+    ffn_norm: Vec<f32>,
+    gate_proj: SparseTernaryMatrix,
+    up_proj: SparseTernaryMatrix,
+    down_proj: SparseTernaryMatrix,
+}
+
 /// Llama-3 model loaded from GGUF. Weights stay in quantized form
 /// in the mmap'd file; only dequantized during matvec.
 pub struct Llama3Model<'a> {
@@ -721,6 +750,8 @@ pub struct Llama3Model<'a> {
     kv_cache: KvCache,
     ternary_layers: Option<Vec<TernaryLayerWeights>>,
     ternary_output_proj: Option<TernaryMatrix>,
+    sparse_ternary_layers: Option<Vec<SparseTernaryLayerWeights>>,
+    sparse_ternary_output: Option<SparseTernaryMatrix>,
 }
 
 impl<'a> Llama3Model<'a> {
@@ -756,6 +787,8 @@ impl<'a> Llama3Model<'a> {
             kv_cache,
             ternary_layers: None,
             ternary_output_proj: None,
+            sparse_ternary_layers: None,
+            sparse_ternary_output: None,
         })
     }
 
@@ -1330,6 +1363,298 @@ impl<'a> Llama3Model<'a> {
         }
     }
 
+    // ─── Sparse Ternary (N:M structured sparsity) ─────────────────────────
+
+    /// Convert all weights to sparse ternary format with N:M structured sparsity.
+    /// n_keep = number of non-zero weights per 16-element block (e.g. 8 = 8:16 = 50% density).
+    pub fn load_sparse_ternary(&mut self, threshold_ratio: f32, n_keep: usize) {
+        let c = &self.config;
+        let kv_dim = c.num_kv_heads * c.head_dim;
+        let mut layers = Vec::with_capacity(c.num_layers);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            eprint!("  Sparse-ternarizing layer {i}/{} ...\r", c.num_layers);
+            layers.push(SparseTernaryLayerWeights {
+                attn_norm: layer.attn_norm.clone(),
+                q_proj: sparsify_weight(&layer.q_proj, c.hidden_dim, c.hidden_dim, threshold_ratio, n_keep),
+                k_proj: sparsify_weight(&layer.k_proj, kv_dim, c.hidden_dim, threshold_ratio, n_keep),
+                v_proj: sparsify_weight(&layer.v_proj, kv_dim, c.hidden_dim, threshold_ratio, n_keep),
+                o_proj: sparsify_weight(&layer.o_proj, c.hidden_dim, c.hidden_dim, threshold_ratio, n_keep),
+                ffn_norm: layer.ffn_norm.clone(),
+                gate_proj: sparsify_weight(&layer.gate_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio, n_keep),
+                up_proj: sparsify_weight(&layer.up_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio, n_keep),
+                down_proj: sparsify_weight(&layer.down_proj, c.hidden_dim, c.intermediate_dim, threshold_ratio, n_keep),
+            });
+        }
+        eprintln!("  Sparse-ternarized {}/{} layers ({}:16)", c.num_layers, c.num_layers, n_keep);
+
+        self.sparse_ternary_output = Some(sparsify_weight(
+            &self.output_proj, c.vocab_size, c.hidden_dim, threshold_ratio, n_keep,
+        ));
+        self.sparse_ternary_layers = Some(layers);
+    }
+
+    /// Forward pass using sparse ternary weights (block-packed, SDOT+LUT optimized).
+    pub fn forward_sparse_ternary(&mut self, token_id: u32) -> Vec<f32> {
+        let st_layers = self.sparse_ternary_layers.as_ref().expect("call load_sparse_ternary() first");
+        let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
+        let c = &self.config;
+        let pos = self.kv_cache.seq_len();
+
+        let emb_start = token_id as usize * c.hidden_dim;
+        let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+
+        let mut norm_buf = vec![0.0f32; c.hidden_dim];
+        let kv_dim = c.num_kv_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut k_buf = vec![0.0f32; kv_dim];
+        let mut v_buf = vec![0.0f32; kv_dim];
+        let mut attn_out = vec![0.0f32; c.hidden_dim];
+        let mut o_buf = vec![0.0f32; c.hidden_dim];
+        let mut gate_buf = vec![0.0f32; c.intermediate_dim];
+        let mut up_buf = vec![0.0f32; c.intermediate_dim];
+        let mut down_buf = vec![0.0f32; c.hidden_dim];
+
+        for layer_idx in 0..c.num_layers {
+            let sl = &st_layers[layer_idx];
+
+            rms_norm(&hidden, &sl.attn_norm, c.norm_eps, &mut norm_buf);
+
+            sparse_ternary_matvec(&sl.q_proj, &norm_buf, &mut q_buf);
+            sparse_ternary_matvec(&sl.k_proj, &norm_buf, &mut k_buf);
+            sparse_ternary_matvec(&sl.v_proj, &norm_buf, &mut v_buf);
+
+            for h in 0..c.num_heads {
+                let start = h * c.head_dim;
+                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+            }
+            for h in 0..c.num_kv_heads {
+                let start = h * c.head_dim;
+                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+            }
+
+            self.kv_cache.append(layer_idx, &k_buf, &v_buf);
+
+            gqa_attention(
+                &q_buf, &self.kv_cache, layer_idx, pos,
+                c.num_heads, c.num_kv_heads, c.head_dim,
+                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+            );
+
+            sparse_ternary_matvec(&sl.o_proj, &attn_out, &mut o_buf);
+            for i in 0..c.hidden_dim {
+                hidden[i] += o_buf[i];
+            }
+
+            rms_norm(&hidden, &sl.ffn_norm, c.norm_eps, &mut norm_buf);
+
+            sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
+            sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
+            for i in 0..c.intermediate_dim {
+                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+            }
+            sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
+
+            for i in 0..c.hidden_dim {
+                hidden[i] += down_buf[i];
+            }
+        }
+
+        self.kv_cache.advance();
+
+        rms_norm(&hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        sparse_ternary_matvec(st_output, &norm_buf, &mut logits);
+        logits
+    }
+
+    /// Draft forward pass using sparse ternary weights (first N layers only).
+    fn forward_sparse_ternary_draft(&mut self, token_id: u32, draft_layers: usize) -> Vec<f32> {
+        let st_layers = self.sparse_ternary_layers.as_ref().expect("call load_sparse_ternary() first");
+        let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
+        let c = &self.config;
+        let pos = self.kv_cache.seq_len();
+        let num_draft = draft_layers.min(c.num_layers);
+
+        let emb_start = token_id as usize * c.hidden_dim;
+        let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+
+        let mut norm_buf = vec![0.0f32; c.hidden_dim];
+        let kv_dim = c.num_kv_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut k_buf = vec![0.0f32; kv_dim];
+        let mut v_buf = vec![0.0f32; kv_dim];
+        let mut attn_out = vec![0.0f32; c.hidden_dim];
+        let mut o_buf = vec![0.0f32; c.hidden_dim];
+        let mut gate_buf = vec![0.0f32; c.intermediate_dim];
+        let mut up_buf = vec![0.0f32; c.intermediate_dim];
+        let mut down_buf = vec![0.0f32; c.hidden_dim];
+
+        for layer_idx in 0..num_draft {
+            let sl = &st_layers[layer_idx];
+
+            rms_norm(&hidden, &sl.attn_norm, c.norm_eps, &mut norm_buf);
+
+            sparse_ternary_matvec(&sl.q_proj, &norm_buf, &mut q_buf);
+            sparse_ternary_matvec(&sl.k_proj, &norm_buf, &mut k_buf);
+            sparse_ternary_matvec(&sl.v_proj, &norm_buf, &mut v_buf);
+
+            for h in 0..c.num_heads {
+                let start = h * c.head_dim;
+                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+            }
+            for h in 0..c.num_kv_heads {
+                let start = h * c.head_dim;
+                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+            }
+
+            self.kv_cache.append(layer_idx, &k_buf, &v_buf);
+
+            gqa_attention(
+                &q_buf, &self.kv_cache, layer_idx, pos,
+                c.num_heads, c.num_kv_heads, c.head_dim,
+                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+            );
+
+            sparse_ternary_matvec(&sl.o_proj, &attn_out, &mut o_buf);
+            for i in 0..c.hidden_dim {
+                hidden[i] += o_buf[i];
+            }
+
+            rms_norm(&hidden, &sl.ffn_norm, c.norm_eps, &mut norm_buf);
+
+            sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
+            sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
+            for i in 0..c.intermediate_dim {
+                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+            }
+            sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
+            for i in 0..c.hidden_dim {
+                hidden[i] += down_buf[i];
+            }
+        }
+
+        self.kv_cache.advance();
+
+        rms_norm(&hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        sparse_ternary_matvec(st_output, &norm_buf, &mut logits);
+        logits
+    }
+
+    /// Generate with sparse ternary speculative decoding.
+    /// Draft model = first `draft_layers` layers (layer-skip).
+    /// Verify model = all layers.
+    pub fn generate_sparse_ternary_speculative(
+        &mut self,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        spec_k: usize,
+        draft_layers: usize,
+    ) -> GenerateResult {
+        let start = Instant::now();
+        let prompt_tokens = tokenizer.encode(prompt);
+        let mut tokens = vec![tokenizer.bos_id];
+        tokens.extend_from_slice(&prompt_tokens);
+
+        self.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        // Prefill
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward_sparse_ternary(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        // Decode with speculation
+        let decode_start = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut total_drafted: usize = 0;
+        let mut total_accepted: usize = 0;
+
+        while generated.len() < max_new_tokens {
+            let next_token = sample_token(&logits, temperature, top_k);
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+            generated.push(next_token);
+            tokens.push(next_token);
+
+            let remaining = max_new_tokens - generated.len();
+            if remaining == 0 {
+                logits = self.forward_sparse_ternary(next_token);
+                continue;
+            }
+
+            let k = spec_k.min(remaining);
+
+            // --- Draft phase ---
+            let saved_pos = self.kv_cache.seq_len();
+            let mut draft_tokens = Vec::with_capacity(k);
+            let mut draft_input = next_token;
+            for _ in 0..k {
+                let draft_logits = self.forward_sparse_ternary_draft(draft_input, draft_layers);
+                draft_input = argmax(&draft_logits);
+                draft_tokens.push(draft_input);
+            }
+            total_drafted += draft_tokens.len();
+
+            // --- Rollback ---
+            self.kv_cache.rollback_to(saved_pos);
+
+            // --- Verify phase ---
+            logits = self.forward_sparse_ternary(next_token);
+
+            for i in 0..draft_tokens.len() {
+                let verified = sample_token(&logits, temperature, top_k);
+                if verified == draft_tokens[i] {
+                    generated.push(draft_tokens[i]);
+                    tokens.push(draft_tokens[i]);
+                    total_accepted += 1;
+                    logits = self.forward_sparse_ternary(draft_tokens[i]);
+                } else {
+                    if verified == tokenizer.eos_id {
+                        break;
+                    }
+                    generated.push(verified);
+                    tokens.push(verified);
+                    logits = self.forward_sparse_ternary(verified);
+                    break;
+                }
+            }
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        GenerateResult {
+            text: tokenizer.decode(&generated),
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+            spec_stats: Some(SpecStats {
+                draft_tokens: total_drafted,
+                accepted_tokens: total_accepted,
+                draft_layers,
+                spec_k,
+            }),
+        }
+    }
+
     // ─── Paged KV Cache forward ─────────────────────────────────────────────
 
     /// Forward pass using a per-request PagedKvCache instead of the model's flat cache.
@@ -1545,6 +1870,12 @@ pub struct SpecStats {
 
 fn ternarize_weight(w: &WeightRef<'_>, rows: usize, cols: usize, threshold_ratio: f32) -> TernaryMatrix {
     TernaryMatrix::from_quantized(w.data, w.qtype, rows, cols, threshold_ratio)
+}
+
+fn sparsify_weight(w: &WeightRef<'_>, rows: usize, cols: usize, threshold_ratio: f32, n_keep: usize) -> SparseTernaryMatrix {
+    // Dequantize to f32 then convert to sparse ternary with N:M sparsity
+    let weights_f32 = w.dequantize_all(rows, cols);
+    SparseTernaryMatrix::from_f32_weights(&weights_f32, rows, cols, threshold_ratio, n_keep)
 }
 
 fn load_weight_ref<'a>(
