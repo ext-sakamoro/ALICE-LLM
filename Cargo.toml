@@ -38,3 +38,7 @@ required-features = ["gguf"]
 [[example]]
 name = "test_1b"
 required-features = ["gguf"]
+
+[[example]]
+name = "test_q3k"
+required-features = ["gguf"]

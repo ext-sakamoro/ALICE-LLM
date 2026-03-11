@@ -55,6 +55,8 @@ pub enum GgmlType {
     Q4_0,
     Q4_1,
     Q8_0,
+    Q2_K,
+    Q3_K,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -69,6 +71,8 @@ impl GgmlType {
             2 => Self::Q4_0,
             3 => Self::Q4_1,
             8 => Self::Q8_0,
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
@@ -85,6 +89,8 @@ impl GgmlType {
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
             Self::Q8_0 => 34,
+            Self::Q2_K => 84,
+            Self::Q3_K => 110,
             Self::Q4_K => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
@@ -98,7 +104,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => QK8_0,
-            Self::Q4_K | Self::Q5_K | Self::Q6_K => QK_K,
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => QK_K,
             Self::Other(_) => 1,
         }
     }
@@ -465,7 +471,10 @@ impl<'a> GgufFile<'a> {
                 }
             }
             GgmlType::Q8_0 => dequantize_q8_0(data, &mut out),
+            GgmlType::Q2_K => dequantize_q2_k(data, &mut out),
+            GgmlType::Q3_K => dequantize_q3_k(data, &mut out),
             GgmlType::Q4_K => dequantize_q4_k(data, &mut out),
+            GgmlType::Q5_K => dequantize_q5_k(data, &mut out),
             GgmlType::Q6_K => dequantize_q6_k(data, &mut out),
             _ => return None,
         }
@@ -484,6 +493,103 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
         let sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
         let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
         (sc, m)
+    }
+}
+
+// ─── Q2_K dequantization ────────────────────────────────────────────────────
+// Block layout (84 bytes per 256 elements):
+//   scales[16] — 4-bit scale (low nibble) + 4-bit min (high nibble)
+//   qs[64]     — 2-bit weights, 4 per byte
+//   d (f16)    — super-block scale
+//   dmin (f16) — super-block min
+
+fn dequantize_q2_k(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 84;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let block = &data[i * block_bytes..(i + 1) * block_bytes];
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+
+        for group in 0..16 {
+            let sc = (scales[group] & 0xF) as f32;
+            let m = (scales[group] >> 4) as f32;
+            for j in 0..16 {
+                let flat = group * 16 + j;
+                let byte_idx = flat / 4;
+                let bit_shift = (flat % 4) * 2;
+                let q = ((qs[byte_idx] >> bit_shift) & 3) as f32;
+                out[out_idx + flat] = d * sc * q - dmin * m;
+            }
+        }
+        out_idx += QK_K;
+    }
+}
+
+// ─── Q3_K dequantization ────────────────────────────────────────────────────
+// Block layout (110 bytes per 256 elements):
+//   hmask[32]  — high bit per weight (bit n of hmask[l] → element at group n*32+l)
+//   qs[64]     — low 2 bits packed (4 groups of 32 per 128-element half)
+//   scales[12] — 16 six-bit scales packed (value - 32)
+//   d (f16)    — super-block scale
+
+/// Decode 16 six-bit scales from Q3_K's 12-byte packed format.
+fn q3k_decode_scales(sc: &[u8]) -> [i32; 16] {
+    let mut scales = [0i32; 16];
+    for j in 0..4 {
+        scales[j]      = (sc[j]     & 0xF) as i32;
+        scales[j + 4]  = (sc[j]     >> 4)  as i32;
+        scales[j + 8]  = (sc[j + 4] & 0xF) as i32;
+        scales[j + 12] = (sc[j + 4] >> 4)  as i32;
+    }
+    for j in 0..4 {
+        let hi = sc[8 + j];
+        scales[j]      |= (( hi       & 3) as i32) << 4;
+        scales[j + 4]  |= (((hi >> 2) & 3) as i32) << 4;
+        scales[j + 8]  |= (((hi >> 4) & 3) as i32) << 4;
+        scales[j + 12] |= (((hi >> 6) & 3) as i32) << 4;
+    }
+    for s in &mut scales { *s -= 32; }
+    scales
+}
+
+fn dequantize_q3_k(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 110;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let block = &data[i * block_bytes..(i + 1) * block_bytes];
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let d = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+        let scales = q3k_decode_scales(&block[96..108]);
+
+        // Unpack 3-bit weights: low 2 bits from qs, high bit from hmask
+        // hmask[l] bit n → element at group_n * 32 + l
+        // qs layout: 32 bytes per 128-element half, bits (shift*2)..(shift*2+1) for sub-group
+        let mut m: u8 = 1;
+        let mut q_off = 0usize;
+        for j in (0..QK_K).step_by(128) {
+            for shift in 0..4u8 {
+                for l in 0..32usize {
+                    let lo2 = (qs[q_off + l] >> (shift * 2)) & 3;
+                    // hmask bit set → high bit present → value = lo2 (range 0..3)
+                    // hmask bit clear → no high bit → value = lo2 - 4 (range -4..-1)
+                    let hi = if hmask[l] & m != 0 { 0i8 } else { -4i8 };
+                    let flat = j + shift as usize * 32 + l;
+                    let is = flat / 16;
+                    out[out_idx + flat] = d * scales[is] as f32 * (lo2 as i8 + hi) as f32;
+                }
+                m <<= 1;
+            }
+            q_off += 32;
+        }
+        out_idx += QK_K;
     }
 }
 
@@ -516,6 +622,55 @@ fn dequantize_q4_k(data: &[u8], out: &mut [f32]) {
             }
             for l in 0..32 {
                 out[out_idx] = d2 * f32::from(qs[q_offset + l] >> 4) - m2f;
+                out_idx += 1;
+            }
+
+            q_offset += 32;
+            is += 2;
+        }
+    }
+}
+
+// ─── Q5_K dequantization ────────────────────────────────────────────────────
+// Block layout (176 bytes per 256 elements):
+//   d (f16)      — super-block scale
+//   dmin (f16)   — super-block min
+//   scales[12]   — same packing as Q4_K (8 scales + 8 mins, 6-bit each)
+//   qh[32]       — high bits (bit 4 for each weight)
+//   qs[128]      — low 4 bits
+
+fn dequantize_q5_k(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 176;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let block = &data[i * block_bytes..(i + 1) * block_bytes];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales_raw = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+
+        let mut is = 0usize;
+        let mut q_offset = 0usize;
+
+        for im in 0..4u8 {
+            let (sc1, m1) = get_scale_min_k4(is, scales_raw);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales_raw);
+            let d1 = d * f32::from(sc1);
+            let m1f = dmin * f32::from(m1);
+            let d2 = d * f32::from(sc2);
+            let m2f = dmin * f32::from(m2);
+
+            for l in 0..32 {
+                let hbit = ((qh[l] >> (im * 2)) & 1) as u8;
+                out[out_idx] = d1 * f32::from((qs[q_offset + l] & 0xF) | (hbit << 4)) - m1f;
+                out_idx += 1;
+            }
+            for l in 0..32 {
+                let hbit = ((qh[l] >> (im * 2 + 1)) & 1) as u8;
+                out[out_idx] = d2 * f32::from((qs[q_offset + l] >> 4) | (hbit << 4)) - m2f;
                 out_idx += 1;
             }
 
@@ -1042,7 +1197,231 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     d * q8k.d * total as f32
 }
 
+/// Q2_K × Q8_K dot product.
+#[inline]
+fn q2k_q8k_dot(q2k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    let scales = &q2k_block[0..16];
+    let qs = &q2k_block[16..80];
+    let d = f16_to_f32(u16::from_le_bytes([q2k_block[80], q2k_block[81]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([q2k_block[82], q2k_block[83]]));
+
+    let mut sumf = 0.0f32;
+    for group in 0..16 {
+        let sc = (scales[group] & 0xF) as i32;
+        let m = (scales[group] >> 4) as i32;
+        let mut dot = 0i32;
+        let mut sum_q8 = 0i32;
+        for j in 0..16 {
+            let flat = group * 16 + j;
+            let byte_idx = flat / 4;
+            let bit_shift = (flat % 4) * 2;
+            let q = ((qs[byte_idx] >> bit_shift) & 3) as i32;
+            dot += q * q8k.qs[flat] as i32;
+            sum_q8 += q8k.qs[flat] as i32;
+        }
+        sumf += d * sc as f32 * dot as f32 - dmin * m as f32 * sum_q8 as f32;
+    }
+    sumf * q8k.d
+}
+
+/// Q5_K × Q8_K dot product.
+#[inline]
+fn q5k_q8k_dot(q5k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    let d = f16_to_f32(u16::from_le_bytes([q5k_block[0], q5k_block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([q5k_block[2], q5k_block[3]]));
+    let scales_raw = &q5k_block[4..16];
+    let qh = &q5k_block[16..48];
+    let qs = &q5k_block[48..176];
+
+    let mut sumf = 0.0f32;
+    let mut is = 0usize;
+    let mut q_offset = 0usize;
+    let mut q8_offset = 0usize;
+
+    for im in 0..4u8 {
+        let (sc1, m1) = get_scale_min_k4(is, scales_raw);
+        let (sc2, m2) = get_scale_min_k4(is + 1, scales_raw);
+
+        let mut dot1 = 0i32;
+        let mut sum1 = 0i32;
+        for l in 0..32 {
+            let hbit = ((qh[l] >> (im * 2)) & 1) as i32;
+            let q = ((qs[q_offset + l] & 0xF) as i32) | (hbit << 4);
+            dot1 += q * q8k.qs[q8_offset + l] as i32;
+            sum1 += q8k.qs[q8_offset + l] as i32;
+        }
+        sumf += d * sc1 as f32 * dot1 as f32 - dmin * m1 as f32 * sum1 as f32;
+
+        let mut dot2 = 0i32;
+        let mut sum2 = 0i32;
+        for l in 0..32 {
+            let hbit = ((qh[l] >> (im * 2 + 1)) & 1) as i32;
+            let q = ((qs[q_offset + l] >> 4) as i32) | (hbit << 4);
+            dot2 += q * q8k.qs[q8_offset + 32 + l] as i32;
+            sum2 += q8k.qs[q8_offset + 32 + l] as i32;
+        }
+        sumf += d * sc2 as f32 * dot2 as f32 - dmin * m2 as f32 * sum2 as f32;
+
+        q_offset += 32;
+        q8_offset += 64;
+        is += 2;
+    }
+    sumf * q8k.d
+}
+
+/// Q3_K × Q8_K dot product.
+#[inline]
+fn q3k_q8k_dot(q3k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    let hmask = &q3k_block[0..32];
+    let qs = &q3k_block[32..96];
+    let d = f16_to_f32(u16::from_le_bytes([q3k_block[108], q3k_block[109]]));
+    let scales = q3k_decode_scales(&q3k_block[96..108]);
+
+    // Unpack 3-bit weights to i8
+    let mut aux8 = [0i8; QK_K];
+    let mut m: u8 = 1;
+    let mut q_off = 0usize;
+    for j in (0..QK_K).step_by(128) {
+        for shift in 0..4u8 {
+            for l in 0..32usize {
+                let lo2 = (qs[q_off + l] >> (shift * 2)) & 3;
+                let hi = if hmask[l] & m != 0 { 0i8 } else { -4i8 };
+                aux8[j + shift as usize * 32 + l] = lo2 as i8 + hi;
+            }
+            m <<= 1;
+        }
+        q_off += 32;
+    }
+
+    // Dot product: 16 sub-blocks of 16 elements
+    let mut total = 0i32;
+    for is in 0..16 {
+        let off = is * 16;
+        let mut dot = 0i32;
+        for l in 0..16 {
+            dot += aux8[off + l] as i32 * q8k.qs[off + l] as i32;
+        }
+        total += scales[is] * dot;
+    }
+
+    d * q8k.d * total as f32
+}
+
 // ─── Fused quantized matvec ─────────────────────────────────────────────────
+
+/// Q2_K matvec: quantizes input to Q8_K, then uses integer dot product.
+pub fn q2k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let q8_blocks = quantize_row_q8_k(input);
+    q2k_matvec_preq(data, rows, cols, &q8_blocks, output);
+}
+
+/// Q2_K matvec with pre-quantized Q8_K input.
+#[allow(unused_variables)]
+pub fn q2k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 84;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        output.par_iter_mut().enumerate().for_each(|(row, out)| {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            let mut sumf = 0.0f32;
+            for bi in 0..blocks_per_row {
+                sumf += q2k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            }
+            *out = sumf;
+        });
+        return;
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        let mut sumf = 0.0f32;
+        for bi in 0..blocks_per_row {
+            sumf += q2k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+        }
+        output[row] = sumf;
+    }
+}
+
+/// Q5_K matvec: quantizes input to Q8_K, then uses integer dot product.
+pub fn q5k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let q8_blocks = quantize_row_q8_k(input);
+    q5k_matvec_preq(data, rows, cols, &q8_blocks, output);
+}
+
+/// Q5_K matvec with pre-quantized Q8_K input.
+#[allow(unused_variables)]
+pub fn q5k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 176;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        output.par_iter_mut().enumerate().for_each(|(row, out)| {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            let mut sumf = 0.0f32;
+            for bi in 0..blocks_per_row {
+                sumf += q5k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            }
+            *out = sumf;
+        });
+        return;
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        let mut sumf = 0.0f32;
+        for bi in 0..blocks_per_row {
+            sumf += q5k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+        }
+        output[row] = sumf;
+    }
+}
+
+/// Q3_K matvec: quantizes input to Q8_K, then uses integer dot product.
+pub fn q3k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let q8_blocks = quantize_row_q8_k(input);
+    q3k_matvec_preq(data, rows, cols, &q8_blocks, output);
+}
+
+/// Q3_K matvec with pre-quantized Q8_K input.
+#[allow(unused_variables)]
+pub fn q3k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 110;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        output.par_iter_mut().enumerate().for_each(|(row, out)| {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            let mut sumf = 0.0f32;
+            for bi in 0..blocks_per_row {
+                sumf += q3k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            }
+            *out = sumf;
+        });
+        return;
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        let mut sumf = 0.0f32;
+        for bi in 0..blocks_per_row {
+            sumf += q3k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+        }
+        output[row] = sumf;
+    }
+}
 
 /// Q4_K matvec: quantizes input to Q8_K, then uses integer dot product.
 pub fn q4k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
@@ -1183,7 +1562,10 @@ pub fn quantized_matvec(
     output: &mut [f32],
 ) {
     match qtype {
+        GgmlType::Q2_K => q2k_matvec(input, data, rows, cols, output),
+        GgmlType::Q3_K => q3k_matvec(input, data, rows, cols, output),
         GgmlType::Q4_K => q4k_matvec(input, data, rows, cols, output),
+        GgmlType::Q5_K => q5k_matvec(input, data, rows, cols, output),
         GgmlType::Q6_K => q6k_matvec(input, data, rows, cols, output),
         GgmlType::Q8_0 => q8_0_matvec(input, data, rows, cols, output),
         GgmlType::F16 => f16_matvec(input, data, rows, cols, output),
@@ -1203,9 +1585,12 @@ pub fn quantized_matvec_preq(
     output: &mut [f32],
 ) {
     match qtype {
+        GgmlType::Q2_K => q2k_matvec_preq(data, rows, cols, q8_blocks, output),
+        GgmlType::Q3_K => q3k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q4_K => q4k_matvec_preq(data, rows, cols, q8_blocks, output),
+        GgmlType::Q5_K => q5k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q6_K => q6k_matvec_preq(data, rows, cols, q8_blocks, output),
-        _ => panic!("quantized_matvec_preq only supports Q4_K/Q6_K, got {qtype:?}"),
+        _ => panic!("quantized_matvec_preq only supports Q2_K-Q6_K, got {qtype:?}"),
     }
 }
 
@@ -1536,7 +1921,10 @@ impl TernaryMatrix {
             let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
             // Dequantize row to f32
             match qtype {
+                GgmlType::Q2_K => dequantize_row_q2k(row_data, &mut row_f32),
+                GgmlType::Q3_K => dequantize_row_q3k(row_data, &mut row_f32),
                 GgmlType::Q4_K => dequantize_row_q4k(row_data, &mut row_f32),
+                GgmlType::Q5_K => dequantize_row_q5k(row_data, &mut row_f32),
                 GgmlType::Q6_K => dequantize_row_q6k(row_data, &mut row_f32),
                 GgmlType::Q8_0 => dequantize_row_q8_0(row_data, &mut row_f32),
                 GgmlType::F16 => dequantize_row_f16(row_data, &mut row_f32),
@@ -2274,7 +2662,10 @@ fn sparse_ternary_dot_scalar(matrix: &SparseTernaryMatrix, row: usize, input: &[
 /// Public API for use by model loading (sparse ternary conversion etc.).
 pub fn dequantize_weight_row(data: &[u8], qtype: GgmlType, out: &mut [f32]) {
     match qtype {
+        GgmlType::Q2_K => dequantize_row_q2k(data, out),
+        GgmlType::Q3_K => dequantize_row_q3k(data, out),
         GgmlType::Q4_K => dequantize_row_q4k(data, out),
+        GgmlType::Q5_K => dequantize_row_q5k(data, out),
         GgmlType::Q6_K => dequantize_row_q6k(data, out),
         GgmlType::Q8_0 => dequantize_row_q8_0(data, out),
         GgmlType::F16 => {
@@ -2292,6 +2683,19 @@ pub fn dequantize_weight_row(data: &[u8], qtype: GgmlType, out: &mut [f32]) {
         }
         _ => out.fill(0.0),
     }
+}
+
+/// Dequantize a single Q3_K row to f32.
+fn dequantize_row_q2k(data: &[u8], out: &mut [f32]) {
+    dequantize_q2_k(data, out);
+}
+
+fn dequantize_row_q3k(data: &[u8], out: &mut [f32]) {
+    dequantize_q3_k(data, out);
+}
+
+fn dequantize_row_q5k(data: &[u8], out: &mut [f32]) {
+    dequantize_q5_k(data, out);
 }
 
 /// Dequantize a single Q4_K row to f32.
