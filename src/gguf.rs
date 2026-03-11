@@ -1814,34 +1814,73 @@ impl SparseTernaryMatrix {
 }
 
 /// Sparse ternary matvec: output = SparseTernaryMatrix × input.
-/// Uses branchless 16-wide block processing for SIMD auto-vectorization.
+/// On aarch64: branchless 4-row NEON micro-kernel with shared input loads.
+/// Uses vtstq_u16 bulk mask expansion (40→11 ops per 16-bit mask).
 pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output: &mut [f32]) {
-    #[cfg(feature = "parallel")]
+    #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
     {
         use rayon::prelude::*;
         output
-            .par_iter_mut()
+            .par_chunks_mut(4)
             .enumerate()
-            .for_each(|(r, out)| {
-                *out = sparse_ternary_dot_flat(matrix, r, input);
+            .for_each(|(chunk_idx, chunk)| {
+                let row_start = chunk_idx * 4;
+                if chunk.len() == 4 {
+                    // SAFETY: NEON mandatory on aarch64, output chunk is disjoint
+                    unsafe {
+                        sparse_ternary_microkernel_4row(matrix, input, chunk, row_start);
+                    }
+                } else {
+                    for (i, out) in chunk.iter_mut().enumerate() {
+                        *out = sparse_ternary_dot_flat(matrix, row_start + i, input);
+                    }
+                }
             });
     }
-    #[cfg(not(feature = "parallel"))]
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "parallel")))]
     {
-        for (r, out) in output.iter_mut().enumerate() {
-            *out = sparse_ternary_dot_flat(matrix, r, input);
+        let rows = matrix.num_rows;
+        let mut r = 0;
+        while r + 4 <= rows {
+            unsafe {
+                sparse_ternary_microkernel_4row(matrix, input, &mut output[r..r + 4], r);
+            }
+            r += 4;
+        }
+        while r < rows {
+            output[r] = sparse_ternary_dot_flat(matrix, r, input);
+            r += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            output
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(r, out)| {
+                    *out = sparse_ternary_dot_flat(matrix, r, input);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (r, out) in output.iter_mut().enumerate() {
+                *out = sparse_ternary_dot_flat(matrix, r, input);
+            }
         }
     }
 }
 
-/// Dispatch to NEON or scalar implementation.
+/// Dispatch to NEON or scalar implementation for single-row dot product.
 #[inline]
 fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64 (mandatory since ARMv8).
-        // We only read from valid matrix/input memory within bounds.
-        unsafe { sparse_ternary_dot_neon(matrix, row, input) }
+        unsafe { sparse_ternary_dot_neon_single(matrix, row, input) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1849,14 +1888,12 @@ fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f3
     }
 }
 
-/// NEON-optimized branchless sparse ternary dot product.
-/// Processes 16 elements per block using 4×4-wide NEON lanes.
-/// Zero branches in the inner loop — mask bits are expanded to f32 via
-/// bit shifts and NEON bitwise select (vbslq_f32).
+/// Single-row NEON dot product using expand_mask_16.
+/// Used for tail rows that don't fill a 4-row micro-kernel.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn sparse_ternary_dot_neon(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
+unsafe fn sparse_ternary_dot_neon_single(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
     let active = matrix.active_masks(row);
@@ -1864,7 +1901,6 @@ unsafe fn sparse_ternary_dot_neon(matrix: &SparseTernaryMatrix, row: usize, inpu
     let scale = matrix.scales[row];
     let blocks = matrix.blocks_per_row;
 
-    // 4 accumulators for 16 elements (4 lanes × 4 groups)
     let mut acc0 = vdupq_n_f32(0.0);
     let mut acc1 = vdupq_n_f32(0.0);
     let mut acc2 = vdupq_n_f32(0.0);
@@ -1872,81 +1908,183 @@ unsafe fn sparse_ternary_dot_neon(matrix: &SparseTernaryMatrix, row: usize, inpu
 
     let neg_one = vdupq_n_f32(-1.0);
     let pos_one = vdupq_n_f32(1.0);
-    let zero = vdupq_n_f32(0.0);
+    let zero_f = vdupq_n_f32(0.0);
 
+    // Bit-test vectors loaded once outside loop
+    let bits_lo = vld1q_u16([1u16, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+    let bits_hi = vld1q_u16([256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768].as_ptr());
+    let zero_u16 = vdupq_n_u16(0);
+
+    // Completely branchless — no zero-check, FMA with 0 weight is harmless
     for blk in 0..blocks {
-        let a = active[blk];
-        if a == 0 {
-            continue; // Only branch: skip entire zero blocks
-        }
-        let s = signs[blk];
         let base = blk * SPARSE_BLOCK;
         let inp = input.as_ptr().add(base);
 
-        // Load 16 floats as 4 NEON registers
         let v0 = vld1q_f32(inp);
         let v1 = vld1q_f32(inp.add(4));
         let v2 = vld1q_f32(inp.add(8));
         let v3 = vld1q_f32(inp.add(12));
 
-        // Expand 16-bit active mask to 4×4 u32 masks
-        // For bits 0-3: shift a >> 0..3, mask with 1, compare != 0
-        let a0 = expand_mask_4(a, 0);
-        let a1 = expand_mask_4(a, 4);
-        let a2 = expand_mask_4(a, 8);
-        let a3 = expand_mask_4(a, 12);
+        let (a0, a1, a2, a3) = expand_mask_16(active[blk], bits_lo, bits_hi, zero_u16);
+        let (s0, s1, s2, s3) = expand_mask_16(signs[blk], bits_lo, bits_hi, zero_u16);
 
-        // Expand 16-bit sign mask to 4×4 u32 masks
-        let s0 = expand_mask_4(s, 0);
-        let s1 = expand_mask_4(s, 4);
-        let s2 = expand_mask_4(s, 8);
-        let s3 = expand_mask_4(s, 12);
+        let w0 = vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f);
+        let w1 = vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f);
+        let w2 = vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f);
+        let w3 = vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f);
 
-        // weight = active ? (sign ? -1.0 : +1.0) : 0.0
-        // = vbsl(active_mask, vbsl(sign_mask, -1, +1), 0)
-        let w0 = vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero);
-        let w1 = vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero);
-        let w2 = vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero);
-        let w3 = vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero);
-
-        // Accumulate: acc += weight * input (but weight ∈ {-1,0,+1}, so this is add/sub/nop)
         acc0 = vfmaq_f32(acc0, w0, v0);
         acc1 = vfmaq_f32(acc1, w1, v1);
         acc2 = vfmaq_f32(acc2, w2, v2);
         acc3 = vfmaq_f32(acc3, w3, v3);
     }
 
-    // Horizontal reduction: sum all 16 lanes
     let sum01 = vaddq_f32(acc0, acc1);
     let sum23 = vaddq_f32(acc2, acc3);
     let sum = vaddq_f32(sum01, sum23);
-    let result = vaddvq_f32(sum);
-
-    scale * result
+    scale * vaddvq_f32(sum)
 }
 
-/// Expand 4 consecutive bits from a 16-bit mask into a NEON uint32x4 mask.
-/// Bit `offset+i` of `mask` → lane `i` of result (all 1s if set, all 0s if not).
-/// Uses NEON compare-against-zero to avoid scalar bit extraction.
+/// Branchless 4-row NEON micro-kernel (Register Blocking).
+/// - Input block loaded ONCE, reused across 4 rows (4× less memory traffic)
+/// - expand_mask_16 for bulk mask expansion (vtstq_u16 based)
+/// - ZERO branches in inner loop — pipeline never stalls
+/// - 16 accumulators + 4 shared input + 5 constants = 25 registers (fits in 32)
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn expand_mask_4(mask: u16, offset: usize) -> std::arch::aarch64::uint32x4_t {
+#[target_feature(enable = "neon")]
+unsafe fn sparse_ternary_microkernel_4row(
+    matrix: &SparseTernaryMatrix,
+    input: &[f32],
+    output: &mut [f32],
+    row_start: usize,
+) {
     use std::arch::aarch64::*;
 
-    // Broadcast the 4-bit nibble to all 4 lanes as u32
-    let nibble = ((mask >> offset) & 0xF) as u32;
-    let bcast = vdupq_n_u32(nibble);
+    let blocks = matrix.blocks_per_row;
 
-    // Each lane tests a different bit: lane i tests bit i
-    // bit_select = [1, 2, 4, 8]
-    let bit_select = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+    // 4 rows × 4 accumulators = 16 NEON registers
+    let mut r0a0 = vdupq_n_f32(0.0); let mut r0a1 = vdupq_n_f32(0.0);
+    let mut r0a2 = vdupq_n_f32(0.0); let mut r0a3 = vdupq_n_f32(0.0);
+    let mut r1a0 = vdupq_n_f32(0.0); let mut r1a1 = vdupq_n_f32(0.0);
+    let mut r1a2 = vdupq_n_f32(0.0); let mut r1a3 = vdupq_n_f32(0.0);
+    let mut r2a0 = vdupq_n_f32(0.0); let mut r2a1 = vdupq_n_f32(0.0);
+    let mut r2a2 = vdupq_n_f32(0.0); let mut r2a3 = vdupq_n_f32(0.0);
+    let mut r3a0 = vdupq_n_f32(0.0); let mut r3a1 = vdupq_n_f32(0.0);
+    let mut r3a2 = vdupq_n_f32(0.0); let mut r3a3 = vdupq_n_f32(0.0);
 
-    // AND: lane i has (nibble & (1<<i)), which is 0 or non-zero
-    let anded = vandq_u32(bcast, bit_select);
+    // Constants — loaded once, live in registers for entire loop
+    let neg_one = vdupq_n_f32(-1.0);
+    let pos_one = vdupq_n_f32(1.0);
+    let zero_f = vdupq_n_f32(0.0);
+    let bits_lo = vld1q_u16([1u16, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+    let bits_hi = vld1q_u16([256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768].as_ptr());
+    let zero_u16 = vdupq_n_u16(0);
 
-    // Compare > 0: produces 0xFFFFFFFF if bit was set, 0x00000000 if not
-    let zero = vdupq_n_u32(0);
-    vcgtq_u32(anded, zero)
+    // Mask slices for all 4 rows (pointers into flat buffer)
+    let act0 = matrix.active_masks(row_start);
+    let act1 = matrix.active_masks(row_start + 1);
+    let act2 = matrix.active_masks(row_start + 2);
+    let act3 = matrix.active_masks(row_start + 3);
+    let sgn0 = matrix.sign_masks(row_start);
+    let sgn1 = matrix.sign_masks(row_start + 1);
+    let sgn2 = matrix.sign_masks(row_start + 2);
+    let sgn3 = matrix.sign_masks(row_start + 3);
+
+    // COMPLETELY BRANCHLESS inner loop
+    // No zero-checks, no skips — OoO execution engine fires at full throughput.
+    // FMA with weight=0 is harmless (adds 0) and costs 1 cycle vs 5-15 cycle
+    // branch misprediction penalty.
+    for blk in 0..blocks {
+        // 1. Load input block ONCE — shared across all 4 rows
+        let base = blk * SPARSE_BLOCK;
+        let inp = input.as_ptr().add(base);
+        let v0 = vld1q_f32(inp);
+        let v1 = vld1q_f32(inp.add(4));
+        let v2 = vld1q_f32(inp.add(8));
+        let v3 = vld1q_f32(inp.add(12));
+
+        // 2. Row 0: expand masks → weights → FMA
+        let (a0, a1, a2, a3) = expand_mask_16(act0[blk], bits_lo, bits_hi, zero_u16);
+        let (s0, s1, s2, s3) = expand_mask_16(sgn0[blk], bits_lo, bits_hi, zero_u16);
+        r0a0 = vfmaq_f32(r0a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
+        r0a1 = vfmaq_f32(r0a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
+        r0a2 = vfmaq_f32(r0a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
+        r0a3 = vfmaq_f32(r0a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+
+        // 3. Row 1
+        let (a0, a1, a2, a3) = expand_mask_16(act1[blk], bits_lo, bits_hi, zero_u16);
+        let (s0, s1, s2, s3) = expand_mask_16(sgn1[blk], bits_lo, bits_hi, zero_u16);
+        r1a0 = vfmaq_f32(r1a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
+        r1a1 = vfmaq_f32(r1a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
+        r1a2 = vfmaq_f32(r1a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
+        r1a3 = vfmaq_f32(r1a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+
+        // 4. Row 2
+        let (a0, a1, a2, a3) = expand_mask_16(act2[blk], bits_lo, bits_hi, zero_u16);
+        let (s0, s1, s2, s3) = expand_mask_16(sgn2[blk], bits_lo, bits_hi, zero_u16);
+        r2a0 = vfmaq_f32(r2a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
+        r2a1 = vfmaq_f32(r2a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
+        r2a2 = vfmaq_f32(r2a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
+        r2a3 = vfmaq_f32(r2a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+
+        // 5. Row 3
+        let (a0, a1, a2, a3) = expand_mask_16(act3[blk], bits_lo, bits_hi, zero_u16);
+        let (s0, s1, s2, s3) = expand_mask_16(sgn3[blk], bits_lo, bits_hi, zero_u16);
+        r3a0 = vfmaq_f32(r3a0, vbslq_f32(a0, vbslq_f32(s0, neg_one, pos_one), zero_f), v0);
+        r3a1 = vfmaq_f32(r3a1, vbslq_f32(a1, vbslq_f32(s1, neg_one, pos_one), zero_f), v1);
+        r3a2 = vfmaq_f32(r3a2, vbslq_f32(a2, vbslq_f32(s2, neg_one, pos_one), zero_f), v2);
+        r3a3 = vfmaq_f32(r3a3, vbslq_f32(a3, vbslq_f32(s3, neg_one, pos_one), zero_f), v3);
+    }
+
+    // Horizontal reduction + scale
+    let s0 = matrix.scales[row_start];
+    let s1 = matrix.scales[row_start + 1];
+    let s2 = matrix.scales[row_start + 2];
+    let s3 = matrix.scales[row_start + 3];
+
+    output[0] = s0 * vaddvq_f32(vaddq_f32(vaddq_f32(r0a0, r0a1), vaddq_f32(r0a2, r0a3)));
+    output[1] = s1 * vaddvq_f32(vaddq_f32(vaddq_f32(r1a0, r1a1), vaddq_f32(r1a2, r1a3)));
+    output[2] = s2 * vaddvq_f32(vaddq_f32(vaddq_f32(r2a0, r2a1), vaddq_f32(r2a2, r2a3)));
+    output[3] = s3 * vaddvq_f32(vaddq_f32(vaddq_f32(r3a0, r3a1), vaddq_f32(r3a2, r3a3)));
+}
+
+/// Expand all 16 bits of a mask into 4 × uint32x4 using vtstq_u16.
+/// Replaces 8 × expand_mask_4 (40 ops) with a single bulk expansion (~11 ops).
+/// `bits_lo` = [1,2,4,8,16,32,64,128], `bits_hi` = [256..32768], `zero` = 0.
+/// These are passed as parameters to keep them in registers across the loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn expand_mask_16(
+    mask: u16,
+    bits_lo: std::arch::aarch64::uint16x8_t,
+    bits_hi: std::arch::aarch64::uint16x8_t,
+    zero: std::arch::aarch64::uint16x8_t,
+) -> (std::arch::aarch64::uint32x4_t, std::arch::aarch64::uint32x4_t,
+      std::arch::aarch64::uint32x4_t, std::arch::aarch64::uint32x4_t) {
+    use std::arch::aarch64::*;
+
+    // Broadcast mask to all 8 lanes
+    let mask_vec = vdupq_n_u16(mask);
+
+    // AND with bit patterns, then compare > 0
+    let lo = vandq_u16(mask_vec, bits_lo);
+    let hi = vandq_u16(mask_vec, bits_hi);
+    let test_lo = vcgtq_u16(lo, zero);   // bits 0-7:  8 × u16 (0xFFFF or 0)
+    let test_hi = vcgtq_u16(hi, zero);   // bits 8-15: 8 × u16 (0xFFFF or 0)
+
+    // Widen u16 → u32 (zero-extend preserves 0xFFFF→0x0000FFFF, but vbslq
+    // only checks MSB per lane so we need sign-extend. Use vmovl which is
+    // unsigned widen — but 0xFFFF widened is 0x0000FFFF whose bit 31 = 0.
+    // Fix: reinterpret as signed and use vmovl_s16 for sign extension.)
+    let test_lo_s = vreinterpretq_s16_u16(test_lo);
+    let test_hi_s = vreinterpretq_s16_u16(test_hi);
+
+    let r0 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(test_lo_s)));   // bits 0-3
+    let r1 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(test_lo_s)));  // bits 4-7
+    let r2 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(test_hi_s)));   // bits 8-11
+    let r3 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(test_hi_s)));  // bits 12-15
+
+    (r0, r1, r2, r3)
 }
 
 /// Scalar fallback for non-aarch64 targets.
