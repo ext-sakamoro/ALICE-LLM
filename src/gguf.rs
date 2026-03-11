@@ -558,10 +558,11 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
 
         let mut ql_off = 0usize;
         let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
 
-        for n in (0..QK_K).step_by(128) {
-            let is = n / 16;
+        for _n in (0..QK_K).step_by(128) {
             for l in 0..32 {
+                let is = l / 16; // matches llama.cpp: is = l/16
                 let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
                 let q2 =
                     ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8
@@ -571,14 +572,15 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
                 let q4 =
                     ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
 
-                out[out_idx + l] = d * f32::from(scales[is] as i8) * f32::from(q1);
-                out[out_idx + l + 32] = d * f32::from(scales[is + 2] as i8) * f32::from(q2);
-                out[out_idx + l + 64] = d * f32::from(scales[is + 4] as i8) * f32::from(q3);
-                out[out_idx + l + 96] = d * f32::from(scales[is + 6] as i8) * f32::from(q4);
+                out[out_idx + l] = d * f32::from(scales[sc_off + is] as i8) * f32::from(q1);
+                out[out_idx + l + 32] = d * f32::from(scales[sc_off + is + 2] as i8) * f32::from(q2);
+                out[out_idx + l + 64] = d * f32::from(scales[sc_off + is + 4] as i8) * f32::from(q3);
+                out[out_idx + l + 96] = d * f32::from(scales[sc_off + is + 6] as i8) * f32::from(q4);
             }
             out_idx += 128;
             ql_off += 64;
             qh_off += 32;
+            sc_off += 8;
         }
     }
 }
@@ -633,11 +635,12 @@ pub fn quantize_row_q8_k(input: &[f32]) -> Vec<BlockQ8K> {
             continue;
         }
 
-        let iscale = -127.0f32 / max_val;
+        // Match llama.cpp: iscale = 128 / max (signed max, not absolute)
+        let iscale = 128.0f32 / max_val;
 
         for j in 0..QK_K {
             let v = nearest_int(iscale * x[j]);
-            block.qs[j] = v.min(127) as i8;
+            block.qs[j] = v.max(-128).min(127) as i8;
         }
 
         // Pre-compute group-of-16 sums
@@ -949,7 +952,7 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
 
 // ─── Dispatch: NEON or scalar ───────────────────────────────────────────────
 
-/// Q4_K × Q8_K dot product. Auto-vectorizes well with -C target-cpu=native.
+/// Q4_K × Q8_K dot product.
 #[inline]
 fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     const KMASK1: u32 = 0x3f3f_3f3f;
@@ -960,7 +963,6 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let dmin = f16_to_f32(u16::from_le_bytes([q4k_block[2], q4k_block[3]]));
     let q4 = &q4k_block[16..144];
 
-    // Unpack nibbles into flat array for vectorizable loops
     let mut aux8 = [0u8; QK_K];
     for g in 0..4 {
         for l in 0..32 {
@@ -969,7 +971,6 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
         }
     }
 
-    // Unpack scales and mins
     let mut utmp = [0u32; 4];
     let sb = &q4k_block[4..16];
     utmp[0] = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
@@ -985,11 +986,9 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let scales = [s0[0],s0[1],s0[2],s0[3],s1[0],s1[1],s1[2],s1[3]];
     let mins = [m0[0],m0[1],m0[2],m0[3],m1[0],m1[1],m1[2],m1[3]];
 
-    // Mins correction
     let mut sumi = 0i32;
     for j in 0..16 { sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32; }
 
-    // 8 sub-blocks of 32 elements — simple reduction loop for auto-vectorization
     let mut total = 0i32;
     for is in 0..8 {
         let off = is * 32;
@@ -1003,7 +1002,7 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
 }
 
-/// Q6_K × Q8_K dot product. Auto-vectorizes well with -C target-cpu=native.
+/// Q6_K × Q8_K dot product. Uses NEON on aarch64, scalar fallback otherwise.
 #[inline]
 fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let ql = &q6k_block[0..128];
@@ -1011,7 +1010,6 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let scales = &q6k_block[192..208];
     let d = f16_to_f32(u16::from_le_bytes([q6k_block[208], q6k_block[209]]));
 
-    // Reconstruct 6-bit signed quants
     let mut aux8 = [0i8; QK_K];
     let mut a_off = 0usize;
     let mut ql_off = 0usize;
@@ -1030,7 +1028,6 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
         a_off += 128; ql_off += 64; qh_off += 32;
     }
 
-    // 16 sub-blocks of 16 — simple reduction for auto-vectorization
     let mut total = 0i32;
     for is in 0..16 {
         let scale = scales[is] as i8 as i32;
@@ -1054,7 +1051,8 @@ pub fn q4k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 }
 
 /// Q4_K matvec with pre-quantized Q8_K input (avoids redundant quantization).
-pub fn q4k_matvec_preq(data: &[u8], _rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+#[allow(unused_variables)]
+pub fn q4k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 144;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1144,7 +1142,8 @@ pub fn q6k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 }
 
 /// Q6_K matvec with pre-quantized Q8_K input.
-pub fn q6k_matvec_preq(data: &[u8], _rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+#[allow(unused_variables)]
+pub fn q6k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 210;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1739,6 +1738,7 @@ impl SparseTernaryRow {
     }
 }
 
+#[allow(dead_code)]
 impl SparseTernaryMatrix {
     /// Build from Vec of SparseTernaryRows, packing into flat contiguous buffer.
     /// Also precomputes packed 2-bit weights for LUT-based expansion.
@@ -2056,6 +2056,7 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
 
 /// Scalar fallback dispatch for single-row dot product (non-aarch64).
 #[inline]
+#[allow(dead_code)]
 fn sparse_ternary_dot_flat(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     sparse_ternary_dot_scalar(matrix, row, input)
 }
@@ -2232,6 +2233,7 @@ unsafe fn expand_packed_2bit_lut(
 
 /// Scalar fallback (used on non-aarch64 and as reference implementation).
 #[inline]
+#[allow(dead_code)]
 fn sparse_ternary_dot_scalar(matrix: &SparseTernaryMatrix, row: usize, input: &[f32]) -> f32 {
     let active = matrix.active_masks(row);
     let signs = matrix.sign_masks(row);

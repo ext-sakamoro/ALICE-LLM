@@ -30,3 +30,11 @@ required-features = ["gguf"]
 [[example]]
 name = "bench_70b_sparse"
 required-features = ["gguf"]
+
+[[example]]
+name = "speculative_dual"
+required-features = ["gguf"]
+
+[[example]]
+name = "test_1b"
+required-features = ["gguf"]
