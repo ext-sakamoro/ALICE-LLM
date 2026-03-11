@@ -4,6 +4,8 @@ Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependen
 
 **0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro CPU.**
 
+**Dual-model speculative decoding: Llama-3.2-1B draft → Llama-3.1-8B verify, 63% accept rate, 5.7 tok/s baseline.**
+
 ## Quick Start
 
 ```bash
@@ -30,11 +32,14 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **GGUF v3 parser** — zero-copy mmap weight loading
 - **Q4_K / Q6_K / Q8_0 / F16 / F32** quantization
 - **llama.cpp-compatible** — Q4_K×Q8_K integer dot product (matches `ggml_vec_dot_q4_K_q8_K`, ±0.03 logits)
-- **Multi-architecture** — Llama-3, Mistral (sliding window), Gemma-2 (softcapping), auto-detected
+- **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), auto-detected
+- **Tied embeddings** — Llama-3.2-1B/3B output projection via quantized `token_embd.weight` (Q6_K matvec)
 - **BPE tokenizer** — GPT-2 byte encoding from GGUF metadata
 - **Contiguous + Paged KV cache** — flat buffer with rollback, or 16-tok/page on-demand allocation
 - **Continuous batching** — round-robin scheduler, per-request PagedKvCache
-- **Speculative decoding** — layer-skip draft + probabilistic sampling (Leviathan et al.)
+- **Speculative decoding** — layer-skip draft + dual-model (1B→8B) + probabilistic sampling (Leviathan et al.)
+- **RoPE frequency scaling** — NTK-aware context extension via `rope_freqs.weight` tensor (Llama-3.1/3.2)
+- **LLVM auto-vectorization** — `target-cpu=native` generates ARM SDOT instructions (37 sdot in Q4_K dot product)
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
 
@@ -44,10 +49,13 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 src/
 ├── lib.rs       — BPE tokenizer, KV cache, attention, RoPE, sampling
 ├── gguf.rs      — GGUF v3 parser, Q4_K/Q6_K/Q8_K quantization, fused matvec,
-│                  ternary/sparse-ternary matrices, NEON SDOT+LUT kernels
-├── llama3.rs    — Multi-arch forward pass, model loading, speculative decoding,
-│                  paged KV cache, continuous batching, sparse ternary inference
+│                  ternary/sparse-ternary matrices, LLVM auto-vectorized SDOT kernels
+├── llama3.rs    — Multi-arch forward pass, model loading, speculative decoding (layer-skip + dual-model),
+│                  paged KV cache, continuous batching, tied embeddings, RoPE freq scaling
 └── training.rs  — Ternary QAT: STE, QatLinear, L1 regularization, AdamW, MSE loss
+
+.cargo/
+└── config.toml  — rustflags: target-cpu=native (enables LLVM SDOT auto-vectorization)
 ```
 
 ---
@@ -279,6 +287,26 @@ if all K drafts accepted:
 
 **8B の限界**: 32層モデルでは各層の表現寄与が大きすぎ、層スキップの受理率がドラフトコストに見合わない。70B（80層）ではスキップ耐性が大幅に向上する。
 
+### Dual-Model Speculative Decoding (1B → 8B)
+
+別モデルをドラフトに使う真の投機的デコード。Llama-3.2-1B (16層, 2048dim) → Llama-3.1-8B (32層, 4096dim):
+
+```bash
+cargo run --release --example speculative_dual --features "gguf,parallel" -- \
+  --model models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  --draft-model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --prompt "What is the capital of Japan?" --max-tokens 60
+```
+
+| Mode | tok/s | Accept Rate | Speedup |
+|---|---|---|---|
+| Baseline (8B only) | 5.7 | — | 1.0x |
+| Speculative K=3 | 3.3 | 54% | 0.58x |
+| Speculative K=4 | 5.6 | 63% | 0.99x |
+| Speculative K=5 | 6.5 | 100% | 1.15x |
+
+**CPU上の制約**: バッチ並列検証が不可能なため、ドラフトモデルのコストが純粋なオーバーヘッドになる。短い応答（K個全受理）では1.15xのスピードアップを確認。GPU上ではバッチ検証により大幅な高速化が期待できる。
+
 ### 70B Speculative Decoding Projections
 
 | spec_k | draft_layers | Accept α | Effective tok/s | Speedup |
@@ -338,6 +366,13 @@ BitNet b1.58 スタイルの学習時量子化:
 ```
 
 ## Performance
+
+### 1B Model (Llama-3.2-1B-Instruct Q4_K_M, M1 Pro)
+
+| Configuration | Decode Speed |
+|---|---|
+| Full 16-layer inference | **20.2 tok/s** |
+| Logit accuracy vs llama.cpp | ±0.09 (top-1 token match) |
 
 ### 8B Model (ELYZA-JP Q4_K_M, M1 Pro)
 

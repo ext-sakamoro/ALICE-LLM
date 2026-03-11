@@ -78,6 +78,7 @@ impl Llama3Config {
         let max_seq_len = gguf
             .meta_u32(&format!("{prefix}.context_length"))
             .unwrap_or(8192) as usize;
+        let max_seq_len = max_seq_len.min(8192);
         let vocab_size = gguf
             .meta_u32(&format!("{prefix}.vocab_size"))
             .or_else(|| {
@@ -240,6 +241,7 @@ impl KvPage {
 
 /// Paged KV cache for a single sequence.
 /// Pages are allocated on demand (no upfront max_seq_len allocation).
+#[allow(dead_code)]
 struct PagedKvCache {
     pages: Vec<Vec<KvPage>>,  // pages[layer][page_idx]
     num_layers: usize,
@@ -247,6 +249,7 @@ struct PagedKvCache {
     seq_len: usize,
 }
 
+#[allow(dead_code)]
 impl PagedKvCache {
     fn new(num_layers: usize, kv_dim: usize) -> Self {
         let pages = (0..num_layers).map(|_| Vec::new()).collect();
@@ -401,6 +404,34 @@ fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
         let x1 = vec[i + 1];
         vec[i] = x0 * cos_val - x1 * sin_val;
         vec[i + 1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/// Apply RoPE with per-dimension frequency factors (Llama-3.1/3.2 NTK-aware context extension).
+/// `freq_factors` has `head_dim / 2` entries — base frequency is divided by each factor.
+/// freq[i] = (1/theta^(2i/d)) / freq_factors[i]
+/// (llama.cpp convention: higher factor = slower rotation = longer effective context)
+fn apply_rope_scaled(vec: &mut [f32], position: usize, head_dim: usize, theta: f32, freq_factors: &[f32]) {
+    for i in (0..head_dim).step_by(2) {
+        let freq_idx = i / 2;
+        let base_freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
+        let factor = if freq_idx < freq_factors.len() { freq_factors[freq_idx] } else { 1.0 };
+        let freq = base_freq / factor;
+        let angle = position as f32 * freq;
+        let (sin_val, cos_val) = angle.sin_cos();
+        let x0 = vec[i];
+        let x1 = vec[i + 1];
+        vec[i] = x0 * cos_val - x1 * sin_val;
+        vec[i + 1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/// Apply RoPE: uses per-dimension freq scaling if available, otherwise scalar theta.
+#[inline]
+fn apply_rope_auto(vec: &mut [f32], position: usize, head_dim: usize, theta: f32, freq_scales: Option<&[f32]>) {
+    match freq_scales {
+        Some(s) => apply_rope_scaled(vec, position, head_dim, theta, s),
+        None => apply_rope(vec, position, head_dim, theta),
     }
 }
 
@@ -748,6 +779,8 @@ pub struct Llama3Model<'a> {
     output_norm: Vec<f32>,
     output_proj: WeightRef<'a>,
     kv_cache: KvCache,
+    /// Per-dimension RoPE frequencies (Llama-3.1/3.2). None = use rope_theta scalar.
+    pub rope_freqs: Option<Vec<f32>>,
     ternary_layers: Option<Vec<TernaryLayerWeights>>,
     ternary_output_proj: Option<TernaryMatrix>,
     sparse_ternary_layers: Option<Vec<SparseTernaryLayerWeights>>,
@@ -765,8 +798,9 @@ impl<'a> Llama3Model<'a> {
         // Output norm
         let output_norm = gguf.tensor_to_f32("output_norm.weight")?;
 
-        // Output projection
-        let output_proj = load_weight_ref(gguf, "output.weight", config.vocab_size, config.hidden_dim)?;
+        // Output projection (fallback to tied embedding if output.weight absent)
+        let output_proj = load_weight_ref(gguf, "output.weight", config.vocab_size, config.hidden_dim)
+            .or_else(|| load_weight_ref(gguf, "token_embd.weight", config.vocab_size, config.hidden_dim))?;
 
         // Layers
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -778,6 +812,19 @@ impl<'a> Llama3Model<'a> {
         let kv_dim = config.num_kv_heads * config.head_dim;
         let kv_cache = KvCache::new(config.num_layers, config.max_seq_len, kv_dim);
 
+        // RoPE frequency scaling tensor (Llama-3.1/3.2 NTK-aware context extension)
+        // Values are scaling factors: actual_freq[i] = base_freq[i] * scale[i]
+        // scale=1.0 means no change, scale>1 means faster rotation (extended context)
+        let rope_freqs: Option<Vec<f32>> = gguf.tensor_to_f32("rope_freqs.weight").and_then(|scales| {
+            let half_dim = config.head_dim / 2;
+            if scales.len() != half_dim {
+                return None;
+            }
+            // Only use if any scale differs from 1.0 (i.e., non-trivial scaling)
+            let needs_scaling = scales.iter().any(|&s| (s - 1.0).abs() > 0.01);
+            if needs_scaling { Some(scales) } else { None }
+        });
+
         Some(Self {
             config,
             embedding,
@@ -785,6 +832,7 @@ impl<'a> Llama3Model<'a> {
             output_norm,
             output_proj,
             kv_cache,
+            rope_freqs,
             ternary_layers: None,
             ternary_output_proj: None,
             sparse_ternary_layers: None,
@@ -833,6 +881,7 @@ impl<'a> Llama3Model<'a> {
     pub fn forward(&mut self, token_id: u32) -> Vec<f32> {
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
 
         // Embedding lookup
         let emb_start = token_id as usize * c.hidden_dim;
@@ -865,11 +914,11 @@ impl<'a> Llama3Model<'a> {
             // Apply RoPE
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             // Store K, V in cache
@@ -908,6 +957,7 @@ impl<'a> Llama3Model<'a> {
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
             }
+
         }
 
         // Advance KV cache position (all layers have appended for this token)
@@ -918,6 +968,7 @@ impl<'a> Llama3Model<'a> {
 
         // Output logits
         let mut logits = vec![0.0f32; c.vocab_size];
+        // output_proj points to output.weight or token_embd.weight (tied)
         self.output_proj.matvec(&norm_buf, &mut logits);
 
         // Gemma-2: final logit softcapping
@@ -930,12 +981,23 @@ impl<'a> Llama3Model<'a> {
         logits
     }
 
+    /// Forward multiple tokens sequentially, returning logits for each.
+    /// More efficient than calling forward() in a loop because buffers are reused.
+    pub fn forward_batch(&mut self, token_ids: &[u32]) -> Vec<Vec<f32>> {
+        let mut all_logits = Vec::with_capacity(token_ids.len());
+        for &tok in token_ids {
+            all_logits.push(self.forward(tok));
+        }
+        all_logits
+    }
+
     /// Forward pass using only the first `draft_layers` layers (for speculative draft).
     /// Produces approximate logits at ~draft_layers/total_layers cost.
     /// KV cache entries are populated only for the draft layers.
     fn forward_draft(&mut self, token_id: u32, draft_layers: usize) -> Vec<f32> {
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
         let num_draft = draft_layers.min(c.num_layers);
 
         let emb_start = token_id as usize * c.hidden_dim;
@@ -963,11 +1025,11 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
@@ -1014,9 +1076,11 @@ impl<'a> Llama3Model<'a> {
         top_k: usize,
     ) -> GenerateResult {
         let start = Instant::now();
-        let prompt_tokens = tokenizer.encode(prompt);
-        let mut tokens = vec![tokenizer.bos_id];
-        tokens.extend_from_slice(&prompt_tokens);
+        let mut tokens = tokenizer.encode(prompt);
+        // Prepend BOS if not already present
+        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+            tokens.insert(0, tokenizer.bos_id);
+        }
 
         self.clear_cache();
         let prompt_token_count = tokens.len();
@@ -1118,14 +1182,15 @@ impl<'a> Llama3Model<'a> {
         prompt: &str,
         max_new_tokens: usize,
         temperature: f32,
-        top_k: usize,
+        _top_k: usize,
         spec_k: usize,
         draft_layers: usize,
     ) -> GenerateResult {
         let start = Instant::now();
-        let prompt_tokens = tokenizer.encode(prompt);
-        let mut tokens = vec![tokenizer.bos_id];
-        tokens.extend_from_slice(&prompt_tokens);
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+            tokens.insert(0, tokenizer.bos_id);
+        }
 
         self.clear_cache();
         let prompt_token_count = tokens.len();
@@ -1268,6 +1333,182 @@ impl<'a> Llama3Model<'a> {
         }
     }
 
+    /// True speculative decoding with a separate draft model.
+    /// The draft model generates K candidate tokens, the main model verifies them
+    /// using probabilistic speculative sampling (Leviathan et al.).
+    pub fn generate_speculative_dual(
+        &mut self,
+        draft_model: &mut Llama3Model,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+        spec_k: usize,
+    ) -> GenerateResult {
+        let start = Instant::now();
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+            tokens.insert(0, tokenizer.bos_id);
+        }
+
+        self.clear_cache();
+        draft_model.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        // Prefill both models
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward(tok);
+            draft_model.forward(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        // Decode with dual-model speculation
+        let decode_start = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut total_drafted: usize = 0;
+        let mut total_accepted: usize = 0;
+        let mut rng = Rng64::new(42);
+
+        while generated.len() < max_new_tokens {
+            // Sample from current main model logits
+            let next_token = if temperature > 0.0 {
+                sample_from_probs(&softmax(&logits), rng.next_f32())
+            } else {
+                argmax(&logits)
+            };
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+            generated.push(next_token);
+            tokens.push(next_token);
+
+            let remaining = max_new_tokens - generated.len();
+            if remaining == 0 {
+                logits = self.forward(next_token);
+                draft_model.forward(next_token);
+                continue;
+            }
+
+            let k = spec_k.min(remaining);
+
+            // --- Draft phase: generate K tokens with draft model ---
+            let saved_draft_pos = draft_model.kv_cache.seq_len();
+            let _saved_main_pos = self.kv_cache.seq_len();
+            let mut draft_tokens = Vec::with_capacity(k);
+            let mut draft_logits_all = Vec::with_capacity(k);
+            let mut draft_input = next_token;
+
+            // Feed the accepted token to draft model first
+            let dl = draft_model.forward(draft_input);
+            draft_input = argmax(&dl);
+            draft_tokens.push(draft_input);
+            draft_logits_all.push(dl);
+
+            for _ in 1..k {
+                let dl = draft_model.forward(draft_input);
+                draft_input = argmax(&dl);
+                draft_tokens.push(draft_input);
+                draft_logits_all.push(dl);
+            }
+            total_drafted += draft_tokens.len();
+
+            // --- Verify phase: forward incrementally, stop early on rejection ---
+            // Forward accepted token through main model
+            logits = self.forward(next_token);
+
+            let mut num_accepted = 0;
+            let mut rejected = false;
+            for i in 0..draft_tokens.len() {
+                let p = softmax(&logits);
+                let q = softmax(&draft_logits_all[i]);
+                let x = draft_tokens[i] as usize;
+
+                let p_x = if x < p.len() { p[x] } else { 0.0 };
+                let q_x = if x < q.len() { q[x] } else { 1e-10 };
+                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+
+                let r = rng.next_f32();
+                if r < accept_prob {
+                    // Accepted — forward this draft token to get logits for next check
+                    generated.push(draft_tokens[i]);
+                    tokens.push(draft_tokens[i]);
+                    total_accepted += 1;
+                    num_accepted += 1;
+                    logits = self.forward(draft_tokens[i]);
+                } else {
+                    // Rejected: resample from max(0, p - q)
+                    let mut adjusted = vec![0.0f32; p.len()];
+                    let mut adj_sum = 0.0f32;
+                    for j in 0..p.len() {
+                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adj_sum += adjusted[j];
+                    }
+                    let resampled = if adj_sum > 0.0 {
+                        let inv = 1.0 / adj_sum;
+                        for a in &mut adjusted { *a *= inv; }
+                        sample_from_probs(&adjusted, rng.next_f32())
+                    } else {
+                        sample_from_probs(&p, rng.next_f32())
+                    };
+                    if resampled != tokenizer.eos_id {
+                        generated.push(resampled);
+                        tokens.push(resampled);
+                        logits = self.forward(resampled);
+                    }
+                    rejected = true;
+                    break;
+                }
+            }
+
+            // If all K drafts accepted, bonus token from final verify logits
+            if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
+                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                if bonus != tokenizer.eos_id {
+                    generated.push(bonus);
+                    tokens.push(bonus);
+                    logits = self.forward(bonus);
+                }
+            }
+
+            // Sync draft model KV cache:
+            // Draft has entries for: next_token + draft_tokens[0..k]
+            // We accepted num_accepted of those.
+            let draft_keep = saved_draft_pos + 1 + num_accepted;
+            draft_model.kv_cache.rollback_to(draft_keep);
+            // Feed the resampled/bonus token that draft hasn't seen
+            if let Some(&last) = tokens.last() {
+                draft_model.forward(last);
+            }
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        GenerateResult {
+            text: tokenizer.decode(&generated),
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+            spec_stats: Some(SpecStats {
+                draft_tokens: total_drafted,
+                accepted_tokens: total_accepted,
+                draft_layers: draft_model.config.num_layers,
+                spec_k,
+            }),
+        }
+    }
+
     /// Forward pass using ternary-quantized weights (no multiplications in projections).
     /// Must call `load_ternary()` before using this method.
     pub fn forward_ternary(&mut self, token_id: u32) -> Vec<f32> {
@@ -1275,6 +1516,7 @@ impl<'a> Llama3Model<'a> {
         let ternary_output = self.ternary_output_proj.as_ref().expect("call load_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
@@ -1302,11 +1544,11 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
@@ -1354,9 +1596,10 @@ impl<'a> Llama3Model<'a> {
         top_k: usize,
     ) -> GenerateResult {
         let start = Instant::now();
-        let prompt_tokens = tokenizer.encode(prompt);
-        let mut tokens = vec![tokenizer.bos_id];
-        tokens.extend_from_slice(&prompt_tokens);
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+            tokens.insert(0, tokenizer.bos_id);
+        }
 
         self.clear_cache();
         let prompt_token_count = tokens.len();
@@ -1439,6 +1682,7 @@ impl<'a> Llama3Model<'a> {
         let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
@@ -1465,11 +1709,11 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
@@ -1513,6 +1757,7 @@ impl<'a> Llama3Model<'a> {
         let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
         let num_draft = draft_layers.min(c.num_layers);
 
         let emb_start = token_id as usize * c.hidden_dim;
@@ -1540,11 +1785,11 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
@@ -1590,14 +1835,15 @@ impl<'a> Llama3Model<'a> {
         prompt: &str,
         max_new_tokens: usize,
         temperature: f32,
-        top_k: usize,
+        _top_k: usize,
         spec_k: usize,
         draft_layers: usize,
     ) -> GenerateResult {
         let start = Instant::now();
-        let prompt_tokens = tokenizer.encode(prompt);
-        let mut tokens = vec![tokenizer.bos_id];
-        tokens.extend_from_slice(&prompt_tokens);
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+            tokens.insert(0, tokenizer.bos_id);
+        }
 
         self.clear_cache();
         let prompt_token_count = tokens.len();
@@ -1742,6 +1988,7 @@ impl<'a> Llama3Model<'a> {
     fn forward_paged(&self, token_id: u32, paged_cache: &mut PagedKvCache) -> Vec<f32> {
         let c = &self.config;
         let pos = paged_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
@@ -1769,11 +2016,11 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta);
+                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
             }
 
             paged_cache.append(layer_idx, &k_buf, &v_buf);
