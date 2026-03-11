@@ -410,6 +410,47 @@ cargo run --release --example bench_70b_sparse --features "gguf,parallel"
 | Mac Mini M4 Pro | 273 GB/s | 5.3 |
 | Mac Studio M4 Ultra | 800 GB/s | 15.6 |
 
+### Quantization Block Specs
+
+| Type | Block Size | Bytes/Block | bpw | Layout |
+|---|---|---|---|---|
+| Q2_K | 256 | 84 | 2.625 | scales[16] + qs[64] + d(f16) + dmin(f16) |
+| Q3_K | 256 | 110 | 3.4375 | hmask[32] + qs[64] + scales[12] + d(f16) |
+| Q4_K | 256 | 144 | 4.5 | d(f16) + dmin(f16) + scales[12] + qs[128] |
+| Q5_K | 256 | 176 | 5.5 | d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] |
+| Q6_K | 256 | 210 | 6.5625 | ql[128] + qh[64] + scales[16] + d(f16) |
+| Q8_0 | 32 | 34 | 8.5 | d(f16) + qs[32] |
+
+Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer — e.g. Q3_K for attention, Q4_K/Q5_K for FFN, Q6_K for embeddings, F32 for norms — so effective bpw is higher than the base type.
+
+### 30B / 70B Model Size Estimates
+
+| Quant | bpw (eff.) | 30B | 70B |
+|---|---|---|---|
+| F16 | 16.0 | 60.0 GB | 140.0 GB |
+| Q8_0 | 8.5 | 31.9 GB | 74.4 GB |
+| Q6_K | 6.56 | 24.6 GB | 57.4 GB |
+| Q5_K_M | ~5.7 | ~21.4 GB | ~49.9 GB |
+| Q4_K_M | ~4.8 | ~18.0 GB | ~42.0 GB |
+| Q3_K_L | ~4.0 | ~15.0 GB | ~35.0 GB |
+| Q3_K_M | ~3.9 | ~14.6 GB | ~34.1 GB |
+| Q3_K_S | ~3.5 | ~13.1 GB | ~30.6 GB |
+| Q2_K | ~3.2 | ~12.0 GB | ~28.0 GB |
+
+### Recommended Quantization by Device Memory
+
+| Memory | 30B Model | 70B Model |
+|---|---|---|
+| **16 GB** (MBA M3) | Q2_K (12GB) ○ / Q3_K_S (13GB) △ | × |
+| **24 GB** (M3 Pro) | Q4_K_M (18GB) ○ | × |
+| **32 GB** (M3 Max) | Q6_K (25GB) ○ | Q2_K (28GB) △ |
+| **36 GB** (M3 Pro) | Q6_K (25GB) ○ | Q3_K_S (31GB) △ |
+| **48 GB** (M4 Max) | Q8_0 (32GB) ○ | Q3_K_M (34GB) ○ |
+| **64 GB** (M2 Ultra) | F16 (60GB) △ | Q4_K_M (42GB) ○ |
+| **128 GB** (M4 Ultra) | F16 (60GB) ○ | Q8_0 (74GB) ○ |
+
+○ = comfortable (model + OS + KV cache fit in RAM), △ = runs with swap pressure
+
 ## CLI Options
 
 ```
