@@ -10,6 +10,15 @@
 //! Provides tokenizer (BPE), KV cache, scaled dot-product attention,
 //! rotary position embeddings (`RoPE`), quantization (INT8/INT4),
 //! sampling (top-k, top-p, temperature), and batch inference.
+//!
+//! ## GGUF Support (feature: `gguf`)
+//!
+//! Load and run Llama-3 models directly from GGUF files with fused
+//! quantized matvec (Q4_K_M, Q8_0). No FP32 materialization needed.
+
+pub mod gguf;
+pub mod llama3;
+pub mod training;
 
 use std::collections::HashMap;
 
