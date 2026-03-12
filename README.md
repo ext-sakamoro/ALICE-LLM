@@ -2,9 +2,9 @@
 
 Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 156 tests.
 
-**0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro CPU.**
+**GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
-**Dual-model speculative decoding: Llama-3.2-1B draft → Llama-3.1-8B verify, 63% accept rate, 5.7 tok/s baseline.**
+**CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro.**
 
 ## Quick Start
 
@@ -41,6 +41,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **RoPE frequency scaling** — NTK-aware context extension via `rope_freqs.weight` tensor (Llama-3.1/3.2)
 - **LLVM auto-vectorization** — `target-cpu=native` generates ARM SDOT instructions (37 sdot in Q4_K dot product)
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
+- **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K/Q6_K dequant-fused matvec, fused SwiGLU, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
 
 ## Architecture
@@ -50,6 +51,10 @@ src/
 ├── lib.rs       — BPE tokenizer, KV cache, attention, RoPE, sampling
 ├── gguf.rs      — GGUF v3 parser, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K quantization, fused matvec,
 │                  ternary/sparse-ternary matrices, LLVM auto-vectorized SDOT kernels
+├── gpu.rs       — wgpu compute engine: GpuEngine, GpuModel, batch-4 speculative decoding,
+│                  zero per-token allocation, subgroup SIMD, Rc-shared engine for dual-model
+├── shaders/     — WGSL compute shaders (Q4_K/Q6_K matvec, fused SwiGLU, RMSNorm, RoPE,
+│                  attention, KV cache, residual — each with K=1 scalar + K=4 batch variant)
 ├── llama3.rs    — Multi-arch forward pass, model loading, speculative decoding (layer-skip + dual-model),
 │                  paged KV cache, continuous batching, tied embeddings, RoPE freq scaling
 └── training.rs  — Ternary QAT: STE, QatLinear, L1 regularization, AdamW, MSE loss
@@ -60,7 +65,89 @@ src/
 
 ---
 
-## The Optimization Journey
+## GPU Inference (wgpu / Metal)
+
+Pure Rust GPU inference via wgpu compute shaders. Zero external ML frameworks — all kernels hand-written in WGSL.
+
+### Quick Start
+
+```bash
+# Single-token autoregressive generation
+cargo run --example generate_gpu --features gpu,gguf --release -- \
+  --prompt "The meaning of life is" --max-tokens 64
+
+# Dual-model speculative decoding (1B draft + 8B verify)
+cargo run --example speculative_dual_gpu --features gpu,gguf --release -- \
+  --prompt "What is the capital of Japan?" --max-tokens 64
+```
+
+### The GPU Optimization Journey (Apple M3 Metal, Llama-3.2-1B Q4_K_M)
+
+```
+                        ┌─────────────────────────────────────────┐
+  71ms ────────────────▶│████████████████████████████  Phase 6    │ 14.0 tok/s
+                        │                                         │
+  84ms ────────────────▶│████████████████████████      Phase 5    │ 11.9 tok/s
+                        │                                         │
+  94ms ────────────────▶│██████████████████████        Phase 4    │ 10.6 tok/s
+  97ms ────────────────▶│█████████████████████         Phase 3    │ 10.3 tok/s
+ 104ms ────────────────▶│███████████████████           Phase 2    │  9.6 tok/s
+ 108ms ────────────────▶│██████████████████            Phase 1.5  │  9.3 tok/s
+ 125ms ────────────────▶│████████████████              Phase 1    │  8.0 tok/s
+                        └─────────────────────────────────────────┘
+                         125    100     80      60   ms/token
+```
+
+| Phase | Technique | ms/token | Speedup | Key Insight |
+|---|---|---|---|---|
+| 1 | Naive GPU matvec (Q4_K per-element) | 125 | 1.0x | GPU compute bound on dequant overhead |
+| 1.5 | Fused dequant-matvec (single kernel) | 108 | 1.16x | Eliminate intermediate buffer: weight decode + FMA in one pass |
+| 2 | Subgroup SIMD reduction (`subgroupAdd`) | 104 | 1.20x | Register-to-register shuffle replaces shared memory reduction |
+| 3 | RMSNorm + RoPE batch-aware | 97 | 1.29x | Zero K=1 regression with batch-capable shaders |
+| 4 | Fused SwiGLU (gate+up+silu×mul) | 94 | 1.33x | Single kernel replaces 3 dispatches, weight read shared |
+| 5 | 2D dispatch (row > 65535 fix) | 84 | 1.49x | `wid.y * grid_x + wid.x` unlocks large output projections |
+| **6** | **Zero per-token allocation** | **71** | **1.76x** | **All 167 bind groups pre-cached at load time** |
+
+### Batch-4 Speculative Decoding
+
+K=4 unrolled scalar accumulators — weight decoded once, 4 FMAs in registers:
+
+```
+K=1 (scalar):    71 ms/token   (14.0 tok/s)
+K=4 (batch):    101 ms/4 tokens (25.3 ms/token, 39.5 tok/s)
+Speedup:        2.82×
+Correctness:    max|diff| = 0.000000 (PASS)
+```
+
+**Dual pipeline architecture**: Original scalar shaders (K=1 fast path) + K=4 unrolled batch shaders. No K=1 regression — `var acc0, acc1, acc2, acc3` guarantees physical GPU registers (vs `var acc: array<f32, 4>` which spills to thread memory).
+
+### Dual-Model GPU Speculative Decoding (1B → 8B)
+
+```
+8B Baseline (K=1):     0.4 tok/s  (2,773 ms/token)
+1B+8B Speculative:     2.1 tok/s  (471 ms/token)
+Speedup:               5.89×
+Accept rate:           90% (19/21)
+```
+
+Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Queue, independent KV caches.
+
+### WGSL Shader Architecture
+
+| Shader | K=1 (scalar) | K=4 (batch) | Bindings |
+|---|---|---|---|
+| `dequant_matvec_q4k` | 1 acc, 1 subgroupAdd | 4 acc, 4 subgroupAdd | weights, input, output, params |
+| `dequant_matvec_q6k` | 1 acc, 1 subgroupAdd | 4 acc, 4 subgroupAdd | weights, input, output, params |
+| `swiglu_fused_q4k` | 2 acc (gate+up) | 8 acc (gate×4+up×4) | gate_w, up_w, input, output, params |
+| `rmsnorm` | batch via `wid.x` | — | input, weights, output, params |
+| `rope` | batch via `wid.y` | — | data, params |
+| `attention` | batch via `wg.y` (causal) | — | Q, K_cache, V_cache, output, params |
+| `kv_cache_append` | batch via `wid.y` | — | input, K/V_cache, params |
+| `residual_add` | element-wise | — | a, b |
+
+---
+
+## The CPU Optimization Journey (70B Sparse Ternary)
 
 70Bモデルのスパースターナリ matvec を、スカラー実装から M1 Pro メモリ帯域の物理限界まで最適化した全記録。
 
@@ -451,6 +538,29 @@ Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer —
 
 ○ = comfortable (model + OS + KV cache fit in RAM), △ = runs with swap pressure
 
+## Inference Server (OpenAI-compatible API)
+
+```bash
+cargo run --bin alice-llm-server --features server --release -- \
+  --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --port 8090
+```
+
+```bash
+# Text completion
+curl http://localhost:8090/v1/completions -H "Content-Type: application/json" \
+  -d '{"prompt":"What is the capital of Japan?","max_tokens":32,"temperature":0}'
+
+# Response:
+# {"choices":[{"text":"The capital of Japan is Tokyo.","finish_reason":"stop"}],
+#  "usage":{"tokens_per_second":14.8,"decode_ms":473}}
+
+# Health check
+curl http://localhost:8090/health
+
+# List models
+curl http://localhost:8090/v1/models
+```
+
 ## CLI Options
 
 ```
@@ -469,7 +579,9 @@ Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer —
 | Feature | Description |
 |---|---|
 | `gguf` | GGUF file loading and multi-arch inference |
-| `parallel` | Rayon-based multi-threaded matvec |
+| `gpu` | wgpu GPU compute (Metal/Vulkan/DX12), requires `gguf` |
+| `server` | HTTP inference server (axum), includes `gpu` + `gguf` |
+| `parallel` | Rayon-based multi-threaded CPU matvec |
 
 ## License
 

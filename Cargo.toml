@@ -14,10 +14,19 @@ default = ["std"]
 std = []
 gguf = ["dep:memmap2"]
 parallel = ["dep:rayon"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "gpu", "gguf"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 rayon = { version = "1.10", optional = true }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [[example]]
 name = "elyza_gguf"
@@ -42,3 +51,32 @@ required-features = ["gguf"]
 [[example]]
 name = "test_q3k"
 required-features = ["gguf"]
+
+[[example]]
+name = "bench_gpu"
+required-features = ["gguf", "gpu"]
+
+[[example]]
+name = "bench_gpu_ffn"
+required-features = ["gguf", "gpu"]
+
+[[example]]
+name = "bench_gpu_forward"
+required-features = ["gguf", "gpu"]
+
+[[example]]
+name = "generate_gpu"
+required-features = ["gguf", "gpu"]
+
+[[example]]
+name = "speculative_gpu"
+required-features = ["gguf", "gpu"]
+
+[[example]]
+name = "speculative_dual_gpu"
+required-features = ["gguf", "gpu"]
+
+[[bin]]
+name = "alice-llm-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
