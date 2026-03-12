@@ -1,5 +1,7 @@
 # ALICE-LLM
 
+**English** | [日本語](README_JP.md)
+
 Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 156 tests.
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
@@ -149,7 +151,7 @@ Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Qu
 
 ## The CPU Optimization Journey (70B Sparse Ternary)
 
-70Bモデルのスパースターナリ matvec を、スカラー実装から Apple Silicon メモリ帯域の物理限界まで最適化した全記録。
+Complete record of optimizing 70B sparse ternary matvec from scalar implementation to the physical memory bandwidth limit of Apple Silicon.
 
 ### The Wall
 
@@ -170,7 +172,7 @@ Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Qu
 
 ### Phase 1 → Scalar Baseline (0.16 tok/s, 1% BW)
 
-素朴な実装。16-bit マスクからビットを1つずつ取り出し、`if bit { sum += x }` の分岐地獄。
+Naive implementation. Extracting bits one-by-one from 16-bit masks, a branch prediction nightmare with `if bit { sum += x }`.
 
 ```rust
 // 70B: 76.5 ms/layer × 80 layers = 6,120 ms/token
@@ -182,11 +184,11 @@ for bit in 0..16 {
 }
 ```
 
-**ボトルネック**: 分岐予測ミス。50%スパースでほぼランダムな分岐パターン。
+**Bottleneck**: Branch prediction misses. Nearly random branch patterns at 50% sparsity.
 
 ### Phase 2 → NEON Mask Expansion (0.26 tok/s, 2% BW, 1.6x)
 
-16-bit マスクを NEON `vtstq_u16` で一括展開。8回の `expand_mask_4` → 1回の `expand_mask_16`。
+Bulk-expanding 16-bit masks with NEON `vtstq_u16`. From 8 calls to `expand_mask_4` down to 1 call to `expand_mask_16`.
 
 ```rust
 // 16 weights expanded in 1 NEON op instead of 16 branches
@@ -194,11 +196,11 @@ let mask_vec = vdupq_n_u16(active_mask);
 let expanded = vtstq_u16(mask_vec, bit_positions);  // 16 lanes simultaneously
 ```
 
-**発見**: 分岐除去だけでは不十分。データ型が f32 のまま — 帯域を浪費している。
+**Finding**: Branch elimination alone is not enough. Data type remains f32 — wasting bandwidth.
 
 ### Phase 3 → Branchless 4-Row Micro-kernel (0.37 tok/s, 3% BW, 2.3x)
 
-4行を同時処理するレジスタブロッキング。活性化ベクトルの読み込みを4行で共有。**ゼロ分岐**。
+Register blocking with 4 rows processed simultaneously. Activation vector loads shared across 4 rows. **Zero branches**.
 
 ```rust
 // 4 rows share the same activation load — 4x register reuse
@@ -209,11 +211,11 @@ acc2 = vmlaq_f32(acc2, w2, act);  // Row 2
 acc3 = vmlaq_f32(acc3, w3, act);  // Row 3
 ```
 
-**発見**: f32 演算は速いが、**f32 の帯域消費が本当の敵**。入力ベクトルは32-bit精度で毎ブロック読み込まれ、帯域の大半を食っている。
+**Finding**: f32 arithmetic is fast, but **f32 bandwidth consumption is the real enemy**. The input vector is read at 32-bit precision per block, consuming most of the bandwidth.
 
 ### Phase 4 → i8 Dynamic Quantization + SDOT (0.70 tok/s, 6% BW, 4.4x)
 
-活性化ベクトルを f32→i8 に動的量子化。SDOT 命令で 16×i8×i8 → 4×i32 を**1命令**で実行。
+Dynamic quantization of activations from f32→i8. SDOT instruction executes 16×i8×i8 → 4×i32 in **a single instruction**.
 
 ```rust
 // NEON-accelerated f32 → i8 quantization
@@ -232,13 +234,13 @@ core::arch::asm!(
 );
 ```
 
-帯域消費 1/4 (f32→i8)。演算スループット 4x (FMA→SDOT)。**しかし 6% BW — まだ遅い。**
+Bandwidth consumption 1/4 (f32→i8). Compute throughput 4x (FMA→SDOT). **But only 6% BW — still slow.**
 
-**発見**: 重みの展開コストが支配的になった。16-bit マスク → i8 重みベクトルへの展開に14命令も使っている。
+**Finding**: Weight expansion cost became dominant. 14 instructions to expand 16-bit mask → i8 weight vector.
 
 ### Phase 5 → vqtbl1q LUT Expansion (1.59 tok/s, 27% BW, 9.9x)
 
-**ターニングポイント**。2-bit packed weights（00=0, 01=+1, 11=−1）を NEON テーブルルックアップで 6命令展開。
+**Turning point**. Expanding 2-bit packed weights (00=0, 01=+1, 11=−1) via NEON table lookup in just 6 instructions.
 
 ```rust
 // Packed 2-bit format: 4 weights per byte (00=0, 01=+1, 11=-1)
@@ -257,18 +259,17 @@ unsafe fn expand_packed_2bit_lut(packed_ptr: *const u8, ...) -> int8x16_t {
 // 6 ops total. Previous mask-based: 14 ops.
 ```
 
-**27% → しかし Phase 6 で真の原因が判明する。**
+**27% — but Phase 6 reveals the true cause.**
 
-Phase 5 で 9.9x に到達したとき、次の疑問が浮かんだ: **残りの 73% はどこに消えている？**
+After reaching 9.9x at Phase 5, the question arose: **where is the remaining 73% going?**
 
-ソフトウェアプリフェッチ (`prfm`)、E-core 除外、チャンクサイズ変更 — すべて**悪化**した（後述）。
-これらの失敗から、真のボトルネックが**演算でもプリフェッチでもない**ことが証明された。
+Software prefetch (`prfm`), E-core exclusion, chunk size changes — all made things **worse** (see below). These failures proved by elimination that the true bottleneck was **neither compute nor prefetching**.
 
 ### Phase 6 → Block-Packed Weight Layout (1.76 tok/s, 45% BW, 11.0x)
 
-**TLBミスの発見と殲滅**。
+**Discovery and elimination of TLB misses**.
 
-従来のメモリレイアウト（Row-major）:
+Previous memory layout (Row-major):
 ```
 Row 0: [blk0][blk1][blk2]...[blk511]    ← 2 KB per row
 Row 1: [blk0][blk1][blk2]...[blk511]    ← 2 KB, different page
@@ -277,7 +278,7 @@ Row 3: [blk0][blk1][blk2]...[blk511]    ← 2 KB, different page
        ↑ 4-row kernel reads blk0 from 4 different pages → 4 TLB misses
 ```
 
-Block-packed レイアウト:
+Block-packed layout:
 ```
 Group 0: [R0-blk0][R1-blk0][R2-blk0][R3-blk0] [R0-blk1][R1-blk1]...
          ↑ 4 rows' blk0 are contiguous → 0 TLB misses, sequential read
@@ -302,11 +303,11 @@ let w2 = expand_packed_2bit_lut(blk_base.add(2 * bytes_per_block)); // Row 2
 let w3 = expand_packed_2bit_lut(blk_base.add(3 * bytes_per_block)); // Row 3
 ```
 
-**27% → 45%。TLBミスの除去だけで帯域利用率が 1.67x。**
+**27% → 45%. TLB miss elimination alone improved bandwidth utilization by 1.67x.**
 
 ### The Ceiling: 45% = Apple Silicon CPU Physical Limit
 
-Apple Silicon の SoC 帯域 200 GB/s は GPU/NPU/Media Engine と共有。CPU が単独で使える帯域は約 90 GB/s（45%）。これは OS カーネルとメモリコントローラのアービトレーションによるハード制約であり、ソフトウェアでは突破できない。
+The Apple Silicon SoC bandwidth of 200 GB/s is shared with GPU/NPU/Media Engine. The bandwidth available exclusively to the CPU is approximately 90 GB/s (45%). This is a hard constraint imposed by the OS kernel and memory controller arbitration, and cannot be broken through software.
 
 ### Summary Table
 
@@ -328,19 +329,19 @@ Apple Silicon の SoC 帯域 200 GB/s は GPU/NPU/Media Engine と共有。CPU �
 | Chunk size 8→16 rows | **−16%** | Rayon work-stealing imbalance; 8 = optimal for Apple Silicon L1 geometry |
 | 2x block unrolling | **−3%** | acc0–acc3 already independent; extra loop overhead for no gain |
 
-**失敗の教訓**: Apple Silicon は HW プリフェッチャーが極めて優秀で、ソフトウェアの介入は cache pollution を引き起こす。Apple UMA では E-core を除外すると帯域の一部を捨てることになる。これらの実験が「27% の壁」の真因が TLB ミスであることの**消去法的証明**となった。
+**Lessons from failure**: The Apple Silicon has an exceptionally capable HW prefetcher, and software intervention causes cache pollution. In Apple UMA, excluding E-cores means discarding part of the available bandwidth. These experiments served as **proof by elimination** that TLB misses were the true cause of the "27% wall".
 
 ---
 
 ## Speculative Decoding
 
-レイヤースキップ方式の自己投機的デコード + 確率的サンプリング:
+Layer-skip self-speculative decoding + probabilistic sampling:
 
-1. **ドラフト**: 先頭 N 層のみで K 個のトークンを高速推測（全logits保存）
-2. **ロールバック**: KV キャッシュをドラフト前の位置に巻き戻し
-3. **確率的受理**: `min(1, p(x)/q(x))` で受理判定 — greedy match より高い受理率
-4. **棄却時リサンプリング**: `max(0, p(x) - q(x))` から再サンプル — 出力分布を厳密に保存
-5. **ボーナストークン**: 全 K 個受理時、検証 logits からもう 1 トークン（K+1 出力/サイクル）
+1. **Draft**: Rapidly predict K tokens using only the first N layers (all logits saved)
+2. **Rollback**: Rewind KV cache to pre-draft position
+3. **Probabilistic acceptance**: Accept/reject via `min(1, p(x)/q(x))` — higher acceptance rate than greedy matching
+4. **Rejection resampling**: Resample from `max(0, p(x) - q(x))` — strictly preserves output distribution
+5. **Bonus token**: When all K drafts are accepted, generate one more token from verify logits (K+1 output/cycle)
 
 ```bash
 cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
@@ -355,9 +356,9 @@ cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
 for each draft token x with draft_logits q, verify_logits p:
     p_dist = softmax(p), q_dist = softmax(q)
     if rand() < min(1, p_dist[x] / q_dist[x]):
-        ACCEPT x                                          ← 分布が近ければ高確率で受理
+        ACCEPT x                                          ← high acceptance when distributions are close
     else:
-        REJECT → resample from normalized max(0, p_dist - q_dist)  ← 不足分から補正サンプル
+        REJECT → resample from normalized max(0, p_dist - q_dist)  ← corrective resample from deficit
 if all K drafts accepted:
     bonus token from final verify logits                   ← K+1 tokens per cycle
 ```
@@ -372,11 +373,11 @@ if all K drafts accepted:
 | 30 | 93.8% | 37% | **25–75%** | 2.5 tok/s |
 | 31 | 96.9% | 58% | **59–62%** | 2.9–3.1 tok/s |
 
-**8B の限界**: 32層モデルでは各層の表現寄与が大きすぎ、層スキップの受理率がドラフトコストに見合わない。70B（80層）ではスキップ耐性が大幅に向上する。
+**8B limitation**: In a 32-layer model, each layer's representational contribution is too large, making layer-skip acceptance rates insufficient to justify draft costs. 70B (80 layers) has significantly higher skip tolerance.
 
 ### Dual-Model Speculative Decoding (1B → 8B)
 
-別モデルをドラフトに使う真の投機的デコード。Llama-3.2-1B (16層, 2048dim) → Llama-3.1-8B (32層, 4096dim):
+True speculative decoding using a separate draft model. Llama-3.2-1B (16 layers, 2048dim) → Llama-3.1-8B (32 layers, 4096dim):
 
 ```bash
 cargo run --release --example speculative_dual --features "gguf,parallel" -- \
@@ -392,7 +393,7 @@ cargo run --release --example speculative_dual --features "gguf,parallel" -- \
 | Speculative K=4 | 5.6 | 63% | 0.99x |
 | Speculative K=5 | 6.5 | 100% | 1.15x |
 
-**CPU上の制約**: バッチ並列検証が不可能なため、ドラフトモデルのコストが純粋なオーバーヘッドになる。短い応答（K個全受理）では1.15xのスピードアップを確認。GPU上ではバッチ検証により大幅な高速化が期待できる。
+**CPU constraint**: Batch parallel verification is not possible, so the draft model cost becomes pure overhead. 1.15x speedup confirmed on short responses (all K drafts accepted). GPU batch verification is expected to provide significant acceleration.
 
 ### 70B Speculative Decoding Projections
 
@@ -406,18 +407,18 @@ cargo run --release --example speculative_dual --features "gguf,parallel" -- \
 
 ## Computation Path (Q4_K)
 
-llama.cpp 互換の整数内積パス:
+llama.cpp-compatible integer dot product path:
 
-1. 入力ベクトルを **Q8_K** に量子化 (256要素/ブロック, f32 scale, i8 values, i16 bsums)
-2. 重み × 入力を **Q4_K×Q8_K** / **Q6_K×Q8_K** 整数内積で計算（乗算はスケール適用時のみ）
-3. 8サブブロック × 32要素の整数累積、6-bit packed scales/mins
-4. 最終結果: `d × d_q8 × Σ(scale × q4 × q8) − dmin × d_q8 × Σ(mins × bsums)`
+1. Quantize input vector to **Q8_K** (256 elements/block, f32 scale, i8 values, i16 bsums)
+2. Compute weight × input via **Q4_K×Q8_K** / **Q6_K×Q8_K** integer dot product (multiplication only at scale application)
+3. 8 sub-blocks × 32 element integer accumulation, 6-bit packed scales/mins
+4. Final result: `d × d_q8 × Σ(scale × q4 × q8) − dmin × d_q8 × Σ(mins × bsums)`
 
-llama.cpp の `ggml_vec_dot_q4_K_q8_K` と完全一致（logits差 ±0.03 以内）。
+Exact match with llama.cpp's `ggml_vec_dot_q4_K_q8_K` (logit difference within ±0.03).
 
 ## Multi-Architecture Support
 
-GGUF の `general.architecture` から自動検出:
+Auto-detected from GGUF `general.architecture`:
 
 | Architecture | GQA | RoPE θ | Sliding Window | Logit Softcapping |
 |---|---|---|---|---|
@@ -427,29 +428,29 @@ GGUF の `general.architecture` から自動検出:
 
 ## Sparse Ternary Quantization
 
-N:M 構造化スパース性による極限圧縮:
+Extreme compression via N:M structured sparsity:
 
-- **N:M structured sparsity**: 16要素中 N 個だけ非ゼロ (8:16 = 50% density)
+- **N:M structured sparsity**: Only N non-zero out of 16 elements (8:16 = 50% density)
 - **Packed 2-bit encoding**: `00=0, 01=+1, 11=-1` — 4 weights/byte
-- **Block-packed layout**: 4行インターリーブ → TLB ミス消滅
-- **vqtbl1q_s8 LUT**: 2-bit → i8 を 6 命令でオンザフライ展開
+- **Block-packed layout**: 4-row interleave → TLB miss elimination
+- **vqtbl1q_s8 LUT**: 2-bit → i8 on-the-fly expansion in 6 instructions
 - **SDOT**: 16×i8×i8 → 4×i32 in 1 instruction (inline asm)
-- **i8 dynamic quantization**: NEON 加速 f32→i8 活性化量子化
+- **i8 dynamic quantization**: NEON-accelerated f32→i8 activation quantization
 
 ## Ternary QAT (Quantization-Aware Training)
 
-BitNet b1.58 スタイルの学習時量子化:
+BitNet b1.58-style quantization-aware training:
 
-- **Straight-Through Estimator**: forward で ternarize、backward で勾配素通し
-- **L1 正則化**: `λ × Σ|w|` で重みの 30%+ を 0 に収束
+- **Straight-Through Estimator**: Ternarize in forward pass, pass gradients through in backward
+- **L1 regularization**: `λ × Σ|w|` converges 30%+ of weights to 0
 - **AdamW**: bias correction + weight decay
 - **Layerwise Mixed Precision**: Attention=1.58bit / FFN=1bit+sparse
 
 ```
-70B 実効ビット/パラメータ推定:
+70B effective bits/parameter estimate:
   Attention (30%): 1.58 bit (ternary)
   FFN (70%):       0.92 bit (sparse ternary 8:16)
-  → 全体平均:      ~1.1 bit/param → 70B ≈ 9.6 GB
+  → Overall avg:   ~1.1 bit/param → 70B ≈ 9.6 GB
 ```
 
 ## Performance
