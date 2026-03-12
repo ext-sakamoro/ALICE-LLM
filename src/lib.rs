@@ -17,6 +17,8 @@
 //! quantized matvec (Q4_K_M, Q8_0). No FP32 materialization needed.
 
 pub mod gguf;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod llama3;
 pub mod training;
 
