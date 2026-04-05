@@ -15,6 +15,7 @@ pub enum ModelArch {
     Llama,
     Mistral,
     Gemma2,
+    Qwen2,
     Qwen3_5,
 }
 
@@ -25,15 +26,15 @@ impl ModelArch {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
             Some("qwen3moe") | Some("qwen3") => {
-                // Qwen3.5 has full_attention_interval => hybrid DeltaNet
                 if gguf.meta_u32("qwen3.full_attention_interval").is_some()
                     || gguf.meta_u32("qwen3moe.full_attention_interval").is_some()
                 {
                     Self::Qwen3_5
                 } else {
-                    Self::Llama // Pure attention Qwen3 uses Llama-compatible arch
+                    Self::Llama
                 }
             }
+            Some(s) if s.starts_with("qwen") => Self::Qwen2,
             _ => Self::Llama,
         }
     }
@@ -44,8 +45,18 @@ impl ModelArch {
             Self::Llama => "llama",
             Self::Mistral => "mistral",
             Self::Gemma2 => "gemma2",
+            Self::Qwen2 => "qwen2",
             Self::Qwen3_5 => "qwen3",
         }
+    }
+
+    /// Resolve the actual GGUF metadata prefix (some models use versioned keys).
+    fn resolve_prefix(&self, gguf: &GgufFile<'_>) -> String {
+        let raw = gguf.meta_str("general.architecture").unwrap_or(self.meta_prefix());
+        if gguf.meta_u32(&format!("{raw}.embedding_length")).is_some() {
+            return raw.to_string();
+        }
+        self.meta_prefix().to_string()
     }
 }
 
@@ -91,7 +102,7 @@ impl Llama3Config {
     /// Load config from GGUF metadata (auto-detects architecture).
     pub fn from_gguf(gguf: &GgufFile<'_>) -> Option<Self> {
         let arch = ModelArch::from_gguf(gguf);
-        let prefix = arch.meta_prefix();
+        let prefix = arch.resolve_prefix(gguf);
 
         let hidden_dim = gguf.meta_u32(&format!("{prefix}.embedding_length"))? as usize;
         let num_heads = gguf.meta_u32(&format!("{prefix}.attention.head_count"))? as usize;
