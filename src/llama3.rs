@@ -15,6 +15,7 @@ pub enum ModelArch {
     Llama,
     Mistral,
     Gemma2,
+    Qwen3_5,
 }
 
 impl ModelArch {
@@ -23,6 +24,16 @@ impl ModelArch {
         match gguf.meta_str("general.architecture") {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
+            Some("qwen3moe") | Some("qwen3") => {
+                // Qwen3.5 has full_attention_interval => hybrid DeltaNet
+                if gguf.meta_u32("qwen3.full_attention_interval").is_some()
+                    || gguf.meta_u32("qwen3moe.full_attention_interval").is_some()
+                {
+                    Self::Qwen3_5
+                } else {
+                    Self::Llama // Pure attention Qwen3 uses Llama-compatible arch
+                }
+            }
             _ => Self::Llama,
         }
     }
@@ -33,6 +44,7 @@ impl ModelArch {
             Self::Llama => "llama",
             Self::Mistral => "mistral",
             Self::Gemma2 => "gemma2",
+            Self::Qwen3_5 => "qwen3",
         }
     }
 }
@@ -60,6 +72,19 @@ pub struct Llama3Config {
     pub attn_logit_softcap: Option<f32>,
     /// Gemma-2: final logit softcapping value (None = no capping).
     pub final_logit_softcap: Option<f32>,
+    /// Qwen3.5: full attention interval (e.g. 4 = every 4th layer is full attention).
+    /// None for pure attention models.
+    pub full_attention_interval: Option<usize>,
+    /// Qwen3.5 DeltaNet: number of QK heads for linear attention.
+    pub linear_num_kv_heads: Option<usize>,
+    /// Qwen3.5 DeltaNet: QK head dimension.
+    pub linear_qk_head_dim: Option<usize>,
+    /// Qwen3.5 DeltaNet: V head dimension.
+    pub linear_kv_head_dim: Option<usize>,
+    /// Qwen3.5 DeltaNet: number of V heads.
+    pub linear_num_v_heads: Option<usize>,
+    /// Qwen3.5 DeltaNet: causal conv1d kernel size (typically 4).
+    pub linear_conv_kernel_dim: Option<usize>,
 }
 
 impl Llama3Config {
@@ -107,6 +132,26 @@ impl Llama3Config {
         let final_logit_softcap = gguf
             .meta_f32(&format!("{prefix}.final_logit_softcapping"));
 
+        // Qwen3.5 DeltaNet hybrid fields
+        let full_attention_interval = gguf
+            .meta_u32(&format!("{prefix}.full_attention_interval"))
+            .map(|v| v as usize);
+        let linear_num_kv_heads = gguf
+            .meta_u32(&format!("{prefix}.linear_num_key_heads"))
+            .map(|v| v as usize);
+        let linear_qk_head_dim = gguf
+            .meta_u32(&format!("{prefix}.linear_qk_head_dim"))
+            .map(|v| v as usize);
+        let linear_kv_head_dim = gguf
+            .meta_u32(&format!("{prefix}.linear_key_value_head_dim"))
+            .map(|v| v as usize);
+        let linear_num_v_heads = gguf
+            .meta_u32(&format!("{prefix}.linear_num_value_heads"))
+            .map(|v| v as usize);
+        let linear_conv_kernel_dim = gguf
+            .meta_u32(&format!("{prefix}.linear_conv_kernel_dim"))
+            .map(|v| v as usize);
+
         Some(Self {
             arch,
             vocab_size,
@@ -122,7 +167,27 @@ impl Llama3Config {
             sliding_window,
             attn_logit_softcap,
             final_logit_softcap,
+            full_attention_interval,
+            linear_num_kv_heads,
+            linear_qk_head_dim,
+            linear_kv_head_dim,
+            linear_num_v_heads,
+            linear_conv_kernel_dim,
         })
+    }
+
+    /// Returns true if this is a hybrid DeltaNet model (Qwen3.5).
+    pub fn is_hybrid(&self) -> bool {
+        self.full_attention_interval.is_some()
+    }
+
+    /// Returns true if layer `i` is a DeltaNet (linear attention) layer.
+    /// Full attention layers are at indices where `(i + 1) % interval == 0`.
+    pub fn is_deltanet_layer(&self, i: usize) -> bool {
+        match self.full_attention_interval {
+            Some(interval) => (i + 1) % interval != 0,
+            None => false,
+        }
     }
 
     /// Llama-3 8B default config.
@@ -143,6 +208,12 @@ impl Llama3Config {
             sliding_window: None,
             attn_logit_softcap: None,
             final_logit_softcap: None,
+            full_attention_interval: None,
+            linear_num_kv_heads: None,
+            linear_qk_head_dim: None,
+            linear_kv_head_dim: None,
+            linear_num_v_heads: None,
+            linear_conv_kernel_dim: None,
         }
     }
 }

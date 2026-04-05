@@ -19,6 +19,8 @@ const SWIGLU_FUSED_Q4K_SHADER: &str = include_str!("shaders/swiglu_fused_q4k.wgs
 const MATVEC_Q4K_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q4k_batch4.wgsl");
 const MATVEC_Q6K_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q6k_batch4.wgsl");
 const SWIGLU_FUSED_Q4K_BATCH4_SHADER: &str = include_str!("shaders/swiglu_fused_q4k_batch4.wgsl");
+const CONV1D_CAUSAL_SHADER: &str = include_str!("shaders/conv1d_causal.wgsl");
+const GATED_DELTANET_SHADER: &str = include_str!("shaders/gated_deltanet.wgsl");
 
 // --- Uniform param structs (must match WGSL) ---
 
@@ -988,6 +990,18 @@ pub struct GpuModelConfig {
     pub rope_theta: f32,
     pub eps: f32,
     pub max_seq_len: usize,
+    /// Qwen3.5 DeltaNet: full attention interval (None = all attention).
+    pub full_attention_interval: Option<usize>,
+    /// Qwen3.5 DeltaNet: number of QK heads for linear attention layers.
+    pub linear_num_kv_heads: Option<u32>,
+    /// Qwen3.5 DeltaNet: QK head dimension.
+    pub linear_qk_head_dim: Option<u32>,
+    /// Qwen3.5 DeltaNet: V head dimension.
+    pub linear_kv_head_dim: Option<u32>,
+    /// Qwen3.5 DeltaNet: number of V heads.
+    pub linear_num_v_heads: Option<u32>,
+    /// Qwen3.5 DeltaNet: causal conv1d kernel size (typically 4).
+    pub linear_conv_kernel_dim: Option<u32>,
 }
 
 /// Pre-cached matvec bind group with dispatch dimensions.
@@ -1032,6 +1046,49 @@ struct LayerWeightBufs {
     down_proj: GpuWeightBuffer,
 }
 
+// ─── DeltaNet (Qwen3.5 Gated DeltaNet) layer structures ───────────────���────
+
+/// DeltaNet layer weight buffers (for linear attention layers in Qwen3.5).
+#[allow(dead_code)]
+struct DeltaNetLayerWeightBufs {
+    attn_norm: GpuBuffer,
+    /// Fused in_proj for q, k, v, z: [qk_dim*2 + v_dim + v_dim, hidden_dim]
+    ssm_in: GpuWeightBuffer,
+    /// Causal conv1d kernel: [kernel_size, conv_dim]
+    conv1d_weight: GpuBuffer,
+    conv1d_bias: GpuBuffer,
+    /// Alpha (decay gate) projection
+    alpha_proj: GpuWeightBuffer,
+    /// Beta (update rate) projection
+    beta_proj: GpuWeightBuffer,
+    /// Output projection
+    ssm_out: GpuWeightBuffer,
+    ffn_norm: GpuBuffer,
+    gate_proj: GpuWeightBuffer,
+    up_proj: GpuWeightBuffer,
+    down_proj: GpuWeightBuffer,
+}
+
+/// DeltaNet layer bind groups.
+#[allow(dead_code)]
+struct DeltaNetLayerBGs {
+    attn_norm_bg: wgpu::BindGroup,
+    ssm_in_proj: MatvecBG,
+    conv1d_bg: wgpu::BindGroup,
+    deltanet_bg: wgpu::BindGroup,
+    ssm_out_proj: MatvecBG,
+    ffn_norm_bg: wgpu::BindGroup,
+    swiglu: SwigluBG,
+    down_proj: MatvecBG,
+}
+
+/// Indicates the type of a layer (attention or DeltaNet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerType {
+    Attention,
+    DeltaNet,
+}
+
 /// Pre-compiled GPU model with zero per-token allocations.
 ///
 /// All `wgpu::BindGroup` and uniform buffers are created once at load time.
@@ -1060,11 +1117,23 @@ pub struct GpuModel {
     logits: GpuBuffer,
     staging: wgpu::Buffer,
 
-    // KV caches
+    // KV caches (attention layers only)
     k_caches: Vec<GpuBuffer>,
     v_caches: Vec<GpuBuffer>,
 
-    // Pre-cached bind groups
+    // DeltaNet state (Qwen3.5 linear attention layers)
+    #[allow(dead_code)]
+    deltanet_states: Vec<GpuBuffer>,   // [num_heads, qk_dim, v_dim] per DeltaNet layer
+    #[allow(dead_code)]
+    deltanet_conv_states: Vec<GpuBuffer>, // [3, conv_dim] per DeltaNet layer
+    #[allow(dead_code)]
+    _deltanet_layer_weights: Vec<DeltaNetLayerWeightBufs>,
+    #[allow(dead_code)]
+    deltanet_layer_bgs: Vec<DeltaNetLayerBGs>,
+    /// Layer type map: layer_types[i] = Attention or DeltaNet
+    layer_types: Vec<LayerType>,
+
+    // Pre-cached bind groups (attention layers)
     layer_bgs: Vec<LayerBGs>,
     rope_q_bg: wgpu::BindGroup,
     rope_k_bg: wgpu::BindGroup,
@@ -1518,6 +1587,13 @@ impl GpuModel {
             "[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs"
         );
 
+        let layer_types: Vec<LayerType> = (0..config.num_layers).map(|i| {
+            match config.full_attention_interval {
+                Some(interval) if (i + 1) % interval != 0 => LayerType::DeltaNet,
+                _ => LayerType::Attention,
+            }
+        }).collect();
+
         Self {
             engine,
             config,
@@ -1537,6 +1613,11 @@ impl GpuModel {
             staging,
             k_caches,
             v_caches,
+            deltanet_states: Vec::new(),
+            deltanet_conv_states: Vec::new(),
+            _deltanet_layer_weights: Vec::new(),
+            deltanet_layer_bgs: Vec::new(),
+            layer_types,
             layer_bgs,
             rope_q_bg,
             rope_k_bg,
@@ -1565,40 +1646,84 @@ impl GpuModel {
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
 
         for i in 0..self.config.num_layers {
+            match self.layer_types[i] {
+                LayerType::Attention => {
+                    let lbg = &self.layer_bgs[i];
+
+                    // --- Attention sub-block ---
+                    // RMSNorm: hidden → norm_buf
+                    cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+                    cp.set_bind_group(0, &lbg.attn_norm_bg, &[]);
+                    cp.dispatch_workgroups(1, 1, 1);
+
+                    // Q/K/V projections from norm_buf
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
+
+                    cp.set_pipeline(&self.engine.rope_pipeline);
+                    cp.set_bind_group(0, &self.rope_q_bg, &[]);
+                    cp.dispatch_workgroups(self.rope_q_dispatch_x, 1, 1);
+                    cp.set_bind_group(0, &self.rope_k_bg, &[]);
+                    cp.dispatch_workgroups(self.rope_k_dispatch_x, 1, 1);
+
+                    cp.set_pipeline(&self.engine.kv_cache_append_pipeline);
+                    cp.set_bind_group(0, &lbg.kv_append_bg, &[]);
+                    cp.dispatch_workgroups(self.kv_dispatch_x, 1, 1);
+
+                    cp.set_pipeline(&self.engine.attention_pipeline);
+                    cp.set_bind_group(0, &lbg.attention_bg, &[]);
+                    cp.dispatch_workgroups(self.config.num_heads, 1, 1);
+
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
+
+                    cp.set_pipeline(&self.engine.residual_add_pipeline);
+                    cp.set_bind_group(0, &self.residual_attn_bg, &[]);
+                    cp.dispatch_workgroups(self.residual_dispatch_x, 1, 1);
+                }
+                LayerType::DeltaNet => {
+                    // Gated DeltaNet linear attention (Qwen3.5)
+                    // TODO: Wire up DeltaNet bind groups when load_deltanet_layers() is implemented.
+                    //   1. RMSNorm: hidden → norm_buf
+                    //   2. ssm_in projection: norm_buf → q, k, v, z (fused)
+                    //   3. Causal conv1d: q, k, v preprocessing (kernel=4)
+                    //   4. DeltaNet recurrence: state update + gated output
+                    //   5. ssm_out projection: deltanet_out → o_buf
+                    //   6. Residual add: hidden += o_buf
+                    //
+                    // For now, DeltaNet layers use the attention path (fallback).
+                    // This works for models that have attention weights for all layers
+                    // but is incorrect for Qwen3.5 hybrid models.
+                    let lbg = &self.layer_bgs[i];
+                    cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+                    cp.set_bind_group(0, &lbg.attn_norm_bg, &[]);
+                    cp.dispatch_workgroups(1, 1, 1);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
+                    cp.set_pipeline(&self.engine.rope_pipeline);
+                    cp.set_bind_group(0, &self.rope_q_bg, &[]);
+                    cp.dispatch_workgroups(self.rope_q_dispatch_x, 1, 1);
+                    cp.set_bind_group(0, &self.rope_k_bg, &[]);
+                    cp.dispatch_workgroups(self.rope_k_dispatch_x, 1, 1);
+                    cp.set_pipeline(&self.engine.kv_cache_append_pipeline);
+                    cp.set_bind_group(0, &lbg.kv_append_bg, &[]);
+                    cp.dispatch_workgroups(self.kv_dispatch_x, 1, 1);
+                    cp.set_pipeline(&self.engine.attention_pipeline);
+                    cp.set_bind_group(0, &lbg.attention_bg, &[]);
+                    cp.dispatch_workgroups(self.config.num_heads, 1, 1);
+                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
+                    cp.set_pipeline(&self.engine.residual_add_pipeline);
+                    cp.set_bind_group(0, &self.residual_attn_bg, &[]);
+                    cp.dispatch_workgroups(self.residual_dispatch_x, 1, 1);
+                }
+            }
+
+            // --- FFN sub-block (shared by both layer types) ---
+            // For DeltaNet layers, we reuse the attention layer's FFN bind groups
+            // until DeltaNet-specific loading is implemented.
             let lbg = &self.layer_bgs[i];
 
-            // --- Attention sub-block ---
-            // RMSNorm: hidden → norm_buf
-            cp.set_pipeline(&self.engine.rmsnorm_pipeline);
-            cp.set_bind_group(0, &lbg.attn_norm_bg, &[]);
-            cp.dispatch_workgroups(1, 1, 1);
-
-            // Q/K/V projections from norm_buf
-            Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
-            Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
-            Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
-
-            cp.set_pipeline(&self.engine.rope_pipeline);
-            cp.set_bind_group(0, &self.rope_q_bg, &[]);
-            cp.dispatch_workgroups(self.rope_q_dispatch_x, 1, 1);
-            cp.set_bind_group(0, &self.rope_k_bg, &[]);
-            cp.dispatch_workgroups(self.rope_k_dispatch_x, 1, 1);
-
-            cp.set_pipeline(&self.engine.kv_cache_append_pipeline);
-            cp.set_bind_group(0, &lbg.kv_append_bg, &[]);
-            cp.dispatch_workgroups(self.kv_dispatch_x, 1, 1);
-
-            cp.set_pipeline(&self.engine.attention_pipeline);
-            cp.set_bind_group(0, &lbg.attention_bg, &[]);
-            cp.dispatch_workgroups(self.config.num_heads, 1, 1);
-
-            Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
-
-            cp.set_pipeline(&self.engine.residual_add_pipeline);
-            cp.set_bind_group(0, &self.residual_attn_bg, &[]);
-            cp.dispatch_workgroups(self.residual_dispatch_x, 1, 1);
-
-            // --- FFN sub-block ---
             // RMSNorm: hidden → norm_buf
             cp.set_pipeline(&self.engine.rmsnorm_pipeline);
             cp.set_bind_group(0, &lbg.ffn_norm_bg, &[]);
