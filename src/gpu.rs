@@ -134,6 +134,9 @@ pub struct GpuEngine {
     matvec_q4k_batch4_pipeline: wgpu::ComputePipeline,
     matvec_q6k_batch4_pipeline: wgpu::ComputePipeline,
     swiglu_batch4_pipeline: wgpu::ComputePipeline,
+    // DeltaNet (Qwen3.5) pipelines
+    conv1d_causal_pipeline: wgpu::ComputePipeline,
+    gated_deltanet_pipeline: wgpu::ComputePipeline,
 }
 
 /// Command builder — chains GPU operations into a single command buffer.
@@ -263,6 +266,8 @@ impl GpuEngine {
             matvec_q4k_batch4_pipeline,
             matvec_q6k_batch4_pipeline,
             swiglu_batch4_pipeline,
+            conv1d_causal_pipeline: make_pipeline(CONV1D_CAUSAL_SHADER, "conv1d_causal", "conv1d_causal"),
+            gated_deltanet_pipeline: make_pipeline(GATED_DELTANET_SHADER, "gated_deltanet", "gated_deltanet"),
             timestamp_period,
             device,
             queue,
@@ -1340,37 +1345,125 @@ impl GpuModel {
         eprintln!("[GpuModel] uploading weights...");
         let t0 = std::time::Instant::now();
 
+        // Determine layer types from config
+        let layer_types: Vec<LayerType> = (0..config.num_layers).map(|i| {
+            match config.full_attention_interval {
+                Some(interval) if (i + 1) % interval != 0 => LayerType::DeltaNet,
+                _ => LayerType::Attention,
+            }
+        }).collect();
+
+        // DeltaNet config (Qwen3.5)
+        let dn_qk_dim = config.linear_qk_head_dim.unwrap_or(128) as usize;
+        let dn_v_dim = config.linear_kv_head_dim.unwrap_or(128) as usize;
+        let dn_num_kv_heads = config.linear_num_kv_heads.unwrap_or(config.num_kv_heads) as usize;
+        let dn_num_v_heads = config.linear_num_v_heads.unwrap_or(config.num_heads) as usize;
+        let dn_conv_kernel = config.linear_conv_kernel_dim.unwrap_or(4) as usize;
+        // Fused in_proj output size: q(qk_dim*num_kv) + k(qk_dim*num_kv) + v(v_dim*num_v) + z(v_dim*num_v)
+        let dn_in_proj_out = dn_qk_dim * dn_num_kv_heads * 2 + dn_v_dim * dn_num_v_heads * 2;
+        let dn_conv_dim = dn_qk_dim * dn_num_kv_heads * 2 + dn_v_dim * dn_num_v_heads; // q+k+v (not z)
+
         let mut layer_weights = Vec::with_capacity(config.num_layers);
+        let mut deltanet_layer_weights: Vec<DeltaNetLayerWeightBufs> = Vec::new();
+        let mut deltanet_states: Vec<GpuBuffer> = Vec::new();
+        let mut deltanet_conv_states: Vec<GpuBuffer> = Vec::new();
+
         for i in 0..config.num_layers {
-            layer_weights.push(LayerWeightBufs {
-                attn_norm: engine.upload_f32(
-                    &gguf.tensor_to_f32(&format!("blk.{i}.attn_norm.weight")).unwrap(),
-                ),
-                q_proj: upload_w(
-                    &format!("blk.{i}.attn_q.weight"), config.hidden_dim, config.hidden_dim,
-                ),
-                k_proj: upload_w(
-                    &format!("blk.{i}.attn_k.weight"), kv_dim, config.hidden_dim,
-                ),
-                v_proj: upload_w(
-                    &format!("blk.{i}.attn_v.weight"), kv_dim, config.hidden_dim,
-                ),
-                o_proj: upload_w(
-                    &format!("blk.{i}.attn_output.weight"), config.hidden_dim, config.hidden_dim,
-                ),
-                ffn_norm: engine.upload_f32(
-                    &gguf.tensor_to_f32(&format!("blk.{i}.ffn_norm.weight")).unwrap(),
-                ),
-                gate_proj: upload_w(
-                    &format!("blk.{i}.ffn_gate.weight"), config.intermediate_dim, config.hidden_dim,
-                ),
-                up_proj: upload_w(
-                    &format!("blk.{i}.ffn_up.weight"), config.intermediate_dim, config.hidden_dim,
-                ),
-                down_proj: upload_w(
-                    &format!("blk.{i}.ffn_down.weight"), config.hidden_dim, config.intermediate_dim,
-                ),
-            });
+            match layer_types[i] {
+                LayerType::Attention => {
+                    layer_weights.push(LayerWeightBufs {
+                        attn_norm: engine.upload_f32(
+                            &gguf.tensor_to_f32(&format!("blk.{i}.attn_norm.weight")).unwrap(),
+                        ),
+                        q_proj: upload_w(
+                            &format!("blk.{i}.attn_q.weight"), config.hidden_dim, config.hidden_dim,
+                        ),
+                        k_proj: upload_w(
+                            &format!("blk.{i}.attn_k.weight"), kv_dim, config.hidden_dim,
+                        ),
+                        v_proj: upload_w(
+                            &format!("blk.{i}.attn_v.weight"), kv_dim, config.hidden_dim,
+                        ),
+                        o_proj: upload_w(
+                            &format!("blk.{i}.attn_output.weight"), config.hidden_dim, config.hidden_dim,
+                        ),
+                        ffn_norm: engine.upload_f32(
+                            &gguf.tensor_to_f32(&format!("blk.{i}.ffn_norm.weight")).unwrap(),
+                        ),
+                        gate_proj: upload_w(
+                            &format!("blk.{i}.ffn_gate.weight"), config.intermediate_dim, config.hidden_dim,
+                        ),
+                        up_proj: upload_w(
+                            &format!("blk.{i}.ffn_up.weight"), config.intermediate_dim, config.hidden_dim,
+                        ),
+                        down_proj: upload_w(
+                            &format!("blk.{i}.ffn_down.weight"), config.hidden_dim, config.intermediate_dim,
+                        ),
+                    });
+                }
+                LayerType::DeltaNet => {
+                    // Load DeltaNet-specific tensors
+                    let conv1d_w = gguf.tensor_to_f32(&format!("blk.{i}.ssm_conv1d.weight")).unwrap();
+                    let conv1d_b = gguf.tensor_to_f32(&format!("blk.{i}.ssm_conv1d.bias")).unwrap();
+
+                    deltanet_layer_weights.push(DeltaNetLayerWeightBufs {
+                        attn_norm: engine.upload_f32(
+                            &gguf.tensor_to_f32(&format!("blk.{i}.attn_norm.weight")).unwrap(),
+                        ),
+                        ssm_in: upload_w(
+                            &format!("blk.{i}.ssm_in.weight"), dn_in_proj_out, config.hidden_dim,
+                        ),
+                        conv1d_weight: engine.upload_f32(&conv1d_w),
+                        conv1d_bias: engine.upload_f32(&conv1d_b),
+                        alpha_proj: upload_w(
+                            &format!("blk.{i}.ssm_alpha.weight"), dn_num_kv_heads, config.hidden_dim,
+                        ),
+                        beta_proj: upload_w(
+                            &format!("blk.{i}.ssm_beta.weight"), dn_num_kv_heads, config.hidden_dim,
+                        ),
+                        ssm_out: upload_w(
+                            &format!("blk.{i}.ssm_out.weight"), config.hidden_dim, dn_v_dim * dn_num_v_heads,
+                        ),
+                        ffn_norm: engine.upload_f32(
+                            &gguf.tensor_to_f32(&format!("blk.{i}.ffn_norm.weight")).unwrap(),
+                        ),
+                        gate_proj: upload_w(
+                            &format!("blk.{i}.ffn_gate.weight"), config.intermediate_dim, config.hidden_dim,
+                        ),
+                        up_proj: upload_w(
+                            &format!("blk.{i}.ffn_up.weight"), config.intermediate_dim, config.hidden_dim,
+                        ),
+                        down_proj: upload_w(
+                            &format!("blk.{i}.ffn_down.weight"), config.hidden_dim, config.intermediate_dim,
+                        ),
+                    });
+
+                    // Recurrent state: [num_kv_heads, qk_dim, v_dim]
+                    deltanet_states.push(engine.alloc_f32(dn_num_kv_heads * dn_qk_dim * dn_v_dim));
+                    // Conv1d ring buffer: [kernel_size - 1, conv_dim]
+                    deltanet_conv_states.push(engine.alloc_f32((dn_conv_kernel - 1) * dn_conv_dim));
+
+                    // Push a dummy LayerWeightBufs placeholder so indexing stays aligned
+                    // (DeltaNet layers use deltanet_layer_weights instead)
+                    layer_weights.push(LayerWeightBufs {
+                        attn_norm: engine.alloc_f32(1),
+                        q_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        k_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        v_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        o_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        ffn_norm: engine.alloc_f32(1),
+                        gate_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        up_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        down_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                    });
+                }
+            }
+        }
+
+        let n_attn = layer_types.iter().filter(|t| **t == LayerType::Attention).count();
+        let n_delta = layer_types.iter().filter(|t| **t == LayerType::DeltaNet).count();
+        if n_delta > 0 {
+            eprintln!("[GpuModel] hybrid: {n_delta} DeltaNet + {n_attn} Attention layers");
         }
 
         // Output projection — fallback to tied embedding
@@ -1411,10 +1504,11 @@ impl GpuModel {
             mapped_at_creation: false,
         });
 
-        // KV caches
-        let mut k_caches = Vec::with_capacity(config.num_layers);
-        let mut v_caches = Vec::with_capacity(config.num_layers);
-        for _ in 0..config.num_layers {
+        // KV caches (only for attention layers)
+        let n_attn_layers = layer_types.iter().filter(|t| **t == LayerType::Attention).count();
+        let mut k_caches = Vec::with_capacity(n_attn_layers);
+        let mut v_caches = Vec::with_capacity(n_attn_layers);
+        for _ in 0..n_attn_layers {
             k_caches.push(engine.alloc_f32(config.max_seq_len * kv_dim));
             v_caches.push(engine.alloc_f32(config.max_seq_len * kv_dim));
         }
@@ -1516,64 +1610,187 @@ impl GpuModel {
         // --- Per-layer bind groups ---
         let kv_append_layout = engine.kv_cache_append_pipeline.get_bind_group_layout(0);
         let attn_layout = engine.attention_pipeline.get_bind_group_layout(0);
+        let conv1d_layout = engine.conv1d_causal_pipeline.get_bind_group_layout(0);
+        let deltanet_layout = engine.gated_deltanet_pipeline.get_bind_group_layout(0);
 
         let mut layer_bgs = Vec::with_capacity(config.num_layers);
+        let mut deltanet_bgs: Vec<DeltaNetLayerBGs> = Vec::new();
+        let mut dn_idx: usize = 0; // index into deltanet_layer_weights
+        let mut attn_kv_idx: usize = 0; // index into k_caches/v_caches
+
+        // Persistent DeltaNet uniform params
+        let dn_conv_params_buf = make_persistent(bytemuck::cast_slice(&[
+            dn_conv_dim as u32, 0u32, 0u32, 0u32, // dim, ring_pos, pad, pad
+        ]));
+        let dn_params_buf = make_persistent(bytemuck::cast_slice(&[
+            dn_num_kv_heads as u32, dn_qk_dim as u32, dn_v_dim as u32, 0u32, // num_heads, qk_dim, v_dim, pad
+        ]));
+
         for i in 0..config.num_layers {
-            let lw = &layer_weights[i];
+            match layer_types[i] {
+                LayerType::Attention => {
+                    let lw = &layer_weights[i];
 
-            // Attention: rmsnorm → norm_buf, then plain matvec from norm_buf
-            let attn_norm_bg = Self::build_rmsnorm_bg(
-                &engine, &hidden, &lw.attn_norm, &norm_buf, &rmsnorm_params_buf,
-            );
-            let q_proj = Self::build_matvec_bg(&engine, &lw.q_proj, &norm_buf, &q_buf);
-            let k_proj = Self::build_matvec_bg(&engine, &lw.k_proj, &norm_buf, &k_buf);
-            let v_proj = Self::build_matvec_bg(&engine, &lw.v_proj, &norm_buf, &v_buf);
-            let o_proj = Self::build_matvec_bg(&engine, &lw.o_proj, &attn_out, &o_buf);
+                    let attn_norm_bg = Self::build_rmsnorm_bg(
+                        &engine, &hidden, &lw.attn_norm, &norm_buf, &rmsnorm_params_buf,
+                    );
+                    let q_proj = Self::build_matvec_bg(&engine, &lw.q_proj, &norm_buf, &q_buf);
+                    let k_proj = Self::build_matvec_bg(&engine, &lw.k_proj, &norm_buf, &k_buf);
+                    let v_proj = Self::build_matvec_bg(&engine, &lw.v_proj, &norm_buf, &v_buf);
+                    let o_proj = Self::build_matvec_bg(&engine, &lw.o_proj, &attn_out, &o_buf);
 
-            // FFN: rmsnorm → norm_buf, then fused swiglu (gate+up+silu×mul)
-            let ffn_norm_bg = Self::build_rmsnorm_bg(
-                &engine, &hidden, &lw.ffn_norm, &norm_buf, &rmsnorm_params_buf,
-            );
-            let swiglu = Self::build_swiglu_bg(
-                &engine, &lw.gate_proj, &lw.up_proj, &norm_buf, &gate_buf,
-            );
-            let down_proj = Self::build_matvec_bg(&engine, &lw.down_proj, &gate_buf, &down_buf);
+                    let ffn_norm_bg = Self::build_rmsnorm_bg(
+                        &engine, &hidden, &lw.ffn_norm, &norm_buf, &rmsnorm_params_buf,
+                    );
+                    let swiglu = Self::build_swiglu_bg(
+                        &engine, &lw.gate_proj, &lw.up_proj, &norm_buf, &gate_buf,
+                    );
+                    let down_proj = Self::build_matvec_bg(&engine, &lw.down_proj, &gate_buf, &down_buf);
 
-            let kv_append_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &kv_append_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: v_buf.buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: k_caches[i].buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: v_caches[i].buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: kv_append_params_buf.as_entire_binding() },
-                ],
-            });
-            let attention_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &attn_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: k_caches[i].buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: v_caches[i].buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: attn_out.buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: attn_params_buf.as_entire_binding() },
-                ],
-            });
+                    let kv_append_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &kv_append_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: v_buf.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: k_caches[attn_kv_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: v_caches[attn_kv_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 4, resource: kv_append_params_buf.as_entire_binding() },
+                        ],
+                    });
+                    let attention_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &attn_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: k_caches[attn_kv_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: v_caches[attn_kv_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: attn_out.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 4, resource: attn_params_buf.as_entire_binding() },
+                        ],
+                    });
+                    attn_kv_idx += 1;
 
-            layer_bgs.push(LayerBGs {
-                attn_norm_bg,
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                kv_append_bg,
-                attention_bg,
-                ffn_norm_bg,
-                swiglu,
-                down_proj,
-            });
+                    layer_bgs.push(LayerBGs {
+                        attn_norm_bg,
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        kv_append_bg,
+                        attention_bg,
+                        ffn_norm_bg,
+                        swiglu,
+                        down_proj,
+                    });
+                }
+                LayerType::DeltaNet => {
+                    let dlw = &deltanet_layer_weights[dn_idx];
+
+                    // DeltaNet attention sub-block bind groups
+                    let attn_norm_bg = Self::build_rmsnorm_bg(
+                        &engine, &hidden, &dlw.attn_norm, &norm_buf, &rmsnorm_params_buf,
+                    );
+                    let ssm_in_proj = Self::build_matvec_bg(&engine, &dlw.ssm_in, &norm_buf, &q_buf);
+
+                    // Conv1d bind group: x=q_buf, state=conv_state, weight/bias, out=k_buf
+                    let conv1d_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &conv1d_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: deltanet_conv_states[dn_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: dlw.conv1d_weight.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: dlw.conv1d_bias.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 4, resource: k_buf.buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 5, resource: dn_conv_params_buf.as_entire_binding() },
+                        ],
+                    });
+
+                    // DeltaNet recurrence bind group
+                    // q=q_buf(qk part), k=q_buf(qk part offset), v=q_buf(v part), alpha, beta, z, state, out
+                    let deltanet_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &deltanet_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },      // q
+                            wgpu::BindGroupEntry { binding: 1, resource: k_buf.buffer.as_entire_binding() },      // k (after conv1d)
+                            wgpu::BindGroupEntry { binding: 2, resource: v_buf.buffer.as_entire_binding() },      // v
+                            wgpu::BindGroupEntry { binding: 3, resource: q_buf.buffer.as_entire_binding() },      // alpha (placeholder, will use alpha_proj output)
+                            wgpu::BindGroupEntry { binding: 4, resource: k_buf.buffer.as_entire_binding() },      // beta (placeholder)
+                            wgpu::BindGroupEntry { binding: 5, resource: v_buf.buffer.as_entire_binding() },      // z (output gate)
+                            wgpu::BindGroupEntry { binding: 6, resource: deltanet_states[dn_idx].buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 7, resource: attn_out.buffer.as_entire_binding() },   // output
+                            wgpu::BindGroupEntry { binding: 8, resource: dn_params_buf.as_entire_binding() },
+                        ],
+                    });
+
+                    let ssm_out_proj = Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
+
+                    // FFN bind groups (same pattern as attention layers)
+                    let ffn_norm_bg = Self::build_rmsnorm_bg(
+                        &engine, &hidden, &dlw.ffn_norm, &norm_buf, &rmsnorm_params_buf,
+                    );
+                    let swiglu = Self::build_swiglu_bg(
+                        &engine, &dlw.gate_proj, &dlw.up_proj, &norm_buf, &gate_buf,
+                    );
+                    let down_proj = Self::build_matvec_bg(&engine, &dlw.down_proj, &gate_buf, &down_buf);
+
+                    deltanet_bgs.push(DeltaNetLayerBGs {
+                        attn_norm_bg,
+                        ssm_in_proj,
+                        conv1d_bg,
+                        deltanet_bg,
+                        ssm_out_proj,
+                        ffn_norm_bg,
+                        swiglu,
+                        down_proj,
+                    });
+
+                    // Push dummy attention LayerBGs (unused but keeps index alignment)
+                    layer_bgs.push(LayerBGs {
+                        attn_norm_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &engine.rmsnorm_pipeline.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: hidden.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: hidden.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: norm_buf.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: rmsnorm_params_buf.as_entire_binding() },
+                            ],
+                        }),
+                        q_proj: Self::build_matvec_bg(&engine, &layer_weights[i].q_proj, &norm_buf, &q_buf),
+                        k_proj: Self::build_matvec_bg(&engine, &layer_weights[i].k_proj, &norm_buf, &k_buf),
+                        v_proj: Self::build_matvec_bg(&engine, &layer_weights[i].v_proj, &norm_buf, &v_buf),
+                        o_proj: Self::build_matvec_bg(&engine, &layer_weights[i].o_proj, &attn_out, &o_buf),
+                        kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None, layout: &kv_append_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: v_buf.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: k_caches[0].buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: v_caches[0].buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 4, resource: kv_append_params_buf.as_entire_binding() },
+                            ],
+                        }),
+                        attention_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None, layout: &attn_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: k_caches[0].buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: v_caches[0].buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: attn_out.buffer.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 4, resource: attn_params_buf.as_entire_binding() },
+                            ],
+                        }),
+                        ffn_norm_bg: Self::build_rmsnorm_bg(&engine, &hidden, &dlw.ffn_norm, &norm_buf, &rmsnorm_params_buf),
+                        swiglu: Self::build_swiglu_bg(&engine, &dlw.gate_proj, &dlw.up_proj, &norm_buf, &gate_buf),
+                        down_proj: Self::build_matvec_bg(&engine, &dlw.down_proj, &gate_buf, &down_buf),
+                    });
+
+                    dn_idx += 1;
+                }
+            }
         }
 
         // Dispatch constants
@@ -1586,13 +1803,6 @@ impl GpuModel {
         eprintln!(
             "[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs"
         );
-
-        let layer_types: Vec<LayerType> = (0..config.num_layers).map(|i| {
-            match config.full_attention_interval {
-                Some(interval) if (i + 1) % interval != 0 => LayerType::DeltaNet,
-                _ => LayerType::Attention,
-            }
-        }).collect();
 
         Self {
             engine,
@@ -1613,10 +1823,10 @@ impl GpuModel {
             staging,
             k_caches,
             v_caches,
-            deltanet_states: Vec::new(),
-            deltanet_conv_states: Vec::new(),
-            _deltanet_layer_weights: Vec::new(),
-            deltanet_layer_bgs: Vec::new(),
+            deltanet_states,
+            deltanet_conv_states,
+            _deltanet_layer_weights: deltanet_layer_weights,
+            deltanet_layer_bgs: deltanet_bgs,
             layer_types,
             layer_bgs,
             rope_q_bg,
@@ -1644,6 +1854,7 @@ impl GpuModel {
     /// Encode the full forward pass into a command encoder.
     fn encode_forward(&self, encoder: &mut wgpu::CommandEncoder) {
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        let mut dn_fwd_idx: usize = 0; // index into deltanet_layer_bgs
 
         for i in 0..self.config.num_layers {
             match self.layer_types[i] {
@@ -1683,58 +1894,66 @@ impl GpuModel {
                 }
                 LayerType::DeltaNet => {
                     // Gated DeltaNet linear attention (Qwen3.5)
-                    // TODO: Wire up DeltaNet bind groups when load_deltanet_layers() is implemented.
-                    //   1. RMSNorm: hidden → norm_buf
-                    //   2. ssm_in projection: norm_buf → q, k, v, z (fused)
-                    //   3. Causal conv1d: q, k, v preprocessing (kernel=4)
-                    //   4. DeltaNet recurrence: state update + gated output
-                    //   5. ssm_out projection: deltanet_out → o_buf
-                    //   6. Residual add: hidden += o_buf
-                    //
-                    // For now, DeltaNet layers use the attention path (fallback).
-                    // This works for models that have attention weights for all layers
-                    // but is incorrect for Qwen3.5 hybrid models.
-                    let lbg = &self.layer_bgs[i];
+                    let dbg = &self.deltanet_layer_bgs[dn_fwd_idx];
+
+                    // 1. RMSNorm: hidden → norm_buf
                     cp.set_pipeline(&self.engine.rmsnorm_pipeline);
-                    cp.set_bind_group(0, &lbg.attn_norm_bg, &[]);
+                    cp.set_bind_group(0, &dbg.attn_norm_bg, &[]);
                     cp.dispatch_workgroups(1, 1, 1);
-                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
-                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
-                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
-                    cp.set_pipeline(&self.engine.rope_pipeline);
-                    cp.set_bind_group(0, &self.rope_q_bg, &[]);
-                    cp.dispatch_workgroups(self.rope_q_dispatch_x, 1, 1);
-                    cp.set_bind_group(0, &self.rope_k_bg, &[]);
-                    cp.dispatch_workgroups(self.rope_k_dispatch_x, 1, 1);
-                    cp.set_pipeline(&self.engine.kv_cache_append_pipeline);
-                    cp.set_bind_group(0, &lbg.kv_append_bg, &[]);
-                    cp.dispatch_workgroups(self.kv_dispatch_x, 1, 1);
-                    cp.set_pipeline(&self.engine.attention_pipeline);
-                    cp.set_bind_group(0, &lbg.attention_bg, &[]);
-                    cp.dispatch_workgroups(self.config.num_heads, 1, 1);
-                    Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
+
+                    // 2. Fused in_proj: norm_buf → q_buf (contains q, k, v, z packed)
+                    Self::dispatch_mv(&self.engine, &mut cp, &dbg.ssm_in_proj);
+
+                    // 3. Causal conv1d: q_buf → k_buf (preprocessed q, k, v)
+                    let dn_conv_dim = self.config.linear_qk_head_dim.unwrap_or(128)
+                        * self.config.linear_num_kv_heads.unwrap_or(self.config.num_kv_heads) * 2
+                        + self.config.linear_kv_head_dim.unwrap_or(128)
+                        * self.config.linear_num_v_heads.unwrap_or(self.config.num_heads);
+                    let conv1d_dispatch = (dn_conv_dim + 255) / 256;
+                    cp.set_pipeline(&self.engine.conv1d_causal_pipeline);
+                    cp.set_bind_group(0, &dbg.conv1d_bg, &[]);
+                    cp.dispatch_workgroups(conv1d_dispatch, 1, 1);
+
+                    // 4. DeltaNet recurrence: state update + gated output → attn_out
+                    let dn_num_heads = self.config.linear_num_kv_heads.unwrap_or(self.config.num_kv_heads);
+                    cp.set_pipeline(&self.engine.gated_deltanet_pipeline);
+                    cp.set_bind_group(0, &dbg.deltanet_bg, &[]);
+                    cp.dispatch_workgroups(dn_num_heads, 1, 1);
+
+                    // 5. Output projection: attn_out → o_buf
+                    Self::dispatch_mv(&self.engine, &mut cp, &dbg.ssm_out_proj);
+
+                    // 6. Residual add: hidden += o_buf
                     cp.set_pipeline(&self.engine.residual_add_pipeline);
                     cp.set_bind_group(0, &self.residual_attn_bg, &[]);
                     cp.dispatch_workgroups(self.residual_dispatch_x, 1, 1);
+
+                    dn_fwd_idx += 1;
                 }
             }
 
-            // --- FFN sub-block (shared by both layer types) ---
-            // For DeltaNet layers, we reuse the attention layer's FFN bind groups
-            // until DeltaNet-specific loading is implemented.
-            let lbg = &self.layer_bgs[i];
+            // --- FFN sub-block ---
+            // Use the correct source of FFN bind groups based on layer type.
+            let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_down) = match self.layer_types[i] {
+                LayerType::Attention => {
+                    let lbg = &self.layer_bgs[i];
+                    (&lbg.ffn_norm_bg, &lbg.swiglu.bg, lbg.swiglu.dispatch_x, lbg.swiglu.dispatch_y, &lbg.down_proj)
+                }
+                LayerType::DeltaNet => {
+                    let dbg = &self.deltanet_layer_bgs[dn_fwd_idx - 1]; // already incremented above
+                    (&dbg.ffn_norm_bg, &dbg.swiglu.bg, dbg.swiglu.dispatch_x, dbg.swiglu.dispatch_y, &dbg.down_proj)
+                }
+            };
 
-            // RMSNorm: hidden → norm_buf
             cp.set_pipeline(&self.engine.rmsnorm_pipeline);
-            cp.set_bind_group(0, &lbg.ffn_norm_bg, &[]);
+            cp.set_bind_group(0, ffn_norm, &[]);
             cp.dispatch_workgroups(1, 1, 1);
 
-            // Fused SwiGLU: gate·norm + up·norm → silu(gate)×up → gate_buf
             cp.set_pipeline(&self.engine.swiglu_fused_q4k_pipeline);
-            cp.set_bind_group(0, &lbg.swiglu.bg, &[]);
-            cp.dispatch_workgroups(lbg.swiglu.dispatch_x, lbg.swiglu.dispatch_y, 1);
+            cp.set_bind_group(0, ffn_swiglu_bg, &[]);
+            cp.dispatch_workgroups(ffn_swiglu_dx, ffn_swiglu_dy, 1);
 
-            Self::dispatch_mv(&self.engine, &mut cp, &lbg.down_proj);
+            Self::dispatch_mv(&self.engine, &mut cp, ffn_down);
 
             cp.set_pipeline(&self.engine.residual_add_pipeline);
             cp.set_bind_group(0, &self.residual_ffn_bg, &[]);
