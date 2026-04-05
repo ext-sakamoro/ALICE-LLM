@@ -28,22 +28,12 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> out_buf: array<f32>; // [num_heads, v_dim]
 @group(0) @binding(8) var<uniform> params: Params;
 
-// L2 normalize a vector in shared memory
-fn l2_norm_factor(buf: ptr<storage, array<f32>, read>, offset: u32, dim: u32) -> f32 {
-    var sum_sq: f32 = 0.0;
-    for (var i = 0u; i < dim; i++) {
-        let val = (*buf)[offset + i];
-        sum_sq += val * val;
-    }
-    return 1.0 / max(sqrt(sum_sq), 1e-12);
-}
-
 fn silu(x: f32) -> f32 {
     return x / (1.0 + exp(-x));
 }
 
 @compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn gated_deltanet(@builtin(global_invocation_id) gid: vec3<u32>) {
     let head = gid.x;
     if head >= params.num_heads { return; }
 
@@ -58,18 +48,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let alpha = alpha_buf[head];
     let beta = beta_buf[head];
 
-    // L2 normalize q and k after SiLU
-    // Pre-compute normalized q, k
-    let q_norm = l2_norm_factor(&q_buf, q_off, qk_dim);
-    let k_norm = l2_norm_factor(&k_buf, k_off, qk_dim);
+    // L2 norm for q
+    var q_sum_sq: f32 = 0.0;
+    for (var i = 0u; i < qk_dim; i += 1u) {
+        let val = q_buf[q_off + i];
+        q_sum_sq += val * val;
+    }
+    let q_norm = 1.0 / max(sqrt(q_sum_sq), 1e-12);
 
-    // Compute error = v - alpha * (S^T @ k)
-    // and update S_new = alpha * S + beta * outer(k, error)
-    // and output = S_new^T @ q
-    for (var j = 0u; j < v_dim; j++) {
+    // L2 norm for k
+    var k_sum_sq: f32 = 0.0;
+    for (var i = 0u; i < qk_dim; i += 1u) {
+        let val = k_buf[k_off + i];
+        k_sum_sq += val * val;
+    }
+    let k_norm = 1.0 / max(sqrt(k_sum_sq), 1e-12);
+
+    for (var j = 0u; j < v_dim; j += 1u) {
         // S^T @ k for column j
         var st_k: f32 = 0.0;
-        for (var i = 0u; i < qk_dim; i++) {
+        for (var i = 0u; i < qk_dim; i += 1u) {
             let k_i = silu(k_buf[k_off + i]) * k_norm;
             st_k += state[s_off + i * v_dim + j] * k_i;
         }
@@ -78,20 +76,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Update state column j and compute output
         var out_j: f32 = 0.0;
-        for (var i = 0u; i < qk_dim; i++) {
+        for (var i = 0u; i < qk_dim; i += 1u) {
             let k_i = silu(k_buf[k_off + i]) * k_norm;
             let q_i = silu(q_buf[q_off + i]) * q_norm;
             let idx = s_off + i * v_dim + j;
 
-            // S_new[i,j] = alpha * S[i,j] + beta * k[i] * error[j]
             let s_new = alpha * state[idx] + beta * k_i * error_j;
             state[idx] = s_new;
 
-            // output[j] += S_new[i,j] * q[i]
             out_j += s_new * q_i;
         }
 
-        // Gated output: out * silu(z)
+        // Gated output
         let gate = silu(z_buf[z_off + j]);
         out_buf[v_off + j] = out_j * gate;
     }

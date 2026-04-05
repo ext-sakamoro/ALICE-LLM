@@ -26,7 +26,7 @@ struct Params {
 @group(0) @binding(5) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn conv1d_causal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = gid.x;
     if d >= params.dim { return; }
 
