@@ -437,7 +437,22 @@ fn main() {
         rope_theta: llm_config.rope_theta,
         eps: llm_config.norm_eps,
         max_seq_len: llm_config.max_seq_len,
+        full_attention_interval: llm_config.full_attention_interval,
+        linear_num_kv_heads: llm_config.linear_num_kv_heads.map(|v| v as u32),
+        linear_qk_head_dim: llm_config.linear_qk_head_dim.map(|v| v as u32),
+        linear_kv_head_dim: llm_config.linear_kv_head_dim.map(|v| v as u32),
+        linear_num_v_heads: llm_config.linear_num_v_heads.map(|v| v as u32),
+        linear_conv_kernel_dim: llm_config.linear_conv_kernel_dim.map(|v| v as u32),
     };
+
+    if llm_config.is_hybrid() {
+        let n_attn = (0..llm_config.num_layers).filter(|i| !llm_config.is_deltanet_layer(*i)).count();
+        let n_delta = llm_config.num_layers - n_attn;
+        println!(
+            "  hybrid: {} DeltaNet + {} Attention (interval={})",
+            n_delta, n_attn, llm_config.full_attention_interval.unwrap_or(0),
+        );
+    }
 
     // Detect chat template
     let chat_template = ChatTemplate::detect(&gguf, llm_config.arch);
