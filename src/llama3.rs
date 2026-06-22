@@ -56,7 +56,9 @@ impl ModelArch {
 
     /// Resolve the actual GGUF metadata prefix (some models use versioned keys).
     fn resolve_prefix(&self, gguf: &GgufFile<'_>) -> String {
-        let raw = gguf.meta_str("general.architecture").unwrap_or(self.meta_prefix());
+        let raw = gguf
+            .meta_str("general.architecture")
+            .unwrap_or(self.meta_prefix());
         if gguf.meta_u32(&format!("{raw}.embedding_length")).is_some() {
             return raw.to_string();
         }

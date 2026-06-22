@@ -56,7 +56,9 @@ impl ChatTemplate {
         }
         match arch {
             alice_llm::llama3::ModelArch::Mistral => Self::Mistral,
-            alice_llm::llama3::ModelArch::Qwen2 | alice_llm::llama3::ModelArch::Qwen3_5 => Self::Qwen2,
+            alice_llm::llama3::ModelArch::Qwen2 | alice_llm::llama3::ModelArch::Qwen3_5 => {
+                Self::Qwen2
+            }
             _ => Self::Llama3,
         }
     }
