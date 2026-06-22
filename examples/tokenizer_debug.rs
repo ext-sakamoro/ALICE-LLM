@@ -24,8 +24,15 @@ fn main() {
 
     // Check some token entries by looking at what IDs are produced
     println!("\n--- Encode tests ---");
-    let tests = ["Hello", "Hello world", "日本", "the", " the",
-                  "<|begin_of_text|>", "<|start_header_id|>"];
+    let tests = [
+        "Hello",
+        "Hello world",
+        "日本",
+        "the",
+        " the",
+        "<|begin_of_text|>",
+        "<|start_header_id|>",
+    ];
     for t in tests {
         let ids = tokenizer.encode(t);
         let decoded = tokenizer.decode(&ids);

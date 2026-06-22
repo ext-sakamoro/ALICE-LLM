@@ -204,44 +204,14 @@ impl GpuEngine {
             device.limits().max_storage_buffer_binding_size / (1024 * 1024)
         );
 
-        let make_pipeline =
-            |source: &str, entry: &str, label: &str| -> wgpu::ComputePipeline {
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(label),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(label),
-                    layout: None,
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            };
-
-        let timestamp_period = queue.get_timestamp_period();
-
-        // Create original pipelines first
-        let matvec_q4k_pipeline = make_pipeline(MATVEC_Q4K_SHADER, "matvec_q4k", "matvec_q4k");
-        let matvec_q6k_pipeline = make_pipeline(MATVEC_Q6K_SHADER, "matvec_q6k", "matvec_q6k");
-        let swiglu_fused_q4k_pipeline = make_pipeline(SWIGLU_FUSED_Q4K_SHADER, "swiglu_fused_q4k", "swiglu_fused_q4k");
-
-        // Batch4 pipelines: share bind group layout with original pipelines
-        // so existing bind groups work with both.
-        let make_batch4 = |source: &str, entry: &str, label: &str, base_pipeline: &wgpu::ComputePipeline| -> wgpu::ComputePipeline {
-            let layout = base_pipeline.get_bind_group_layout(0);
+        let make_pipeline = |source: &str, entry: &str, label: &str| -> wgpu::ComputePipeline {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &[&layout],
-                    push_constant_ranges: &[],
-                })),
+                layout: None,
                 module: &module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
@@ -249,25 +219,95 @@ impl GpuEngine {
             })
         };
 
-        let matvec_q4k_batch4_pipeline = make_batch4(MATVEC_Q4K_BATCH4_SHADER, "matvec_q4k_batch4", "matvec_q4k_batch4", &matvec_q4k_pipeline);
-        let matvec_q6k_batch4_pipeline = make_batch4(MATVEC_Q6K_BATCH4_SHADER, "matvec_q6k_batch4", "matvec_q6k_batch4", &matvec_q6k_pipeline);
-        let swiglu_batch4_pipeline = make_batch4(SWIGLU_FUSED_Q4K_BATCH4_SHADER, "swiglu_fused_q4k_batch4", "swiglu_batch4", &swiglu_fused_q4k_pipeline);
+        let timestamp_period = queue.get_timestamp_period();
+
+        // Create original pipelines first
+        let matvec_q4k_pipeline = make_pipeline(MATVEC_Q4K_SHADER, "matvec_q4k", "matvec_q4k");
+        let matvec_q6k_pipeline = make_pipeline(MATVEC_Q6K_SHADER, "matvec_q6k", "matvec_q6k");
+        let swiglu_fused_q4k_pipeline = make_pipeline(
+            SWIGLU_FUSED_Q4K_SHADER,
+            "swiglu_fused_q4k",
+            "swiglu_fused_q4k",
+        );
+
+        // Batch4 pipelines: share bind group layout with original pipelines
+        // so existing bind groups work with both.
+        let make_batch4 = |source: &str,
+                           entry: &str,
+                           label: &str,
+                           base_pipeline: &wgpu::ComputePipeline|
+         -> wgpu::ComputePipeline {
+            let layout = base_pipeline.get_bind_group_layout(0);
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[&layout],
+                        push_constant_ranges: &[],
+                    }),
+                ),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+
+        let matvec_q4k_batch4_pipeline = make_batch4(
+            MATVEC_Q4K_BATCH4_SHADER,
+            "matvec_q4k_batch4",
+            "matvec_q4k_batch4",
+            &matvec_q4k_pipeline,
+        );
+        let matvec_q6k_batch4_pipeline = make_batch4(
+            MATVEC_Q6K_BATCH4_SHADER,
+            "matvec_q6k_batch4",
+            "matvec_q6k_batch4",
+            &matvec_q6k_pipeline,
+        );
+        let swiglu_batch4_pipeline = make_batch4(
+            SWIGLU_FUSED_Q4K_BATCH4_SHADER,
+            "swiglu_fused_q4k_batch4",
+            "swiglu_batch4",
+            &swiglu_fused_q4k_pipeline,
+        );
 
         Self {
             matvec_q4k_pipeline,
             matvec_q6k_pipeline,
             rmsnorm_pipeline: make_pipeline(RMSNORM_SHADER, "rmsnorm", "rmsnorm"),
             silu_mul_pipeline: make_pipeline(SILU_MUL_SHADER, "silu_mul", "silu_mul"),
-            residual_add_pipeline: make_pipeline(RESIDUAL_ADD_SHADER, "residual_add", "residual_add"),
+            residual_add_pipeline: make_pipeline(
+                RESIDUAL_ADD_SHADER,
+                "residual_add",
+                "residual_add",
+            ),
             rope_pipeline: make_pipeline(ROPE_SHADER, "rope", "rope"),
             attention_pipeline: make_pipeline(ATTENTION_SHADER, "attention", "attention"),
-            kv_cache_append_pipeline: make_pipeline(KV_CACHE_APPEND_SHADER, "kv_cache_append", "kv_cache_append"),
+            kv_cache_append_pipeline: make_pipeline(
+                KV_CACHE_APPEND_SHADER,
+                "kv_cache_append",
+                "kv_cache_append",
+            ),
             swiglu_fused_q4k_pipeline,
             matvec_q4k_batch4_pipeline,
             matvec_q6k_batch4_pipeline,
             swiglu_batch4_pipeline,
-            conv1d_causal_pipeline: make_pipeline(CONV1D_CAUSAL_SHADER, "conv1d_causal", "conv1d_causal"),
-            gated_deltanet_pipeline: make_pipeline(GATED_DELTANET_SHADER, "gated_deltanet", "gated_deltanet"),
+            conv1d_causal_pipeline: make_pipeline(
+                CONV1D_CAUSAL_SHADER,
+                "conv1d_causal",
+                "conv1d_causal",
+            ),
+            gated_deltanet_pipeline: make_pipeline(
+                GATED_DELTANET_SHADER,
+                "gated_deltanet",
+                "gated_deltanet",
+            ),
             timestamp_period,
             device,
             queue,
@@ -407,7 +447,9 @@ impl GpuEngine {
             blocks_per_row: weights.blocks_per_row,
             grid_x: weights.rows.min(65535),
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
         let params_buf = self
             .device
@@ -535,9 +577,7 @@ impl GpuEngine {
             tx.send(r).ok();
         });
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .expect("channel closed")
-            .expect("map failed");
+        rx.recv().expect("channel closed").expect("map failed");
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data)[..n].to_vec();
         drop(data);
@@ -561,12 +601,7 @@ fn matvec_dispatch(rows: u32) -> (u32, u32, u32) {
 
 impl<'a> GpuPass<'a> {
     /// Q4_K matvec: output = weights × input (GPU buffers, no readback).
-    pub fn matvec_q4k(
-        &mut self,
-        weights: &GpuWeightBuffer,
-        input: &GpuBuffer,
-        output: &GpuBuffer,
-    ) {
+    pub fn matvec_q4k(&mut self, weights: &GpuWeightBuffer, input: &GpuBuffer, output: &GpuBuffer) {
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
         let params = self.engine.make_uniform(&MatvecParams {
             rows: weights.rows,
@@ -574,7 +609,9 @@ impl<'a> GpuPass<'a> {
             blocks_per_row: weights.blocks_per_row,
             grid_x,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         });
         let layout = self.engine.matvec_q4k_pipeline.get_bind_group_layout(0);
         let bg = self
@@ -613,13 +650,7 @@ impl<'a> GpuPass<'a> {
     }
 
     /// RMSNorm: output[i] = input[i] * weight[i] * rsqrt(mean(input^2) + eps).
-    pub fn rmsnorm(
-        &mut self,
-        input: &GpuBuffer,
-        weight: &GpuBuffer,
-        output: &GpuBuffer,
-        eps: f32,
-    ) {
+    pub fn rmsnorm(&mut self, input: &GpuBuffer, weight: &GpuBuffer, output: &GpuBuffer, eps: f32) {
         let params = self.engine.make_uniform(&RmsnormParams {
             dim: input.len as u32,
             eps,
@@ -739,7 +770,9 @@ impl<'a> GpuPass<'a> {
             head_dim,
             theta,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         });
         let layout = self.engine.rope_pipeline.get_bind_group_layout(0);
         let bg = self
@@ -772,12 +805,7 @@ impl<'a> GpuPass<'a> {
     }
 
     /// Q6_K matvec: output = weights × input (GPU buffers, no readback).
-    pub fn matvec_q6k(
-        &mut self,
-        weights: &GpuWeightBuffer,
-        input: &GpuBuffer,
-        output: &GpuBuffer,
-    ) {
+    pub fn matvec_q6k(&mut self, weights: &GpuWeightBuffer, input: &GpuBuffer, output: &GpuBuffer) {
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
         let params = self.engine.make_uniform(&MatvecParams {
             rows: weights.rows,
@@ -785,7 +813,9 @@ impl<'a> GpuPass<'a> {
             blocks_per_row: weights.blocks_per_row,
             grid_x,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         });
         let layout = self.engine.matvec_q6k_pipeline.get_bind_group_layout(0);
         let bg = self
@@ -1034,7 +1064,7 @@ struct LayerBGs {
     kv_append_bg: wgpu::BindGroup,
     attention_bg: wgpu::BindGroup,
     ffn_norm_bg: wgpu::BindGroup,
-    swiglu: SwigluBG,       // fused gate + up + silu×mul
+    swiglu: SwigluBG, // fused gate + up + silu×mul
     down_proj: MatvecBG,
 }
 
@@ -1128,7 +1158,7 @@ pub struct GpuModel {
 
     // DeltaNet state (Qwen3.5 linear attention layers)
     #[allow(dead_code)]
-    deltanet_states: Vec<GpuBuffer>,   // [num_heads, qk_dim, v_dim] per DeltaNet layer
+    deltanet_states: Vec<GpuBuffer>, // [num_heads, qk_dim, v_dim] per DeltaNet layer
     #[allow(dead_code)]
     deltanet_conv_states: Vec<GpuBuffer>, // [3, conv_dim] per DeltaNet layer
     #[allow(dead_code)]
@@ -1237,7 +1267,9 @@ impl GpuModel {
             blocks_per_row: w.blocks_per_row,
             grid_x,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         });
         let pipeline = match w.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
@@ -1248,14 +1280,31 @@ impl GpuModel {
             label: None,
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: w.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: input.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: output.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: w.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
             ],
         });
         drop(params_buf); // BindGroup holds Arc ref to GPU resource
-        MatvecBG { bg, dispatch_x, dispatch_y, quant: w.quant }
+        MatvecBG {
+            bg,
+            dispatch_x,
+            dispatch_y,
+            quant: w.quant,
+        }
     }
 
     fn build_rmsnorm_bg(
@@ -1270,10 +1319,22 @@ impl GpuModel {
             label: None,
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: input.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: weight.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: output.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
             ],
         })
     }
@@ -1292,32 +1353,49 @@ impl GpuModel {
             blocks_per_row: gate_w.blocks_per_row,
             grid_x,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         });
         let layout = engine.swiglu_fused_q4k_pipeline.get_bind_group_layout(0);
         let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: gate_w.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: up_w.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: input.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: output.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gate_w.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: up_w.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: input.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
             ],
         });
         drop(params_buf); // BindGroup holds Arc ref to GPU resource
-        SwigluBG { bg, dispatch_x, dispatch_y }
+        SwigluBG {
+            bg,
+            dispatch_x,
+            dispatch_y,
+        }
     }
 
     /// Load model from GGUF, upload all weights, pre-create all bind groups.
     /// Load model from GGUF (takes ownership of engine).
     #[cfg(feature = "gguf")]
-    pub fn load(
-        engine: GpuEngine,
-        gguf: &crate::gguf::GgufFile,
-        config: GpuModelConfig,
-    ) -> Self {
+    pub fn load(engine: GpuEngine, gguf: &crate::gguf::GgufFile, config: GpuModelConfig) -> Self {
         Self::load_shared(Arc::new(engine), gguf, config)
     }
 
@@ -1346,12 +1424,12 @@ impl GpuModel {
         let t0 = std::time::Instant::now();
 
         // Determine layer types from config
-        let layer_types: Vec<LayerType> = (0..config.num_layers).map(|i| {
-            match config.full_attention_interval {
+        let layer_types: Vec<LayerType> = (0..config.num_layers)
+            .map(|i| match config.full_attention_interval {
                 Some(interval) if (i + 1) % interval != 0 => LayerType::DeltaNet,
                 _ => LayerType::Attention,
-            }
-        }).collect();
+            })
+            .collect();
 
         // DeltaNet config (Qwen3.5)
         let dn_qk_dim = config.linear_qk_head_dim.unwrap_or(128) as usize;
@@ -1373,68 +1451,108 @@ impl GpuModel {
                 LayerType::Attention => {
                     layer_weights.push(LayerWeightBufs {
                         attn_norm: engine.upload_f32(
-                            &gguf.tensor_to_f32(&format!("blk.{i}.attn_norm.weight")).unwrap(),
+                            &gguf
+                                .tensor_to_f32(&format!("blk.{i}.attn_norm.weight"))
+                                .unwrap(),
                         ),
                         q_proj: upload_w(
-                            &format!("blk.{i}.attn_q.weight"), config.hidden_dim, config.hidden_dim,
+                            &format!("blk.{i}.attn_q.weight"),
+                            config.hidden_dim,
+                            config.hidden_dim,
                         ),
                         k_proj: upload_w(
-                            &format!("blk.{i}.attn_k.weight"), kv_dim, config.hidden_dim,
+                            &format!("blk.{i}.attn_k.weight"),
+                            kv_dim,
+                            config.hidden_dim,
                         ),
                         v_proj: upload_w(
-                            &format!("blk.{i}.attn_v.weight"), kv_dim, config.hidden_dim,
+                            &format!("blk.{i}.attn_v.weight"),
+                            kv_dim,
+                            config.hidden_dim,
                         ),
                         o_proj: upload_w(
-                            &format!("blk.{i}.attn_output.weight"), config.hidden_dim, config.hidden_dim,
+                            &format!("blk.{i}.attn_output.weight"),
+                            config.hidden_dim,
+                            config.hidden_dim,
                         ),
                         ffn_norm: engine.upload_f32(
-                            &gguf.tensor_to_f32(&format!("blk.{i}.ffn_norm.weight")).unwrap(),
+                            &gguf
+                                .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
+                                .unwrap(),
                         ),
                         gate_proj: upload_w(
-                            &format!("blk.{i}.ffn_gate.weight"), config.intermediate_dim, config.hidden_dim,
+                            &format!("blk.{i}.ffn_gate.weight"),
+                            config.intermediate_dim,
+                            config.hidden_dim,
                         ),
                         up_proj: upload_w(
-                            &format!("blk.{i}.ffn_up.weight"), config.intermediate_dim, config.hidden_dim,
+                            &format!("blk.{i}.ffn_up.weight"),
+                            config.intermediate_dim,
+                            config.hidden_dim,
                         ),
                         down_proj: upload_w(
-                            &format!("blk.{i}.ffn_down.weight"), config.hidden_dim, config.intermediate_dim,
+                            &format!("blk.{i}.ffn_down.weight"),
+                            config.hidden_dim,
+                            config.intermediate_dim,
                         ),
                     });
                 }
                 LayerType::DeltaNet => {
                     // Load DeltaNet-specific tensors
-                    let conv1d_w = gguf.tensor_to_f32(&format!("blk.{i}.ssm_conv1d.weight")).unwrap();
-                    let conv1d_b = gguf.tensor_to_f32(&format!("blk.{i}.ssm_conv1d.bias")).unwrap();
+                    let conv1d_w = gguf
+                        .tensor_to_f32(&format!("blk.{i}.ssm_conv1d.weight"))
+                        .unwrap();
+                    let conv1d_b = gguf
+                        .tensor_to_f32(&format!("blk.{i}.ssm_conv1d.bias"))
+                        .unwrap();
 
                     deltanet_layer_weights.push(DeltaNetLayerWeightBufs {
                         attn_norm: engine.upload_f32(
-                            &gguf.tensor_to_f32(&format!("blk.{i}.attn_norm.weight")).unwrap(),
+                            &gguf
+                                .tensor_to_f32(&format!("blk.{i}.attn_norm.weight"))
+                                .unwrap(),
                         ),
                         ssm_in: upload_w(
-                            &format!("blk.{i}.ssm_in.weight"), dn_in_proj_out, config.hidden_dim,
+                            &format!("blk.{i}.ssm_in.weight"),
+                            dn_in_proj_out,
+                            config.hidden_dim,
                         ),
                         conv1d_weight: engine.upload_f32(&conv1d_w),
                         conv1d_bias: engine.upload_f32(&conv1d_b),
                         alpha_proj: upload_w(
-                            &format!("blk.{i}.ssm_alpha.weight"), dn_num_kv_heads, config.hidden_dim,
+                            &format!("blk.{i}.ssm_alpha.weight"),
+                            dn_num_kv_heads,
+                            config.hidden_dim,
                         ),
                         beta_proj: upload_w(
-                            &format!("blk.{i}.ssm_beta.weight"), dn_num_kv_heads, config.hidden_dim,
+                            &format!("blk.{i}.ssm_beta.weight"),
+                            dn_num_kv_heads,
+                            config.hidden_dim,
                         ),
                         ssm_out: upload_w(
-                            &format!("blk.{i}.ssm_out.weight"), config.hidden_dim, dn_v_dim * dn_num_v_heads,
+                            &format!("blk.{i}.ssm_out.weight"),
+                            config.hidden_dim,
+                            dn_v_dim * dn_num_v_heads,
                         ),
                         ffn_norm: engine.upload_f32(
-                            &gguf.tensor_to_f32(&format!("blk.{i}.ffn_norm.weight")).unwrap(),
+                            &gguf
+                                .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
+                                .unwrap(),
                         ),
                         gate_proj: upload_w(
-                            &format!("blk.{i}.ffn_gate.weight"), config.intermediate_dim, config.hidden_dim,
+                            &format!("blk.{i}.ffn_gate.weight"),
+                            config.intermediate_dim,
+                            config.hidden_dim,
                         ),
                         up_proj: upload_w(
-                            &format!("blk.{i}.ffn_up.weight"), config.intermediate_dim, config.hidden_dim,
+                            &format!("blk.{i}.ffn_up.weight"),
+                            config.intermediate_dim,
+                            config.hidden_dim,
                         ),
                         down_proj: upload_w(
-                            &format!("blk.{i}.ffn_down.weight"), config.hidden_dim, config.intermediate_dim,
+                            &format!("blk.{i}.ffn_down.weight"),
+                            config.hidden_dim,
+                            config.intermediate_dim,
                         ),
                     });
 
@@ -1460,16 +1578,21 @@ impl GpuModel {
             }
         }
 
-        let n_attn = layer_types.iter().filter(|t| **t == LayerType::Attention).count();
-        let n_delta = layer_types.iter().filter(|t| **t == LayerType::DeltaNet).count();
+        let n_attn = layer_types
+            .iter()
+            .filter(|t| **t == LayerType::Attention)
+            .count();
+        let n_delta = layer_types
+            .iter()
+            .filter(|t| **t == LayerType::DeltaNet)
+            .count();
         if n_delta > 0 {
             eprintln!("[GpuModel] hybrid: {n_delta} DeltaNet + {n_attn} Attention layers");
         }
 
         // Output projection — fallback to tied embedding
-        let output_norm_weight = engine.upload_f32(
-            &gguf.tensor_to_f32("output_norm.weight").unwrap(),
-        );
+        let output_norm_weight =
+            engine.upload_f32(&gguf.tensor_to_f32("output_norm.weight").unwrap());
         let (out_name, vocab_size) = if let Some(info) = gguf.tensor_info("output.weight") {
             ("output.weight", info.dims[1] as usize)
         } else {
@@ -1505,7 +1628,10 @@ impl GpuModel {
         });
 
         // KV caches (only for attention layers)
-        let n_attn_layers = layer_types.iter().filter(|t| **t == LayerType::Attention).count();
+        let n_attn_layers = layer_types
+            .iter()
+            .filter(|t| **t == LayerType::Attention)
+            .count();
         let mut k_caches = Vec::with_capacity(n_attn_layers);
         let mut v_caches = Vec::with_capacity(n_attn_layers);
         for _ in 0..n_attn_layers {
@@ -1515,11 +1641,13 @@ impl GpuModel {
 
         // --- Persistent uniform buffers (updated per-token via write_buffer) ---
         let make_persistent = |data: &[u8]| -> wgpu::Buffer {
-            engine.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: data,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            })
+            engine
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: data,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                })
         };
 
         let rope_q_params_buf = make_persistent(bytemuck::bytes_of(&RopeParams {
@@ -1528,7 +1656,9 @@ impl GpuModel {
             head_dim: config.head_dim,
             theta: config.rope_theta,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         }));
         let rope_k_params_buf = make_persistent(bytemuck::bytes_of(&RopeParams {
             position: 0,
@@ -1536,7 +1666,9 @@ impl GpuModel {
             head_dim: config.head_dim,
             theta: config.rope_theta,
             batch_size: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         }));
         let kv_append_params_buf = make_persistent(bytemuck::bytes_of(&KvCacheParams {
             position: 0,
@@ -1562,16 +1694,28 @@ impl GpuModel {
             label: None,
             layout: &rope_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: rope_q_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rope_q_params_buf.as_entire_binding(),
+                },
             ],
         });
         let rope_k_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &rope_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: rope_k_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: k_buf.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rope_k_params_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -1580,16 +1724,28 @@ impl GpuModel {
             label: None,
             layout: &residual_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: hidden.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: o_buf.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: hidden.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: o_buf.buffer.as_entire_binding(),
+                },
             ],
         });
         let residual_ffn_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &residual_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: hidden.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: down_buf.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: hidden.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: down_buf.buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1603,9 +1759,14 @@ impl GpuModel {
 
         // Output head: separate rmsnorm + matvec
         let output_norm_bg = Self::build_rmsnorm_bg(
-            &engine, &hidden, &output_norm_weight, &norm_buf, &rmsnorm_params_buf,
+            &engine,
+            &hidden,
+            &output_norm_weight,
+            &norm_buf,
+            &rmsnorm_params_buf,
         );
-        let output_proj_bg = Self::build_matvec_bg(&engine, &output_proj_weight, &norm_buf, &logits);
+        let output_proj_bg =
+            Self::build_matvec_bg(&engine, &output_proj_weight, &norm_buf, &logits);
 
         // --- Per-layer bind groups ---
         let kv_append_layout = engine.kv_cache_append_pipeline.get_bind_group_layout(0);
@@ -1620,10 +1781,16 @@ impl GpuModel {
 
         // Persistent DeltaNet uniform params
         let dn_conv_params_buf = make_persistent(bytemuck::cast_slice(&[
-            dn_conv_dim as u32, 0u32, 0u32, 0u32, // dim, ring_pos, pad, pad
+            dn_conv_dim as u32,
+            0u32,
+            0u32,
+            0u32, // dim, ring_pos, pad, pad
         ]));
         let dn_params_buf = make_persistent(bytemuck::cast_slice(&[
-            dn_num_kv_heads as u32, dn_qk_dim as u32, dn_v_dim as u32, 0u32, // num_heads, qk_dim, v_dim, pad
+            dn_num_kv_heads as u32,
+            dn_qk_dim as u32,
+            dn_v_dim as u32,
+            0u32, // num_heads, qk_dim, v_dim, pad
         ]));
 
         for i in 0..config.num_layers {
@@ -1632,7 +1799,11 @@ impl GpuModel {
                     let lw = &layer_weights[i];
 
                     let attn_norm_bg = Self::build_rmsnorm_bg(
-                        &engine, &hidden, &lw.attn_norm, &norm_buf, &rmsnorm_params_buf,
+                        &engine,
+                        &hidden,
+                        &lw.attn_norm,
+                        &norm_buf,
+                        &rmsnorm_params_buf,
                     );
                     let q_proj = Self::build_matvec_bg(&engine, &lw.q_proj, &norm_buf, &q_buf);
                     let k_proj = Self::build_matvec_bg(&engine, &lw.k_proj, &norm_buf, &k_buf);
@@ -1640,35 +1811,76 @@ impl GpuModel {
                     let o_proj = Self::build_matvec_bg(&engine, &lw.o_proj, &attn_out, &o_buf);
 
                     let ffn_norm_bg = Self::build_rmsnorm_bg(
-                        &engine, &hidden, &lw.ffn_norm, &norm_buf, &rmsnorm_params_buf,
+                        &engine,
+                        &hidden,
+                        &lw.ffn_norm,
+                        &norm_buf,
+                        &rmsnorm_params_buf,
                     );
                     let swiglu = Self::build_swiglu_bg(
-                        &engine, &lw.gate_proj, &lw.up_proj, &norm_buf, &gate_buf,
+                        &engine,
+                        &lw.gate_proj,
+                        &lw.up_proj,
+                        &norm_buf,
+                        &gate_buf,
                     );
-                    let down_proj = Self::build_matvec_bg(&engine, &lw.down_proj, &gate_buf, &down_buf);
+                    let down_proj =
+                        Self::build_matvec_bg(&engine, &lw.down_proj, &gate_buf, &down_buf);
 
-                    let kv_append_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &kv_append_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: v_buf.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: k_caches[attn_kv_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: v_caches[attn_kv_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: kv_append_params_buf.as_entire_binding() },
-                        ],
-                    });
-                    let attention_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &attn_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: k_caches[attn_kv_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: v_caches[attn_kv_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: attn_out.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: attn_params_buf.as_entire_binding() },
-                        ],
-                    });
+                    let kv_append_bg =
+                        engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &kv_append_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: k_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: v_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: k_caches[attn_kv_idx].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: v_caches[attn_kv_idx].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 4,
+                                    resource: kv_append_params_buf.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    let attention_bg =
+                        engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &attn_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: q_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: k_caches[attn_kv_idx].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: v_caches[attn_kv_idx].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: attn_out.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 4,
+                                    resource: attn_params_buf.as_entire_binding(),
+                                },
+                            ],
+                        });
                     attn_kv_idx += 1;
 
                     layer_bgs.push(LayerBGs {
@@ -1689,21 +1901,44 @@ impl GpuModel {
 
                     // DeltaNet attention sub-block bind groups
                     let attn_norm_bg = Self::build_rmsnorm_bg(
-                        &engine, &hidden, &dlw.attn_norm, &norm_buf, &rmsnorm_params_buf,
+                        &engine,
+                        &hidden,
+                        &dlw.attn_norm,
+                        &norm_buf,
+                        &rmsnorm_params_buf,
                     );
-                    let ssm_in_proj = Self::build_matvec_bg(&engine, &dlw.ssm_in, &norm_buf, &q_buf);
+                    let ssm_in_proj =
+                        Self::build_matvec_bg(&engine, &dlw.ssm_in, &norm_buf, &q_buf);
 
                     // Conv1d bind group: x=q_buf, state=conv_state, weight/bias, out=k_buf
                     let conv1d_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &conv1d_layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: deltanet_conv_states[dn_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: dlw.conv1d_weight.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: dlw.conv1d_bias.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: k_buf.buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 5, resource: dn_conv_params_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: q_buf.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: deltanet_conv_states[dn_idx].buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: dlw.conv1d_weight.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: dlw.conv1d_bias.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: k_buf.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: dn_conv_params_buf.as_entire_binding(),
+                            },
                         ],
                     });
 
@@ -1713,28 +1948,65 @@ impl GpuModel {
                         label: None,
                         layout: &deltanet_layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },      // q
-                            wgpu::BindGroupEntry { binding: 1, resource: k_buf.buffer.as_entire_binding() },      // k (after conv1d)
-                            wgpu::BindGroupEntry { binding: 2, resource: v_buf.buffer.as_entire_binding() },      // v
-                            wgpu::BindGroupEntry { binding: 3, resource: q_buf.buffer.as_entire_binding() },      // alpha (placeholder, will use alpha_proj output)
-                            wgpu::BindGroupEntry { binding: 4, resource: k_buf.buffer.as_entire_binding() },      // beta (placeholder)
-                            wgpu::BindGroupEntry { binding: 5, resource: v_buf.buffer.as_entire_binding() },      // z (output gate)
-                            wgpu::BindGroupEntry { binding: 6, resource: deltanet_states[dn_idx].buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 7, resource: attn_out.buffer.as_entire_binding() },   // output
-                            wgpu::BindGroupEntry { binding: 8, resource: dn_params_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: q_buf.buffer.as_entire_binding(),
+                            }, // q
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: k_buf.buffer.as_entire_binding(),
+                            }, // k (after conv1d)
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: v_buf.buffer.as_entire_binding(),
+                            }, // v
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: q_buf.buffer.as_entire_binding(),
+                            }, // alpha (placeholder, will use alpha_proj output)
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: k_buf.buffer.as_entire_binding(),
+                            }, // beta (placeholder)
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: v_buf.buffer.as_entire_binding(),
+                            }, // z (output gate)
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: deltanet_states[dn_idx].buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: attn_out.buffer.as_entire_binding(),
+                            }, // output
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: dn_params_buf.as_entire_binding(),
+                            },
                         ],
                     });
 
-                    let ssm_out_proj = Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
+                    let ssm_out_proj =
+                        Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
 
                     // FFN bind groups (same pattern as attention layers)
                     let ffn_norm_bg = Self::build_rmsnorm_bg(
-                        &engine, &hidden, &dlw.ffn_norm, &norm_buf, &rmsnorm_params_buf,
+                        &engine,
+                        &hidden,
+                        &dlw.ffn_norm,
+                        &norm_buf,
+                        &rmsnorm_params_buf,
                     );
                     let swiglu = Self::build_swiglu_bg(
-                        &engine, &dlw.gate_proj, &dlw.up_proj, &norm_buf, &gate_buf,
+                        &engine,
+                        &dlw.gate_proj,
+                        &dlw.up_proj,
+                        &norm_buf,
+                        &gate_buf,
                     );
-                    let down_proj = Self::build_matvec_bg(&engine, &dlw.down_proj, &gate_buf, &down_buf);
+                    let down_proj =
+                        Self::build_matvec_bg(&engine, &dlw.down_proj, &gate_buf, &down_buf);
 
                     deltanet_bgs.push(DeltaNetLayerBGs {
                         attn_norm_bg,
@@ -1753,39 +2025,120 @@ impl GpuModel {
                             label: None,
                             layout: &engine.rmsnorm_pipeline.get_bind_group_layout(0),
                             entries: &[
-                                wgpu::BindGroupEntry { binding: 0, resource: hidden.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 1, resource: hidden.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 2, resource: norm_buf.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 3, resource: rmsnorm_params_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: hidden.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: hidden.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: norm_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: rmsnorm_params_buf.as_entire_binding(),
+                                },
                             ],
                         }),
-                        q_proj: Self::build_matvec_bg(&engine, &layer_weights[i].q_proj, &norm_buf, &q_buf),
-                        k_proj: Self::build_matvec_bg(&engine, &layer_weights[i].k_proj, &norm_buf, &k_buf),
-                        v_proj: Self::build_matvec_bg(&engine, &layer_weights[i].v_proj, &norm_buf, &v_buf),
-                        o_proj: Self::build_matvec_bg(&engine, &layer_weights[i].o_proj, &attn_out, &o_buf),
+                        q_proj: Self::build_matvec_bg(
+                            &engine,
+                            &layer_weights[i].q_proj,
+                            &norm_buf,
+                            &q_buf,
+                        ),
+                        k_proj: Self::build_matvec_bg(
+                            &engine,
+                            &layer_weights[i].k_proj,
+                            &norm_buf,
+                            &k_buf,
+                        ),
+                        v_proj: Self::build_matvec_bg(
+                            &engine,
+                            &layer_weights[i].v_proj,
+                            &norm_buf,
+                            &v_buf,
+                        ),
+                        o_proj: Self::build_matvec_bg(
+                            &engine,
+                            &layer_weights[i].o_proj,
+                            &attn_out,
+                            &o_buf,
+                        ),
                         kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: None, layout: &kv_append_layout,
+                            label: None,
+                            layout: &kv_append_layout,
                             entries: &[
-                                wgpu::BindGroupEntry { binding: 0, resource: k_buf.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 1, resource: v_buf.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 2, resource: k_caches[0].buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 3, resource: v_caches[0].buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 4, resource: kv_append_params_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: k_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: v_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: k_caches[0].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: v_caches[0].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 4,
+                                    resource: kv_append_params_buf.as_entire_binding(),
+                                },
                             ],
                         }),
                         attention_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: None, layout: &attn_layout,
+                            label: None,
+                            layout: &attn_layout,
                             entries: &[
-                                wgpu::BindGroupEntry { binding: 0, resource: q_buf.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 1, resource: k_caches[0].buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 2, resource: v_caches[0].buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 3, resource: attn_out.buffer.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 4, resource: attn_params_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: q_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: k_caches[0].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: v_caches[0].buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: attn_out.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 4,
+                                    resource: attn_params_buf.as_entire_binding(),
+                                },
                             ],
                         }),
-                        ffn_norm_bg: Self::build_rmsnorm_bg(&engine, &hidden, &dlw.ffn_norm, &norm_buf, &rmsnorm_params_buf),
-                        swiglu: Self::build_swiglu_bg(&engine, &dlw.gate_proj, &dlw.up_proj, &norm_buf, &gate_buf),
-                        down_proj: Self::build_matvec_bg(&engine, &dlw.down_proj, &gate_buf, &down_buf),
+                        ffn_norm_bg: Self::build_rmsnorm_bg(
+                            &engine,
+                            &hidden,
+                            &dlw.ffn_norm,
+                            &norm_buf,
+                            &rmsnorm_params_buf,
+                        ),
+                        swiglu: Self::build_swiglu_bg(
+                            &engine,
+                            &dlw.gate_proj,
+                            &dlw.up_proj,
+                            &norm_buf,
+                            &gate_buf,
+                        ),
+                        down_proj: Self::build_matvec_bg(
+                            &engine,
+                            &dlw.down_proj,
+                            &gate_buf,
+                            &down_buf,
+                        ),
                     });
 
                     dn_idx += 1;
@@ -1800,9 +2153,7 @@ impl GpuModel {
         let kv_dispatch_x = ((kv_dim as u32) + 255) / 256;
 
         let total_bgs = layer_bgs.len() * 10 + 7;
-        eprintln!(
-            "[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs"
-        );
+        eprintln!("[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs");
 
         Self {
             engine,
@@ -1906,16 +2257,26 @@ impl GpuModel {
 
                     // 3. Causal conv1d: q_buf → k_buf (preprocessed q, k, v)
                     let dn_conv_dim = self.config.linear_qk_head_dim.unwrap_or(128)
-                        * self.config.linear_num_kv_heads.unwrap_or(self.config.num_kv_heads) * 2
+                        * self
+                            .config
+                            .linear_num_kv_heads
+                            .unwrap_or(self.config.num_kv_heads)
+                        * 2
                         + self.config.linear_kv_head_dim.unwrap_or(128)
-                        * self.config.linear_num_v_heads.unwrap_or(self.config.num_heads);
+                            * self
+                                .config
+                                .linear_num_v_heads
+                                .unwrap_or(self.config.num_heads);
                     let conv1d_dispatch = (dn_conv_dim + 255) / 256;
                     cp.set_pipeline(&self.engine.conv1d_causal_pipeline);
                     cp.set_bind_group(0, &dbg.conv1d_bg, &[]);
                     cp.dispatch_workgroups(conv1d_dispatch, 1, 1);
 
                     // 4. DeltaNet recurrence: state update + gated output → attn_out
-                    let dn_num_heads = self.config.linear_num_kv_heads.unwrap_or(self.config.num_kv_heads);
+                    let dn_num_heads = self
+                        .config
+                        .linear_num_kv_heads
+                        .unwrap_or(self.config.num_kv_heads);
                     cp.set_pipeline(&self.engine.gated_deltanet_pipeline);
                     cp.set_bind_group(0, &dbg.deltanet_bg, &[]);
                     cp.dispatch_workgroups(dn_num_heads, 1, 1);
@@ -1934,16 +2295,29 @@ impl GpuModel {
 
             // --- FFN sub-block ---
             // Use the correct source of FFN bind groups based on layer type.
-            let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_down) = match self.layer_types[i] {
-                LayerType::Attention => {
-                    let lbg = &self.layer_bgs[i];
-                    (&lbg.ffn_norm_bg, &lbg.swiglu.bg, lbg.swiglu.dispatch_x, lbg.swiglu.dispatch_y, &lbg.down_proj)
-                }
-                LayerType::DeltaNet => {
-                    let dbg = &self.deltanet_layer_bgs[dn_fwd_idx - 1]; // already incremented above
-                    (&dbg.ffn_norm_bg, &dbg.swiglu.bg, dbg.swiglu.dispatch_x, dbg.swiglu.dispatch_y, &dbg.down_proj)
-                }
-            };
+            let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_down) =
+                match self.layer_types[i] {
+                    LayerType::Attention => {
+                        let lbg = &self.layer_bgs[i];
+                        (
+                            &lbg.ffn_norm_bg,
+                            &lbg.swiglu.bg,
+                            lbg.swiglu.dispatch_x,
+                            lbg.swiglu.dispatch_y,
+                            &lbg.down_proj,
+                        )
+                    }
+                    LayerType::DeltaNet => {
+                        let dbg = &self.deltanet_layer_bgs[dn_fwd_idx - 1]; // already incremented above
+                        (
+                            &dbg.ffn_norm_bg,
+                            &dbg.swiglu.bg,
+                            dbg.swiglu.dispatch_x,
+                            dbg.swiglu.dispatch_y,
+                            &dbg.down_proj,
+                        )
+                    }
+                };
 
             cp.set_pipeline(&self.engine.rmsnorm_pipeline);
             cp.set_bind_group(0, ffn_norm, &[]);
@@ -1995,18 +2369,18 @@ impl GpuModel {
 
     /// Update persistent uniform buffers for the current position.
     fn update_uniforms(&self, pos: u32, seq_len: u32) {
-        self.engine.queue.write_buffer(
-            &self.rope_q_params_buf, 0, bytemuck::bytes_of(&pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.rope_k_params_buf, 0, bytemuck::bytes_of(&pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.kv_append_params_buf, 0, bytemuck::bytes_of(&pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.attn_params_buf, 0, bytemuck::bytes_of(&seq_len),
-        );
+        self.engine
+            .queue
+            .write_buffer(&self.rope_q_params_buf, 0, bytemuck::bytes_of(&pos));
+        self.engine
+            .queue
+            .write_buffer(&self.rope_k_params_buf, 0, bytemuck::bytes_of(&pos));
+        self.engine
+            .queue
+            .write_buffer(&self.kv_append_params_buf, 0, bytemuck::bytes_of(&pos));
+        self.engine
+            .queue
+            .write_buffer(&self.attn_params_buf, 0, bytemuck::bytes_of(&seq_len));
     }
 
     /// Upload token embedding to the hidden buffer.
@@ -2014,7 +2388,8 @@ impl GpuModel {
         let start = token_id as usize * self.config.hidden_dim;
         let end = start + self.config.hidden_dim;
         self.engine.queue.write_buffer(
-            &self.hidden.buffer, 0,
+            &self.hidden.buffer,
+            0,
             bytemuck::cast_slice(&self.embedding[start..end]),
         );
     }
@@ -2031,9 +2406,10 @@ impl GpuModel {
         self.update_uniforms(pos, seq_len);
         self.upload_embedding(token_id);
 
-        let mut encoder = self.engine.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode_forward(&mut encoder);
         self.engine.queue.submit(Some(encoder.finish()));
 
@@ -2053,9 +2429,10 @@ impl GpuModel {
         self.update_uniforms(pos, seq_len);
         self.upload_embedding(token_id);
 
-        let mut encoder = self.engine.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode_forward(&mut encoder);
 
         let size = (self.vocab_size * 4) as u64;
@@ -2081,7 +2458,11 @@ impl GpuModel {
     /// GPU KV memory beyond `pos` is stale but harmless — attention shader
     /// only reads up to `seq_len`, and future appends overwrite old entries.
     pub fn rollback_to(&mut self, pos: u32) {
-        debug_assert!(pos <= self.seq_len, "rollback_to({pos}) > seq_len({})", self.seq_len);
+        debug_assert!(
+            pos <= self.seq_len,
+            "rollback_to({pos}) > seq_len({})",
+            self.seq_len
+        );
         self.seq_len = pos;
     }
 
@@ -2105,12 +2486,22 @@ impl GpuModel {
         self.upload_embedding(token_id);
 
         let mut r = ProfileResult {
-            rmsnorm_us: 0.0, matvec_q4k_us: 0.0, matvec_q6k_us: 0.0,
-            swiglu_us: 0.0, rope_us: 0.0, kv_append_us: 0.0,
-            attention_us: 0.0, residual_us: 0.0,
-            rmsnorm_n: 0, matvec_q4k_n: 0, matvec_q6k_n: 0,
-            swiglu_n: 0, rope_n: 0, kv_append_n: 0,
-            attention_n: 0, residual_n: 0,
+            rmsnorm_us: 0.0,
+            matvec_q4k_us: 0.0,
+            matvec_q6k_us: 0.0,
+            swiglu_us: 0.0,
+            rope_us: 0.0,
+            kv_append_us: 0.0,
+            attention_us: 0.0,
+            residual_us: 0.0,
+            rmsnorm_n: 0,
+            matvec_q4k_n: 0,
+            matvec_q6k_n: 0,
+            swiglu_n: 0,
+            rope_n: 0,
+            kv_append_n: 0,
+            attention_n: 0,
+            residual_n: 0,
         };
 
         let e = &self.engine;
@@ -2125,45 +2516,112 @@ impl GpuModel {
             for mv in [&lbg.q_proj, &lbg.k_proj, &lbg.v_proj] {
                 let (us, qt) = timed_mv(e, mv);
                 match qt {
-                    GpuQuantType::Q4K => { r.matvec_q4k_us += us; r.matvec_q4k_n += 1; }
-                    GpuQuantType::Q6K => { r.matvec_q6k_us += us; r.matvec_q6k_n += 1; }
+                    GpuQuantType::Q4K => {
+                        r.matvec_q4k_us += us;
+                        r.matvec_q4k_n += 1;
+                    }
+                    GpuQuantType::Q6K => {
+                        r.matvec_q6k_us += us;
+                        r.matvec_q6k_n += 1;
+                    }
                 }
             }
 
-            r.rope_us += timed_dispatch(e, &e.rope_pipeline, &self.rope_q_bg, self.rope_q_dispatch_x, 1, 1);
+            r.rope_us += timed_dispatch(
+                e,
+                &e.rope_pipeline,
+                &self.rope_q_bg,
+                self.rope_q_dispatch_x,
+                1,
+                1,
+            );
             r.rope_n += 1;
-            r.rope_us += timed_dispatch(e, &e.rope_pipeline, &self.rope_k_bg, self.rope_k_dispatch_x, 1, 1);
+            r.rope_us += timed_dispatch(
+                e,
+                &e.rope_pipeline,
+                &self.rope_k_bg,
+                self.rope_k_dispatch_x,
+                1,
+                1,
+            );
             r.rope_n += 1;
 
-            r.kv_append_us += timed_dispatch(e, &e.kv_cache_append_pipeline, &lbg.kv_append_bg, self.kv_dispatch_x, 1, 1);
+            r.kv_append_us += timed_dispatch(
+                e,
+                &e.kv_cache_append_pipeline,
+                &lbg.kv_append_bg,
+                self.kv_dispatch_x,
+                1,
+                1,
+            );
             r.kv_append_n += 1;
 
-            r.attention_us += timed_dispatch(e, &e.attention_pipeline, &lbg.attention_bg, self.config.num_heads, 1, 1);
+            r.attention_us += timed_dispatch(
+                e,
+                &e.attention_pipeline,
+                &lbg.attention_bg,
+                self.config.num_heads,
+                1,
+                1,
+            );
             r.attention_n += 1;
 
             let (us, qt) = timed_mv(e, &lbg.o_proj);
             match qt {
-                GpuQuantType::Q4K => { r.matvec_q4k_us += us; r.matvec_q4k_n += 1; }
-                GpuQuantType::Q6K => { r.matvec_q6k_us += us; r.matvec_q6k_n += 1; }
+                GpuQuantType::Q4K => {
+                    r.matvec_q4k_us += us;
+                    r.matvec_q4k_n += 1;
+                }
+                GpuQuantType::Q6K => {
+                    r.matvec_q6k_us += us;
+                    r.matvec_q6k_n += 1;
+                }
             }
 
-            r.residual_us += timed_dispatch(e, &e.residual_add_pipeline, &self.residual_attn_bg, self.residual_dispatch_x, 1, 1);
+            r.residual_us += timed_dispatch(
+                e,
+                &e.residual_add_pipeline,
+                &self.residual_attn_bg,
+                self.residual_dispatch_x,
+                1,
+                1,
+            );
             r.residual_n += 1;
 
             // --- FFN sub-block ---
             r.rmsnorm_us += timed_dispatch(e, &e.rmsnorm_pipeline, &lbg.ffn_norm_bg, 1, 1, 1);
             r.rmsnorm_n += 1;
 
-            r.swiglu_us += timed_dispatch(e, &e.swiglu_fused_q4k_pipeline, &lbg.swiglu.bg, lbg.swiglu.dispatch_x, lbg.swiglu.dispatch_y, 1);
+            r.swiglu_us += timed_dispatch(
+                e,
+                &e.swiglu_fused_q4k_pipeline,
+                &lbg.swiglu.bg,
+                lbg.swiglu.dispatch_x,
+                lbg.swiglu.dispatch_y,
+                1,
+            );
             r.swiglu_n += 1;
 
             let (us, qt) = timed_mv(e, &lbg.down_proj);
             match qt {
-                GpuQuantType::Q4K => { r.matvec_q4k_us += us; r.matvec_q4k_n += 1; }
-                GpuQuantType::Q6K => { r.matvec_q6k_us += us; r.matvec_q6k_n += 1; }
+                GpuQuantType::Q4K => {
+                    r.matvec_q4k_us += us;
+                    r.matvec_q4k_n += 1;
+                }
+                GpuQuantType::Q6K => {
+                    r.matvec_q6k_us += us;
+                    r.matvec_q6k_n += 1;
+                }
             }
 
-            r.residual_us += timed_dispatch(e, &e.residual_add_pipeline, &self.residual_ffn_bg, self.residual_dispatch_x, 1, 1);
+            r.residual_us += timed_dispatch(
+                e,
+                &e.residual_add_pipeline,
+                &self.residual_ffn_bg,
+                self.residual_dispatch_x,
+                1,
+                1,
+            );
             r.residual_n += 1;
         }
 
@@ -2173,8 +2631,14 @@ impl GpuModel {
 
         let (us, qt) = timed_mv(e, &self.output_proj_bg);
         match qt {
-            GpuQuantType::Q4K => { r.matvec_q4k_us += us; r.matvec_q4k_n += 1; }
-            GpuQuantType::Q6K => { r.matvec_q6k_us += us; r.matvec_q6k_n += 1; }
+            GpuQuantType::Q4K => {
+                r.matvec_q4k_us += us;
+                r.matvec_q4k_n += 1;
+            }
+            GpuQuantType::Q6K => {
+                r.matvec_q6k_us += us;
+                r.matvec_q6k_n += 1;
+            }
         }
 
         self.seq_len = seq_len;
@@ -2190,7 +2654,8 @@ impl GpuModel {
             let end = start + self.config.hidden_dim;
             let buf_offset = (k * self.config.hidden_dim * 4) as u64;
             self.engine.queue.write_buffer(
-                &self.hidden.buffer, buf_offset,
+                &self.hidden.buffer,
+                buf_offset,
                 bytemuck::cast_slice(&self.embedding[start..end]),
             );
         }
@@ -2276,29 +2741,35 @@ impl GpuModel {
     /// Weight decoded ONCE, 4 scalar FMAs in GPU registers — zero spill.
     /// No uniform batch_size updates needed (compile-time constant in shaders).
     pub fn forward_batch(&mut self, token_ids: &[u32]) {
-        assert!(token_ids.len() == 4, "forward_batch requires exactly 4 tokens");
+        assert!(
+            token_ids.len() == 4,
+            "forward_batch requires exactly 4 tokens"
+        );
         let base_pos = self.seq_len;
 
         // Update per-position uniforms
+        self.engine
+            .queue
+            .write_buffer(&self.rope_q_params_buf, 0, bytemuck::bytes_of(&base_pos));
+        self.engine
+            .queue
+            .write_buffer(&self.rope_k_params_buf, 0, bytemuck::bytes_of(&base_pos));
         self.engine.queue.write_buffer(
-            &self.rope_q_params_buf, 0, bytemuck::bytes_of(&base_pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.rope_k_params_buf, 0, bytemuck::bytes_of(&base_pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.kv_append_params_buf, 0, bytemuck::bytes_of(&base_pos),
+            &self.kv_append_params_buf,
+            0,
+            bytemuck::bytes_of(&base_pos),
         );
         let attn_seq_len = base_pos + 1;
-        self.engine.queue.write_buffer(
-            &self.attn_params_buf, 0, bytemuck::bytes_of(&attn_seq_len),
-        );
+        self.engine
+            .queue
+            .write_buffer(&self.attn_params_buf, 0, bytemuck::bytes_of(&attn_seq_len));
 
         self.upload_embeddings_batch(token_ids);
 
-        let mut encoder = self.engine.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode_forward_batch4(&mut encoder);
         self.engine.queue.submit(Some(encoder.finish()));
 
@@ -2307,27 +2778,33 @@ impl GpuModel {
 
     /// Execute batch-4 forward pass with logits readback for all 4 tokens.
     pub fn forward_batch_and_read(&mut self, token_ids: &[u32]) -> Vec<f32> {
-        assert!(token_ids.len() == 4, "forward_batch_and_read requires exactly 4 tokens");
+        assert!(
+            token_ids.len() == 4,
+            "forward_batch_and_read requires exactly 4 tokens"
+        );
         let base_pos = self.seq_len;
 
+        self.engine
+            .queue
+            .write_buffer(&self.rope_q_params_buf, 0, bytemuck::bytes_of(&base_pos));
+        self.engine
+            .queue
+            .write_buffer(&self.rope_k_params_buf, 0, bytemuck::bytes_of(&base_pos));
         self.engine.queue.write_buffer(
-            &self.rope_q_params_buf, 0, bytemuck::bytes_of(&base_pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.rope_k_params_buf, 0, bytemuck::bytes_of(&base_pos),
-        );
-        self.engine.queue.write_buffer(
-            &self.kv_append_params_buf, 0, bytemuck::bytes_of(&base_pos),
+            &self.kv_append_params_buf,
+            0,
+            bytemuck::bytes_of(&base_pos),
         );
         let attn_seq_len = base_pos + 1;
-        self.engine.queue.write_buffer(
-            &self.attn_params_buf, 0, bytemuck::bytes_of(&attn_seq_len),
-        );
+        self.engine
+            .queue
+            .write_buffer(&self.attn_params_buf, 0, bytemuck::bytes_of(&attn_seq_len));
         self.upload_embeddings_batch(token_ids);
 
-        let mut encoder = self.engine.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode_forward_batch4(&mut encoder);
 
         let total_logits = 4 * self.vocab_size;
@@ -2357,11 +2834,14 @@ impl GpuModel {
         // Each dispatch uses 2 query slots (beginning + end of compute pass)
         let num_queries = total_dispatches * 2;
 
-        let query_set = self.engine.device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("timestamp_queries"),
-            ty: wgpu::QueryType::Timestamp,
-            count: num_queries,
-        });
+        let query_set = self
+            .engine
+            .device
+            .create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("timestamp_queries"),
+                ty: wgpu::QueryType::Timestamp,
+                count: num_queries,
+            });
 
         let resolve_buf = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("timestamp_resolve"),
@@ -2380,9 +2860,10 @@ impl GpuModel {
         // 0=rmsnorm, 1=matvec_q4k, 2=matvec_q6k, 3=swiglu, 4=rope, 5=kv_append, 6=attention, 7=residual
         let mut op_tags: Vec<u8> = Vec::with_capacity(total_dispatches as usize);
 
-        let mut encoder = self.engine.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
         let mut dispatch_idx: u32 = 0;
 
@@ -2427,26 +2908,96 @@ impl GpuModel {
             let lbg = &self.layer_bgs[i];
 
             // Attention sub-block
-            ts_dispatch!(&self.engine.rmsnorm_pipeline, &lbg.attn_norm_bg, 1, 1, 1, 0u8);
+            ts_dispatch!(
+                &self.engine.rmsnorm_pipeline,
+                &lbg.attn_norm_bg,
+                1,
+                1,
+                1,
+                0u8
+            );
             ts_dispatch_mv!(lbg.q_proj);
             ts_dispatch_mv!(lbg.k_proj);
             ts_dispatch_mv!(lbg.v_proj);
-            ts_dispatch!(&self.engine.rope_pipeline, &self.rope_q_bg, self.rope_q_dispatch_x, 1, 1, 4u8);
-            ts_dispatch!(&self.engine.rope_pipeline, &self.rope_k_bg, self.rope_k_dispatch_x, 1, 1, 4u8);
-            ts_dispatch!(&self.engine.kv_cache_append_pipeline, &lbg.kv_append_bg, self.kv_dispatch_x, 1, 1, 5u8);
-            ts_dispatch!(&self.engine.attention_pipeline, &lbg.attention_bg, self.config.num_heads, 1, 1, 6u8);
+            ts_dispatch!(
+                &self.engine.rope_pipeline,
+                &self.rope_q_bg,
+                self.rope_q_dispatch_x,
+                1,
+                1,
+                4u8
+            );
+            ts_dispatch!(
+                &self.engine.rope_pipeline,
+                &self.rope_k_bg,
+                self.rope_k_dispatch_x,
+                1,
+                1,
+                4u8
+            );
+            ts_dispatch!(
+                &self.engine.kv_cache_append_pipeline,
+                &lbg.kv_append_bg,
+                self.kv_dispatch_x,
+                1,
+                1,
+                5u8
+            );
+            ts_dispatch!(
+                &self.engine.attention_pipeline,
+                &lbg.attention_bg,
+                self.config.num_heads,
+                1,
+                1,
+                6u8
+            );
             ts_dispatch_mv!(lbg.o_proj);
-            ts_dispatch!(&self.engine.residual_add_pipeline, &self.residual_attn_bg, self.residual_dispatch_x, 1, 1, 7u8);
+            ts_dispatch!(
+                &self.engine.residual_add_pipeline,
+                &self.residual_attn_bg,
+                self.residual_dispatch_x,
+                1,
+                1,
+                7u8
+            );
 
             // FFN sub-block
-            ts_dispatch!(&self.engine.rmsnorm_pipeline, &lbg.ffn_norm_bg, 1, 1, 1, 0u8);
-            ts_dispatch!(&self.engine.swiglu_fused_q4k_pipeline, &lbg.swiglu.bg, lbg.swiglu.dispatch_x, lbg.swiglu.dispatch_y, 1, 3u8);
+            ts_dispatch!(
+                &self.engine.rmsnorm_pipeline,
+                &lbg.ffn_norm_bg,
+                1,
+                1,
+                1,
+                0u8
+            );
+            ts_dispatch!(
+                &self.engine.swiglu_fused_q4k_pipeline,
+                &lbg.swiglu.bg,
+                lbg.swiglu.dispatch_x,
+                lbg.swiglu.dispatch_y,
+                1,
+                3u8
+            );
             ts_dispatch_mv!(lbg.down_proj);
-            ts_dispatch!(&self.engine.residual_add_pipeline, &self.residual_ffn_bg, self.residual_dispatch_x, 1, 1, 7u8);
+            ts_dispatch!(
+                &self.engine.residual_add_pipeline,
+                &self.residual_ffn_bg,
+                self.residual_dispatch_x,
+                1,
+                1,
+                7u8
+            );
         }
 
         // Output head
-        ts_dispatch!(&self.engine.rmsnorm_pipeline, &self.output_norm_bg, 1, 1, 1, 0u8);
+        ts_dispatch!(
+            &self.engine.rmsnorm_pipeline,
+            &self.output_norm_bg,
+            1,
+            1,
+            1,
+            0u8
+        );
         ts_dispatch_mv!(self.output_proj_bg);
 
         // Resolve timestamps to buffer
@@ -2459,7 +3010,9 @@ impl GpuModel {
         // Readback timestamps
         let slice = readback_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.engine.device.poll(wgpu::Maintain::Wait);
         rx.recv().expect("channel closed").expect("map failed");
         let data = slice.get_mapped_range();
@@ -2468,12 +3021,22 @@ impl GpuModel {
         let period_us = self.engine.timestamp_period as f64 / 1000.0; // ns→µs
 
         let mut r = ProfileResult {
-            rmsnorm_us: 0.0, matvec_q4k_us: 0.0, matvec_q6k_us: 0.0,
-            swiglu_us: 0.0, rope_us: 0.0, kv_append_us: 0.0,
-            attention_us: 0.0, residual_us: 0.0,
-            rmsnorm_n: 0, matvec_q4k_n: 0, matvec_q6k_n: 0,
-            swiglu_n: 0, rope_n: 0, kv_append_n: 0,
-            attention_n: 0, residual_n: 0,
+            rmsnorm_us: 0.0,
+            matvec_q4k_us: 0.0,
+            matvec_q6k_us: 0.0,
+            swiglu_us: 0.0,
+            rope_us: 0.0,
+            kv_append_us: 0.0,
+            attention_us: 0.0,
+            residual_us: 0.0,
+            rmsnorm_n: 0,
+            matvec_q4k_n: 0,
+            matvec_q6k_n: 0,
+            swiglu_n: 0,
+            rope_n: 0,
+            kv_append_n: 0,
+            attention_n: 0,
+            residual_n: 0,
         };
 
         for i in 0..total_dispatches as usize {
@@ -2482,14 +3045,38 @@ impl GpuModel {
             let delta_us = (end_ts.wrapping_sub(begin_ts)) as f64 * period_us;
             let tag = op_tags[i];
             match tag {
-                0 => { r.rmsnorm_us += delta_us; r.rmsnorm_n += 1; }
-                1 => { r.matvec_q4k_us += delta_us; r.matvec_q4k_n += 1; }
-                2 => { r.matvec_q6k_us += delta_us; r.matvec_q6k_n += 1; }
-                3 => { r.swiglu_us += delta_us; r.swiglu_n += 1; }
-                4 => { r.rope_us += delta_us; r.rope_n += 1; }
-                5 => { r.kv_append_us += delta_us; r.kv_append_n += 1; }
-                6 => { r.attention_us += delta_us; r.attention_n += 1; }
-                7 => { r.residual_us += delta_us; r.residual_n += 1; }
+                0 => {
+                    r.rmsnorm_us += delta_us;
+                    r.rmsnorm_n += 1;
+                }
+                1 => {
+                    r.matvec_q4k_us += delta_us;
+                    r.matvec_q4k_n += 1;
+                }
+                2 => {
+                    r.matvec_q6k_us += delta_us;
+                    r.matvec_q6k_n += 1;
+                }
+                3 => {
+                    r.swiglu_us += delta_us;
+                    r.swiglu_n += 1;
+                }
+                4 => {
+                    r.rope_us += delta_us;
+                    r.rope_n += 1;
+                }
+                5 => {
+                    r.kv_append_us += delta_us;
+                    r.kv_append_n += 1;
+                }
+                6 => {
+                    r.attention_us += delta_us;
+                    r.attention_n += 1;
+                }
+                7 => {
+                    r.residual_us += delta_us;
+                    r.residual_n += 1;
+                }
                 _ => {}
             }
         }

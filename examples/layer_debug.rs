@@ -26,7 +26,10 @@ fn main() {
     let encoded = tokenizer.encode(prompt);
     println!("BOS ID: {}", tokenizer.bos_id);
     println!("Encoded prompt: {:?}", &encoded);
-    println!("First token == BOS? {}", encoded.first() == Some(&tokenizer.bos_id));
+    println!(
+        "First token == BOS? {}",
+        encoded.first() == Some(&tokenizer.bos_id)
+    );
     println!();
 
     // Test: forward BOS, then check logits
@@ -53,8 +56,11 @@ fn main() {
     for (i, &tok) in tokens.iter().enumerate() {
         last_logits = model.forward(tok);
         let (sum, min, max, l2) = vec_stats(&last_logits);
-        let argmax = last_logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        let argmax = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
         let decoded = tokenizer.decode(&[argmax.0 as u32]);
         println!("  [{i}] tok={tok:6} logits: sum={sum:8.1}, min={min:8.3}, max={max:8.3}, L2={l2:8.1}, argmax={} '{decoded}'",
             argmax.0);
@@ -63,11 +69,17 @@ fn main() {
     // Now generate 3 tokens from the last logits
     println!("\n=== Generate from last logits ===");
     for i in 0..3 {
-        let argmax = last_logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        let argmax = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
         let next_id = argmax.0 as u32;
         let decoded = tokenizer.decode(&[next_id]);
-        println!("  gen[{i}] token={next_id} logit={:.4} '{decoded}'", argmax.1);
+        println!(
+            "  gen[{i}] token={next_id} logit={:.4} '{decoded}'",
+            argmax.1
+        );
         last_logits = model.forward(next_id);
     }
 }

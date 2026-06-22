@@ -43,9 +43,7 @@ fn main() {
     let inter_dim = gate_info.dims[1] as usize; // 8192
     let eps = 1e-5f32;
 
-    println!(
-        "FFN: hidden_dim={hidden_dim}, intermediate_dim={inter_dim}, eps={eps}"
-    );
+    println!("FFN: hidden_dim={hidden_dim}, intermediate_dim={inter_dim}, eps={eps}");
 
     let gate_data = gguf.tensor_data("blk.0.ffn_gate.weight").unwrap();
     let up_data = gguf.tensor_data("blk.0.ffn_up.weight").unwrap();
@@ -67,12 +65,33 @@ fn main() {
         let mut down_buf = vec![0.0f32; hidden_dim];
 
         rms_norm(&cpu_hidden, &norm_data, eps, &mut norm_buf);
-        quantized_matvec(&norm_buf, gate_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut gate_buf);
-        quantized_matvec(&norm_buf, up_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut up_buf);
+        quantized_matvec(
+            &norm_buf,
+            gate_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut gate_buf,
+        );
+        quantized_matvec(
+            &norm_buf,
+            up_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut up_buf,
+        );
         for i in 0..inter_dim {
             gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
         }
-        quantized_matvec(&gate_buf, down_data, GgmlType::Q4_K, hidden_dim, inter_dim, &mut down_buf);
+        quantized_matvec(
+            &gate_buf,
+            down_data,
+            GgmlType::Q4_K,
+            hidden_dim,
+            inter_dim,
+            &mut down_buf,
+        );
         for i in 0..hidden_dim {
             cpu_hidden[i] += down_buf[i];
         }
@@ -87,12 +106,33 @@ fn main() {
         let mut down_buf = vec![0.0f32; hidden_dim];
 
         rms_norm(&cpu_hidden, &norm_data, eps, &mut norm_buf);
-        quantized_matvec(&norm_buf, gate_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut gate_buf);
-        quantized_matvec(&norm_buf, up_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut up_buf);
+        quantized_matvec(
+            &norm_buf,
+            gate_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut gate_buf,
+        );
+        quantized_matvec(
+            &norm_buf,
+            up_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut up_buf,
+        );
         for i in 0..inter_dim {
             gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
         }
-        quantized_matvec(&gate_buf, down_data, GgmlType::Q4_K, hidden_dim, inter_dim, &mut down_buf);
+        quantized_matvec(
+            &gate_buf,
+            down_data,
+            GgmlType::Q4_K,
+            hidden_dim,
+            inter_dim,
+            &mut down_buf,
+        );
         for i in 0..hidden_dim {
             cpu_hidden[i] += down_buf[i];
         }
@@ -106,12 +146,33 @@ fn main() {
         let mut up_buf = vec![0.0f32; inter_dim];
         let mut down_buf = vec![0.0f32; hidden_dim];
         rms_norm(&cpu_hidden, &norm_data, eps, &mut norm_buf);
-        quantized_matvec(&norm_buf, gate_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut gate_buf);
-        quantized_matvec(&norm_buf, up_data, GgmlType::Q4_K, inter_dim, hidden_dim, &mut up_buf);
+        quantized_matvec(
+            &norm_buf,
+            gate_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut gate_buf,
+        );
+        quantized_matvec(
+            &norm_buf,
+            up_data,
+            GgmlType::Q4_K,
+            inter_dim,
+            hidden_dim,
+            &mut up_buf,
+        );
         for i in 0..inter_dim {
             gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
         }
-        quantized_matvec(&gate_buf, down_data, GgmlType::Q4_K, hidden_dim, inter_dim, &mut down_buf);
+        quantized_matvec(
+            &gate_buf,
+            down_data,
+            GgmlType::Q4_K,
+            hidden_dim,
+            inter_dim,
+            &mut down_buf,
+        );
         for i in 0..hidden_dim {
             cpu_hidden[i] += down_buf[i];
         }
@@ -207,7 +268,11 @@ fn main() {
                 continue;
             }
             if c.is_nan() != g.is_nan() {
-                println!("  MISMATCH at [{i}]: cpu_nan={} gpu_nan={}", c.is_nan(), g.is_nan());
+                println!(
+                    "  MISMATCH at [{i}]: cpu_nan={} gpu_nan={}",
+                    c.is_nan(),
+                    g.is_nan()
+                );
             }
             total_checked += 1;
             if c.abs() > 1e-6 {

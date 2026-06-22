@@ -1,0 +1,6 @@
+# Rust toolchain pin (a note 準拠)
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+

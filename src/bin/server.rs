@@ -16,7 +16,9 @@
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
 use alice_llm::gpu::{GpuEngine, GpuModel, GpuModelConfig};
 use alice_llm::llama3::Llama3Config;
-use alice_llm::{apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter};
+use alice_llm::{
+    apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter,
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -153,8 +155,12 @@ struct ChatCompletionRequest {
     _stream: bool,
 }
 
-fn default_max_tokens() -> usize { 2048 }
-fn default_top_k() -> usize { 40 }
+fn default_max_tokens() -> usize {
+    2048
+}
+fn default_top_k() -> usize {
+    40
+}
 
 #[derive(Serialize)]
 struct CompletionResponse {
@@ -246,7 +252,10 @@ fn generate(
 ) -> Result<(String, usize, usize, u64, String), StatusCode> {
     let prompt_tokens = state.tokenizer.encode(prompt_text);
 
-    let mut model = state.model.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut model = state
+        .model
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     model.reset();
 
     // Prefill
@@ -290,7 +299,13 @@ fn generate(
     let decode_ms = t_decode.elapsed().as_millis() as u64;
     let text = state.tokenizer.decode(&generated);
 
-    Ok((text, prompt_tokens.len(), generated.len(), decode_ms, finish_reason))
+    Ok((
+        text,
+        prompt_tokens.len(),
+        generated.len(),
+        decode_ms,
+        finish_reason,
+    ))
 }
 
 fn make_req_id() -> String {
@@ -332,10 +347,19 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Json<CompletionResponse>, StatusCode> {
-    let (text, n_prompt, n_gen, decode_ms, finish_reason) =
-        generate(&state, &req.prompt, req.max_tokens, req.temperature, req.top_k)?;
+    let (text, n_prompt, n_gen, decode_ms, finish_reason) = generate(
+        &state,
+        &req.prompt,
+        req.max_tokens,
+        req.temperature,
+        req.top_k,
+    )?;
 
-    let tps = if decode_ms > 0 { n_gen as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 };
+    let tps = if decode_ms > 0 {
+        n_gen as f64 / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
 
     Ok(Json(CompletionResponse {
         id: make_req_id(),
@@ -364,7 +388,11 @@ async fn chat_completions(
     let (text, n_prompt, n_gen, decode_ms, finish_reason) =
         generate(&state, &prompt, req.max_tokens, req.temperature, req.top_k)?;
 
-    let tps = if decode_ms > 0 { n_gen as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 };
+    let tps = if decode_ms > 0 {
+        n_gen as f64 / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
 
     Ok(Json(ChatCompletionResponse {
         id: make_req_id(),
@@ -421,11 +449,16 @@ fn main() {
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
 
     // Auto-detect model config from GGUF metadata
-    let llm_config = Llama3Config::from_gguf(&gguf).expect("Failed to detect model config from GGUF");
+    let llm_config =
+        Llama3Config::from_gguf(&gguf).expect("Failed to detect model config from GGUF");
     println!(
         "  arch: {:?}, layers: {}, hidden: {}, heads: {}/{}, vocab: {}",
-        llm_config.arch, llm_config.num_layers, llm_config.hidden_dim,
-        llm_config.num_heads, llm_config.num_kv_heads, llm_config.vocab_size,
+        llm_config.arch,
+        llm_config.num_layers,
+        llm_config.hidden_dim,
+        llm_config.num_heads,
+        llm_config.num_kv_heads,
+        llm_config.vocab_size,
     );
 
     let config = GpuModelConfig {
@@ -447,11 +480,15 @@ fn main() {
     };
 
     if llm_config.is_hybrid() {
-        let n_attn = (0..llm_config.num_layers).filter(|i| !llm_config.is_deltanet_layer(*i)).count();
+        let n_attn = (0..llm_config.num_layers)
+            .filter(|i| !llm_config.is_deltanet_layer(*i))
+            .count();
         let n_delta = llm_config.num_layers - n_attn;
         println!(
             "  hybrid: {} DeltaNet + {} Attention (interval={})",
-            n_delta, n_attn, llm_config.full_attention_interval.unwrap_or(0),
+            n_delta,
+            n_attn,
+            llm_config.full_attention_interval.unwrap_or(0),
         );
     }
 
@@ -476,7 +513,10 @@ fn main() {
     let engine = GpuEngine::new();
     let model = GpuModel::load(engine, &gguf, config);
     let vocab_size = model.vocab_size();
-    println!("Model ready: {}ms (vocab={vocab_size})", t0.elapsed().as_millis());
+    println!(
+        "Model ready: {}ms (vocab={vocab_size})",
+        t0.elapsed().as_millis()
+    );
 
     let model_name = std::path::Path::new(&model_path)
         .file_stem()
@@ -508,7 +548,9 @@ fn main() {
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind");
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .expect("Failed to bind");
         axum::serve(listener, app).await.expect("Server error");
     });
 }

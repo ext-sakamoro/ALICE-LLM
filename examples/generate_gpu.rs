@@ -9,7 +9,9 @@
 //!     --model path/to/model.gguf --prompt "Hello" --max-tokens 128 --temperature 0.8
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
-use alice_llm::{sample_argmax, apply_temperature, top_k_filter, softmax_inplace, sample_with_random};
+use alice_llm::{
+    apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter,
+};
 use std::io::Write;
 use std::time::Instant;
 
@@ -45,7 +47,11 @@ fn main() {
         let data = std::fs::read(&model_path).expect("Failed to read GGUF file");
         let gguf = GgufFile::parse(&data).expect("Failed to parse GGUF");
         let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
-        println!("  GGUF parsed: {}ms (vocab={})", t0.elapsed().as_millis(), tokenizer.vocab_size());
+        println!(
+            "  GGUF parsed: {}ms (vocab={})",
+            t0.elapsed().as_millis(),
+            tokenizer.vocab_size()
+        );
 
         // --- Model config (Llama-3.2-1B) ---
         let config = GpuModelConfig {
@@ -145,7 +151,11 @@ fn main() {
         );
         println!(
             "Avg: {:.1}ms/token (decode only), position={}",
-            if n_gen > 0 { decode_ms as f64 / n_gen as f64 } else { 0.0 },
+            if n_gen > 0 {
+                decode_ms as f64 / n_gen as f64
+            } else {
+                0.0
+            },
             model.position(),
         );
     }

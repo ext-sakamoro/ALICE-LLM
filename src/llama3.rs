@@ -4,7 +4,11 @@
 //! (Logit Softcapping). Performs inference directly on Q4_K_M/Q8_0
 //! quantized data via fused dequantize+matvec.
 
-use crate::gguf::{quantized_matvec, quantized_matvec_preq, quantize_row_q8_k, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, TernaryMatrix, ternary_matvec, SparseTernaryMatrix, sparse_ternary_matvec};
+use crate::gguf::{
+    quantize_row_q8_k, quantized_matvec, quantized_matvec_preq, sparse_ternary_matvec,
+    ternary_matvec, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, SparseTernaryMatrix,
+    TernaryMatrix,
+};
 use std::time::Instant;
 
 // ─── Model architecture ─────────────────────────────────────────────────────
@@ -115,18 +119,19 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.context_length"))
             .unwrap_or(8192) as usize;
         let max_seq_len = max_seq_len.min(8192);
-        let vocab_size = gguf
-            .meta_u32(&format!("{prefix}.vocab_size"))
-            .or_else(|| {
-                gguf.meta("tokenizer.ggml.tokens")
-                    .and_then(|v| match v {
-                        crate::gguf::MetaValue::Array(arr) => Some(arr.len() as u32),
-                        _ => None,
-                    })
-            })? as usize;
+        let vocab_size = gguf.meta_u32(&format!("{prefix}.vocab_size")).or_else(|| {
+            gguf.meta("tokenizer.ggml.tokens").and_then(|v| match v {
+                crate::gguf::MetaValue::Array(arr) => Some(arr.len() as u32),
+                _ => None,
+            })
+        })? as usize;
         let rope_theta = gguf
             .meta_f32(&format!("{prefix}.rope.freq_base"))
-            .unwrap_or(if arch == ModelArch::Mistral { 1_000_000.0 } else { 500_000.0 });
+            .unwrap_or(if arch == ModelArch::Mistral {
+                1_000_000.0
+            } else {
+                500_000.0
+            });
         let norm_eps = gguf
             .meta_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
@@ -138,10 +143,8 @@ impl Llama3Config {
             .map(|v| v as usize);
 
         // Gemma-2: logit softcapping
-        let attn_logit_softcap = gguf
-            .meta_f32(&format!("{prefix}.attn_logit_softcapping"));
-        let final_logit_softcap = gguf
-            .meta_f32(&format!("{prefix}.final_logit_softcapping"));
+        let attn_logit_softcap = gguf.meta_f32(&format!("{prefix}.attn_logit_softcapping"));
+        let final_logit_softcap = gguf.meta_f32(&format!("{prefix}.final_logit_softcapping"));
 
         // Qwen3.5 DeltaNet hybrid fields
         let full_attention_interval = gguf
@@ -325,7 +328,7 @@ impl KvPage {
 /// Pages are allocated on demand (no upfront max_seq_len allocation).
 #[allow(dead_code)]
 struct PagedKvCache {
-    pages: Vec<Vec<KvPage>>,  // pages[layer][page_idx]
+    pages: Vec<Vec<KvPage>>, // pages[layer][page_idx]
     num_layers: usize,
     kv_dim: usize,
     seq_len: usize,
@@ -335,7 +338,12 @@ struct PagedKvCache {
 impl PagedKvCache {
     fn new(num_layers: usize, kv_dim: usize) -> Self {
         let pages = (0..num_layers).map(|_| Vec::new()).collect();
-        Self { pages, num_layers, kv_dim, seq_len: 0 }
+        Self {
+            pages,
+            num_layers,
+            kv_dim,
+            seq_len: 0,
+        }
     }
 
     fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
@@ -350,9 +358,13 @@ impl PagedKvCache {
         page.used += 1;
     }
 
-    fn advance(&mut self) { self.seq_len += 1; }
+    fn advance(&mut self) {
+        self.seq_len += 1;
+    }
 
-    fn seq_len(&self) -> usize { self.seq_len }
+    fn seq_len(&self) -> usize {
+        self.seq_len
+    }
 
     #[inline]
     fn key_at(&self, layer: usize, pos: usize) -> &[f32] {
@@ -373,7 +385,11 @@ impl PagedKvCache {
     fn rollback_to(&mut self, pos: usize) {
         self.seq_len = pos;
         for layer_pages in &mut self.pages {
-            let needed = if pos == 0 { 0 } else { (pos - 1) / PAGE_SIZE + 1 };
+            let needed = if pos == 0 {
+                0
+            } else {
+                (pos - 1) / PAGE_SIZE + 1
+            };
             layer_pages.truncate(needed);
             if let Some(last) = layer_pages.last_mut() {
                 let rem = pos % PAGE_SIZE;
@@ -419,7 +435,10 @@ pub struct BatchScheduler {
 
 impl BatchScheduler {
     pub fn new() -> Self {
-        Self { requests: Vec::new(), next_id: 0 }
+        Self {
+            requests: Vec::new(),
+            next_id: 0,
+        }
     }
 
     /// Add a new request. Returns the request ID.
@@ -493,11 +512,21 @@ fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
 /// `freq_factors` has `head_dim / 2` entries — base frequency is divided by each factor.
 /// freq[i] = (1/theta^(2i/d)) / freq_factors[i]
 /// (llama.cpp convention: higher factor = slower rotation = longer effective context)
-fn apply_rope_scaled(vec: &mut [f32], position: usize, head_dim: usize, theta: f32, freq_factors: &[f32]) {
+fn apply_rope_scaled(
+    vec: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_factors: &[f32],
+) {
     for i in (0..head_dim).step_by(2) {
         let freq_idx = i / 2;
         let base_freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
-        let factor = if freq_idx < freq_factors.len() { freq_factors[freq_idx] } else { 1.0 };
+        let factor = if freq_idx < freq_factors.len() {
+            freq_factors[freq_idx]
+        } else {
+            1.0
+        };
         let freq = base_freq / factor;
         let angle = position as f32 * freq;
         let (sin_val, cos_val) = angle.sin_cos();
@@ -510,7 +539,13 @@ fn apply_rope_scaled(vec: &mut [f32], position: usize, head_dim: usize, theta: f
 
 /// Apply RoPE: uses per-dimension freq scaling if available, otherwise scalar theta.
 #[inline]
-fn apply_rope_auto(vec: &mut [f32], position: usize, head_dim: usize, theta: f32, freq_scales: Option<&[f32]>) {
+fn apply_rope_auto(
+    vec: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scales: Option<&[f32]>,
+) {
     match freq_scales {
         Some(s) => apply_rope_scaled(vec, position, head_dim, theta, s),
         None => apply_rope(vec, position, head_dim, theta),
@@ -684,7 +719,9 @@ impl<'a> WeightRef<'a> {
 
     /// Matvec with pre-quantized Q8_K input (avoids redundant quantization).
     fn matvec_preq(&self, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
-        quantized_matvec_preq(self.data, self.qtype, self.rows, self.cols, q8_blocks, output);
+        quantized_matvec_preq(
+            self.data, self.qtype, self.rows, self.cols, q8_blocks, output,
+        );
     }
 
     /// Dequantize all weights to f32 (row-major, rows × cols).
@@ -820,7 +857,7 @@ fn mode_bits(mode: LayerQuantMode) -> f32 {
         LayerQuantMode::SparseTernary { n_keep } => {
             // Effective bits: ternary base (1.58) × density ratio
             let density = n_keep as f32 / 16.0; // SPARSE_BLOCK = 16
-            // Plus mask overhead: 32 bits per block of 16 = 2 bits/param
+                                                // Plus mask overhead: 32 bits per block of 16 = 2 bits/param
             density * 1.58 + 2.0 * (1.0 / 16.0) // mask amortized
         }
     }
@@ -881,8 +918,17 @@ impl<'a> Llama3Model<'a> {
         let output_norm = gguf.tensor_to_f32("output_norm.weight")?;
 
         // Output projection (fallback to tied embedding if output.weight absent)
-        let output_proj = load_weight_ref(gguf, "output.weight", config.vocab_size, config.hidden_dim)
-            .or_else(|| load_weight_ref(gguf, "token_embd.weight", config.vocab_size, config.hidden_dim))?;
+        let output_proj =
+            load_weight_ref(gguf, "output.weight", config.vocab_size, config.hidden_dim).or_else(
+                || {
+                    load_weight_ref(
+                        gguf,
+                        "token_embd.weight",
+                        config.vocab_size,
+                        config.hidden_dim,
+                    )
+                },
+            )?;
 
         // Layers
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -897,15 +943,20 @@ impl<'a> Llama3Model<'a> {
         // RoPE frequency scaling tensor (Llama-3.1/3.2 NTK-aware context extension)
         // Values are scaling factors: actual_freq[i] = base_freq[i] * scale[i]
         // scale=1.0 means no change, scale>1 means faster rotation (extended context)
-        let rope_freqs: Option<Vec<f32>> = gguf.tensor_to_f32("rope_freqs.weight").and_then(|scales| {
-            let half_dim = config.head_dim / 2;
-            if scales.len() != half_dim {
-                return None;
-            }
-            // Only use if any scale differs from 1.0 (i.e., non-trivial scaling)
-            let needs_scaling = scales.iter().any(|&s| (s - 1.0).abs() > 0.01);
-            if needs_scaling { Some(scales) } else { None }
-        });
+        let rope_freqs: Option<Vec<f32>> =
+            gguf.tensor_to_f32("rope_freqs.weight").and_then(|scales| {
+                let half_dim = config.head_dim / 2;
+                if scales.len() != half_dim {
+                    return None;
+                }
+                // Only use if any scale differs from 1.0 (i.e., non-trivial scaling)
+                let needs_scaling = scales.iter().any(|&s| (s - 1.0).abs() > 0.01);
+                if needs_scaling {
+                    Some(scales)
+                } else {
+                    None
+                }
+            });
 
         Some(Self {
             config,
@@ -933,14 +984,39 @@ impl<'a> Llama3Model<'a> {
             eprint!("  Ternarizing layer {i}/{} ...\r", c.num_layers);
             ternary_layers.push(TernaryLayerWeights {
                 attn_norm: layer.attn_norm.clone(),
-                q_proj: ternarize_weight(&layer.q_proj, c.hidden_dim, c.hidden_dim, threshold_ratio),
+                q_proj: ternarize_weight(
+                    &layer.q_proj,
+                    c.hidden_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
                 k_proj: ternarize_weight(&layer.k_proj, kv_dim, c.hidden_dim, threshold_ratio),
                 v_proj: ternarize_weight(&layer.v_proj, kv_dim, c.hidden_dim, threshold_ratio),
-                o_proj: ternarize_weight(&layer.o_proj, c.hidden_dim, c.hidden_dim, threshold_ratio),
+                o_proj: ternarize_weight(
+                    &layer.o_proj,
+                    c.hidden_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
                 ffn_norm: layer.ffn_norm.clone(),
-                gate_proj: ternarize_weight(&layer.gate_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio),
-                up_proj: ternarize_weight(&layer.up_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio),
-                down_proj: ternarize_weight(&layer.down_proj, c.hidden_dim, c.intermediate_dim, threshold_ratio),
+                gate_proj: ternarize_weight(
+                    &layer.gate_proj,
+                    c.intermediate_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
+                up_proj: ternarize_weight(
+                    &layer.up_proj,
+                    c.intermediate_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
+                down_proj: ternarize_weight(
+                    &layer.down_proj,
+                    c.hidden_dim,
+                    c.intermediate_dim,
+                    threshold_ratio,
+                ),
             });
         }
         eprintln!("  Ternarized {}/{} layers", c.num_layers, c.num_layers);
@@ -996,11 +1072,23 @@ impl<'a> Llama3Model<'a> {
             // Apply RoPE
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             // Store K, V in cache
@@ -1008,9 +1096,16 @@ impl<'a> Llama3Model<'a> {
 
             // GQA attention (supports SWA + logit softcapping)
             gqa_attention(
-                &q_buf, &self.kv_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             // Output projection
@@ -1039,7 +1134,6 @@ impl<'a> Llama3Model<'a> {
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
             }
-
         }
 
         // Advance KV cache position (all layers have appended for this token)
@@ -1107,19 +1201,38 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
 
             gqa_attention(
-                &q_buf, &self.kv_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             layer.o_proj.matvec(&attn_out, &mut o_buf);
@@ -1190,8 +1303,7 @@ impl<'a> Llama3Model<'a> {
 
             // Top-k + argmax sampling
             let next_token = if top_k > 0 && top_k < logits.len() {
-                let mut indexed: Vec<(usize, f32)> =
-                    logits.iter().copied().enumerate().collect();
+                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 indexed.truncate(top_k);
 
@@ -1359,7 +1471,9 @@ impl<'a> Llama3Model<'a> {
                     }
                     let resampled = if adj_sum > 0.0 {
                         let inv = 1.0 / adj_sum;
-                        for a in &mut adjusted { *a *= inv; }
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
                         sample_from_probs(&adjusted, rng.next_f32())
                     } else {
                         sample_from_probs(&p, rng.next_f32())
@@ -1529,7 +1643,9 @@ impl<'a> Llama3Model<'a> {
                     }
                     let resampled = if adj_sum > 0.0 {
                         let inv = 1.0 / adj_sum;
-                        for a in &mut adjusted { *a *= inv; }
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
                         sample_from_probs(&adjusted, rng.next_f32())
                     } else {
                         sample_from_probs(&p, rng.next_f32())
@@ -1594,8 +1710,14 @@ impl<'a> Llama3Model<'a> {
     /// Forward pass using ternary-quantized weights (no multiplications in projections).
     /// Must call `load_ternary()` before using this method.
     pub fn forward_ternary(&mut self, token_id: u32) -> Vec<f32> {
-        let ternary_layers = self.ternary_layers.as_ref().expect("call load_ternary() first");
-        let ternary_output = self.ternary_output_proj.as_ref().expect("call load_ternary() first");
+        let ternary_layers = self
+            .ternary_layers
+            .as_ref()
+            .expect("call load_ternary() first");
+        let ternary_output = self
+            .ternary_output_proj
+            .as_ref()
+            .expect("call load_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -1626,19 +1748,38 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
 
             gqa_attention(
-                &q_buf, &self.kv_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             ternary_matvec(&tl.o_proj, &attn_out, &mut o_buf);
@@ -1740,28 +1881,83 @@ impl<'a> Llama3Model<'a> {
             eprint!("  Sparse-ternarizing layer {i}/{} ...\r", c.num_layers);
             layers.push(SparseTernaryLayerWeights {
                 attn_norm: layer.attn_norm.clone(),
-                q_proj: sparsify_weight(&layer.q_proj, c.hidden_dim, c.hidden_dim, threshold_ratio, n_keep),
-                k_proj: sparsify_weight(&layer.k_proj, kv_dim, c.hidden_dim, threshold_ratio, n_keep),
-                v_proj: sparsify_weight(&layer.v_proj, kv_dim, c.hidden_dim, threshold_ratio, n_keep),
-                o_proj: sparsify_weight(&layer.o_proj, c.hidden_dim, c.hidden_dim, threshold_ratio, n_keep),
+                q_proj: sparsify_weight(
+                    &layer.q_proj,
+                    c.hidden_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
+                k_proj: sparsify_weight(
+                    &layer.k_proj,
+                    kv_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
+                v_proj: sparsify_weight(
+                    &layer.v_proj,
+                    kv_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
+                o_proj: sparsify_weight(
+                    &layer.o_proj,
+                    c.hidden_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
                 ffn_norm: layer.ffn_norm.clone(),
-                gate_proj: sparsify_weight(&layer.gate_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio, n_keep),
-                up_proj: sparsify_weight(&layer.up_proj, c.intermediate_dim, c.hidden_dim, threshold_ratio, n_keep),
-                down_proj: sparsify_weight(&layer.down_proj, c.hidden_dim, c.intermediate_dim, threshold_ratio, n_keep),
+                gate_proj: sparsify_weight(
+                    &layer.gate_proj,
+                    c.intermediate_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
+                up_proj: sparsify_weight(
+                    &layer.up_proj,
+                    c.intermediate_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
+                down_proj: sparsify_weight(
+                    &layer.down_proj,
+                    c.hidden_dim,
+                    c.intermediate_dim,
+                    threshold_ratio,
+                    n_keep,
+                ),
             });
         }
-        eprintln!("  Sparse-ternarized {}/{} layers ({}:16)", c.num_layers, c.num_layers, n_keep);
+        eprintln!(
+            "  Sparse-ternarized {}/{} layers ({}:16)",
+            c.num_layers, c.num_layers, n_keep
+        );
 
         self.sparse_ternary_output = Some(sparsify_weight(
-            &self.output_proj, c.vocab_size, c.hidden_dim, threshold_ratio, n_keep,
+            &self.output_proj,
+            c.vocab_size,
+            c.hidden_dim,
+            threshold_ratio,
+            n_keep,
         ));
         self.sparse_ternary_layers = Some(layers);
     }
 
     /// Forward pass using sparse ternary weights (block-packed, SDOT+LUT optimized).
     pub fn forward_sparse_ternary(&mut self, token_id: u32) -> Vec<f32> {
-        let st_layers = self.sparse_ternary_layers.as_ref().expect("call load_sparse_ternary() first");
-        let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
+        let st_layers = self
+            .sparse_ternary_layers
+            .as_ref()
+            .expect("call load_sparse_ternary() first");
+        let st_output = self
+            .sparse_ternary_output
+            .as_ref()
+            .expect("call load_sparse_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -1791,19 +1987,38 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
 
             gqa_attention(
-                &q_buf, &self.kv_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             sparse_ternary_matvec(&sl.o_proj, &attn_out, &mut o_buf);
@@ -1835,8 +2050,14 @@ impl<'a> Llama3Model<'a> {
 
     /// Draft forward pass using sparse ternary weights (first N layers only).
     fn forward_sparse_ternary_draft(&mut self, token_id: u32, draft_layers: usize) -> Vec<f32> {
-        let st_layers = self.sparse_ternary_layers.as_ref().expect("call load_sparse_ternary() first");
-        let st_output = self.sparse_ternary_output.as_ref().expect("call load_sparse_ternary() first");
+        let st_layers = self
+            .sparse_ternary_layers
+            .as_ref()
+            .expect("call load_sparse_ternary() first");
+        let st_output = self
+            .sparse_ternary_output
+            .as_ref()
+            .expect("call load_sparse_ternary() first");
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -1867,19 +2088,38 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
 
             gqa_attention(
-                &q_buf, &self.kv_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             sparse_ternary_matvec(&sl.o_proj, &attn_out, &mut o_buf);
@@ -2010,7 +2250,9 @@ impl<'a> Llama3Model<'a> {
                     }
                     let resampled = if adj_sum > 0.0 {
                         let inv = 1.0 / adj_sum;
-                        for a in &mut adjusted { *a *= inv; }
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
                         sample_from_probs(&adjusted, rng.next_f32())
                     } else {
                         sample_from_probs(&p, rng.next_f32())
@@ -2098,19 +2340,38 @@ impl<'a> Llama3Model<'a> {
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut q_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
             for h in 0..c.num_kv_heads {
                 let start = h * c.head_dim;
-                apply_rope_auto(&mut k_buf[start..start + c.head_dim], pos, c.head_dim, c.rope_theta, rope_freqs_ref);
+                apply_rope_auto(
+                    &mut k_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                );
             }
 
             paged_cache.append(layer_idx, &k_buf, &v_buf);
 
             gqa_attention_paged(
-                &q_buf, paged_cache, layer_idx, pos,
-                c.num_heads, c.num_kv_heads, c.head_dim,
-                c.sliding_window, c.attn_logit_softcap, &mut attn_out,
+                &q_buf,
+                paged_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window,
+                c.attn_logit_softcap,
+                &mut attn_out,
             );
 
             layer.o_proj.matvec(&attn_out, &mut o_buf);
@@ -2179,7 +2440,9 @@ impl<'a> Llama3Model<'a> {
 
         // Sample first token from prefill logits
         for (i, req) in scheduler.requests_mut().iter_mut().enumerate() {
-            if req.done { continue; }
+            if req.done {
+                continue;
+            }
             if let Some(ref logits) = pending_logits[i] {
                 let next_token = sample_token(logits, req.temperature, top_k);
                 if next_token == tokenizer.eos_id {
@@ -2285,7 +2548,13 @@ struct Rng64 {
 
 impl Rng64 {
     fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed } }
+        Self {
+            state: if seed == 0 {
+                0xDEAD_BEEF_CAFE_BABEu64
+            } else {
+                seed
+            },
+        }
     }
 
     /// Returns a uniform f32 in [0, 1).
@@ -2327,11 +2596,22 @@ pub struct SpecStats {
 
 // ─── Weight loading helpers ─────────────────────────────────────────────────
 
-fn ternarize_weight(w: &WeightRef<'_>, rows: usize, cols: usize, threshold_ratio: f32) -> TernaryMatrix {
+fn ternarize_weight(
+    w: &WeightRef<'_>,
+    rows: usize,
+    cols: usize,
+    threshold_ratio: f32,
+) -> TernaryMatrix {
     TernaryMatrix::from_quantized(w.data, w.qtype, rows, cols, threshold_ratio)
 }
 
-fn sparsify_weight(w: &WeightRef<'_>, rows: usize, cols: usize, threshold_ratio: f32, n_keep: usize) -> SparseTernaryMatrix {
+fn sparsify_weight(
+    w: &WeightRef<'_>,
+    rows: usize,
+    cols: usize,
+    threshold_ratio: f32,
+    n_keep: usize,
+) -> SparseTernaryMatrix {
     // Dequantize to f32 then convert to sparse ternary with N:M sparsity
     let weights_f32 = w.dequantize_all(rows, cols);
     SparseTernaryMatrix::from_f32_weights(&weights_f32, rows, cols, threshold_ratio, n_keep)
@@ -2637,7 +2917,10 @@ mod tests {
 
         let q4k_bytes = (total_params as f64 * 0.6) / 1e9;
         // Should be around 4.5-5.5 GB
-        assert!(q4k_bytes > 3.0 && q4k_bytes < 7.0, "Q4_K estimate: {q4k_bytes:.1} GB");
+        assert!(
+            q4k_bytes > 3.0 && q4k_bytes < 7.0,
+            "Q4_K estimate: {q4k_bytes:.1} GB"
+        );
     }
 
     #[test]
@@ -2667,7 +2950,10 @@ mod tests {
         let mp = MixedPrecisionConfig::target_10gb(80); // 70B = 80 layers
         assert_eq!(mp.layer_configs.len(), 80);
         assert_eq!(mp.get(0).attention_mode, LayerQuantMode::Ternary);
-        assert_eq!(mp.get(0).ffn_mode, LayerQuantMode::SparseTernary { n_keep: 8 });
+        assert_eq!(
+            mp.get(0).ffn_mode,
+            LayerQuantMode::SparseTernary { n_keep: 8 }
+        );
     }
 
     #[test]
@@ -2675,7 +2961,10 @@ mod tests {
         // Full ternary: 1.58 bits/param
         let mp_ternary = MixedPrecisionConfig::uniform(LayerQuantConfig::full_ternary(), 32);
         let bits_ternary = mp_ternary.estimate_bits_per_param();
-        assert!((bits_ternary - 1.58).abs() < 0.01, "full ternary: {bits_ternary}");
+        assert!(
+            (bits_ternary - 1.58).abs() < 0.01,
+            "full ternary: {bits_ternary}"
+        );
 
         // Aggressive: attn=1.58 (30%), FFN=sparse (70%) → should be < 1.58
         let mp_aggressive = MixedPrecisionConfig::target_10gb(32);
@@ -2699,9 +2988,7 @@ mod tests {
             "bits/param={bpp}, should be < 1.58 for 10GB target"
         );
         // Print for visibility
-        eprintln!(
-            "70B estimate: {bpp:.3} bits/param → {model_size_gb:.1} GB (target: <10 GB)"
-        );
+        eprintln!("70B estimate: {bpp:.3} bits/param → {model_size_gb:.1} GB (target: <10 GB)");
     }
 
     #[test]
