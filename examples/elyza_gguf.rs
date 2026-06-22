@@ -104,7 +104,15 @@ fn main() {
     let result = if ternary {
         model.generate_ternary(&tokenizer, &formatted, max_tokens, temperature, 40)
     } else if spec_k > 0 {
-        model.generate_speculative(&tokenizer, &formatted, max_tokens, temperature, 40, spec_k, draft_layers)
+        model.generate_speculative(
+            &tokenizer,
+            &formatted,
+            max_tokens,
+            temperature,
+            40,
+            spec_k,
+            draft_layers,
+        )
     } else {
         model.generate(&tokenizer, &formatted, max_tokens, temperature, 40)
     };
@@ -128,7 +136,11 @@ fn main() {
         };
         println!(
             "Speculation: {}/{} drafts accepted ({:.0}%), K={}, draft_layers={}",
-            stats.accepted_tokens, stats.draft_tokens, accept_rate, stats.spec_k, stats.draft_layers
+            stats.accepted_tokens,
+            stats.draft_tokens,
+            accept_rate,
+            stats.spec_k,
+            stats.draft_layers
         );
     }
 }

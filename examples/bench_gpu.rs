@@ -1,4 +1,4 @@
-use alice_llm::gguf::{GgufFile, GgmlType};
+use alice_llm::gguf::{GgmlType, GgufFile};
 use std::fs;
 use std::time::Instant;
 
@@ -6,9 +6,9 @@ use std::time::Instant;
 use alice_llm::gpu::GpuEngine;
 
 fn main() {
-    let model_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/Users/ys/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string());
+    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
+        "/Users/ys/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
+    });
 
     println!("Loading model: {model_path}");
     let data = fs::read(&model_path).unwrap();
@@ -36,18 +36,30 @@ fn main() {
         tensor_data.len() / 1024
     );
 
-    let input: Vec<f32> = (0..cols)
-        .map(|i| (i as f32 * 0.0001).sin() * 0.1)
-        .collect();
+    let input: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.0001).sin() * 0.1).collect();
 
     // --- CPU benchmark ---
     let mut cpu_output = vec![0.0f32; rows];
-    alice_llm::gguf::quantized_matvec(&input, tensor_data, GgmlType::Q4_K, rows, cols, &mut cpu_output);
+    alice_llm::gguf::quantized_matvec(
+        &input,
+        tensor_data,
+        GgmlType::Q4_K,
+        rows,
+        cols,
+        &mut cpu_output,
+    );
 
     let n_iter = 100;
     let t0 = Instant::now();
     for _ in 0..n_iter {
-        alice_llm::gguf::quantized_matvec(&input, tensor_data, GgmlType::Q4_K, rows, cols, &mut cpu_output);
+        alice_llm::gguf::quantized_matvec(
+            &input,
+            tensor_data,
+            GgmlType::Q4_K,
+            rows,
+            cols,
+            &mut cpu_output,
+        );
     }
     let cpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
     println!("\nCPU matvec: {cpu_us:.0} µs/iter ({n_iter} iters)");
@@ -93,11 +105,23 @@ fn main() {
 
         let readback_overhead = gpu_readback_us - gpu_dispatch_us;
 
-        println!("\nGPU kernel (batch):  {gpu_kernel_us:.0} µs/iter  ({:.2}x vs CPU)", cpu_us / gpu_kernel_us);
-        println!("GPU dispatch+submit: {gpu_dispatch_us:.0} µs/iter  ({:.2}x vs CPU)", cpu_us / gpu_dispatch_us);
-        println!("GPU with readback:   {gpu_readback_us:.0} µs/iter  ({:.2}x vs CPU)", cpu_us / gpu_readback_us);
+        println!(
+            "\nGPU kernel (batch):  {gpu_kernel_us:.0} µs/iter  ({:.2}x vs CPU)",
+            cpu_us / gpu_kernel_us
+        );
+        println!(
+            "GPU dispatch+submit: {gpu_dispatch_us:.0} µs/iter  ({:.2}x vs CPU)",
+            cpu_us / gpu_dispatch_us
+        );
+        println!(
+            "GPU with readback:   {gpu_readback_us:.0} µs/iter  ({:.2}x vs CPU)",
+            cpu_us / gpu_readback_us
+        );
         println!("Readback overhead:   {readback_overhead:.0} µs/iter");
-        println!("\n=> Full-pipeline GPU (batch) would run at {:.2}x CPU speed", cpu_us / gpu_kernel_us);
+        println!(
+            "\n=> Full-pipeline GPU (batch) would run at {:.2}x CPU speed",
+            cpu_us / gpu_kernel_us
+        );
 
         // --- Correctness ---
         println!("\nCorrectness (first 5):");
@@ -113,7 +137,10 @@ fn main() {
         for i in 0..rows {
             max_diff = max_diff.max((cpu_output[i] - gpu_output[i]).abs());
         }
-        println!("Max diff: {max_diff:.6} — {}", if max_diff < 0.1 { "PASS" } else { "FAIL" });
+        println!(
+            "Max diff: {max_diff:.6} — {}",
+            if max_diff < 0.1 { "PASS" } else { "FAIL" }
+        );
     }
 
     #[cfg(not(feature = "gpu"))]

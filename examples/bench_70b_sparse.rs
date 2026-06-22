@@ -6,10 +6,7 @@
 //! Usage:
 //!   cargo run --release --example bench_70b_sparse --features "gguf,parallel"
 
-use alice_llm::gguf::{
-    SparseTernaryMatrix, SparseTernaryRow, SPARSE_BLOCK,
-    sparse_ternary_matvec,
-};
+use alice_llm::gguf::{sparse_ternary_matvec, SparseTernaryMatrix, SparseTernaryRow, SPARSE_BLOCK};
 use std::time::Instant;
 
 /// Llama-3 70B config
@@ -69,7 +66,12 @@ fn make_sparse_matrix(rows: usize, cols: usize, n_keep: usize) -> SparseTernaryM
         });
     }
 
-    SparseTernaryMatrix::from_rows(mat_rows, rows, cols, 1.0 - (n_keep as f32 / SPARSE_BLOCK as f32))
+    SparseTernaryMatrix::from_rows(
+        mat_rows,
+        rows,
+        cols,
+        1.0 - (n_keep as f32 / SPARSE_BLOCK as f32),
+    )
 }
 
 fn bench_matvec(name: &str, matrix: &SparseTernaryMatrix, input: &[f32], iters: usize) -> f64 {
@@ -107,7 +109,10 @@ fn main() {
     println!("  Hidden: {HIDDEN_DIM}, Heads: {NUM_HEADS}, KV Heads: {NUM_KV_HEADS}");
     println!("  FFN intermediate: {INTERMEDIATE_DIM}");
     println!("  Layers: {NUM_LAYERS}");
-    println!("  Sparsity: {N_KEEP}:16 ({:.0}% density)", N_KEEP as f32 / 16.0 * 100.0);
+    println!(
+        "  Sparsity: {N_KEEP}:16 ({:.0}% density)",
+        N_KEEP as f32 / 16.0 * 100.0
+    );
     println!();
 
     let kv_dim = NUM_KV_HEADS * HEAD_DIM; // 1024
@@ -116,12 +121,12 @@ fn main() {
     println!("Generating sparse ternary weights for 1 layer...");
     let gen_start = Instant::now();
 
-    let q_proj = make_sparse_matrix(HIDDEN_DIM, HIDDEN_DIM, N_KEEP);    // 8192×8192
-    let k_proj = make_sparse_matrix(kv_dim, HIDDEN_DIM, N_KEEP);        // 1024×8192
-    let v_proj = make_sparse_matrix(kv_dim, HIDDEN_DIM, N_KEEP);        // 1024×8192
-    let o_proj = make_sparse_matrix(HIDDEN_DIM, HIDDEN_DIM, N_KEEP);    // 8192×8192
+    let q_proj = make_sparse_matrix(HIDDEN_DIM, HIDDEN_DIM, N_KEEP); // 8192×8192
+    let k_proj = make_sparse_matrix(kv_dim, HIDDEN_DIM, N_KEEP); // 1024×8192
+    let v_proj = make_sparse_matrix(kv_dim, HIDDEN_DIM, N_KEEP); // 1024×8192
+    let o_proj = make_sparse_matrix(HIDDEN_DIM, HIDDEN_DIM, N_KEEP); // 8192×8192
     let gate_proj = make_sparse_matrix(INTERMEDIATE_DIM, HIDDEN_DIM, N_KEEP); // 28672×8192
-    let up_proj = make_sparse_matrix(INTERMEDIATE_DIM, HIDDEN_DIM, N_KEEP);   // 28672×8192
+    let up_proj = make_sparse_matrix(INTERMEDIATE_DIM, HIDDEN_DIM, N_KEEP); // 28672×8192
     let down_proj = make_sparse_matrix(HIDDEN_DIM, INTERMEDIATE_DIM, N_KEEP); // 8192×28672
 
     let gen_ms = gen_start.elapsed().as_millis();
@@ -144,7 +149,10 @@ fn main() {
     println!();
     println!("=== Memory ===");
     println!("  1 layer (sparse ternary): {layer_mb:.1} MB");
-    println!("  {NUM_LAYERS} layers: {:.1} GB", layer_mb * NUM_LAYERS as f64 / 1024.0);
+    println!(
+        "  {NUM_LAYERS} layers: {:.1} GB",
+        layer_mb * NUM_LAYERS as f64 / 1024.0
+    );
     println!("  Full model estimate (+ embedding): {model_gb:.1} GB");
 
     // Benchmark
@@ -152,7 +160,9 @@ fn main() {
     println!("=== Matvec Benchmark (1 layer) ===");
 
     let hidden_input: Vec<f32> = (0..HIDDEN_DIM).map(|i| (i as f32 * 0.001).sin()).collect();
-    let ffn_input: Vec<f32> = (0..INTERMEDIATE_DIM).map(|i| (i as f32 * 0.001).cos()).collect();
+    let ffn_input: Vec<f32> = (0..INTERMEDIATE_DIM)
+        .map(|i| (i as f32 * 0.001).cos())
+        .collect();
 
     let iters = 5; // Few iters since each is expensive
 
@@ -177,15 +187,18 @@ fn main() {
     // Bandwidth analysis
     // Each matvec reads: active weights (masks) + input vector
     // Sparse ternary: 4 bytes per block (active_mask + sign_mask) + scale per row
-    let bytes_per_token = layer_bytes as f64 * NUM_LAYERS as f64
-        + HIDDEN_DIM as f64 * 4.0 * NUM_LAYERS as f64 * 7.0; // input vectors
+    let bytes_per_token =
+        layer_bytes as f64 * NUM_LAYERS as f64 + HIDDEN_DIM as f64 * 4.0 * NUM_LAYERS as f64 * 7.0; // input vectors
     let bandwidth_gb_s = bytes_per_token / (token_ms / 1000.0) / 1e9;
 
     println!("=== Bandwidth Analysis ===");
     println!("  Data read per token: {:.1} GB", bytes_per_token / 1e9);
     println!("  Effective bandwidth: {bandwidth_gb_s:.1} GB/s");
     println!("  M1 Pro theoretical:  200 GB/s");
-    println!("  Utilization:         {:.0}%", bandwidth_gb_s / 200.0 * 100.0);
+    println!(
+        "  Utilization:         {:.0}%",
+        bandwidth_gb_s / 200.0 * 100.0
+    );
     println!();
 
     // Comparison table
@@ -223,14 +236,20 @@ fn main() {
     //   → effective_tok_s = (1 + k*α) / (token_ms + k*draft_ms + token_ms) * 1000
 
     let configs = [
-        (4, 8, 0.6),   // spec_k=4, draft_layers=8 (10%), acceptance=60%
-        (4, 16, 0.5),  // spec_k=4, draft_layers=16 (20%), acceptance=50%
-        (3, 8, 0.7),   // spec_k=3, draft_layers=8 (10%), acceptance=70%
-        (4, 8, 0.8),   // spec_k=4, draft_layers=8 (10%), acceptance=80% (optimistic)
+        (4, 8, 0.6),  // spec_k=4, draft_layers=8 (10%), acceptance=60%
+        (4, 16, 0.5), // spec_k=4, draft_layers=16 (20%), acceptance=50%
+        (3, 8, 0.7),  // spec_k=3, draft_layers=8 (10%), acceptance=70%
+        (4, 8, 0.8),  // spec_k=4, draft_layers=8 (10%), acceptance=80% (optimistic)
     ];
 
-    println!("  {:>6} {:>12} {:>10} {:>12} {:>10}", "spec_k", "draft_layers", "accept_α", "eff. tok/s", "speedup");
-    println!("  {:>6} {:>12} {:>10} {:>12} {:>10}", "------", "------------", "--------", "----------", "-------");
+    println!(
+        "  {:>6} {:>12} {:>10} {:>12} {:>10}",
+        "spec_k", "draft_layers", "accept_α", "eff. tok/s", "speedup"
+    );
+    println!(
+        "  {:>6} {:>12} {:>10} {:>12} {:>10}",
+        "------", "------------", "--------", "----------", "-------"
+    );
     for (k, draft_layers, alpha) in &configs {
         let draft_ms = token_ms * (*draft_layers as f64) / (NUM_LAYERS as f64);
         // Per speculation cycle:
@@ -243,7 +262,14 @@ fn main() {
         let output_tokens = 1.0 + (*k as f64) * alpha;
         let eff_tps = output_tokens / cycle_cost_ms * 1000.0;
         let speedup = eff_tps / tok_per_sec;
-        println!("  {:>6} {:>12} {:>10.0}% {:>10.2} {:>9.1}x", k, draft_layers, alpha * 100.0, eff_tps, speedup);
+        println!(
+            "  {:>6} {:>12} {:>10.0}% {:>10.2} {:>9.1}x",
+            k,
+            draft_layers,
+            alpha * 100.0,
+            eff_tps,
+            speedup
+        );
     }
 
     println!();

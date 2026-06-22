@@ -8,7 +8,12 @@ fn main() {
     let gguf = GgufFile::parse(&data).unwrap();
 
     // Print tensor types to verify Q3_K is present
-    let tensors = ["blk.0.attn_q.weight", "blk.0.ffn_gate.weight", "blk.0.attn_k.weight", "token_embd.weight"];
+    let tensors = [
+        "blk.0.attn_q.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.attn_k.weight",
+        "token_embd.weight",
+    ];
     for name in &tensors {
         if let Some(info) = gguf.tensor_info(name) {
             println!("  {name}: {:?} dims={:?}", info.qtype, info.dims);
@@ -23,7 +28,10 @@ fn main() {
     let prompt = "<|start_header_id|>user<|end_header_id|>\n\nWhat is 1+1?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     let result = model.generate(&tok, prompt, 30, 0.0, 40);
     println!("Greedy: \"{}\"", result.text);
-    println!("{} tokens, {:.1} tok/s", result.tokens_generated, result.tokens_per_sec);
+    println!(
+        "{} tokens, {:.1} tok/s",
+        result.tokens_generated, result.tokens_per_sec
+    );
 
     // Try with temperature
     model.clear_cache();

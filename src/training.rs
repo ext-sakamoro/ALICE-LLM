@@ -43,7 +43,11 @@ pub fn ternarize_weights(weights: &mut [f32], ratio: f32) -> f32 {
         }
     }
 
-    let scale = if count > 0 { (sum_abs / count as f64) as f32 } else { 1.0 };
+    let scale = if count > 0 {
+        (sum_abs / count as f64) as f32
+    } else {
+        1.0
+    };
 
     for w in weights.iter_mut() {
         let t = ternarize(*w, thresh);

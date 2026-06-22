@@ -56,14 +56,22 @@ fn main() {
     let mut model = Llama3Model::from_gguf(&gguf).expect("Failed to load model");
     let load_ms = load_start.elapsed().as_millis();
     println!("  Loaded in {load_ms}ms");
-    println!("  Config: hidden={}, heads={}, kv_heads={}, layers={}",
-        model.config.hidden_dim, model.config.num_heads,
-        model.config.num_kv_heads, model.config.num_layers);
+    println!(
+        "  Config: hidden={}, heads={}, kv_heads={}, layers={}",
+        model.config.hidden_dim,
+        model.config.num_heads,
+        model.config.num_kv_heads,
+        model.config.num_layers
+    );
     println!("  Vocab: {}", tokenizer.vocab_size());
     println!();
 
     // Run benchmark
-    println!("Running {}/{} prompts, max_tokens={max_tokens}", PROMPTS.len(), PROMPTS.len());
+    println!(
+        "Running {}/{} prompts, max_tokens={max_tokens}",
+        PROMPTS.len(),
+        PROMPTS.len()
+    );
     println!("{}", "=".repeat(60));
 
     let mut total_tokens = 0usize;
@@ -82,8 +90,7 @@ fn main() {
         println!("  → {}", result.text.chars().take(200).collect::<String>());
         println!(
             "  {} tok, {:.1} tok/s, prefill={}ms, decode={}ms",
-            result.tokens_generated, result.tokens_per_sec,
-            result.prefill_ms, result.decode_ms
+            result.tokens_generated, result.tokens_per_sec, result.prefill_ms, result.decode_ms
         );
 
         total_tokens += result.tokens_generated;

@@ -14,7 +14,7 @@
 //!     --prompt "Hello" --max-tokens 128
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
-use alice_llm::{sample_argmax, softmax, sample_with_random};
+use alice_llm::{sample_argmax, sample_with_random, softmax};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,7 +26,9 @@ const EOT_ID: u32 = 128009;
 
 struct Rng64(u64);
 impl Rng64 {
-    fn new(seed: u64) -> Self { Self(seed) }
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
     fn next_f32(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -35,10 +37,13 @@ impl Rng64 {
     }
 }
 
-fn is_stop(tok: u32, eos: u32) -> bool { tok == eos || tok == EOT_ID }
+fn is_stop(tok: u32, eos: u32) -> bool {
+    tok == eos || tok == EOT_ID
+}
 
 fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
-    args.iter().position(|a| a == flag)
+    args.iter()
+        .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
 }
@@ -138,7 +143,9 @@ fn main() {
         let mut baseline_tokens: Vec<u32> = Vec::new();
         for _ in 0..max_tokens {
             let next = sample_argmax(&logits) as u32;
-            if is_stop(next, tokenizer.eos_id) { break; }
+            if is_stop(next, tokenizer.eos_id) {
+                break;
+            }
             baseline_tokens.push(next);
             logits = verifier.forward_and_read(next);
         }
@@ -148,8 +155,14 @@ fn main() {
         println!("---");
         let base_tps = if base_ms > 0 {
             baseline_tokens.len() as f64 / (base_ms as f64 / 1000.0)
-        } else { 0.0 };
-        println!("{} tokens, {:.1} tok/s ({base_ms}ms)\n", baseline_tokens.len(), base_tps);
+        } else {
+            0.0
+        };
+        println!(
+            "{} tokens, {:.1} tok/s ({base_ms}ms)\n",
+            baseline_tokens.len(),
+            base_tps
+        );
 
         // ======================================================
         // Speculative: 1B draft + 8B batch-4 verify
@@ -180,7 +193,9 @@ fn main() {
         'outer: while spec_tokens.len() < max_tokens {
             // Sample current token from draft's logits
             let current_token = sample_argmax(&draft_prev_logits) as u32;
-            if is_stop(current_token, tokenizer.eos_id) { break; }
+            if is_stop(current_token, tokenizer.eos_id) {
+                break;
+            }
             spec_tokens.push(current_token);
 
             let remaining = max_tokens - spec_tokens.len();
@@ -250,7 +265,9 @@ fn main() {
                     }
                     let resampled = if adj_sum > 0.0 {
                         let inv = 1.0 / adj_sum;
-                        for a in &mut adjusted { *a *= inv; }
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
                         sample_with_random(&adjusted, rng.next_f32()) as u32
                     } else {
                         sample_with_random(&p, rng.next_f32()) as u32
@@ -299,13 +316,18 @@ fn main() {
         println!("---");
         let spec_tps = if spec_ms > 0 {
             spec_tokens.len() as f64 / (spec_ms as f64 / 1000.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let accept_rate = if total_drafted > 0 {
             total_accepted as f64 / total_drafted as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         println!(
             "{} tokens, {:.1} tok/s ({spec_ms}ms)",
-            spec_tokens.len(), spec_tps,
+            spec_tokens.len(),
+            spec_tps,
         );
         println!(
             "Speculation: {total_accepted}/{total_drafted} accepted ({accept_rate:.0}%), {total_rounds} rounds\n"
@@ -313,9 +335,21 @@ fn main() {
 
         // --- Summary ---
         println!("=== Summary ===");
-        let speedup = if base_tps > 0.0 { spec_tps / base_tps } else { 0.0 };
-        println!("8B Baseline:    {:.1} tok/s ({base_ms}ms, {} tokens)", base_tps, baseline_tokens.len());
-        println!("1B+8B Speculative: {:.1} tok/s ({spec_ms}ms, {} tokens)", spec_tps, spec_tokens.len());
+        let speedup = if base_tps > 0.0 {
+            spec_tps / base_tps
+        } else {
+            0.0
+        };
+        println!(
+            "8B Baseline:    {:.1} tok/s ({base_ms}ms, {} tokens)",
+            base_tps,
+            baseline_tokens.len()
+        );
+        println!(
+            "1B+8B Speculative: {:.1} tok/s ({spec_ms}ms, {} tokens)",
+            spec_tps,
+            spec_tokens.len()
+        );
         println!("Speedup:        {speedup:.2}×");
         println!("Accept rate:    {accept_rate:.0}% ({total_accepted}/{total_drafted})");
     }

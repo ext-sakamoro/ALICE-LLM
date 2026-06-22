@@ -1,0 +1,6 @@
+# Rust toolchain pin (feedback_clippy_rust_version_drift 準拠)
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+

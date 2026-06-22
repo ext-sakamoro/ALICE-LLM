@@ -541,19 +541,21 @@ fn dequantize_q2_k(data: &[u8], out: &mut [f32]) {
 fn q3k_decode_scales(sc: &[u8]) -> [i32; 16] {
     let mut scales = [0i32; 16];
     for j in 0..4 {
-        scales[j]      = (sc[j]     & 0xF) as i32;
-        scales[j + 4]  = (sc[j]     >> 4)  as i32;
-        scales[j + 8]  = (sc[j + 4] & 0xF) as i32;
-        scales[j + 12] = (sc[j + 4] >> 4)  as i32;
+        scales[j] = (sc[j] & 0xF) as i32;
+        scales[j + 4] = (sc[j] >> 4) as i32;
+        scales[j + 8] = (sc[j + 4] & 0xF) as i32;
+        scales[j + 12] = (sc[j + 4] >> 4) as i32;
     }
     for j in 0..4 {
         let hi = sc[8 + j];
-        scales[j]      |= (( hi       & 3) as i32) << 4;
-        scales[j + 4]  |= (((hi >> 2) & 3) as i32) << 4;
-        scales[j + 8]  |= (((hi >> 4) & 3) as i32) << 4;
+        scales[j] |= ((hi & 3) as i32) << 4;
+        scales[j + 4] |= (((hi >> 2) & 3) as i32) << 4;
+        scales[j + 8] |= (((hi >> 4) & 3) as i32) << 4;
         scales[j + 12] |= (((hi >> 6) & 3) as i32) << 4;
     }
-    for s in &mut scales { *s -= 32; }
+    for s in &mut scales {
+        *s -= 32;
+    }
     scales
 }
 
@@ -720,17 +722,18 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
                 let is = l / 16; // matches llama.cpp: is = l/16
                 let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
                 let q2 =
-                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8
-                        - 32;
-                let q3 =
-                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
                 let q4 =
                     ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
 
                 out[out_idx + l] = d * f32::from(scales[sc_off + is] as i8) * f32::from(q1);
-                out[out_idx + l + 32] = d * f32::from(scales[sc_off + is + 2] as i8) * f32::from(q2);
-                out[out_idx + l + 64] = d * f32::from(scales[sc_off + is + 4] as i8) * f32::from(q3);
-                out[out_idx + l + 96] = d * f32::from(scales[sc_off + is + 6] as i8) * f32::from(q4);
+                out[out_idx + l + 32] =
+                    d * f32::from(scales[sc_off + is + 2] as i8) * f32::from(q2);
+                out[out_idx + l + 64] =
+                    d * f32::from(scales[sc_off + is + 4] as i8) * f32::from(q3);
+                out[out_idx + l + 96] =
+                    d * f32::from(scales[sc_off + is + 6] as i8) * f32::from(q4);
             }
             out_idx += 128;
             ql_off += 64;
@@ -745,9 +748,9 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
 /// Q8_K block: intermediate quantization format for input vectors.
 /// Matches llama.cpp's `block_q8_K` exactly.
 pub struct BlockQ8K {
-    pub d: f32,              // scale factor (f32, not f16)
-    pub qs: [i8; QK_K],     // 256 quantized values
-    pub bsums: [i16; 16],   // pre-computed sums of groups of 16
+    pub d: f32,           // scale factor (f32, not f16)
+    pub qs: [i8; QK_K],   // 256 quantized values
+    pub bsums: [i16; 16], // pre-computed sums of groups of 16
 }
 
 /// Round to nearest integer using the same algorithm as llama.cpp's `nearest_int`.
@@ -973,9 +976,24 @@ mod neon_dot {
         const KMASK3: u32 = 0x0303_0303;
 
         let mut utmp = [0u32; 4];
-        utmp[0] = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
-        utmp[1] = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
-        utmp[2] = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        utmp[0] = u32::from_le_bytes([
+            scale_bytes[0],
+            scale_bytes[1],
+            scale_bytes[2],
+            scale_bytes[3],
+        ]);
+        utmp[1] = u32::from_le_bytes([
+            scale_bytes[4],
+            scale_bytes[5],
+            scale_bytes[6],
+            scale_bytes[7],
+        ]);
+        utmp[2] = u32::from_le_bytes([
+            scale_bytes[8],
+            scale_bytes[9],
+            scale_bytes[10],
+            scale_bytes[11],
+        ]);
 
         utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
         let uaux = utmp[1] & KMASK1;
@@ -1012,9 +1030,13 @@ fn q4k_q8k_dot_scalar(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let mut a_off = 0usize;
     let mut q4_off = 0usize;
     for _ in 0..4 {
-        for l in 0..32 { aux8[a_off + l] = (q4[q4_off + l] & 0xF) as i8; }
+        for l in 0..32 {
+            aux8[a_off + l] = (q4[q4_off + l] & 0xF) as i8;
+        }
         a_off += 32;
-        for l in 0..32 { aux8[a_off + l] = (q4[q4_off + l] >> 4) as i8; }
+        for l in 0..32 {
+            aux8[a_off + l] = (q4[q4_off + l] >> 4) as i8;
+        }
         a_off += 32;
         q4_off += 32;
     }
@@ -1030,13 +1052,17 @@ fn q4k_q8k_dot_scalar(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     utmp[2] = uaux;
     utmp[0] &= KMASK1;
 
-    let s0 = utmp[0].to_le_bytes(); let s1 = utmp[1].to_le_bytes();
-    let m0 = utmp[2].to_le_bytes(); let m1 = utmp[3].to_le_bytes();
-    let scales = [s0[0],s0[1],s0[2],s0[3],s1[0],s1[1],s1[2],s1[3]];
-    let mins = [m0[0],m0[1],m0[2],m0[3],m1[0],m1[1],m1[2],m1[3]];
+    let s0 = utmp[0].to_le_bytes();
+    let s1 = utmp[1].to_le_bytes();
+    let m0 = utmp[2].to_le_bytes();
+    let m1 = utmp[3].to_le_bytes();
+    let scales = [s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]];
+    let mins = [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3]];
 
     let mut sumi = 0i32;
-    for j in 0..16 { sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32; }
+    for j in 0..16 {
+        sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
+    }
 
     let mut aux32 = [0i32; 8];
     let mut a_idx = 0usize;
@@ -1047,14 +1073,17 @@ fn q4k_q8k_dot_scalar(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             for l in 0..8 {
                 aux32[l] += scale * (q8k.qs[q8_idx + l] as i32 * aux8[a_idx + l] as i32);
             }
-            q8_idx += 8; a_idx += 8;
+            q8_idx += 8;
+            a_idx += 8;
         }
     }
 
     let d_all = d * q8k.d;
     let dmin_all = dmin * q8k.d;
     let mut sumf = 0.0f32;
-    for l in 0..8 { sumf += d_all * aux32[l] as f32; }
+    for l in 0..8 {
+        sumf += d_all * aux32[l] as f32;
+    }
     sumf -= dmin_all * sumi as f32;
     sumf
 }
@@ -1083,7 +1112,9 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             aux8[a_off + l + 96] =
                 ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
         }
-        a_off += 128; ql_off += 64; qh_off += 32;
+        a_off += 128;
+        ql_off += 64;
+        qh_off += 32;
     }
 
     let mut aux32 = [0i32; 8];
@@ -1095,13 +1126,16 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             for l in 0..8 {
                 aux32[l] += scale * (q8k.qs[q8_idx + l] as i32 * aux8[a_idx + l] as i32);
             }
-            q8_idx += 8; a_idx += 8;
+            q8_idx += 8;
+            a_idx += 8;
         }
     }
 
     let d_all = d * q8k.d;
     let mut sumf = 0.0f32;
-    for l in 0..8 { sumf += d_all * aux32[l] as f32; }
+    for l in 0..8 {
+        sumf += d_all * aux32[l] as f32;
+    }
     sumf
 }
 
@@ -1136,13 +1170,17 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
     utmp[2] = uaux;
     utmp[0] &= KMASK1;
-    let s0 = utmp[0].to_le_bytes(); let s1 = utmp[1].to_le_bytes();
-    let m0 = utmp[2].to_le_bytes(); let m1 = utmp[3].to_le_bytes();
-    let scales = [s0[0],s0[1],s0[2],s0[3],s1[0],s1[1],s1[2],s1[3]];
-    let mins = [m0[0],m0[1],m0[2],m0[3],m1[0],m1[1],m1[2],m1[3]];
+    let s0 = utmp[0].to_le_bytes();
+    let s1 = utmp[1].to_le_bytes();
+    let m0 = utmp[2].to_le_bytes();
+    let m1 = utmp[3].to_le_bytes();
+    let scales = [s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]];
+    let mins = [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3]];
 
     let mut sumi = 0i32;
-    for j in 0..16 { sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32; }
+    for j in 0..16 {
+        sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
+    }
 
     let mut total = 0i32;
     for is in 0..8 {
@@ -1180,7 +1218,9 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             aux8[a_off + l + 96] =
                 ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
         }
-        a_off += 128; ql_off += 64; qh_off += 32;
+        a_off += 128;
+        ql_off += 64;
+        qh_off += 32;
     }
 
     let mut total = 0i32;
@@ -1317,7 +1357,13 @@ pub fn q2k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 
 /// Q2_K matvec with pre-quantized Q8_K input.
 #[allow(unused_variables)]
-pub fn q2k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+pub fn q2k_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 84;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1329,7 +1375,10 @@ pub fn q2k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             let mut sumf = 0.0f32;
             for bi in 0..blocks_per_row {
-                sumf += q2k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+                sumf += q2k_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
             }
             *out = sumf;
         });
@@ -1341,7 +1390,10 @@ pub fn q2k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
         let mut sumf = 0.0f32;
         for bi in 0..blocks_per_row {
-            sumf += q2k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            sumf += q2k_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
         }
         output[row] = sumf;
     }
@@ -1355,7 +1407,13 @@ pub fn q5k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 
 /// Q5_K matvec with pre-quantized Q8_K input.
 #[allow(unused_variables)]
-pub fn q5k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+pub fn q5k_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 176;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1367,7 +1425,10 @@ pub fn q5k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             let mut sumf = 0.0f32;
             for bi in 0..blocks_per_row {
-                sumf += q5k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+                sumf += q5k_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
             }
             *out = sumf;
         });
@@ -1379,7 +1440,10 @@ pub fn q5k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
         let mut sumf = 0.0f32;
         for bi in 0..blocks_per_row {
-            sumf += q5k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            sumf += q5k_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
         }
         output[row] = sumf;
     }
@@ -1393,7 +1457,13 @@ pub fn q3k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 
 /// Q3_K matvec with pre-quantized Q8_K input.
 #[allow(unused_variables)]
-pub fn q3k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+pub fn q3k_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 110;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1405,7 +1475,10 @@ pub fn q3k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             let mut sumf = 0.0f32;
             for bi in 0..blocks_per_row {
-                sumf += q3k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+                sumf += q3k_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
             }
             *out = sumf;
         });
@@ -1417,7 +1490,10 @@ pub fn q3k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
         let mut sumf = 0.0f32;
         for bi in 0..blocks_per_row {
-            sumf += q3k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            sumf += q3k_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
         }
         output[row] = sumf;
     }
@@ -1431,7 +1507,13 @@ pub fn q4k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 
 /// Q4_K matvec with pre-quantized Q8_K input (avoids redundant quantization).
 #[allow(unused_variables)]
-pub fn q4k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+pub fn q4k_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 144;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1443,7 +1525,10 @@ pub fn q4k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             let mut sumf = 0.0f32;
             for bi in 0..blocks_per_row {
-                sumf += q4k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+                sumf += q4k_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
             }
             *out = sumf;
         });
@@ -1455,7 +1540,10 @@ pub fn q4k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
         let mut sumf = 0.0f32;
         for bi in 0..blocks_per_row {
-            sumf += q4k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            sumf += q4k_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
         }
         output[row] = sumf;
     }
@@ -1522,7 +1610,13 @@ pub fn q6k_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: 
 
 /// Q6_K matvec with pre-quantized Q8_K input.
 #[allow(unused_variables)]
-pub fn q6k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[BlockQ8K], output: &mut [f32]) {
+pub fn q6k_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
     let blocks_per_row = cols / QK_K;
     let block_bytes = 210;
     let row_bytes = blocks_per_row * block_bytes;
@@ -1534,7 +1628,10 @@ pub fn q6k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             let mut sumf = 0.0f32;
             for bi in 0..blocks_per_row {
-                sumf += q6k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+                sumf += q6k_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
             }
             *out = sumf;
         });
@@ -1546,7 +1643,10 @@ pub fn q6k_matvec_preq(data: &[u8], rows: usize, cols: usize, q8_blocks: &[Block
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
         let mut sumf = 0.0f32;
         for bi in 0..blocks_per_row {
-            sumf += q6k_q8k_dot(&row_data[bi * block_bytes..(bi + 1) * block_bytes], &q8_blocks[bi]);
+            sumf += q6k_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
         }
         output[row] = sumf;
     }
@@ -1896,7 +1996,12 @@ impl TernaryRow {
             0.0
         };
 
-        Self { pos_mask, neg_mask, scale, num_cols }
+        Self {
+            pos_mask,
+            neg_mask,
+            scale,
+            num_cols,
+        }
     }
 }
 
@@ -1945,7 +2050,11 @@ impl TernaryMatrix {
             rows.push(TernaryRow::from_f32(&row_f32, threshold_ratio));
         }
 
-        Self { rows, num_rows, num_cols }
+        Self {
+            rows,
+            num_rows,
+            num_cols,
+        }
     }
 }
 
@@ -1959,12 +2068,9 @@ fn ternary_matvec_impl(rows: &[TernaryRow], input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(r, out)| {
-                *out = ternary_dot_row(&rows[r], input);
-            });
+        output.par_iter_mut().enumerate().for_each(|(r, out)| {
+            *out = ternary_dot_row(&rows[r], input);
+        });
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -2070,8 +2176,8 @@ impl SparseTernaryRow {
                 let global = base + i;
                 let byte_idx = global / 8;
                 let bit = 1u8 << (global % 8);
-                let is_nonzero = (row.pos_mask[byte_idx] & bit) != 0
-                    || (row.neg_mask[byte_idx] & bit) != 0;
+                let is_nonzero =
+                    (row.pos_mask[byte_idx] & bit) != 0 || (row.neg_mask[byte_idx] & bit) != 0;
                 if is_nonzero {
                     candidates.push((i, original_weights[global].abs()));
                 }
@@ -2101,7 +2207,13 @@ impl SparseTernaryRow {
             row.scale
         };
 
-        Self { active_masks, sign_masks, scale, num_cols, num_blocks }
+        Self {
+            active_masks,
+            sign_masks,
+            scale,
+            num_cols,
+            num_blocks,
+        }
     }
 
     /// Create directly from f32 weights with N:M structured sparsity.
@@ -2112,7 +2224,10 @@ impl SparseTernaryRow {
 
     /// Count of non-zero elements.
     pub fn nnz(&self) -> usize {
-        self.active_masks.iter().map(|m| m.count_ones() as usize).sum()
+        self.active_masks
+            .iter()
+            .map(|m| m.count_ones() as usize)
+            .sum()
     }
 
     /// Effective bits per parameter (including the 2-byte masks per block overhead).
@@ -2130,7 +2245,12 @@ impl SparseTernaryRow {
 impl SparseTernaryMatrix {
     /// Build from Vec of SparseTernaryRows, packing into flat contiguous buffer.
     /// Also precomputes packed 2-bit weights for LUT-based expansion.
-    pub fn from_rows(rows: Vec<SparseTernaryRow>, num_rows: usize, num_cols: usize, target_sparsity: f32) -> Self {
+    pub fn from_rows(
+        rows: Vec<SparseTernaryRow>,
+        num_rows: usize,
+        num_cols: usize,
+        target_sparsity: f32,
+    ) -> Self {
         let blocks_per_row = (num_cols + SPARSE_BLOCK - 1) / SPARSE_BLOCK;
         let stride = blocks_per_row * 2;
         let mut mask_buf = vec![0u16; num_rows * stride];
@@ -2160,7 +2280,13 @@ impl SparseTernaryMatrix {
                         let is_active = (active >> bit) & 1;
                         let is_sign = (sign >> bit) & 1;
                         // 00=0, 01=+1, 11=-1
-                        let code = if is_active == 0 { 0u8 } else if is_sign == 0 { 1 } else { 3 };
+                        let code = if is_active == 0 {
+                            0u8
+                        } else if is_sign == 0 {
+                            1
+                        } else {
+                            3
+                        };
                         packed_byte |= code << (j * 2);
                     }
                     packed_2bit[pack_base + blk * bytes_per_block + byte_idx] = packed_byte;
@@ -2181,7 +2307,8 @@ impl SparseTernaryMatrix {
                     let r = r_base + lane;
                     if r < num_rows {
                         let src_off = r * blocks_per_row * bytes_per_block + blk * bytes_per_block;
-                        let dst_off = g * group_bytes + blk * 4 * bytes_per_block + lane * bytes_per_block;
+                        let dst_off =
+                            g * group_bytes + blk * 4 * bytes_per_block + lane * bytes_per_block;
                         packed_blocked[dst_off..dst_off + bytes_per_block]
                             .copy_from_slice(&packed_2bit[src_off..src_off + bytes_per_block]);
                     }
@@ -2189,7 +2316,16 @@ impl SparseTernaryMatrix {
             }
         }
 
-        Self { mask_buf, packed_2bit, packed_blocked, scales, num_rows, num_cols, blocks_per_row, target_sparsity }
+        Self {
+            mask_buf,
+            packed_2bit,
+            packed_blocked,
+            scales,
+            num_rows,
+            num_cols,
+            blocks_per_row,
+            target_sparsity,
+        }
     }
 
     /// Convert a dense TernaryMatrix to sparse, enforcing N:M structured sparsity.
@@ -2199,7 +2335,9 @@ impl SparseTernaryMatrix {
         n_keep: usize,
     ) -> Self {
         let target_sparsity = 1.0 - (n_keep as f32 / SPARSE_BLOCK as f32);
-        let rows: Vec<SparseTernaryRow> = dense.rows.iter()
+        let rows: Vec<SparseTernaryRow> = dense
+            .rows
+            .iter()
             .zip(original_weights_per_row.iter())
             .map(|(row, orig)| SparseTernaryRow::from_ternary_row(row, orig, n_keep))
             .collect();
@@ -2218,7 +2356,11 @@ impl SparseTernaryMatrix {
         let mut rows = Vec::with_capacity(num_rows);
         for r in 0..num_rows {
             let row_data = &weights[r * num_cols..(r + 1) * num_cols];
-            rows.push(SparseTernaryRow::from_f32(row_data, threshold_ratio, n_keep));
+            rows.push(SparseTernaryRow::from_f32(
+                row_data,
+                threshold_ratio,
+                n_keep,
+            ));
         }
         Self::from_rows(rows, num_rows, num_cols, target_sparsity)
     }
@@ -2261,7 +2403,10 @@ impl SparseTernaryMatrix {
 
     /// Estimated memory in bytes (masks + packed_2bit + packed_blocked + scales).
     pub fn memory_bytes(&self) -> usize {
-        self.mask_buf.len() * 2 + self.packed_2bit.len() + self.packed_blocked.len() + self.scales.len() * 4
+        self.mask_buf.len() * 2
+            + self.packed_2bit.len()
+            + self.packed_blocked.len()
+            + self.scales.len() * 4
     }
 }
 
@@ -2297,7 +2442,11 @@ fn quantize_activation_i8(input: &[f32]) -> (Vec<i8>, f32) {
 /// vmaxvq_f32 for abs-max, vcvtnq_s32_f32 + vqmovn for narrowing.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn quantize_activation_i8_neon(input: &[f32], n: usize, padded_len: usize) -> (Vec<i8>, f32) {
+unsafe fn quantize_activation_i8_neon(
+    input: &[f32],
+    n: usize,
+    padded_len: usize,
+) -> (Vec<i8>, f32) {
     use std::arch::aarch64::*;
 
     // 1. Find abs max using NEON pairwise max
@@ -2383,8 +2532,11 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
                 while pos + 4 <= chunk.len() {
                     unsafe {
                         sparse_ternary_microkernel_4row_sdot(
-                            matrix, &act_i8, act_scale,
-                            &mut chunk[pos..pos + 4], row_start + pos,
+                            matrix,
+                            &act_i8,
+                            act_scale,
+                            &mut chunk[pos..pos + 4],
+                            row_start + pos,
                         );
                     }
                     pos += 4;
@@ -2392,9 +2544,8 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
                 // Tail rows (1-3)
                 while pos < chunk.len() {
                     unsafe {
-                        chunk[pos] = sparse_ternary_dot_sdot(
-                            matrix, &act_i8, act_scale, row_start + pos,
-                        );
+                        chunk[pos] =
+                            sparse_ternary_dot_sdot(matrix, &act_i8, act_scale, row_start + pos);
                     }
                     pos += 1;
                 }
@@ -2408,7 +2559,11 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
         while r + 4 <= rows {
             unsafe {
                 sparse_ternary_microkernel_4row_sdot(
-                    matrix, &act_i8, act_scale, &mut output[r..r + 4], r,
+                    matrix,
+                    &act_i8,
+                    act_scale,
+                    &mut output[r..r + 4],
+                    r,
                 );
             }
             r += 4;
@@ -2426,12 +2581,9 @@ pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
-            output
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(r, out)| {
-                    *out = sparse_ternary_dot_flat(matrix, r, input);
-                });
+            output.par_iter_mut().enumerate().for_each(|(r, out)| {
+                *out = sparse_ternary_dot_flat(matrix, r, input);
+            });
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -2472,7 +2624,8 @@ unsafe fn sparse_ternary_dot_sdot(
     // LUT constants — live in registers across all blocks
     let lut = vld1q_s8([0i8, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_ptr());
     let replicate_idx = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
-    let shift_amounts = vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
+    let shift_amounts =
+        vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
     let mask_03 = vdupq_n_u8(0x03);
 
     // Branchless loop: LUT expand + sdot
@@ -2481,7 +2634,10 @@ unsafe fn sparse_ternary_dot_sdot(
         let aq = vld1q_s8(act_i8.as_ptr().add(blk * SPARSE_BLOCK));
         let w = expand_packed_2bit_lut(
             packed.as_ptr().add(blk * bytes_per_block),
-            lut, replicate_idx, shift_amounts, mask_03,
+            lut,
+            replicate_idx,
+            shift_amounts,
+            mask_03,
         );
         acc = sdot_s32(acc, w, aq);
     }
@@ -2519,7 +2675,8 @@ unsafe fn sparse_ternary_microkernel_4row_sdot(
     // LUT constants — live in registers across all blocks
     let lut = vld1q_s8([0i8, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_ptr());
     let replicate_idx = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
-    let shift_amounts = vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
+    let shift_amounts =
+        vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
     let mask_03 = vdupq_n_u8(0x03);
 
     // Block-packed pointer: group's data is contiguous
@@ -2540,13 +2697,31 @@ unsafe fn sparse_ternary_microkernel_4row_sdot(
         let w0 = expand_packed_2bit_lut(blk_base, lut, replicate_idx, shift_amounts, mask_03);
         acc0 = sdot_s32(acc0, w0, aq);
 
-        let w1 = expand_packed_2bit_lut(blk_base.add(bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
+        let w1 = expand_packed_2bit_lut(
+            blk_base.add(bytes_per_block),
+            lut,
+            replicate_idx,
+            shift_amounts,
+            mask_03,
+        );
         acc1 = sdot_s32(acc1, w1, aq);
 
-        let w2 = expand_packed_2bit_lut(blk_base.add(2 * bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
+        let w2 = expand_packed_2bit_lut(
+            blk_base.add(2 * bytes_per_block),
+            lut,
+            replicate_idx,
+            shift_amounts,
+            mask_03,
+        );
         acc2 = sdot_s32(acc2, w2, aq);
 
-        let w3 = expand_packed_2bit_lut(blk_base.add(3 * bytes_per_block), lut, replicate_idx, shift_amounts, mask_03);
+        let w3 = expand_packed_2bit_lut(
+            blk_base.add(3 * bytes_per_block),
+            lut,
+            replicate_idx,
+            shift_amounts,
+            mask_03,
+        );
         acc3 = sdot_s32(acc3, w3, aq);
     }
 
@@ -2677,7 +2852,10 @@ pub fn dequantize_weight_row(data: &[u8], qtype: GgmlType, out: &mut [f32]) {
         GgmlType::F32 => {
             for i in 0..out.len() {
                 out[i] = f32::from_le_bytes([
-                    data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3],
+                    data[i * 4],
+                    data[i * 4 + 1],
+                    data[i * 4 + 2],
+                    data[i * 4 + 3],
                 ]);
             }
         }
@@ -2732,10 +2910,18 @@ fn dequantize_row_q4k(data: &[u8], out: &mut [f32]) {
             for l in 0..32 {
                 let qi = if l < 16 {
                     let byte_idx = (is / 2) * 32 + l;
-                    if is % 2 == 0 { qs[byte_idx] & 0xF } else { qs[byte_idx] >> 4 }
+                    if is % 2 == 0 {
+                        qs[byte_idx] & 0xF
+                    } else {
+                        qs[byte_idx] >> 4
+                    }
                 } else {
                     let byte_idx = (is / 2) * 32 + 16 + (l - 16);
-                    if is % 2 == 0 { qs[byte_idx] & 0xF } else { qs[byte_idx] >> 4 }
+                    if is % 2 == 0 {
+                        qs[byte_idx] & 0xF
+                    } else {
+                        qs[byte_idx] >> 4
+                    }
                 };
                 out[blk * QK_K + off + l] = sc * qi as f32 - mn;
             }
@@ -2983,8 +3169,8 @@ mod tests {
     fn test_sparse_ternary_enforces_nm_sparsity() {
         // 16 weights, keep 4 per block (75% sparsity = 4:16)
         let weights: Vec<f32> = vec![
-            1.0, -2.0, 0.5, -0.1, 3.0, -0.3, 0.8, -0.05,
-            0.02, -1.5, 0.7, -0.9, 0.01, -0.4, 2.5, -0.6,
+            1.0, -2.0, 0.5, -0.1, 3.0, -0.3, 0.8, -0.05, 0.02, -1.5, 0.7, -0.9, 0.01, -0.4, 2.5,
+            -0.6,
         ];
         let row = SparseTernaryRow::from_f32(&weights, 0.1, 4);
         assert_eq!(row.active_masks[0].count_ones(), 4);
@@ -2995,20 +3181,19 @@ mod tests {
     fn test_sparse_ternary_matvec_matches_dense() {
         // Create a small matrix, compare sparse vs dense ternary matvec
         let weights = vec![
-            1.0, -2.0, 0.5, -0.1, 3.0, -0.3, 0.8, -0.05,
-            0.02, -1.5, 0.7, -0.9, 0.01, -0.4, 2.5, -0.6,
-            // Row 2
-            -1.0, 2.0, -0.5, 0.1, -3.0, 0.3, -0.8, 0.05,
-            -0.02, 1.5, -0.7, 0.9, -0.01, 0.4, -2.5, 0.6,
+            1.0, -2.0, 0.5, -0.1, 3.0, -0.3, 0.8, -0.05, 0.02, -1.5, 0.7, -0.9, 0.01, -0.4, 2.5,
+            -0.6, // Row 2
+            -1.0, 2.0, -0.5, 0.1, -3.0, 0.3, -0.8, 0.05, -0.02, 1.5, -0.7, 0.9, -0.01, 0.4, -2.5,
+            0.6,
         ];
         let num_rows = 2;
         let num_cols = 16;
 
         // Dense ternary (keep all)
         let dense = TernaryMatrix {
-            rows: (0..num_rows).map(|r| {
-                TernaryRow::from_f32(&weights[r * num_cols..(r + 1) * num_cols], 0.05)
-            }).collect(),
+            rows: (0..num_rows)
+                .map(|r| TernaryRow::from_f32(&weights[r * num_cols..(r + 1) * num_cols], 0.05))
+                .collect(),
             num_rows,
             num_cols,
         };
@@ -3016,8 +3201,9 @@ mod tests {
         // Sparse ternary (keep 16 = all, so should match dense)
         let sparse = SparseTernaryMatrix::from_f32_weights(&weights, num_rows, num_cols, 0.05, 16);
 
-        let input = vec![1.0, 0.5, -1.0, 2.0, 0.3, -0.7, 1.5, -0.2,
-                         0.8, -1.2, 0.4, 0.6, -0.9, 1.1, -0.3, 0.7];
+        let input = vec![
+            1.0, 0.5, -1.0, 2.0, 0.3, -0.7, 1.5, -0.2, 0.8, -1.2, 0.4, 0.6, -0.9, 1.1, -0.3, 0.7,
+        ];
         let mut dense_out = vec![0.0f32; num_rows];
         let mut sparse_out = vec![0.0f32; num_rows];
 
@@ -3030,7 +3216,9 @@ mod tests {
             let tol = dense_out[i].abs().max(0.01) * 0.05;
             assert!(
                 (dense_out[i] - sparse_out[i]).abs() < tol,
-                "row {i}: dense={} sparse={}", dense_out[i], sparse_out[i]
+                "row {i}: dense={} sparse={}",
+                dense_out[i],
+                sparse_out[i]
             );
         }
     }
@@ -3056,8 +3244,9 @@ mod tests {
     #[test]
     fn test_sparse_ternary_dot_correctness() {
         // Manual test: 16 weights, keep top-2, verify dot product
-        let weights = vec![0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0,
-                           0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let weights = vec![
+            0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
         let row = SparseTernaryRow::from_f32(&weights, 0.01, 2);
 
         // Only positions 3 (+5.0→+1) and 10 (-3.0→-1) should be active
@@ -3079,7 +3268,8 @@ mod tests {
         let expected = scale * 3.0;
         assert!(
             (output[0] - expected).abs() < expected.abs() * 0.05,
-            "result={}, expected={expected}", output[0]
+            "result={}, expected={expected}",
+            output[0]
         );
     }
 }

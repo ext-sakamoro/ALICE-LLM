@@ -22,6 +22,12 @@ fn main() {
     println!("\nGenerating 3 tokens...");
     let result = model.generate(&tokenizer, "Hello", 3, 0.0, 1);
     println!("Output: {:?}", result.text);
-    println!("Tokens: {}, Speed: {:.2} tok/s", result.tokens_generated, result.tokens_per_sec);
-    println!("Prefill: {}ms, Decode: {}ms", result.prefill_ms, result.decode_ms);
+    println!(
+        "Tokens: {}, Speed: {:.2} tok/s",
+        result.tokens_generated, result.tokens_per_sec
+    );
+    println!(
+        "Prefill: {}ms, Decode: {}ms",
+        result.prefill_ms, result.decode_ms
+    );
 }

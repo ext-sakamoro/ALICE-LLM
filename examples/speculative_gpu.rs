@@ -17,7 +17,7 @@
 //!     --prompt "The meaning of life is" --max-tokens 128
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
-use alice_llm::{sample_argmax, softmax, sample_with_random};
+use alice_llm::{sample_argmax, sample_with_random, softmax};
 use std::time::Instant;
 
 #[cfg(feature = "gpu")]
@@ -29,7 +29,9 @@ const EOT_ID: u32 = 128009; // <|eot_id|>
 /// Simple xorshift64 PRNG.
 struct Rng64(u64);
 impl Rng64 {
-    fn new(seed: u64) -> Self { Self(seed) }
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
     fn next_f32(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -107,7 +109,9 @@ fn main() {
         let mut baseline_tokens: Vec<u32> = Vec::new();
         for _ in 0..max_tokens {
             let next = sample_argmax(&logits) as u32;
-            if is_stop_token(next, tokenizer.eos_id) { break; }
+            if is_stop_token(next, tokenizer.eos_id) {
+                break;
+            }
             baseline_tokens.push(next);
             logits = model.forward_and_read(next);
         }
@@ -117,10 +121,13 @@ fn main() {
         println!("---");
         let baseline_tps = if baseline_ms > 0 {
             baseline_tokens.len() as f64 / (baseline_ms as f64 / 1000.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         println!(
             "{} tokens, {:.1} tok/s ({baseline_ms}ms)",
-            baseline_tokens.len(), baseline_tps,
+            baseline_tokens.len(),
+            baseline_tps,
         );
 
         // =====================================================
@@ -145,7 +152,9 @@ fn main() {
         'outer: while spec_tokens.len() < max_tokens {
             // Sample current token from logits
             let current_token = sample_argmax(&logits) as u32;
-            if is_stop_token(current_token, tokenizer.eos_id) { break; }
+            if is_stop_token(current_token, tokenizer.eos_id) {
+                break;
+            }
             spec_tokens.push(current_token);
 
             let remaining = max_tokens - spec_tokens.len();
@@ -216,7 +225,9 @@ fn main() {
                     }
                     let resampled = if adj_sum > 0.0 {
                         let inv = 1.0 / adj_sum;
-                        for a in &mut adjusted { *a *= inv; }
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
                         sample_with_random(&adjusted, rng.next_f32()) as u32
                     } else {
                         sample_with_random(&p, rng.next_f32()) as u32
@@ -262,13 +273,18 @@ fn main() {
         println!("---");
         let spec_tps = if spec_ms > 0 {
             spec_tokens.len() as f64 / (spec_ms as f64 / 1000.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let accept_rate = if total_drafted > 0 {
             total_accepted as f64 / total_drafted as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         println!(
             "{} tokens, {:.1} tok/s ({spec_ms}ms)",
-            spec_tokens.len(), spec_tps,
+            spec_tokens.len(),
+            spec_tps,
         );
         println!(
             "Speculation: {total_accepted}/{total_drafted} accepted ({accept_rate:.0}%), {total_rounds} rounds"
@@ -276,17 +292,30 @@ fn main() {
 
         // --- Comparison ---
         println!("\n--- Comparison ---");
-        let speedup = if baseline_tps > 0.0 { spec_tps / baseline_tps } else { 0.0 };
+        let speedup = if baseline_tps > 0.0 {
+            spec_tps / baseline_tps
+        } else {
+            0.0
+        };
         println!("Baseline:    {:.1} tok/s ({baseline_ms}ms)", baseline_tps);
         println!("Speculative: {:.1} tok/s ({spec_ms}ms)", spec_tps);
         println!("Speedup:     {speedup:.2}×");
         let text_match = baseline_text == spec_text;
-        println!("Text match:  {}", if text_match { "PASS" } else { "MISMATCH" });
+        println!(
+            "Text match:  {}",
+            if text_match { "PASS" } else { "MISMATCH" }
+        );
         if !text_match {
-            println!("  Baseline ({} tokens): {}...", baseline_tokens.len(),
-                &baseline_text[..baseline_text.len().min(80)]);
-            println!("  Speculative ({} tokens): {}...", spec_tokens.len(),
-                &spec_text[..spec_text.len().min(80)]);
+            println!(
+                "  Baseline ({} tokens): {}...",
+                baseline_tokens.len(),
+                &baseline_text[..baseline_text.len().min(80)]
+            );
+            println!(
+                "  Speculative ({} tokens): {}...",
+                spec_tokens.len(),
+                &spec_text[..spec_text.len().min(80)]
+            );
         }
     }
 

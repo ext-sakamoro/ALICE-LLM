@@ -17,7 +17,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let profile_mode = args.iter().any(|a| a == "--profile");
     let batch_mode = args.iter().any(|a| a == "--batch");
-    let model_path = args.iter().find(|a| !a.starts_with('-') && **a != args[0])
+    let model_path = args
+        .iter()
+        .find(|a| !a.starts_with('-') && **a != args[0])
         .cloned()
         .unwrap_or_else(|| {
             "/Users/ys/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
@@ -41,8 +43,12 @@ fn main() {
 
     println!(
         "Llama-3.2-1B: {} layers, hidden={}, inter={}, heads={}/{}, head_dim={}",
-        config.num_layers, config.hidden_dim, config.intermediate_dim,
-        config.num_heads, config.num_kv_heads, config.head_dim,
+        config.num_layers,
+        config.hidden_dim,
+        config.intermediate_dim,
+        config.num_heads,
+        config.num_kv_heads,
+        config.head_dim,
     );
 
     #[cfg(feature = "gpu")]
@@ -64,32 +70,49 @@ fn main() {
             let n_iter = 30;
 
             // K=1: original scalar fast path
-            for _ in 0..n_warmup { model.forward(test_token); }
+            for _ in 0..n_warmup {
+                model.forward(test_token);
+            }
             model.sync();
             model.reset();
 
             let t0 = Instant::now();
-            for _ in 0..n_iter { model.forward(test_token); }
+            for _ in 0..n_iter {
+                model.forward(test_token);
+            }
             model.sync();
             let k1_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
             model.reset();
 
             // K=4: batch4 unrolled scalar path
             let batch_tokens = [1u32, 1, 1, 1];
-            for _ in 0..n_warmup { model.forward_batch(&batch_tokens); }
+            for _ in 0..n_warmup {
+                model.forward_batch(&batch_tokens);
+            }
             model.sync();
             model.reset();
 
             let t0 = Instant::now();
-            for _ in 0..n_iter { model.forward_batch(&batch_tokens); }
+            for _ in 0..n_iter {
+                model.forward_batch(&batch_tokens);
+            }
             model.sync();
             let k4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
             let k4_per_token = k4_us / 4.0;
             model.reset();
 
-            println!("K=1 (scalar):    {k1_us:.0} µs/token  ({:.1} tok/s)", 1e6 / k1_us);
-            println!("K=4 (unrolled):  {k4_us:.0} µs/batch  ({:.1} ms)", k4_us / 1000.0);
-            println!("  per token:     {k4_per_token:.0} µs/token  ({:.1} tok/s)", 1e6 / k4_per_token);
+            println!(
+                "K=1 (scalar):    {k1_us:.0} µs/token  ({:.1} tok/s)",
+                1e6 / k1_us
+            );
+            println!(
+                "K=4 (unrolled):  {k4_us:.0} µs/batch  ({:.1} ms)",
+                k4_us / 1000.0
+            );
+            println!(
+                "  per token:     {k4_per_token:.0} µs/token  ({:.1} tok/s)",
+                1e6 / k4_per_token
+            );
             println!("  speedup:       {:.2}×", k1_us / k4_per_token);
 
             // Correctness: compare single-token vs batch logits
@@ -100,7 +123,8 @@ fn main() {
             let batch_logits = model.forward_batch_and_read(&[1, 1, 1, 1]);
 
             let first_batch_logits = &batch_logits[..model.vocab_size()];
-            let max_diff = single_logits.iter()
+            let max_diff = single_logits
+                .iter()
                 .zip(first_batch_logits.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
@@ -153,25 +177,48 @@ fn main() {
             }
 
             let labels = [
-                "rmsnorm", "matvec_q4k", "matvec_q6k", "swiglu",
-                "rope", "kv_append", "attention", "residual",
+                "rmsnorm",
+                "matvec_q4k",
+                "matvec_q6k",
+                "swiglu",
+                "rope",
+                "kv_append",
+                "attention",
+                "residual",
             ];
             let grand_total: f64 = totals.iter().sum::<f64>() / n_profile as f64;
 
-            println!("\n{:<14} {:>6} {:>10} {:>10} {:>7}",
-                "Operation", "Count", "Total(µs)", "Avg(µs)", "Share");
+            println!(
+                "\n{:<14} {:>6} {:>10} {:>10} {:>7}",
+                "Operation", "Count", "Total(µs)", "Avg(µs)", "Share"
+            );
             println!("{}", "-".repeat(55));
             for i in 0..8 {
                 let avg_total = totals[i] / n_profile as f64;
-                let avg_per = if counts[i] > 0 { avg_total / counts[i] as f64 } else { 0.0 };
+                let avg_per = if counts[i] > 0 {
+                    avg_total / counts[i] as f64
+                } else {
+                    0.0
+                };
                 let share = avg_total / grand_total * 100.0;
-                println!("{:<14} {:>6} {:>10.0} {:>10.1} {:>6.1}%",
-                    labels[i], counts[i], avg_total, avg_per, share);
+                println!(
+                    "{:<14} {:>6} {:>10.0} {:>10.1} {:>6.1}%",
+                    labels[i], counts[i], avg_total, avg_per, share
+                );
             }
             println!("{}", "-".repeat(55));
-            println!("{:<14} {:>6} {:>10.0} {:>10} {:>6}",
-                "TOTAL", counts.iter().sum::<u32>(), grand_total, "", "100%");
-            println!("\n{:.1} ms/token (GPU timestamps, zero sync overhead)", grand_total / 1000.0);
+            println!(
+                "{:<14} {:>6} {:>10.0} {:>10} {:>6}",
+                "TOTAL",
+                counts.iter().sum::<u32>(),
+                grand_total,
+                "",
+                "100%"
+            );
+            println!(
+                "\n{:.1} ms/token (GPU timestamps, zero sync overhead)",
+                grand_total / 1000.0
+            );
         } else {
             // --- Normal benchmark mode ---
             let n_warmup = 5;
@@ -211,7 +258,10 @@ fn main() {
                 println!("  {id:6}: {logit:+.4}");
             }
 
-            let valid = logits.iter().filter(|v| !v.is_nan() && !v.is_infinite()).count();
+            let valid = logits
+                .iter()
+                .filter(|v| !v.is_nan() && !v.is_infinite())
+                .count();
             let nan_count = logits.iter().filter(|v| v.is_nan()).count();
             println!(
                 "Logits: {valid} valid, {nan_count} NaN, {} total (vocab={})",
