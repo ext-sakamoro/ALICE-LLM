@@ -20,7 +20,10 @@ pub mod gguf;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod llama3;
+pub mod matrix;
 pub mod training;
+
+pub use matrix::{dot_flat, Matrix};
 
 use std::collections::HashMap;
 
@@ -487,14 +490,21 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
 }
 
 /// Top-k filtering: keep only the top k logits, set the rest to -inf.
+///
+/// Uses `select_nth_unstable_by` (partial sort, O(N)) to find the K-th
+/// largest logit without fully sorting the whole vocabulary — matters
+/// once `vocab_size` grows past 10k.
 pub fn top_k_filter(logits: &mut [f32], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
     }
-    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let threshold = indexed[k - 1].1;
+    // O(N) partial sort: locate the K-th largest value.
+    let mut vals: Vec<f32> = logits.to_vec();
+    let kth = k - 1;
+    vals.select_nth_unstable_by(kth, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = vals[kth];
     for l in logits.iter_mut() {
         if *l < threshold {
             *l = f32::NEG_INFINITY;
