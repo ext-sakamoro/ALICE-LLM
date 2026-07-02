@@ -14,12 +14,14 @@ default = ["std"]
 std = []
 gguf = ["dep:memmap2"]
 parallel = ["dep:rayon"]
+simd = ["dep:wide"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "gpu", "gguf"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 rayon = { version = "1.10", optional = true }
+wide = { version = "0.7", optional = true }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
