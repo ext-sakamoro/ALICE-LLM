@@ -58,9 +58,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (default features)
         if: matrix.features == 'default'
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
         run: cargo test --lib
       - name: cargo test (--features simd)
         if: matrix.features == 'simd'
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
         run: cargo test --lib --features simd
 
   build_release:
