@@ -2739,7 +2739,10 @@ unsafe fn sparse_ternary_microkernel_4row_sdot(
 
 /// SDOT via inline assembly: acc.4s += a.16b · b.16b
 /// Processes 16 × i8×i8 → 4 × i32 accumulation in 1 instruction.
-#[cfg(target_arch = "aarch64")]
+///
+/// Requires ARMv8.2-A dotprod extension. Enable via `-C target-feature=+dotprod`
+/// or on toolchains where the base ABI already implies it (macOS aarch64-apple-darwin).
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 #[inline(always)]
 unsafe fn sdot_s32(
     acc: std::arch::aarch64::int32x4_t,
@@ -2755,6 +2758,31 @@ unsafe fn sdot_s32(
         options(nostack, preserves_flags),
     );
     result
+}
+
+/// NEON fallback when ARMv8.2-A dotprod is unavailable: uses signed 16-bit
+/// multiply-accumulate (`vmlal_s16`) over the 4 low/high halves of the 128-bit lanes.
+/// Semantics match `sdot`: `acc.4s += Σ_{k=0..3} a.i8[4i+k] * b.i8[4i+k]` per output lane `i`.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn sdot_s32(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    use std::arch::aarch64::{
+        vget_high_s16, vget_high_s8, vget_low_s16, vget_low_s8, vmlal_s16, vmovl_s8,
+    };
+    // Sign-extend i8×16 to i16×8 (low + high halves).
+    let a_lo = vmovl_s8(vget_low_s8(a));
+    let a_hi = vmovl_s8(vget_high_s8(a));
+    let b_lo = vmovl_s8(vget_low_s8(b));
+    let b_hi = vmovl_s8(vget_high_s8(b));
+    // Accumulate 4 pairwise multiply-add rounds (i16 × i16 → i32).
+    let r = vmlal_s16(acc, vget_low_s16(a_lo), vget_low_s16(b_lo));
+    let r = vmlal_s16(r, vget_high_s16(a_lo), vget_high_s16(b_lo));
+    let r = vmlal_s16(r, vget_low_s16(a_hi), vget_low_s16(b_hi));
+    vmlal_s16(r, vget_high_s16(a_hi), vget_high_s16(b_hi))
 }
 
 /// LUT-based 2-bit → i8 expansion using vqtbl1q_s8.
