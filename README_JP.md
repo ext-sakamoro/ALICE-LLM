@@ -45,6 +45,9 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **スパースターナリ** — N:M構造化スパース性、2-bitパック、LUT+SDOT最適化、ブロックパックレイアウト
 - **GPU推論 (wgpu)** — Metal/Vulkan/DX12コンピュートシェーダー、Q4_K/Q6_K脱量子化融合matvec、融合SwiGLU、バッチ4投機的デコード、トークン単位メモリ確保ゼロ、サブグループSIMDリダクション
 - **Ternary QAT** — STE、L1正則化、AdamW、レイヤー単位混合精度
+- **フラットキャッシュアラインド `Matrix<T>`** — 単一連続 `Vec<T>` の row-major レイアウトが `Vec<Vec<T>>` を置き換え、`matmul_flat` は FMA `mul_add` を `j` 連続 inner loop で使用しキャッシュラインを coalescing
+- **部分ソートサンプリング** — `top_k_filter` が `select_nth_unstable_by` による O(N) の K 番目選択を採用、10 万規模の大語彙でもコスト維持
+- **オプション SIMD (`--features simd`)** — `wide::f32x8` chunked dot 積 + FMA `mul_add` + scalar tail 処理、ARM NEON と x86_64 AVX2 の両方を `wide` 経由でルーティング
 
 ## アーキテクチャ
 

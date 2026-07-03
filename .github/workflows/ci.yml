@@ -19,10 +19,10 @@ jobs:
         with:
           components: rustfmt
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
   actionlint:
-    name: actionlint (workflow YAML 検証)
+    name: actionlint (workflow YAML validation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,3 +32,43 @@ jobs:
           fail_level: error
           reporter: github-check
 
+  clippy:
+    name: Clippy (lib, warn level)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --lib -- -W clippy::all
+
+  test:
+    name: Test (${{ matrix.os }} / ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        features: [default, simd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (default features)
+        if: matrix.features == 'default'
+        run: cargo test --lib
+      - name: cargo test (--features simd)
+        if: matrix.features == 'simd'
+        run: cargo test --lib --features simd
+
+  build_release:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release --lib
