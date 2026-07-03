@@ -45,6 +45,9 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
 - **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K/Q6_K dequant-fused matvec, fused SwiGLU, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
+- **Flat cache-aligned `Matrix<T>`** — single contiguous `Vec<T>` row-major layout replaces `Vec<Vec<T>>`, `matmul_flat` uses FMA `mul_add` on a `j`-contiguous inner loop for cache-line coalescing
+- **Partial-sort sampling** — `top_k_filter` uses `select_nth_unstable_by` for O(N) K-th selection, keeps large vocabularies (100k+) affordable
+- **Optional SIMD (`--features simd`)** — `wide::f32x8` chunked dot product with FMA `mul_add` and scalar tail handling; ARM NEON and x86_64 AVX2 both routed through `wide`
 
 ## Architecture
 
