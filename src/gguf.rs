@@ -16,7 +16,7 @@ const QK8_0: usize = 32;
 // ─── Half-precision conversion ──────────────────────────────────────────────
 
 #[inline]
-fn f16_to_f32(h: u16) -> f32 {
+const fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exponent = ((h >> 10) & 0x1f) as u32;
     let mantissa = (h & 0x3ff) as u32;
@@ -64,7 +64,7 @@ pub enum GgmlType {
 }
 
 impl GgmlType {
-    fn from_u32(v: u32) -> Self {
+    const fn from_u32(v: u32) -> Self {
         match v {
             0 => Self::F32,
             1 => Self::F16,
@@ -82,7 +82,7 @@ impl GgmlType {
 
     /// Byte size per block of quantized data.
     #[must_use]
-    pub fn block_bytes(&self) -> usize {
+    pub const fn block_bytes(&self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
@@ -100,7 +100,7 @@ impl GgmlType {
 
     /// Number of elements per block.
     #[must_use]
-    pub fn elements_per_block(&self) -> usize {
+    pub const fn elements_per_block(&self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => QK8_0,
@@ -127,12 +127,12 @@ pub enum MetaValue {
     F64(f64),
     Bool(bool),
     Str(String),
-    Array(Vec<MetaValue>),
+    Array(Vec<Self>),
 }
 
 impl MetaValue {
     /// Get as u32.
-    pub fn as_u32(&self) -> Option<u32> {
+    pub const fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U32(v) => Some(*v),
             Self::I32(v) => Some(*v as u32),
@@ -142,7 +142,7 @@ impl MetaValue {
     }
 
     /// Get as f32.
-    pub fn as_f32(&self) -> Option<f32> {
+    pub const fn as_f32(&self) -> Option<f32> {
         match self {
             Self::F32(v) => Some(*v),
             Self::F64(v) => Some(*v as f32),
@@ -197,7 +197,7 @@ impl TensorInfo {
     pub fn data_size(&self) -> usize {
         let n = self.n_elements();
         let epb = self.qtype.elements_per_block();
-        let n_blocks = (n + epb - 1) / epb;
+        let n_blocks = n.div_ceil(epb);
         n_blocks * self.qtype.block_bytes()
     }
 }
@@ -210,7 +210,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    const fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
@@ -315,7 +315,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn align(&mut self, alignment: usize) {
+    const fn align(&mut self, alignment: usize) {
         let rem = self.pos % alignment;
         if rem != 0 {
             self.pos += alignment - rem;
@@ -346,7 +346,7 @@ impl<'a> GgufFile<'a> {
         }
 
         let version = r.read_u32()?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return None;
         }
 
@@ -387,7 +387,7 @@ impl<'a> GgufFile<'a> {
 
         let alignment = metadata
             .get("general.alignment")
-            .and_then(|v| v.as_u32())
+            .and_then(MetaValue::as_u32)
             .unwrap_or(GGUF_DEFAULT_ALIGNMENT as u32) as usize;
 
         // Align to data section
@@ -666,12 +666,12 @@ fn dequantize_q5_k(data: &[u8], out: &mut [f32]) {
             let m2f = dmin * f32::from(m2);
 
             for l in 0..32 {
-                let hbit = ((qh[l] >> (im * 2)) & 1) as u8;
+                let hbit = ((qh[l] >> (im * 2)) & 1);
                 out[out_idx] = d1 * f32::from((qs[q_offset + l] & 0xF) | (hbit << 4)) - m1f;
                 out_idx += 1;
             }
             for l in 0..32 {
-                let hbit = ((qh[l] >> (im * 2 + 1)) & 1) as u8;
+                let hbit = ((qh[l] >> (im * 2 + 1)) & 1);
                 out[out_idx] = d2 * f32::from((qs[q_offset + l] >> 4) | (hbit << 4)) - m2f;
                 out_idx += 1;
             }
@@ -720,7 +720,7 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
         for _n in (0..QK_K).step_by(128) {
             for l in 0..32 {
                 let is = l / 16; // matches llama.cpp: is = l/16
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
+                let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
                 let q2 =
                     ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
                 let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
@@ -942,8 +942,7 @@ mod neon_dot {
         let mut qh_off = 0usize;
         for _ in 0..2 {
             for l in 0..32 {
-                aux8[a_off + l] =
-                    ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
                 aux8[a_off + l + 32] =
                     ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
                 aux8[a_off + l + 64] =
@@ -1103,8 +1102,7 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let mut qh_off = 0usize;
     for _ in 0..2 {
         for l in 0..32 {
-            aux8[a_off + l] =
-                ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
+            aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
             aux8[a_off + l + 32] =
                 ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
             aux8[a_off + l + 64] =
@@ -1209,8 +1207,7 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let mut qh_off = 0usize;
     for _ in 0..2 {
         for l in 0..32 {
-            aux8[a_off + l] =
-                ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
+            aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
             aux8[a_off + l + 32] =
                 ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
             aux8[a_off + l + 64] =
@@ -1937,7 +1934,7 @@ impl GgufTokenizer {
 
     /// Vocabulary size.
     #[must_use]
-    pub fn vocab_size(&self) -> usize {
+    pub const fn vocab_size(&self) -> usize {
         self.tokens.len()
     }
 }
@@ -1966,7 +1963,7 @@ impl TernaryRow {
     /// (0.7 = weights below 0.7 × mean(|w|) become zero).
     pub fn from_f32(weights: &[f32], threshold_ratio: f32) -> Self {
         let num_cols = weights.len();
-        let num_bytes = (num_cols + 7) / 8;
+        let num_bytes = num_cols.div_ceil(8);
 
         let mean_abs: f32 = weights.iter().map(|w| w.abs()).sum::<f32>() / num_cols as f32;
         let threshold = threshold_ratio * mean_abs;
@@ -2116,6 +2113,7 @@ fn ternary_dot_row(row: &TernaryRow, input: &[f32]) -> f32 {
 pub const SPARSE_BLOCK: usize = 16;
 
 /// A sparse ternary row using N:M structured sparsity.
+///
 /// Within each block of SPARSE_BLOCK elements, non-zero positions are stored
 /// as a compact bitmask (16 bits = 2 bytes per block), and signs are packed
 /// in another bitmask (only for non-zero positions).
@@ -2160,7 +2158,7 @@ impl SparseTernaryRow {
     /// (from the original f32 weights) and zeros the rest.
     pub fn from_ternary_row(row: &TernaryRow, original_weights: &[f32], n_keep: usize) -> Self {
         let num_cols = row.num_cols;
-        let num_blocks = (num_cols + SPARSE_BLOCK - 1) / SPARSE_BLOCK;
+        let num_blocks = num_cols.div_ceil(SPARSE_BLOCK);
         let mut active_masks = vec![0u16; num_blocks];
         let mut sign_masks = vec![0u16; num_blocks];
         let mut abs_sum = 0.0f64;
@@ -2251,7 +2249,7 @@ impl SparseTernaryMatrix {
         num_cols: usize,
         target_sparsity: f32,
     ) -> Self {
-        let blocks_per_row = (num_cols + SPARSE_BLOCK - 1) / SPARSE_BLOCK;
+        let blocks_per_row = num_cols.div_ceil(SPARSE_BLOCK);
         let stride = blocks_per_row * 2;
         let mut mask_buf = vec![0u16; num_rows * stride];
         let mut scales = Vec::with_capacity(num_rows);
@@ -2296,7 +2294,7 @@ impl SparseTernaryMatrix {
 
         // Build block-packed layout: groups of 4 rows, interleaved by block.
         // For 4-row micro-kernel: sequential memory access eliminates TLB misses.
-        let num_groups = (num_rows + 3) / 4;
+        let num_groups = num_rows.div_ceil(4);
         let group_bytes = 4 * blocks_per_row * bytes_per_block; // 4 rows × all blocks
         let mut packed_blocked = vec![0u8; num_groups * group_bytes + 16]; // +16 padding
 
@@ -2402,7 +2400,7 @@ impl SparseTernaryMatrix {
     }
 
     /// Estimated memory in bytes (masks + packed_2bit + packed_blocked + scales).
-    pub fn memory_bytes(&self) -> usize {
+    pub const fn memory_bytes(&self) -> usize {
         self.mask_buf.len() * 2
             + self.packed_2bit.len()
             + self.packed_blocked.len()
@@ -2415,7 +2413,7 @@ impl SparseTernaryMatrix {
 /// On aarch64: NEON-accelerated abs-max search and narrowing conversion.
 fn quantize_activation_i8(input: &[f32]) -> (Vec<i8>, f32) {
     let n = input.len();
-    let padded_len = ((n + SPARSE_BLOCK - 1) / SPARSE_BLOCK) * SPARSE_BLOCK;
+    let padded_len = n.div_ceil(SPARSE_BLOCK) * SPARSE_BLOCK;
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -2512,6 +2510,7 @@ unsafe fn quantize_activation_i8_neon(
 }
 
 /// Sparse ternary matvec: output = SparseTernaryMatrix × input.
+///
 /// On aarch64 with dotprod: i8 dynamic quantization + vdotq_s32 (16 elements/instruction).
 /// Branchless 4-row micro-kernel with shared activation loads.
 pub fn sparse_ternary_matvec(matrix: &SparseTernaryMatrix, input: &[f32], output: &mut [f32]) {
@@ -2933,11 +2932,11 @@ fn dequantize_row_q4k(data: &[u8], out: &mut [f32]) {
             scales[i] = scales_raw[i] & 0x3F;
             mins[i] = scales_raw[i + 4] & 0x3F;
         }
-        scales[4] = (scales_raw[0 + 8] & 0xF) | ((scales_raw[0] >> 6) << 4);
+        scales[4] = (scales_raw[8] & 0xF) | ((scales_raw[0] >> 6) << 4);
         scales[5] = (scales_raw[1 + 8] & 0xF) | ((scales_raw[1] >> 6) << 4);
         scales[6] = (scales_raw[2 + 8] & 0xF) | ((scales_raw[2] >> 6) << 4);
         scales[7] = (scales_raw[3 + 8] & 0xF) | ((scales_raw[3] >> 6) << 4);
-        mins[4] = (scales_raw[0 + 8] >> 4) | ((scales_raw[4] >> 6) << 4);
+        mins[4] = (scales_raw[8] >> 4) | ((scales_raw[4] >> 6) << 4);
         mins[5] = (scales_raw[1 + 8] >> 4) | ((scales_raw[5] >> 6) << 4);
         mins[6] = (scales_raw[2 + 8] >> 4) | ((scales_raw[6] >> 6) << 4);
         mins[7] = (scales_raw[3 + 8] >> 4) | ((scales_raw[7] >> 6) << 4);
@@ -2987,8 +2986,7 @@ fn dequantize_row_q6k(data: &[u8], out: &mut [f32]) {
         let mut qh_off = 0usize;
         for _ in 0..2 {
             for l in 0..32 {
-                aux8[a_off + l] =
-                    ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
                 aux8[a_off + l + 32] =
                     ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
                 aux8[a_off + l + 64] =
