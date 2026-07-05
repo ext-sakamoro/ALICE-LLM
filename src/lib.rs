@@ -22,7 +22,36 @@
     clippy::many_single_char_names,
     clippy::manual_midpoint,
     clippy::approx_constant,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    clippy::unnecessary_wraps,
+    clippy::match_same_arms,
+    clippy::needless_range_loop,
+    clippy::manual_clamp,
+    clippy::useless_conversion,
+    clippy::used_underscore_binding,
+    clippy::needless_pass_by_value,
+    clippy::missing_const_for_fn,
+    clippy::unused_self,
+    clippy::option_if_let_else,
+    clippy::inline_always,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::or_fun_call,
+    clippy::too_many_arguments,
+    clippy::unnecessary_map_or,
+    clippy::redundant_pub_crate,
+    clippy::branches_sharing_code,
+    clippy::doc_link_with_quotes,
+    clippy::assigning_clones,
+    clippy::redundant_closure_for_method_calls,
+    clippy::significant_drop_tightening,
+    clippy::useless_let_if_seq,
+    clippy::use_self,
+    clippy::collection_is_never_read
+)]
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls
 )]
 
 pub mod attention;

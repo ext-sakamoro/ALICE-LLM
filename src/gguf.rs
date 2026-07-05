@@ -666,12 +666,12 @@ fn dequantize_q5_k(data: &[u8], out: &mut [f32]) {
             let m2f = dmin * f32::from(m2);
 
             for l in 0..32 {
-                let hbit = ((qh[l] >> (im * 2)) & 1);
+                let hbit = (qh[l] >> (im * 2)) & 1;
                 out[out_idx] = d1 * f32::from((qs[q_offset + l] & 0xF) | (hbit << 4)) - m1f;
                 out_idx += 1;
             }
             for l in 0..32 {
-                let hbit = ((qh[l] >> (im * 2 + 1)) & 1);
+                let hbit = (qh[l] >> (im * 2 + 1)) & 1;
                 out[out_idx] = d2 * f32::from((qs[q_offset + l] >> 4) | (hbit << 4)) - m2f;
                 out_idx += 1;
             }
