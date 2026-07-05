@@ -29,7 +29,7 @@ impl ModelArch {
         match gguf.meta_str("general.architecture") {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
-            Some("qwen3moe") | Some("qwen3") => {
+            Some("qwen3moe" | "qwen3") => {
                 if gguf.meta_u32("qwen3.full_attention_interval").is_some()
                     || gguf.meta_u32("qwen3moe.full_attention_interval").is_some()
                 {
@@ -44,7 +44,7 @@ impl ModelArch {
     }
 
     /// GGUF metadata key prefix for this architecture.
-    fn meta_prefix(&self) -> &'static str {
+    const fn meta_prefix(&self) -> &'static str {
         match self {
             Self::Llama => "llama",
             Self::Mistral => "mistral",
@@ -193,22 +193,22 @@ impl Llama3Config {
     }
 
     /// Returns true if this is a hybrid DeltaNet model (Qwen3.5).
-    pub fn is_hybrid(&self) -> bool {
+    pub const fn is_hybrid(&self) -> bool {
         self.full_attention_interval.is_some()
     }
 
     /// Returns true if layer `i` is a DeltaNet (linear attention) layer.
     /// Full attention layers are at indices where `(i + 1) % interval == 0`.
-    pub fn is_deltanet_layer(&self, i: usize) -> bool {
+    pub const fn is_deltanet_layer(&self, i: usize) -> bool {
         match self.full_attention_interval {
-            Some(interval) => (i + 1) % interval != 0,
+            Some(interval) => !(i + 1).is_multiple_of(interval),
             None => false,
         }
     }
 
     /// Llama-3 8B default config.
     #[must_use]
-    pub fn llama3_8b() -> Self {
+    pub const fn llama3_8b() -> Self {
         Self {
             arch: ModelArch::Llama,
             vocab_size: 128_256,
@@ -260,7 +260,7 @@ impl KvCache {
     }
 
     #[inline]
-    fn offset(&self, layer: usize, pos: usize) -> usize {
+    const fn offset(&self, layer: usize, pos: usize) -> usize {
         (layer * self.max_seq_len + pos) * self.kv_dim
     }
 
@@ -271,11 +271,11 @@ impl KvCache {
     }
 
     /// Call once after all layers have appended for a given position.
-    fn advance(&mut self) {
+    const fn advance(&mut self) {
         self.seq_len += 1;
     }
 
-    fn seq_len(&self) -> usize {
+    const fn seq_len(&self) -> usize {
         self.seq_len
     }
 
@@ -292,11 +292,11 @@ impl KvCache {
     }
 
     /// Rollback KV cache to a previous position (for speculative decoding).
-    fn rollback_to(&mut self, pos: usize) {
+    const fn rollback_to(&mut self, pos: usize) {
         self.seq_len = pos;
     }
 
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.seq_len = 0;
     }
 }
@@ -321,7 +321,7 @@ impl KvPage {
         }
     }
 
-    fn is_full(&self) -> bool {
+    const fn is_full(&self) -> bool {
         self.used >= PAGE_SIZE
     }
 }
@@ -360,11 +360,11 @@ impl PagedKvCache {
         page.used += 1;
     }
 
-    fn advance(&mut self) {
+    const fn advance(&mut self) {
         self.seq_len += 1;
     }
 
-    fn seq_len(&self) -> usize {
+    const fn seq_len(&self) -> usize {
         self.seq_len
     }
 
@@ -408,7 +408,7 @@ impl PagedKvCache {
     }
 
     fn total_pages(&self) -> usize {
-        self.pages.iter().map(|lp| lp.len()).sum()
+        self.pages.iter().map(std::vec::Vec::len).sum()
     }
 
     fn memory_bytes(&self) -> usize {
@@ -435,8 +435,14 @@ pub struct BatchScheduler {
     next_id: usize,
 }
 
+impl Default for BatchScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BatchScheduler {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             requests: Vec::new(),
             next_id: 0,
@@ -714,7 +720,7 @@ struct WeightRef<'a> {
     cols: usize,
 }
 
-impl<'a> WeightRef<'a> {
+impl WeightRef<'_> {
     fn matvec(&self, input: &[f32], output: &mut [f32]) {
         quantized_matvec(input, self.data, self.qtype, self.rows, self.cols, output);
     }
@@ -759,7 +765,7 @@ struct LayerWeights<'a> {
 // ─── Layerwise Mixed Precision ──────────────────────────────────────────────
 
 /// Quantization strategy for a single layer.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerQuantMode {
     /// 1.58-bit ternary {-1, 0, +1} with scale.
     Ternary,
@@ -788,7 +794,7 @@ pub struct MixedPrecisionConfig {
 
 impl LayerQuantConfig {
     /// Default: full ternary for both attention and FFN.
-    pub fn full_ternary() -> Self {
+    pub const fn full_ternary() -> Self {
         Self {
             attention_mode: LayerQuantMode::Ternary,
             ffn_mode: LayerQuantMode::Ternary,
@@ -796,7 +802,7 @@ impl LayerQuantConfig {
     }
 
     /// Aggressive: ternary attention, binary+sparse FFN (for 10GB target).
-    pub fn aggressive_compression(n_keep: usize) -> Self {
+    pub const fn aggressive_compression(n_keep: usize) -> Self {
         Self {
             attention_mode: LayerQuantMode::Ternary,
             ffn_mode: LayerQuantMode::SparseTernary { n_keep },
@@ -1322,15 +1328,13 @@ impl<'a> Llama3Model<'a> {
                 indexed
                     .iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                    .map(|(idx, _)| *idx as u32)
-                    .unwrap_or(0)
+                    .map_or(0, |(idx, _)| *idx as u32)
             } else {
                 logits
                     .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(idx, _)| idx as u32)
-                    .unwrap_or(0)
+                    .map_or(0, |(idx, _)| idx as u32)
             };
 
             if next_token == tokenizer.eos_id {
@@ -2500,8 +2504,7 @@ fn sample_token(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
         indexed
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(idx, _)| *idx as u32)
-            .unwrap_or(0)
+            .map_or(0, |(idx, _)| *idx as u32)
     } else {
         argmax(&logits)
     }
@@ -2512,13 +2515,12 @@ fn argmax(logits: &[f32]) -> u32 {
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(idx, _)| idx as u32)
-        .unwrap_or(0)
+        .map_or(0, |(idx, _)| idx as u32)
 }
 
 /// Convert logits to probability distribution via softmax.
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_val).exp()).collect();
     let sum: f32 = probs.iter().sum();
     if sum > 0.0 {
@@ -2549,7 +2551,7 @@ struct Rng64 {
 }
 
 impl Rng64 {
-    fn new(seed: u64) -> Self {
+    const fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
                 0xDEAD_BEEF_CAFE_BABEu64

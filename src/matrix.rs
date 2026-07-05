@@ -15,7 +15,7 @@ use std::ops::Range;
 ///
 /// `data.len() == rows * cols`, laid out as
 /// `[row0_col0, row0_col1, ..., row0_col{cols-1}, row1_col0, ...]`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matrix<T> {
     data: Vec<T>,
     rows: usize,

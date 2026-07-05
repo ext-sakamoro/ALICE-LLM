@@ -66,7 +66,7 @@ pub struct StraightThroughEstimator {
 }
 
 impl StraightThroughEstimator {
-    pub fn new(ratio: f32) -> Self {
+    pub const fn new(ratio: f32) -> Self {
         Self { ratio }
     }
 
