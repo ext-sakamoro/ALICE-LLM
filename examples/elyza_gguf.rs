@@ -84,10 +84,19 @@ fn main() {
     }
     println!();
 
-    // Format as Llama-3 instruct
-    let formatted = format!(
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-    );
+    // Detect chat template from GGUF metadata (model architecture).
+    let arch_str = gguf.meta_str("general.architecture").unwrap_or("llama");
+    let formatted = match arch_str {
+        "qwen2" | "qwen3" | "qwen3moe" => format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        "gemma2" | "gemma3" => format!(
+            "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+        ),
+        _ => format!(
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        ),
+    };
 
     println!("Prompt: {prompt}");
     if ternary {
