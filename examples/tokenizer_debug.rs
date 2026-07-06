@@ -53,4 +53,19 @@ fn main() {
     println!("  {} tokens: {:?}", ids.len(), &ids[..ids.len().min(30)]);
     let decoded = tokenizer.decode(&ids);
     println!("  decode: '{}'", decoded);
+
+    // Optional: tokenize an arbitrary user-supplied prompt
+    if let Some(pos) = args.iter().position(|a| a == "--prompt") {
+        if let Some(user_prompt) = args.get(pos + 1) {
+            println!("\n--- User prompt tokenization ---");
+            let ids = tokenizer.encode(user_prompt);
+            println!("  input: {:?}", user_prompt);
+            println!("  count: {}", ids.len());
+            println!("  ids: {:?}", ids);
+            for id in &ids {
+                let piece = tokenizer.decode(&[*id]);
+                println!("    {}: {:?}", id, piece);
+            }
+        }
+    }
 }
