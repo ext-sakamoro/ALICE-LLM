@@ -137,7 +137,13 @@ impl Llama3Config {
         let norm_eps = gguf
             .meta_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
-        let head_dim = hidden_dim / num_heads;
+        // Gemma-2 has explicit head_dim (256 for 2B, != hidden_dim/num_heads).
+        // Qwen 3 also stores explicit key_length.
+        // Fall back to hidden_dim/num_heads for models without this metadata (Llama, Mistral).
+        let head_dim = gguf
+            .meta_u32(&format!("{prefix}.attention.key_length"))
+            .map(|v| v as usize)
+            .unwrap_or(hidden_dim / num_heads);
 
         // Mistral: sliding window attention
         let sliding_window = gguf
@@ -502,6 +508,26 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+/// Qwen 3 QK-Norm: apply per-head RMSNorm to Q or K buffer in-place.
+/// `buf` shape: [num_heads * head_dim] (Q) or [num_kv_heads * head_dim] (K).
+/// `weight` shape: [head_dim] (broadcast across heads).
+fn apply_qk_norm(buf: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
+    let num_heads = buf.len() / head_dim;
+    for h in 0..num_heads {
+        let start = h * head_dim;
+        let slice = &mut buf[start..start + head_dim];
+        let mut ss = 0.0f64;
+        for &v in slice.iter() {
+            ss += (v as f64) * (v as f64);
+        }
+        let mean = (ss / head_dim as f64) as f32;
+        let scale = 1.0f32 / (mean + eps).sqrt();
+        for (i, w) in weight.iter().enumerate() {
+            slice[i] = slice[i] * scale * w;
+        }
+    }
+}
+
 // ─── RoPE ───────────────────────────────────────────────────────────────────
 
 fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
@@ -756,6 +782,16 @@ struct LayerWeights<'a> {
     k_proj: WeightRef<'a>,
     v_proj: WeightRef<'a>,
     o_proj: WeightRef<'a>,
+    /// Qwen 2/2.5 attention Q projection bias (None for Llama/Mistral/Gemma/Qwen 3).
+    q_bias: Option<Vec<f32>>,
+    /// Qwen 2/2.5 attention K projection bias.
+    k_bias: Option<Vec<f32>>,
+    /// Qwen 2/2.5 attention V projection bias.
+    v_bias: Option<Vec<f32>>,
+    /// Qwen 3 per-head RMSNorm applied to Q before RoPE (None for other arch).
+    q_norm: Option<Vec<f32>>,
+    /// Qwen 3 per-head RMSNorm applied to K before RoPE.
+    k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     gate_proj: WeightRef<'a>,
     up_proj: WeightRef<'a>,
@@ -1076,6 +1112,29 @@ impl<'a> Llama3Model<'a> {
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
             layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
             layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
+            if let Some(b) = &layer.q_bias {
+                for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
+                    *q += bi;
+                }
+            }
+            if let Some(b) = &layer.k_bias {
+                for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
+                    *k += bi;
+                }
+            }
+            if let Some(b) = &layer.v_bias {
+                for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
+                    *v += bi;
+                }
+            }
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            if let Some(w) = &layer.q_norm {
+                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+            }
+            if let Some(w) = &layer.k_norm {
+                apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
+            }
 
             // Apply RoPE
             for h in 0..c.num_heads {
@@ -1206,6 +1265,29 @@ impl<'a> Llama3Model<'a> {
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
             layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
             layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
+            if let Some(b) = &layer.q_bias {
+                for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
+                    *q += bi;
+                }
+            }
+            if let Some(b) = &layer.k_bias {
+                for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
+                    *k += bi;
+                }
+            }
+            if let Some(b) = &layer.v_bias {
+                for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
+                    *v += bi;
+                }
+            }
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            if let Some(w) = &layer.q_norm {
+                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+            }
+            if let Some(w) = &layer.k_norm {
+                apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
+            }
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
@@ -2343,6 +2425,29 @@ impl<'a> Llama3Model<'a> {
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
             layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
             layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
+            if let Some(b) = &layer.q_bias {
+                for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
+                    *q += bi;
+                }
+            }
+            if let Some(b) = &layer.k_bias {
+                for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
+                    *k += bi;
+                }
+            }
+            if let Some(b) = &layer.v_bias {
+                for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
+                    *v += bi;
+                }
+            }
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            if let Some(w) = &layer.q_norm {
+                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+            }
+            if let Some(w) = &layer.k_norm {
+                apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
+            }
 
             for h in 0..c.num_heads {
                 let start = h * c.head_dim;
@@ -2691,12 +2796,26 @@ fn load_layer_weights<'a>(
         config.intermediate_dim,
     )?;
 
+    // Qwen 2/2.5: attention projection biases (absent for Llama/Mistral/Gemma/Qwen 3).
+    let q_bias = gguf.tensor_to_f32(&format!("{prefix}.attn_q.bias"));
+    let k_bias = gguf.tensor_to_f32(&format!("{prefix}.attn_k.bias"));
+    let v_bias = gguf.tensor_to_f32(&format!("{prefix}.attn_v.bias"));
+
+    // Qwen 3: per-head RMSNorm on Q/K before RoPE (absent for other arch).
+    let q_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_norm.weight"));
+    let k_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_k_norm.weight"));
+
     Some(LayerWeights {
         attn_norm,
         q_proj,
         k_proj,
         v_proj,
         o_proj,
+        q_bias,
+        k_bias,
+        v_bias,
+        q_norm,
+        k_norm,
         ffn_norm,
         gate_proj,
         up_proj,
