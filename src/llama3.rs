@@ -20,6 +20,7 @@ pub enum ModelArch {
     Mistral,
     Gemma2,
     Qwen2,
+    Qwen3,
     Qwen3_5,
 }
 
@@ -35,7 +36,7 @@ impl ModelArch {
                 {
                     Self::Qwen3_5
                 } else {
-                    Self::Llama
+                    Self::Qwen3
                 }
             }
             Some(s) if s.starts_with("qwen") => Self::Qwen2,
@@ -50,8 +51,22 @@ impl ModelArch {
             Self::Mistral => "mistral",
             Self::Gemma2 => "gemma2",
             Self::Qwen2 => "qwen2",
-            Self::Qwen3_5 => "qwen3",
+            Self::Qwen3 | Self::Qwen3_5 => "qwen3",
         }
+    }
+
+    /// Returns true if this architecture uses NEOX RoPE (half rotation:
+    /// pair (i, i+d/2) rotated together) as opposed to NORM RoPE (pair
+    /// (i, i+1)). llama.cpp source `llama_model_rope_type` reference.
+    /// - NORM (Llama family, Mistral): q/k weights are permuted in GGUF
+    ///   conversion so paired rotation is equivalent to HF half rotation.
+    /// - NEOX (Qwen 2/3, Gemma 2): weights stored as-is in HF layout,
+    ///   forward pass applies half rotation directly.
+    pub const fn use_neox_rope(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2
+        )
     }
 
     /// Resolve the actual GGUF metadata prefix (some models use versioned keys).
@@ -210,6 +225,12 @@ impl Llama3Config {
             Some(interval) => !(i + 1).is_multiple_of(interval),
             None => false,
         }
+    }
+
+    /// Returns true if the model uses NEOX (half rotation) RoPE convention.
+    /// Delegates to `ModelArch::use_neox_rope`.
+    pub const fn use_neox_rope(&self) -> bool {
+        self.arch.use_neox_rope()
     }
 
     /// Effective sliding window for layer `i`.
@@ -587,7 +608,50 @@ fn apply_rope_scaled(
     }
 }
 
-/// Apply RoPE: uses per-dimension freq scaling if available, otherwise scalar theta.
+/// NEOX RoPE (GPT-NeoX / HF convention): rotate pairs (i, i + head_dim/2).
+/// Used by Qwen 2/3 and Gemma 2. Q/K weights in GGUF are stored in HF layout
+/// (not permuted like Llama family), so we apply the half rotation directly.
+fn apply_rope_neox(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
+    let half = head_dim / 2;
+    for i in 0..half {
+        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let angle = position as f32 * freq;
+        let (sin_val, cos_val) = angle.sin_cos();
+        let x0 = vec[i];
+        let x1 = vec[i + half];
+        vec[i] = x0 * cos_val - x1 * sin_val;
+        vec[i + half] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/// NEOX RoPE with per-dimension frequency factors (for NTK-aware scaling).
+fn apply_rope_scaled_neox(
+    vec: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_factors: &[f32],
+) {
+    let half = head_dim / 2;
+    for i in 0..half {
+        let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let factor = if i < freq_factors.len() {
+            freq_factors[i]
+        } else {
+            1.0
+        };
+        let freq = base_freq / factor;
+        let angle = position as f32 * freq;
+        let (sin_val, cos_val) = angle.sin_cos();
+        let x0 = vec[i];
+        let x1 = vec[i + half];
+        vec[i] = x0 * cos_val - x1 * sin_val;
+        vec[i + half] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/// Apply RoPE: dispatches to NORM (paired) vs NEOX (half rotation) based on `neox`,
+/// then to scaled vs scalar based on `freq_scales`.
 #[inline]
 fn apply_rope_auto(
     vec: &mut [f32],
@@ -595,10 +659,13 @@ fn apply_rope_auto(
     head_dim: usize,
     theta: f32,
     freq_scales: Option<&[f32]>,
+    neox: bool,
 ) {
-    match freq_scales {
-        Some(s) => apply_rope_scaled(vec, position, head_dim, theta, s),
-        None => apply_rope(vec, position, head_dim, theta),
+    match (neox, freq_scales) {
+        (false, Some(s)) => apply_rope_scaled(vec, position, head_dim, theta, s),
+        (false, None) => apply_rope(vec, position, head_dim, theta),
+        (true, Some(s)) => apply_rope_scaled_neox(vec, position, head_dim, theta, s),
+        (true, None) => apply_rope_neox(vec, position, head_dim, theta),
     }
 }
 
@@ -1172,6 +1239,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -1182,6 +1250,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
@@ -1345,6 +1414,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -1355,6 +1425,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
@@ -1933,6 +2004,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -1943,6 +2015,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
@@ -2180,6 +2253,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -2190,6 +2264,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
@@ -2288,6 +2363,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -2298,6 +2374,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
@@ -2571,6 +2648,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
             for h in 0..c.num_kv_heads {
@@ -2581,6 +2659,7 @@ impl<'a> Llama3Model<'a> {
                     c.head_dim,
                     c.rope_theta,
                     rope_freqs_ref,
+                    c.use_neox_rope(),
                 );
             }
 
