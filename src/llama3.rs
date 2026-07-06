@@ -1477,6 +1477,12 @@ impl<'a> Llama3Model<'a> {
             tokens.push(next_token);
             generated.push(next_token);
 
+            // DEBUG: print token id + individual decode (temporary for arch verify)
+            if std::env::var("ALICE_LLM_DEBUG_TOKENS").is_ok() {
+                let tok_text = tokenizer.decode(&[next_token]);
+                eprintln!("[TOK] id={next_token} text={tok_text:?}");
+            }
+
             // Forward the NEW token to get logits for next iteration
             logits = self.forward(next_token);
         }
