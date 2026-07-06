@@ -87,7 +87,12 @@ fn main() {
     // Detect chat template from GGUF metadata (model architecture).
     let arch_str = gguf.meta_str("general.architecture").unwrap_or("llama");
     let formatted = match arch_str {
-        "qwen2" | "qwen3" | "qwen3moe" => format!(
+        // Qwen 3 has "thinking mode" default-on which loops <think>...</think>
+        // in greedy sampling. Pre-fill empty <think></think> to disable it.
+        "qwen3" | "qwen3moe" => format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ),
+        "qwen2" => format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         ),
         "gemma2" | "gemma3" => format!(
