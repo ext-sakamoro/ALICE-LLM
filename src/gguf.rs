@@ -158,6 +158,17 @@ impl MetaValue {
         }
     }
 
+    /// Get as bool. Accepts Bool, U8 (0/1), and integer types (nonzero = true).
+    pub const fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            Self::U8(v) => Some(*v != 0),
+            Self::U32(v) => Some(*v != 0),
+            Self::I32(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
+
     /// Get as string array.
     pub fn as_str_array(&self) -> Option<Vec<&str>> {
         match self {
@@ -425,6 +436,12 @@ impl<'a> GgufFile<'a> {
     #[must_use]
     pub fn meta_f32(&self, key: &str) -> Option<f32> {
         self.meta(key)?.as_f32()
+    }
+
+    /// Get metadata bool.
+    #[must_use]
+    pub fn meta_bool(&self, key: &str) -> Option<bool> {
+        self.meta(key)?.as_bool()
     }
 
     /// Get raw quantized data for a tensor.
@@ -1742,6 +1759,9 @@ pub struct GgufTokenizer {
     byte_decoder: HashMap<char, u8>,
     pub bos_id: u32,
     pub eos_id: u32,
+    /// Whether the tokenizer should prepend BOS to encoded sequences.
+    /// Qwen 3 has add_bos_token=False; Llama family defaults to True.
+    pub add_bos_token: bool,
 }
 
 impl GgufTokenizer {
@@ -1790,6 +1810,8 @@ impl GgufTokenizer {
 
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
+        // Qwen 3: add_bos_token = False (default True for Llama family).
+        let add_bos_token = gguf.meta_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
 
         Some(Self {
             tokens,
@@ -1800,6 +1822,7 @@ impl GgufTokenizer {
             byte_decoder: gpt2_char_to_byte(),
             bos_id,
             eos_id,
+            add_bos_token,
         })
     }
 
