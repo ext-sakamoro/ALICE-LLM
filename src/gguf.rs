@@ -1811,7 +1811,9 @@ impl GgufTokenizer {
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
         // Qwen 3: add_bos_token = False (default True for Llama family).
-        let add_bos_token = gguf.meta_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
+        let add_bos_token = gguf
+            .meta_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(true);
 
         Some(Self {
             tokens,
