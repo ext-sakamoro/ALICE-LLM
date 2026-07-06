@@ -182,6 +182,20 @@ impl MetaValue {
             _ => None,
         }
     }
+
+    /// Get as u32 array (accepts arrays of U32/I32/U64 elements).
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    out.push(v.as_u32()?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
 }
 
 // ─── Tensor info ────────────────────────────────────────────────────────────
@@ -1774,13 +1788,24 @@ impl GgufTokenizer {
         let mut token_to_id = HashMap::with_capacity(token_strs.len());
         let mut special_tokens = Vec::new();
 
+        // Prefer GGUF `tokenizer.ggml.token_type`: 3 = CONTROL, 4 = USER_DEFINED
+        // are atomic / must not be split by BPE (e.g. Qwen 3 `<think>` / `</think>`,
+        // `<tool_call>` etc). Falls back to `<|...|>` string pattern when the
+        // token_type array is absent (older Llama-3 conversions).
+        let token_types = gguf
+            .meta("tokenizer.ggml.token_type")
+            .and_then(|m| m.as_u32_array());
+
         for (i, t) in token_strs.iter().enumerate() {
             let bytes = t.as_bytes().to_vec();
             token_to_id.insert(bytes.clone(), i as u32);
             tokens.push(bytes);
 
-            // Detect special tokens: <|...|> pattern
-            if t.starts_with("<|") && t.ends_with("|>") {
+            let is_special = match &token_types {
+                Some(types) => matches!(types.get(i).copied(), Some(3 | 4)),
+                None => t.starts_with("<|") && t.ends_with("|>"),
+            };
+            if is_special {
                 special_tokens.push((t.to_string(), i as u32));
             }
         }
