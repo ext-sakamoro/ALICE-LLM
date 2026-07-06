@@ -792,6 +792,10 @@ struct LayerWeights<'a> {
     q_norm: Option<Vec<f32>>,
     /// Qwen 3 per-head RMSNorm applied to K before RoPE.
     k_norm: Option<Vec<f32>>,
+    /// Gemma-2 post-attention RMSNorm (before residual add).
+    post_attn_norm: Option<Vec<f32>>,
+    /// Gemma-2 post-FFN RMSNorm (before residual add).
+    post_ffn_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     gate_proj: WeightRef<'a>,
     up_proj: WeightRef<'a>,
@@ -1178,6 +1182,13 @@ impl<'a> Llama3Model<'a> {
             // Output projection
             layer.o_proj.matvec(&attn_out, &mut o_buf);
 
+            // Gemma-2 post-attention RMSNorm (before residual add; no-op for others)
+            if let Some(w) = &layer.post_attn_norm {
+                let mut tmp = vec![0.0f32; c.hidden_dim];
+                rms_norm(&o_buf, w, c.norm_eps, &mut tmp);
+                o_buf.copy_from_slice(&tmp);
+            }
+
             // Residual
             for i in 0..c.hidden_dim {
                 hidden[i] += o_buf[i];
@@ -1196,6 +1207,13 @@ impl<'a> Llama3Model<'a> {
             }
 
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
+
+            // Gemma-2 post-FFN RMSNorm (before residual add; no-op for others)
+            if let Some(w) = &layer.post_ffn_norm {
+                let mut tmp = vec![0.0f32; c.hidden_dim];
+                rms_norm(&down_buf, w, c.norm_eps, &mut tmp);
+                down_buf.copy_from_slice(&tmp);
+            }
 
             // Residual
             for i in 0..c.hidden_dim {
@@ -2808,6 +2826,10 @@ fn load_layer_weights<'a>(
     let q_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_norm.weight"));
     let k_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_k_norm.weight"));
 
+    // Gemma-2: sandwich norm (post-attention + post-FFN, before residual add).
+    let post_attn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_attention_norm.weight"));
+    let post_ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_ffw_norm.weight"));
+
     Some(LayerWeights {
         attn_norm,
         q_proj,
@@ -2819,6 +2841,8 @@ fn load_layer_weights<'a>(
         v_bias,
         q_norm,
         k_norm,
+        post_attn_norm,
+        post_ffn_norm,
         ffn_norm,
         gate_proj,
         up_proj,
