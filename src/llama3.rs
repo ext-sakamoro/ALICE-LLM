@@ -1411,7 +1411,10 @@ impl<'a> Llama3Model<'a> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Prepend BOS if not already present
-        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+        // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
+        if tokenizer.add_bos_token
+            && (tokens.is_empty() || tokens[0] != tokenizer.bos_id)
+        {
             tokens.insert(0, tokenizer.bos_id);
         }
 
@@ -1518,7 +1521,10 @@ impl<'a> Llama3Model<'a> {
     ) -> GenerateResult {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
-        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+        // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
+        if tokenizer.add_bos_token
+            && (tokens.is_empty() || tokens[0] != tokenizer.bos_id)
+        {
             tokens.insert(0, tokenizer.bos_id);
         }
 
@@ -1679,7 +1685,10 @@ impl<'a> Llama3Model<'a> {
     ) -> GenerateResult {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
-        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+        // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
+        if tokenizer.add_bos_token
+            && (tokens.is_empty() || tokens[0] != tokenizer.bos_id)
+        {
             tokens.insert(0, tokenizer.bos_id);
         }
 
@@ -1963,7 +1972,10 @@ impl<'a> Llama3Model<'a> {
     ) -> GenerateResult {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
-        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+        // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
+        if tokenizer.add_bos_token
+            && (tokens.is_empty() || tokens[0] != tokenizer.bos_id)
+        {
             tokens.insert(0, tokenizer.bos_id);
         }
 
@@ -2320,7 +2332,10 @@ impl<'a> Llama3Model<'a> {
     ) -> GenerateResult {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
-        if tokens.is_empty() || tokens[0] != tokenizer.bos_id {
+        // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
+        if tokenizer.add_bos_token
+            && (tokens.is_empty() || tokens[0] != tokenizer.bos_id)
+        {
             tokens.insert(0, tokenizer.bos_id);
         }
 
