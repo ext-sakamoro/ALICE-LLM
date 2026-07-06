@@ -1092,6 +1092,13 @@ impl<'a> Llama3Model<'a> {
         // Embedding lookup
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         // Reusable buffers
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
@@ -1263,6 +1270,13 @@ impl<'a> Llama3Model<'a> {
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
@@ -1830,6 +1844,13 @@ impl<'a> Llama3Model<'a> {
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
@@ -2070,6 +2091,13 @@ impl<'a> Llama3Model<'a> {
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
@@ -2171,6 +2199,13 @@ impl<'a> Llama3Model<'a> {
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
@@ -2422,6 +2457,13 @@ impl<'a> Llama3Model<'a> {
 
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
+        if c.arch == ModelArch::Gemma2 {
+            let scale = (c.hidden_dim as f32).sqrt();
+            for h in hidden.iter_mut() {
+                *h *= scale;
+            }
+        }
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
