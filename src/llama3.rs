@@ -212,6 +212,22 @@ impl Llama3Config {
         }
     }
 
+    /// Effective sliding window for layer `i`.
+    /// - Gemma-2: even layers use sliding_window, odd layers use full attention.
+    /// - Others: uniform sliding_window across all layers.
+    pub const fn sliding_window_for_layer(&self, i: usize) -> Option<usize> {
+        match self.arch {
+            ModelArch::Gemma2 => {
+                if i % 2 == 0 {
+                    self.sliding_window
+                } else {
+                    None
+                }
+            }
+            _ => self.sliding_window,
+        }
+    }
+
     /// Llama-3 8B default config.
     #[must_use]
     pub const fn llama3_8b() -> Self {
@@ -1181,7 +1197,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
@@ -1352,7 +1368,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
@@ -1904,7 +1920,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
@@ -2150,7 +2166,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
@@ -2258,7 +2274,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
@@ -2540,7 +2556,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_heads,
                 c.num_kv_heads,
                 c.head_dim,
-                c.sliding_window,
+                c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
                 &mut attn_out,
             );
