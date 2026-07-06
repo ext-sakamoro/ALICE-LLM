@@ -1431,7 +1431,34 @@ impl<'a> Llama3Model<'a> {
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
 
+        // Repetition penalty (env-configurable, default 1.0 = disabled).
+        // Applied to recently generated tokens' logits before sampling.
+        // ALICE_LLM_REP_PENALTY=1.1 is typical for anti-repetition in Qwen 3.
+        let rep_penalty: f32 = std::env::var("ALICE_LLM_REP_PENALTY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        let rep_window: usize = std::env::var("ALICE_LLM_REP_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+
         for _ in 0..max_new_tokens {
+            // Repetition penalty on recently generated tokens (if enabled).
+            if (rep_penalty - 1.0).abs() > f32::EPSILON {
+                let start = generated.len().saturating_sub(rep_window);
+                for &tok in &generated[start..] {
+                    let idx = tok as usize;
+                    if idx < logits.len() {
+                        if logits[idx] > 0.0 {
+                            logits[idx] /= rep_penalty;
+                        } else {
+                            logits[idx] *= rep_penalty;
+                        }
+                    }
+                }
+            }
+
             // Temperature
             if temperature > 0.0 && temperature != 1.0 {
                 let inv_t = 1.0 / temperature;
