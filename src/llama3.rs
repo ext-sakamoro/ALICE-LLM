@@ -1092,7 +1092,7 @@ impl<'a> Llama3Model<'a> {
         // Reusable buffers
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -1248,7 +1248,7 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -1815,7 +1815,7 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -2055,7 +2055,7 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -2156,7 +2156,7 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -2407,7 +2407,7 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.hidden_dim];
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -2748,13 +2748,16 @@ fn load_layer_weights<'a>(
     config: &Llama3Config,
 ) -> Option<LayerWeights<'a>> {
     let prefix = format!("blk.{layer}");
+    // Gemma-2: num_heads * head_dim (= 2048) != hidden_dim (= 2304).
+    // Other models: q_dim == hidden_dim (identity).
+    let q_dim = config.num_heads * config.head_dim;
     let kv_dim = config.num_kv_heads * config.head_dim;
 
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
     let q_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_q.weight"),
-        config.hidden_dim,
+        q_dim,
         config.hidden_dim,
     )?;
     let k_proj = load_weight_ref(
@@ -2773,7 +2776,7 @@ fn load_layer_weights<'a>(
         gguf,
         &format!("{prefix}.attn_output.weight"),
         config.hidden_dim,
-        config.hidden_dim,
+        q_dim,
     )?;
 
     let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
