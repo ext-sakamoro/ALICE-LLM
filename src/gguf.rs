@@ -1759,18 +1759,35 @@ fn gpt2_char_to_byte() -> HashMap<char, u8> {
 
 // ─── Tokenizer ──────────────────────────────────────────────────────────────
 
-/// BPE tokenizer loaded from GGUF metadata.
-/// Uses GPT-2 byte encoding for Llama-3 compatibility.
+/// GGUF tokenizer model type.
+/// Detected from `tokenizer.ggml.model` metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerModel {
+    /// GPT-2 byte-level BPE (Llama-3, Qwen 2/3, etc.).
+    Gpt2Bpe,
+    /// SentencePiece with score-based BPE merging (Llama-1/2, Gemma 2).
+    /// Uses `▁` (U+2581) as word boundary marker and byte fallback (`<0xNN>`).
+    Spm,
+}
+
+/// GGUF tokenizer supporting both GPT-2 byte-level BPE and SentencePiece SPM.
 pub struct GgufTokenizer {
     tokens: Vec<Vec<u8>>,
     merges: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Per-token scores (SPM only). Populated when `model_type == Spm`.
+    scores: Vec<f32>,
     token_to_id: HashMap<Vec<u8>, u32>,
-    /// Special tokens (e.g. `<|begin_of_text|>`) sorted by length desc.
+    /// Byte fallback tokens `<0x00>`..`<0xFF>` → token id (SPM only).
+    byte_to_id: [Option<u32>; 256],
+    /// Special tokens (e.g. `<|begin_of_text|>`, `<start_of_turn>`) sorted by
+    /// length desc for greedy matching.
     special_tokens: Vec<(String, u32)>,
-    /// GPT-2 byte→char mapping (for encoding input text).
+    /// GPT-2 byte→char mapping (for encoding input text, BPE only).
     byte_encoder: [char; 256],
-    /// GPT-2 char→byte mapping (for decoding tokens to text).
+    /// GPT-2 char→byte mapping (for decoding tokens to text, BPE only).
     byte_decoder: HashMap<char, u8>,
+    /// Tokenizer model type (BPE vs SPM). Determines encode/decode path.
+    model_type: TokenizerModel,
     pub bos_id: u32,
     pub eos_id: u32,
     /// Whether the tokenizer should prepend BOS to encoded sequences.
@@ -1778,11 +1795,63 @@ pub struct GgufTokenizer {
     pub add_bos_token: bool,
 }
 
+/// SentencePiece symbol: pointer + length + doubly-linked list indices.
+/// Used during SPM tokenization to represent contiguous merged pieces.
+#[derive(Clone, Copy)]
+struct SpmSymbol {
+    /// Byte offset in the preprocessed text.
+    text_start: usize,
+    /// Byte length of this symbol (0 = merged away).
+    text_len: usize,
+    /// Index of previous active symbol, or -1 if head.
+    prev: i32,
+    /// Index of next active symbol, or -1 if tail.
+    next: i32,
+}
+
+/// Candidate bigram merge with its score.
+#[derive(Clone, Copy)]
+struct SpmBigram {
+    left: usize,
+    right: usize,
+    score: f32,
+    /// Total byte size at enqueue time — used to detect stale entries
+    /// whose constituent symbols have been merged elsewhere.
+    size: usize,
+}
+
+impl PartialEq for SpmBigram {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.left == other.left
+    }
+}
+impl Eq for SpmBigram {}
+impl PartialOrd for SpmBigram {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SpmBigram {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is a max-heap: higher score first, then smaller left index.
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| other.left.cmp(&self.left))
+    }
+}
+
 impl GgufTokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile<'_>) -> Option<Self> {
         let tokens_meta = gguf.meta("tokenizer.ggml.tokens")?;
         let token_strs = tokens_meta.as_str_array()?;
+
+        // Detect tokenizer model: "gpt2" (Llama-3, Qwen), "llama" (Gemma 2, Llama-1/2).
+        let model_type = match gguf.meta_str("tokenizer.ggml.model") {
+            Some("llama") => TokenizerModel::Spm,
+            _ => TokenizerModel::Gpt2Bpe,
+        };
 
         let mut tokens = Vec::with_capacity(token_strs.len());
         let mut token_to_id = HashMap::with_capacity(token_strs.len());
@@ -1796,6 +1865,10 @@ impl GgufTokenizer {
             .meta("tokenizer.ggml.token_type")
             .and_then(|m| m.as_u32_array());
 
+        // Byte fallback table (SPM): maps byte value 0x00..0xFF → token id.
+        // Populated from `<0xNN>` tokens (type=6 BYTE) in the vocabulary.
+        let mut byte_to_id: [Option<u32>; 256] = [None; 256];
+
         for (i, t) in token_strs.iter().enumerate() {
             let bytes = t.as_bytes().to_vec();
             token_to_id.insert(bytes.clone(), i as u32);
@@ -1807,6 +1880,17 @@ impl GgufTokenizer {
             };
             if is_special {
                 special_tokens.push((t.to_string(), i as u32));
+            }
+
+            // SPM byte fallback: parse `<0xNN>` token strings.
+            if model_type == TokenizerModel::Spm
+                && t.len() == 6
+                && t.starts_with("<0x")
+                && t.ends_with('>')
+            {
+                if let Ok(b) = u8::from_str_radix(&t[3..5], 16) {
+                    byte_to_id[b as usize] = Some(i as u32);
+                }
             }
         }
 
@@ -1833,6 +1917,20 @@ impl GgufTokenizer {
             Vec::new()
         };
 
+        // SPM scores (only meaningful for `tokenizer.ggml.model == "llama"`).
+        // Fallback to empty vec (BPE path ignores scores).
+        let scores: Vec<f32> = gguf
+            .meta("tokenizer.ggml.scores")
+            .and_then(|m| match m {
+                MetaValue::Array(arr) => Some(
+                    arr.iter()
+                        .filter_map(MetaValue::as_f32)
+                        .collect::<Vec<f32>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
         // Qwen 3: add_bos_token = False (default True for Llama family).
@@ -1843,10 +1941,13 @@ impl GgufTokenizer {
         Some(Self {
             tokens,
             merges,
+            scores,
             token_to_id,
+            byte_to_id,
             special_tokens,
             byte_encoder: gpt2_byte_to_char(),
             byte_decoder: gpt2_char_to_byte(),
+            model_type,
             bos_id,
             eos_id,
             add_bos_token,
@@ -1854,8 +1955,9 @@ impl GgufTokenizer {
     }
 
     /// Encode text to token IDs.
-    /// Handles special tokens as atomic units, then applies GPT-2
-    /// byte-level BPE to remaining text segments.
+    /// Handles special tokens as atomic units, then applies GPT-2 byte-level
+    /// BPE (for GPT-2 vocab) or SentencePiece SPM (for llama vocab) to the
+    /// remaining text segments.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut result = Vec::new();
         let mut remaining = text;
@@ -1885,12 +1987,141 @@ impl GgufTokenizer {
                 }
             }
 
-            // BPE encode the text chunk
+            // Encode the text chunk with the appropriate algorithm.
             let chunk = &remaining[..next_boundary];
-            result.extend(self.bpe_encode_chunk(chunk));
+            match self.model_type {
+                TokenizerModel::Gpt2Bpe => result.extend(self.bpe_encode_chunk(chunk)),
+                TokenizerModel::Spm => result.extend(self.spm_encode_chunk(chunk)),
+            }
             remaining = &remaining[next_boundary..];
         }
 
+        result
+    }
+
+    /// SentencePiece SPM encoding using score-based greedy bigram merging.
+    /// Ported from llama.cpp `llm_tokenizer_spm_session::tokenize`.
+    ///
+    /// Preprocessing: replace ' ' with '▁' (U+2581, 3-byte UTF-8) and prepend
+    /// '▁' if the chunk doesn't already start with one. Then the algorithm
+    /// splits the text into UTF-8 codepoints and greedily merges highest-score
+    /// bigrams whose concatenation exists in the vocab. Unmatched symbols fall
+    /// back to byte tokens (`<0xNN>`).
+    fn spm_encode_chunk(&self, text: &str) -> Vec<u32> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        // Preprocess: ' ' → '▁' (U+2581). Prepend '▁' if not already present.
+        let mut preprocessed = String::with_capacity(text.len() + 3);
+        if !text.starts_with('\u{2581}') {
+            preprocessed.push('\u{2581}');
+        }
+        for c in text.chars() {
+            if c == ' ' {
+                preprocessed.push('\u{2581}');
+            } else {
+                preprocessed.push(c);
+            }
+        }
+
+        let bytes = preprocessed.as_bytes();
+
+        // Split into UTF-8 codepoints as initial symbols.
+        let mut symbols: Vec<SpmSymbol> = Vec::new();
+        for (byte_idx, c) in preprocessed.char_indices() {
+            let clen = c.len_utf8();
+            let idx = symbols.len();
+            let prev = if idx == 0 { -1 } else { (idx - 1) as i32 };
+            symbols.push(SpmSymbol {
+                text_start: byte_idx,
+                text_len: clen,
+                prev,
+                next: -1,
+            });
+        }
+        let n_symbols = symbols.len();
+        for i in 0..n_symbols.saturating_sub(1) {
+            symbols[i].next = (i + 1) as i32;
+        }
+
+        // Priority queue of candidate bigrams (max-heap by score).
+        let mut work_queue: std::collections::BinaryHeap<SpmBigram> =
+            std::collections::BinaryHeap::new();
+
+        let try_add = |symbols: &[SpmSymbol],
+                       queue: &mut std::collections::BinaryHeap<SpmBigram>,
+                       left: i32,
+                       right: i32| {
+            if left < 0 || right < 0 {
+                return;
+            }
+            let l = left as usize;
+            let r = right as usize;
+            let start = symbols[l].text_start;
+            let size = symbols[l].text_len + symbols[r].text_len;
+            let merged = &bytes[start..start + size];
+            if let Some(&id) = self.token_to_id.get(merged) {
+                let score = self
+                    .scores
+                    .get(id as usize)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY);
+                queue.push(SpmBigram {
+                    left: l,
+                    right: r,
+                    score,
+                    size,
+                });
+            }
+        };
+
+        // Seed with initial adjacent bigrams.
+        for i in 1..n_symbols {
+            try_add(&symbols, &mut work_queue, (i - 1) as i32, i as i32);
+        }
+
+        // Greedy merge highest-score bigrams.
+        while let Some(bigram) = work_queue.pop() {
+            let left_len = symbols[bigram.left].text_len;
+            let right_len = symbols[bigram.right].text_len;
+            // Skip if either symbol was already merged elsewhere.
+            if left_len == 0 || right_len == 0 || left_len + right_len != bigram.size {
+                continue;
+            }
+            // Merge right into left, remove right from linked list.
+            symbols[bigram.left].text_len += right_len;
+            symbols[bigram.right].text_len = 0;
+            symbols[bigram.left].next = symbols[bigram.right].next;
+            if symbols[bigram.right].next >= 0 {
+                let next_idx = symbols[bigram.right].next as usize;
+                symbols[next_idx].prev = bigram.left as i32;
+            }
+            // Enqueue new neighbor bigrams.
+            let prev = symbols[bigram.left].prev;
+            let next = symbols[bigram.left].next;
+            try_add(&symbols, &mut work_queue, prev, bigram.left as i32);
+            try_add(&symbols, &mut work_queue, bigram.left as i32, next);
+        }
+
+        // Traverse final linked list, emit token ids (with byte fallback).
+        let mut result = Vec::new();
+        let mut idx: i32 = 0;
+        while idx != -1 {
+            let sym = symbols[idx as usize];
+            let segment = &bytes[sym.text_start..sym.text_start + sym.text_len];
+            if let Some(&id) = self.token_to_id.get(segment) {
+                result.push(id);
+            } else {
+                // Byte fallback: emit `<0xNN>` for each byte.
+                for &b in segment {
+                    if let Some(id) = self.byte_to_id[b as usize] {
+                        result.push(id);
+                    }
+                }
+            }
+            idx = sym.next;
+        }
         result
     }
 
@@ -1946,36 +2177,60 @@ impl GgufTokenizer {
     }
 
     /// Decode token IDs to text.
-    /// Converts GPT-2 unicode characters back to raw bytes.
-    /// Skips control tokens and handles `<0xNN>` byte tokens.
+    /// Dispatches to BPE (GPT-2 byte encoding) or SPM (`▁` → space) based on
+    /// tokenizer model. Skips control tokens and handles `<0xNN>` byte tokens.
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            if let Some(token) = self.tokens.get(id as usize) {
-                if let Ok(s) = std::str::from_utf8(token) {
-                    // Skip control/special tokens in output
-                    if s.starts_with("<|") && s.ends_with("|>") {
-                        continue;
-                    }
-                    // Handle byte tokens <0xNN>
-                    if s.starts_with("<0x") && s.ends_with('>') && s.len() == 6 {
-                        if let Ok(byte_val) = u8::from_str_radix(&s[3..5], 16) {
-                            bytes.push(byte_val);
-                            continue;
-                        }
-                    }
-                    // Decode GPT-2 unicode chars → raw bytes
+            let Some(token) = self.tokens.get(id as usize) else {
+                continue;
+            };
+            let Ok(s) = std::str::from_utf8(token) else {
+                bytes.extend_from_slice(token);
+                continue;
+            };
+            // Skip GPT-2 control tokens.
+            if s.starts_with("<|") && s.ends_with("|>") {
+                continue;
+            }
+            // Skip SPM special tokens (single-piece `<...>` control markers).
+            if self.model_type == TokenizerModel::Spm
+                && s.starts_with('<')
+                && s.ends_with('>')
+                && !s.starts_with("<0x")
+                && !s.contains('\u{2581}')
+            {
+                continue;
+            }
+            // Byte fallback token `<0xNN>` — output raw byte.
+            if s.starts_with("<0x") && s.ends_with('>') && s.len() == 6 {
+                if let Ok(byte_val) = u8::from_str_radix(&s[3..5], 16) {
+                    bytes.push(byte_val);
+                    continue;
+                }
+            }
+            match self.model_type {
+                TokenizerModel::Spm => {
+                    // SPM: '▁' (U+2581) marks word boundary → convert to space.
                     for ch in s.chars() {
-                        if let Some(&b) = self.byte_decoder.get(&ch) {
-                            bytes.push(b);
+                        if ch == '\u{2581}' {
+                            bytes.push(b' ');
                         } else {
-                            // Unknown char, keep as UTF-8
                             let mut buf = [0u8; 4];
                             bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
                     }
-                } else {
-                    bytes.extend_from_slice(token);
+                }
+                TokenizerModel::Gpt2Bpe => {
+                    // BPE: decode GPT-2 unicode chars → raw bytes.
+                    for ch in s.chars() {
+                        if let Some(&b) = self.byte_decoder.get(&ch) {
+                            bytes.push(b);
+                        } else {
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
                 }
             }
         }
