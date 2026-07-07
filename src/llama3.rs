@@ -167,9 +167,9 @@ impl Llama3Config {
             .or_else(|| {
                 gguf.meta(&format!("{prefix}.feed_forward_length"))
                     .and_then(|v| match v {
-                        crate::gguf::MetaValue::Array(arr) => {
-                            arr.first().and_then(|item| item.as_u32().map(|v| v as usize))
-                        }
+                        crate::gguf::MetaValue::Array(arr) => arr
+                            .first()
+                            .and_then(|item| item.as_u32().map(|v| v as usize)),
                         _ => None,
                     })
             })?;
@@ -230,21 +230,21 @@ impl Llama3Config {
             .map(|v| v as usize);
 
         // Gemma 3n: per-layer sliding window boolean pattern
-        let sliding_window_pattern =
-            gguf.meta(&format!("{prefix}.attention.sliding_window_pattern"))
-                .and_then(|v| match v {
-                    crate::gguf::MetaValue::Array(arr) => {
-                        let mut out = Vec::with_capacity(arr.len());
-                        for item in arr {
-                            match item {
-                                crate::gguf::MetaValue::Bool(b) => out.push(*b),
-                                _ => return None,
-                            }
+        let sliding_window_pattern = gguf
+            .meta(&format!("{prefix}.attention.sliding_window_pattern"))
+            .and_then(|v| match v {
+                crate::gguf::MetaValue::Array(arr) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        match item {
+                            crate::gguf::MetaValue::Bool(b) => out.push(*b),
+                            _ => return None,
                         }
-                        Some(out)
                     }
-                    _ => None,
-                });
+                    Some(out)
+                }
+                _ => None,
+            });
 
         // Gemma 3n: per-layer activation sparsity scale (f32 array)
         let activation_sparsity_scale = gguf
@@ -433,7 +433,9 @@ impl Llama3Config {
     /// `num_layers`. `map[i] == i` means layer i owns its KV cache; `map[i] != i`
     /// means layer i redirects reads and skips writes.
     pub fn build_kv_layer_map(&self) -> Vec<usize> {
-        (0..self.num_layers).map(|i| self.kv_source_layer(i)).collect()
+        (0..self.num_layers)
+            .map(|i| self.kv_source_layer(i))
+            .collect()
     }
 
     /// Effective sliding window for layer `i`.
@@ -1450,8 +1452,8 @@ impl<'a> Llama3Model<'a> {
                 load_weight_ref(
                     gguf,
                     "per_layer_model_proj.weight",
-                    config.num_layers * dim,  // rows = out_dim
-                    config.hidden_dim,        // cols = in_dim
+                    config.num_layers * dim, // rows = out_dim
+                    config.hidden_dim,       // cols = in_dim
                 )
             });
             let per_layer_proj_norm = gguf.tensor_to_f32("per_layer_proj_norm.weight");
@@ -1686,7 +1688,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -1921,7 +1927,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -2116,9 +2126,9 @@ impl<'a> Llama3Model<'a> {
         let inv_sqrt2 = 1.0f32 / 2.0f32.sqrt();
         for l in 0..n_layer {
             for i in 0..n_embd_altup {
-                inp_per_layer_lookup[l][i] =
-                    (inp_per_layer_lookup[l][i] + per_layer_proj_normed[l * n_embd_altup + i])
-                        * inv_sqrt2;
+                inp_per_layer_lookup[l][i] = (inp_per_layer_lookup[l][i]
+                    + per_layer_proj_normed[l * n_embd_altup + i])
+                    * inv_sqrt2;
             }
         }
         inp_per_layer_lookup
@@ -2126,17 +2136,19 @@ impl<'a> Llama3Model<'a> {
 
     /// AltUp router modalities: compute a per-altup-input activation vector
     /// from the active stream (per llama.cpp `altup_compute_router_modalities`).
-    fn altup_router_modalities(&self, active: &[f32], layer_idx: usize, n_altup: usize) -> Vec<f32> {
+    fn altup_router_modalities(
+        &self,
+        active: &[f32],
+        layer_idx: usize,
+        n_altup: usize,
+    ) -> Vec<f32> {
         let c = &self.config;
         let layer = &self.layers[layer_idx];
         let router_norm_w = layer
             .altup_router_norm
             .as_ref()
             .expect("Gemma3n: altup_router_norm");
-        let router_w = layer
-            .altup_router
-            .as_ref()
-            .expect("Gemma3n: altup_router");
+        let router_w = layer.altup_router.as_ref().expect("Gemma3n: altup_router");
         // router_inputs = RMSNorm(active, router_norm_w) / n_embd
         let mut router_inputs = vec![0.0f32; c.hidden_dim];
         rms_norm(active, router_norm_w, c.norm_eps, &mut router_inputs);
@@ -2149,7 +2161,13 @@ impl<'a> Llama3Model<'a> {
         // == row-major with rows=n_altup, cols=hidden_dim. So matmul(w, x) →
         // out[i] = sum_j w[i * hidden_dim + j] * x[j].
         let mut modalities = vec![0.0f32; n_altup];
-        mat_vec_f32(router_w, n_altup, c.hidden_dim, &router_inputs, &mut modalities);
+        mat_vec_f32(
+            router_w,
+            n_altup,
+            c.hidden_dim,
+            &router_inputs,
+            &mut modalities,
+        );
         for v in &mut modalities {
             *v = v.tanh();
         }
@@ -2179,7 +2197,13 @@ impl<'a> Llama3Model<'a> {
             .as_ref()
             .expect("Gemma3n: altup_predict_coef");
         let mut coef_flat = vec![0.0f32; n_altup * n_altup];
-        mat_vec_f32(predict_coef, n_altup * n_altup, n_altup, &modalities, &mut coef_flat);
+        mat_vec_f32(
+            predict_coef,
+            n_altup * n_altup,
+            n_altup,
+            &modalities,
+            &mut coef_flat,
+        );
         // Coefficient matrix: `coef[out][in]`
         // For each output stream: predictions[out] = sum_in coef[out][in] * streams[in] + streams[out]
         let mut predictions: Vec<Vec<f32>> = vec![vec![0.0f32; hidden_dim]; n_altup];
@@ -2435,7 +2459,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -3027,7 +3055,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -3278,7 +3310,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -3390,7 +3426,11 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
-                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                if c.arch == ModelArch::Gemma3n {
+                    Some(1.0)
+                } else {
+                    None
+                },
                 &mut attn_out,
             );
 
@@ -4030,14 +4070,14 @@ fn load_layer_weights<'a>(
         let inp_gate = load_weight_ref(
             gguf,
             &format!("{prefix}.inp_gate.weight"),
-            per_layer_dim,      // rows = out_dim
-            config.hidden_dim,  // cols = in_dim
+            per_layer_dim,     // rows = out_dim
+            config.hidden_dim, // cols = in_dim
         );
         let proj = load_weight_ref(
             gguf,
             &format!("{prefix}.proj.weight"),
-            config.hidden_dim,  // rows = out_dim
-            per_layer_dim,      // cols = in_dim
+            config.hidden_dim, // rows = out_dim
+            per_layer_dim,     // cols = in_dim
         );
         (inp_gate, proj)
     } else {
@@ -4512,9 +4552,17 @@ mod tests {
         // Layer 20: pattern[20] = true (SWA) → 18
         assert_eq!(c.kv_source_layer(20), 18, "layer 20 (SWA) should map to 18");
         // Layer 24: pattern[24] = false (full attention) → 19
-        assert_eq!(c.kv_source_layer(24), 19, "layer 24 (full) should map to 19");
+        assert_eq!(
+            c.kv_source_layer(24),
+            19,
+            "layer 24 (full) should map to 19"
+        );
         // Layer 29: pattern[29] = false (full attention) → 19
-        assert_eq!(c.kv_source_layer(29), 19, "layer 29 (full) should map to 19");
+        assert_eq!(
+            c.kv_source_layer(29),
+            19,
+            "layer 29 (full) should map to 19"
+        );
         // Layer 21-23: SWA → 18
         for i in 21..24 {
             assert_eq!(c.kv_source_layer(i), 18, "layer {i} (SWA) should map to 18");
