@@ -19,6 +19,9 @@ pub enum ModelArch {
     Llama,
     Mistral,
     Gemma2,
+    /// Gemma 3n (E2B/E4B): AltUp + Laurel + per-layer input embedding +
+    /// shared KV cache + activation sparsity for first N layers.
+    Gemma3n,
     Qwen2,
     Qwen3,
     Qwen3_5,
@@ -30,6 +33,7 @@ impl ModelArch {
         match gguf.meta_str("general.architecture") {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
+            Some("gemma3n") => Self::Gemma3n,
             Some("qwen3moe" | "qwen3") => {
                 if gguf.meta_u32("qwen3.full_attention_interval").is_some()
                     || gguf.meta_u32("qwen3moe.full_attention_interval").is_some()
@@ -50,6 +54,7 @@ impl ModelArch {
             Self::Llama => "llama",
             Self::Mistral => "mistral",
             Self::Gemma2 => "gemma2",
+            Self::Gemma3n => "gemma3n",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 | Self::Qwen3_5 => "qwen3",
         }
@@ -65,7 +70,7 @@ impl ModelArch {
     pub const fn use_neox_rope(&self) -> bool {
         matches!(
             self,
-            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2
+            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2 | Self::Gemma3n
         )
     }
 
@@ -117,6 +122,28 @@ pub struct Llama3Config {
     pub linear_num_v_heads: Option<usize>,
     /// Qwen3.5 DeltaNet: causal conv1d kernel size (typically 4).
     pub linear_conv_kernel_dim: Option<usize>,
+    /// Gemma 3n: per-layer sliding window boolean pattern. When Some,
+    /// entry `i = true` means layer `i` uses SWA, `false` = full attention.
+    /// Supersedes Gemma 2 even/odd alternation.
+    pub sliding_window_pattern: Option<Vec<bool>>,
+    /// Gemma 3n: per-layer FFN activation sparsity scale. First N entries
+    /// are finite (GELU + sparsity threshold `scale * std`), rest are -inf
+    /// (dense, no sparsity). Absent → all layers dense (SiLU for non-Gemma).
+    pub activation_sparsity_scale: Option<Vec<f32>>,
+    /// Gemma 3n: number of layers with unique KV cache. Later layers reuse
+    /// KV cache from earlier layers (layer_i for i >= shared_kv_layers
+    /// shares cache with layer_(i - shared_kv_layers) or similar mapping,
+    /// exact scheme confirmed in Phase 4).
+    pub shared_kv_layers: Option<usize>,
+    /// Gemma 3n: per-layer input embedding dimension (256 for E2B).
+    /// Additional embedding table `per_layer_token_embd.weight` projected
+    /// and added to hidden state at each layer.
+    pub per_layer_input_embedding_dim: Option<usize>,
+    /// Gemma 3n: number of AltUp residual streams (4 for E2B). Enables the
+    /// AltUp mechanism (alternative up-projection with router + correct/predict).
+    pub altup_num_inputs: Option<usize>,
+    /// Gemma 3n: AltUp active input index (0 for E2B).
+    pub altup_active_idx: Option<usize>,
 }
 
 impl Llama3Config {
@@ -131,7 +158,21 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.attention.head_count_kv"))
             .unwrap_or(num_heads as u32) as usize;
         let num_layers = gguf.meta_u32(&format!("{prefix}.block_count"))? as usize;
-        let intermediate_dim = gguf.meta_u32(&format!("{prefix}.feed_forward_length"))? as usize;
+        // Gemma 3n stores `feed_forward_length` as a per-layer array (all same
+        // value for E2B). Fall back to reading first element when scalar u32
+        // read fails.
+        let intermediate_dim = gguf
+            .meta_u32(&format!("{prefix}.feed_forward_length"))
+            .map(|v| v as usize)
+            .or_else(|| {
+                gguf.meta(&format!("{prefix}.feed_forward_length"))
+                    .and_then(|v| match v {
+                        crate::gguf::MetaValue::Array(arr) => {
+                            arr.first().and_then(|item| item.as_u32().map(|v| v as usize))
+                        }
+                        _ => None,
+                    })
+            })?;
         let max_seq_len = gguf
             .meta_u32(&format!("{prefix}.context_length"))
             .unwrap_or(8192) as usize;
@@ -189,6 +230,58 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.linear_conv_kernel_dim"))
             .map(|v| v as usize);
 
+        // Gemma 3n: per-layer sliding window boolean pattern
+        let sliding_window_pattern =
+            gguf.meta(&format!("{prefix}.attention.sliding_window_pattern"))
+                .and_then(|v| match v {
+                    crate::gguf::MetaValue::Array(arr) => {
+                        let mut out = Vec::with_capacity(arr.len());
+                        for item in arr {
+                            match item {
+                                crate::gguf::MetaValue::Bool(b) => out.push(*b),
+                                _ => return None,
+                            }
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                });
+
+        // Gemma 3n: per-layer activation sparsity scale (f32 array)
+        let activation_sparsity_scale = gguf
+            .meta(&format!("{prefix}.activation_sparsity_scale"))
+            .and_then(|v| match v {
+                crate::gguf::MetaValue::Array(arr) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        match item {
+                            crate::gguf::MetaValue::F32(f) => out.push(*f),
+                            _ => return None,
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            });
+
+        // Gemma 3n: shared KV cache layer count
+        let shared_kv_layers = gguf
+            .meta_u32(&format!("{prefix}.attention.shared_kv_layers"))
+            .map(|v| v as usize);
+
+        // Gemma 3n: per-layer input embedding dimension
+        let per_layer_input_embedding_dim = gguf
+            .meta_u32(&format!("{prefix}.embedding_length_per_layer_input"))
+            .map(|v| v as usize);
+
+        // Gemma 3n: AltUp mechanism
+        let altup_num_inputs = gguf
+            .meta_u32(&format!("{prefix}.altup.num_inputs"))
+            .map(|v| v as usize);
+        let altup_active_idx = gguf
+            .meta_u32(&format!("{prefix}.altup.active_idx"))
+            .map(|v| v as usize);
+
         Some(Self {
             arch,
             vocab_size,
@@ -210,6 +303,12 @@ impl Llama3Config {
             linear_kv_head_dim,
             linear_num_v_heads,
             linear_conv_kernel_dim,
+            sliding_window_pattern,
+            activation_sparsity_scale,
+            shared_kv_layers,
+            per_layer_input_embedding_dim,
+            altup_num_inputs,
+            altup_active_idx,
         })
     }
 
@@ -233,26 +332,134 @@ impl Llama3Config {
         self.arch.use_neox_rope()
     }
 
-    /// Apply the FFN gate activation for this architecture.
-    /// Gemma 2 uses GELU (tanh approximation); all others use SiLU (SwiGLU).
+    /// Apply the FFN gate activation for this architecture at a given layer.
+    /// - Gemma 2: GELU (tanh approximation) uniformly.
+    /// - Gemma 3n: GELU uniformly (llama.cpp `ggml_gelu` matches HF exact GELU
+    ///   for Gemma 3n). Per-layer sparsity masking is applied **before** this
+    ///   step via `apply_ffn_sparsity`.
+    /// - All others: SiLU (SwiGLU).
     #[inline]
-    pub fn apply_ffn_act(&self, x: f32) -> f32 {
+    pub fn apply_ffn_act(&self, _layer_idx: usize, x: f32) -> f32 {
         match self.arch {
-            ModelArch::Gemma2 => gelu_approx(x),
+            ModelArch::Gemma2 | ModelArch::Gemma3n => gelu_approx(x),
             _ => silu(x),
         }
     }
 
+    /// Apply Gemma 3n activation sparsity (gaussian_topk) in-place to
+    /// `gate_buf` for sparse layers. No-op for non-Gemma-3n or layers where
+    /// `activation_sparsity_scale[layer_idx]` is not finite (dense).
+    ///
+    /// Semantics (llama.cpp `gaussian_topk`):
+    ///   mean = mean(gate_buf)
+    ///   std  = sqrt(sum((x - mean)^2) / (n - 1))   (unbiased std)
+    ///   cutoff = mean + scale * std
+    ///   gate_buf[i] = max(0, gate_buf[i] - cutoff)  (ReLU shift)
+    ///
+    /// For scale = 1.6448 (~= Φ⁻¹(0.95)), retains the top ~5% of values.
+    pub fn apply_ffn_sparsity(&self, layer_idx: usize, gate_buf: &mut [f32]) {
+        if self.arch != ModelArch::Gemma3n {
+            return;
+        }
+        let scale = match self
+            .activation_sparsity_scale
+            .as_ref()
+            .and_then(|arr| arr.get(layer_idx))
+        {
+            Some(s) if s.is_finite() => *s,
+            _ => return,
+        };
+        let n = gate_buf.len();
+        if n < 2 {
+            return;
+        }
+        // Compute mean
+        let mut sum = 0.0f64;
+        for &x in gate_buf.iter() {
+            sum += x as f64;
+        }
+        let mean = (sum / n as f64) as f32;
+        // Compute unbiased variance: sum((x - mean)^2) / (n - 1)
+        let mut sq_sum = 0.0f64;
+        for &x in gate_buf.iter() {
+            let d = (x - mean) as f64;
+            sq_sum += d * d;
+        }
+        let std = (sq_sum / (n - 1) as f64).sqrt() as f32;
+        let cutoff = mean + scale * std;
+        // ReLU shift in-place
+        for x in gate_buf.iter_mut() {
+            *x = (*x - cutoff).max(0.0);
+        }
+    }
+
+    /// Number of "root" layers with unique KV cache. Later layers reuse KV
+    /// from these roots (Gemma 3n shared-KV mechanism).
+    ///
+    /// For non-Gemma3n architectures, returns `num_layers` (every layer has
+    /// its own KV cache). For Gemma 3n, returns `num_layers - shared_kv_layers`
+    /// per the metadata (E2B: 30 - 10 = 20, E4B: 35 - 15 = 20). Matches
+    /// llama.cpp `hparams.n_layer_kv_from_start`.
+    pub fn kv_from_start_layers(&self) -> usize {
+        match (self.arch, self.shared_kv_layers) {
+            (ModelArch::Gemma3n, Some(shared)) if shared < self.num_layers => {
+                self.num_layers - shared
+            }
+            _ => self.num_layers,
+        }
+    }
+
+    /// Return the KV-cache "source layer" whose K/V should be read/written for
+    /// layer `i`. For most architectures this is `i` itself. For Gemma 3n
+    /// layers at index `i >= kv_from_start_layers()`:
+    ///   - SWA layer → source = `kv_from_start_layers() - 2`
+    ///   - Full attention → source = `kv_from_start_layers() - 1`
+    ///
+    /// This matches the llama.cpp `layer_reuse_cb` for `LLM_ARCH_GEMMA3N`.
+    pub fn kv_source_layer(&self, i: usize) -> usize {
+        if self.arch != ModelArch::Gemma3n {
+            return i;
+        }
+        let root = self.kv_from_start_layers();
+        if i < root {
+            return i;
+        }
+        // For layers >= root, redirect to the last "own KV" layer of matching type.
+        let is_swa = self.sliding_window_for_layer(i).is_some();
+        let offset = if is_swa { 2 } else { 1 };
+        root.saturating_sub(offset)
+    }
+
+    /// Build the layer→KV-source mapping for the whole model. Length equals
+    /// `num_layers`. `map[i] == i` means layer i owns its KV cache; `map[i] != i`
+    /// means layer i redirects reads and skips writes.
+    pub fn build_kv_layer_map(&self) -> Vec<usize> {
+        (0..self.num_layers).map(|i| self.kv_source_layer(i)).collect()
+    }
+
     /// Effective sliding window for layer `i`.
     /// - Gemma-2: even layers use sliding_window, odd layers use full attention.
+    /// - Gemma 3n: per-layer boolean pattern from
+    ///   `attention.sliding_window_pattern` (true = SWA, false = full).
     /// - Others: uniform sliding_window across all layers.
-    pub const fn sliding_window_for_layer(&self, i: usize) -> Option<usize> {
+    pub fn sliding_window_for_layer(&self, i: usize) -> Option<usize> {
         match self.arch {
             ModelArch::Gemma2 => {
                 if i % 2 == 0 {
                     self.sliding_window
                 } else {
                     None
+                }
+            }
+            ModelArch::Gemma3n => {
+                if let Some(pattern) = self.sliding_window_pattern.as_ref() {
+                    if pattern.get(i).copied().unwrap_or(false) {
+                        self.sliding_window
+                    } else {
+                        None
+                    }
+                } else {
+                    self.sliding_window
                 }
             }
             _ => self.sliding_window,
@@ -283,6 +490,12 @@ impl Llama3Config {
             linear_kv_head_dim: None,
             linear_num_v_heads: None,
             linear_conv_kernel_dim: None,
+            sliding_window_pattern: None,
+            activation_sparsity_scale: None,
+            shared_kv_layers: None,
+            per_layer_input_embedding_dim: None,
+            altup_num_inputs: None,
+            altup_active_idx: None,
         }
     }
 }
@@ -297,6 +510,12 @@ struct KvCache {
     max_seq_len: usize,
     kv_dim: usize,
     seq_len: usize,
+    /// Layer → KV-source layer mapping (Gemma 3n shared-KV support). For most
+    /// architectures this is the identity `[0, 1, ..., num_layers-1]`. For
+    /// Gemma 3n, later layers redirect reads and skip writes to earlier layers.
+    /// `map[i] == i` means layer i owns its KV cache; `map[i] != i` means
+    /// layer i is a shared read from `map[i]`.
+    kv_layer_map: Vec<usize>,
 }
 
 impl KvCache {
@@ -309,7 +528,15 @@ impl KvCache {
             max_seq_len,
             kv_dim,
             seq_len: 0,
+            kv_layer_map: (0..num_layers).collect(),
         }
+    }
+
+    /// Install a custom layer→KV-source mapping. Must be called before any
+    /// `append`. `map.len()` must equal `num_layers`.
+    fn set_layer_map(&mut self, map: Vec<usize>) {
+        assert_eq!(map.len(), self._num_layers, "kv_layer_map length mismatch");
+        self.kv_layer_map = map;
     }
 
     #[inline]
@@ -318,6 +545,11 @@ impl KvCache {
     }
 
     fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
+        // Skip writes for shared layers (Gemma 3n): the target KV cache was
+        // already populated by the "source" layer earlier in the forward pass.
+        if self.kv_layer_map[layer] != layer {
+            return;
+        }
         let off = self.offset(layer, self.seq_len);
         self.keys[off..off + self.kv_dim].copy_from_slice(k);
         self.values[off..off + self.kv_dim].copy_from_slice(v);
@@ -334,13 +566,16 @@ impl KvCache {
 
     #[inline]
     fn key_at(&self, layer: usize, pos: usize) -> &[f32] {
-        let off = self.offset(layer, pos);
+        // Redirect via layer map for shared-KV layers (Gemma 3n).
+        let src_layer = self.kv_layer_map[layer];
+        let off = self.offset(src_layer, pos);
         &self.keys[off..off + self.kv_dim]
     }
 
     #[inline]
     fn value_at(&self, layer: usize, pos: usize) -> &[f32] {
-        let off = self.offset(layer, pos);
+        let src_layer = self.kv_layer_map[layer];
+        let off = self.offset(src_layer, pos);
         &self.values[off..off + self.kv_dim]
     }
 
@@ -555,6 +790,49 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+/// Per-head RMSNorm without weight (in place). Same as `apply_qk_norm` but
+/// with an implicit identity weight vector. Used for V normalization in
+/// Gemma 3n.
+fn apply_head_rms_norm_identity(buf: &mut [f32], head_dim: usize, eps: f32) {
+    let num_heads = buf.len() / head_dim;
+    for h in 0..num_heads {
+        let start = h * head_dim;
+        let slice = &mut buf[start..start + head_dim];
+        let mut ss = 0.0f64;
+        for &v in slice.iter() {
+            ss += (v as f64) * (v as f64);
+        }
+        let mean = (ss / head_dim as f64) as f32;
+        let scale = 1.0f32 / (mean + eps).sqrt();
+        for v in slice.iter_mut() {
+            *v *= scale;
+        }
+    }
+}
+
+/// F32 dense matrix-vector product: `out[i] = sum_j w[i * cols + j] * x[j]`.
+/// Row-major storage; `w.len()` must equal `rows * cols`.
+fn mat_vec_f32(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    for i in 0..rows {
+        let row = &w[i * cols..(i + 1) * cols];
+        let mut sum = 0.0f32;
+        for j in 0..cols {
+            sum += row[j] * x[j];
+        }
+        out[i] = sum;
+    }
+}
+
+/// L2 magnitude (Frobenius norm): sqrt(sum(x^2)). Used by Gemma 3n AltUp
+/// magnitude-preserving projection.
+fn l2_magnitude(x: &[f32]) -> f32 {
+    let mut ss = 0.0f64;
+    for &v in x {
+        ss += (v as f64) * (v as f64);
+    }
+    (ss as f32).sqrt()
+}
+
 /// Qwen 3 QK-Norm: apply per-head RMSNorm to Q or K buffer in-place.
 /// `buf` shape: [num_heads * head_dim] (Q) or [num_kv_heads * head_dim] (K).
 /// `weight` shape: [head_dim] (broadcast across heads).
@@ -683,6 +961,8 @@ fn apply_rope_auto(
 
 /// Compute GQA attention into `attn_out`.
 /// Supports Mistral Sliding Window and Gemma-2 logit softcapping.
+/// When `attention_scale` is Some(x), uses x as the score-scaling factor
+/// instead of the default 1/sqrt(head_dim). Gemma 3n uses 1.0.
 fn gqa_attention(
     q_buf: &[f32],
     kv_cache: &KvCache,
@@ -693,11 +973,12 @@ fn gqa_attention(
     head_dim: usize,
     sliding_window: Option<usize>,
     attn_logit_softcap: Option<f32>,
+    attention_scale: Option<f32>,
     attn_out: &mut [f32],
 ) {
     let seq_len = pos + 1;
     let heads_per_kv = num_heads / num_kv_heads;
-    let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+    let inv_sqrt_d = attention_scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
 
     let attn_start = match sliding_window {
         Some(w) => seq_len.saturating_sub(w),
@@ -903,6 +1184,31 @@ struct LayerWeights<'a> {
     gate_proj: WeightRef<'a>,
     up_proj: WeightRef<'a>,
     down_proj: WeightRef<'a>,
+    // ── Gemma 3n per-layer tensors (None for other architectures) ──────────
+    /// Gemma 3n: extra RMSNorm applied at the end of layer (post_norm).
+    post_norm: Option<Vec<f32>>,
+    /// Gemma 3n: per-layer input embedding gate projection.
+    /// Shape [hidden_dim, per_layer_input_embedding_dim].
+    inp_gate: Option<WeightRef<'a>>,
+    /// Gemma 3n: extra projection connecting the per-layer embedding branch.
+    /// Shape [per_layer_input_embedding_dim, hidden_dim].
+    proj: Option<WeightRef<'a>>,
+    /// Gemma 3n Laurel left projection [hidden_dim, laurel_rank=64].
+    laurel_l: Option<Vec<f32>>,
+    /// Gemma 3n Laurel right projection [laurel_rank=64, hidden_dim].
+    laurel_r: Option<Vec<f32>>,
+    /// Gemma 3n Laurel post-branch RMSNorm [hidden_dim].
+    laurel_post_norm: Option<Vec<f32>>,
+    /// Gemma 3n AltUp router [hidden_dim, altup_num_inputs].
+    altup_router: Option<Vec<f32>>,
+    /// Gemma 3n AltUp router pre-RMSNorm [hidden_dim].
+    altup_router_norm: Option<Vec<f32>>,
+    /// Gemma 3n AltUp predict coefficient matrix [altup_num_inputs, altup_num_inputs^2].
+    altup_predict_coef: Option<Vec<f32>>,
+    /// Gemma 3n AltUp correct coefficient matrix [altup_num_inputs, altup_num_inputs].
+    altup_correct_coef: Option<Vec<f32>>,
+    /// Gemma 3n AltUp correction scale [hidden_dim].
+    altup_correct_scale: Option<Vec<f32>>,
 }
 
 // ─── Layerwise Mixed Precision ──────────────────────────────────────────────
@@ -1055,6 +1361,23 @@ pub struct Llama3Model<'a> {
     ternary_output_proj: Option<TernaryMatrix>,
     sparse_ternary_layers: Option<Vec<SparseTernaryLayerWeights>>,
     sparse_ternary_output: Option<SparseTernaryMatrix>,
+    // ── Gemma 3n global weights (None for other architectures) ─────────────
+    /// Gemma 3n per-layer input embedding table
+    /// [num_layers * per_layer_input_embedding_dim, vocab_size] Q5_1.
+    /// Kept as raw bytes for memory efficiency; slice-dequantize per token
+    /// via [`Self::per_layer_embedding_for_token`].
+    per_layer_token_embd_raw: Option<&'a [u8]>,
+    /// Gemma 3n per-layer embedding projection
+    /// [hidden_dim, num_layers * per_layer_input_embedding_dim].
+    per_layer_model_proj: Option<WeightRef<'a>>,
+    /// Gemma 3n per-layer projection RMSNorm weight
+    /// [per_layer_input_embedding_dim].
+    per_layer_proj_norm: Option<Vec<f32>>,
+    /// Gemma 3n AltUp projection [hidden_dim, hidden_dim, altup_num_inputs - 1]
+    /// (dequantized F16 → f32).
+    altup_proj: Option<Vec<f32>>,
+    /// Gemma 3n AltUp un-embed projection (mirror shape of altup_proj).
+    altup_unembd_proj: Option<Vec<f32>>,
 }
 
 impl<'a> Llama3Model<'a> {
@@ -1089,7 +1412,9 @@ impl<'a> Llama3Model<'a> {
         }
 
         let kv_dim = config.num_kv_heads * config.head_dim;
-        let kv_cache = KvCache::new(config.num_layers, config.max_seq_len, kv_dim);
+        let mut kv_cache = KvCache::new(config.num_layers, config.max_seq_len, kv_dim);
+        // Gemma 3n shared-KV layer mapping (no-op for other architectures).
+        kv_cache.set_layer_map(config.build_kv_layer_map());
 
         // RoPE frequency scaling tensor (Llama-3.1/3.2 NTK-aware context extension)
         // Values are scaling factors: actual_freq[i] = base_freq[i] * scale[i]
@@ -1109,6 +1434,41 @@ impl<'a> Llama3Model<'a> {
                 }
             });
 
+        // Gemma 3n global weights (per-layer input embedding + AltUp projections).
+        // All fields are None for non-Gemma3n architectures.
+        let (
+            per_layer_token_embd_raw,
+            per_layer_model_proj,
+            per_layer_proj_norm,
+            altup_proj,
+            altup_unembd_proj,
+        ) = if config.arch == ModelArch::Gemma3n {
+            let per_layer_token_embd_raw = gguf.tensor_data("per_layer_token_embd.weight");
+            // per_layer_model_proj.weight ggml shape {n_embd, n_layer * n_embd_altup}
+            // (ne0=n_embd=in, ne1=n_layer*n_embd_altup=out)
+            // → rows=n_layer*n_embd_altup, cols=n_embd.
+            let per_layer_model_proj = config.per_layer_input_embedding_dim.and_then(|dim| {
+                load_weight_ref(
+                    gguf,
+                    "per_layer_model_proj.weight",
+                    config.num_layers * dim,  // rows = out_dim
+                    config.hidden_dim,        // cols = in_dim
+                )
+            });
+            let per_layer_proj_norm = gguf.tensor_to_f32("per_layer_proj_norm.weight");
+            let altup_proj = gguf.tensor_to_f32("altup_proj.weight");
+            let altup_unembd_proj = gguf.tensor_to_f32("altup_unembd_proj.weight");
+            (
+                per_layer_token_embd_raw,
+                per_layer_model_proj,
+                per_layer_proj_norm,
+                altup_proj,
+                altup_unembd_proj,
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
         Some(Self {
             config,
             embedding,
@@ -1121,7 +1481,40 @@ impl<'a> Llama3Model<'a> {
             ternary_output_proj: None,
             sparse_ternary_layers: None,
             sparse_ternary_output: None,
+            per_layer_token_embd_raw,
+            per_layer_model_proj,
+            per_layer_proj_norm,
+            altup_proj,
+            altup_unembd_proj,
         })
+    }
+
+    /// Gemma 3n: dequantize the per-layer input embedding slice for a single
+    /// token. Returns a `Vec<f32>` of length `num_layers * per_layer_dim`.
+    /// Returns `None` for non-Gemma3n models or when the per-layer token
+    /// embedding table is absent.
+    ///
+    /// Memory-efficient: dequantizes only the requested token's slice (~30 KB)
+    /// rather than materializing the full ~8 GB f32 table upfront.
+    pub fn per_layer_embedding_for_token(&self, token_id: u32) -> Option<Vec<f32>> {
+        let raw = self.per_layer_token_embd_raw?;
+        let per_layer_dim = self.config.per_layer_input_embedding_dim?;
+        let elements_per_token = self.config.num_layers * per_layer_dim;
+        // Q5_1: block size = 32 elements, block bytes = 24.
+        let qk = crate::gguf::GgmlType::Q5_1.elements_per_block();
+        let block_bytes = crate::gguf::GgmlType::Q5_1.block_bytes();
+        if elements_per_token % qk != 0 {
+            return None;
+        }
+        let blocks_per_token = elements_per_token / qk;
+        let start = (token_id as usize) * blocks_per_token * block_bytes;
+        let end = start + blocks_per_token * block_bytes;
+        if end > raw.len() {
+            return None;
+        }
+        let mut out = vec![0.0f32; elements_per_token];
+        crate::gguf::dequantize_q5_1(&raw[start..end], &mut out);
+        Some(out)
     }
 
     /// Ternarize all weights for ternary inference mode.
@@ -1188,6 +1581,12 @@ impl<'a> Llama3Model<'a> {
 
     /// Forward pass for a single token. Returns logits [vocab_size].
     pub fn forward(&mut self, token_id: u32) -> Vec<f32> {
+        // Gemma 3n: use dedicated forward path (AltUp + Laurel + per-layer
+        // input embedding + shared KV are fundamentally different from the
+        // standard single-stream flow).
+        if self.config.arch == ModelArch::Gemma3n {
+            return self.forward_gemma3n(token_id);
+        }
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -1288,6 +1687,7 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
                 &mut attn_out,
             );
 
@@ -1314,8 +1714,9 @@ impl<'a> Llama3Model<'a> {
             layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
 
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
 
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
@@ -1352,6 +1753,581 @@ impl<'a> Llama3Model<'a> {
         }
 
         logits
+    }
+
+    /// Gemma 3n forward pass. Mirrors llama.cpp
+    /// `llama_model_gemma3n::graph::build_arch_graph`.
+    ///
+    /// Data shape convention (single-token autoregressive):
+    ///   * altup streams:      `Vec<Vec<f32>>` of shape `[n_altup][hidden_dim]`
+    ///   * inp_per_layer:      `Vec<Vec<f32>>` of shape `[n_layer][n_embd_altup]`
+    ///
+    /// # Panics
+    /// Panics if the model was not loaded with Gemma 3n architecture (missing
+    /// required per-layer / global tensors).
+    fn forward_gemma3n(&mut self, token_id: u32) -> Vec<f32> {
+        let c = self.config.clone();
+        let hidden_dim = c.hidden_dim;
+        let n_altup = c.altup_num_inputs.expect("Gemma3n: altup_num_inputs");
+        let n_embd_altup = c
+            .per_layer_input_embedding_dim
+            .expect("Gemma3n: per_layer_input_embedding_dim");
+        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let n_layer_sparsity = c
+            .activation_sparsity_scale
+            .as_ref()
+            .map(|arr| arr.iter().take_while(|s| s.is_finite()).count())
+            .unwrap_or(0);
+        let pos = self.kv_cache.seq_len();
+        let rope_freqs_ref = self.rope_freqs.as_deref();
+
+        // ── Embedding lookup + Gemma-style scale ────────────────────────────
+        let emb_start = token_id as usize * hidden_dim;
+        let mut inpl: Vec<f32> = self.embedding[emb_start..emb_start + hidden_dim].to_vec();
+        let scale = (hidden_dim as f32).sqrt();
+        for v in inpl.iter_mut() {
+            *v *= scale;
+        }
+
+        // ── Per-layer input embedding lookup + projection ───────────────────
+        // Shape: [n_layer][n_embd_altup]
+        let inp_per_layer =
+            self.gemma3n_per_layer_inputs(token_id, &inpl, n_embd_altup, c.num_layers);
+
+        // ── Initialize AltUp streams: [n_altup][hidden_dim] ────────────────
+        let mut streams: Vec<Vec<f32>> = vec![Vec::new(); n_altup];
+        streams[i_altup_act] = inpl.clone();
+        // Compute other streams via altup_proj (magnitude-preserving)
+        let target_magnitude = l2_magnitude(&inpl);
+        let altup_proj = self
+            .altup_proj
+            .as_ref()
+            .expect("Gemma3n: altup_proj missing");
+        // altup_proj shape: [n_embd, n_embd, n_altup - 1] in ggml row-major.
+        // ggml stores innermost dim first, so the layout is:
+        //   for i_altup in 0..n_altup-1:
+        //     for row in 0..n_embd:  (== output dim)
+        //       for col in 0..n_embd:  (== input dim)
+        // We index as: altup_proj[i_altup * n_embd * n_embd + row * n_embd + col]
+        let n_embd = hidden_dim;
+        for i_altup in 0..(n_altup - 1) {
+            let slab_start = i_altup * n_embd * n_embd;
+            let slab = &altup_proj[slab_start..slab_start + n_embd * n_embd];
+            let mut added = vec![0.0f32; n_embd];
+            mat_vec_f32(slab, n_embd, n_embd, &inpl, &mut added);
+            // Magnitude-preserve normalization
+            let new_mag = l2_magnitude(&added);
+            if new_mag > 0.0 {
+                let factor = target_magnitude / new_mag;
+                for v in added.iter_mut() {
+                    *v *= factor;
+                }
+            }
+            // Fill the stream after i_altup_act (skip active).
+            let dest_idx = if i_altup < i_altup_act {
+                i_altup
+            } else {
+                i_altup + 1
+            };
+            streams[dest_idx] = added;
+        }
+
+        // Reusable buffers
+        let mut norm_buf = vec![0.0f32; hidden_dim];
+        let kv_dim = c.num_kv_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
+        let mut k_buf = vec![0.0f32; kv_dim];
+        let mut v_buf = vec![0.0f32; kv_dim];
+        let mut attn_out = vec![0.0f32; hidden_dim];
+        let mut o_buf = vec![0.0f32; hidden_dim];
+        let mut gate_buf = vec![0.0f32; c.intermediate_dim];
+        let mut up_buf = vec![0.0f32; c.intermediate_dim];
+        let mut down_buf = vec![0.0f32; hidden_dim];
+
+        // ── Per-layer loop ─────────────────────────────────────────────────
+        for layer_idx in 0..c.num_layers {
+            let layer = &self.layers[layer_idx];
+
+            // ── Altup predict ──────────────────────────────────────────────
+            let predictions = self.altup_predict(&streams, layer_idx, n_altup);
+            // active_prediction is predictions[i_altup_act]
+            let active_prediction = predictions[i_altup_act].clone();
+            let mut cur = active_prediction.clone();
+
+            // ── attn_norm ──────────────────────────────────────────────────
+            rms_norm(&cur, &layer.attn_norm, c.norm_eps, &mut norm_buf);
+            cur.copy_from_slice(&norm_buf);
+
+            // ── Laurel branch (parallel to attention) ──────────────────────
+            let laurel_out = self.laurel(&cur, layer_idx);
+
+            // ── Attention (Q, K, V projections + norms + RoPE) ─────────────
+            let q8_attn = quantize_row_q8_k(&cur);
+            layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
+            // Only compute K, V for "own KV" layers (Gemma 3n shared KV: shared
+            // layers reuse a previous layer's cache).
+            let owns_kv = self.kv_cache.kv_layer_map[layer_idx] == layer_idx;
+            if owns_kv {
+                layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
+                layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            }
+
+            // Q, K per-head RMSNorm (Gemma 3n uses them like Qwen 3)
+            if let Some(w) = &layer.q_norm {
+                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+            }
+            if owns_kv {
+                if let Some(w) = &layer.k_norm {
+                    apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
+                }
+                // V RMSNorm without weight (identity gain)
+                apply_head_rms_norm_identity(&mut v_buf, c.head_dim, c.norm_eps);
+            }
+
+            // Apply RoPE to Q and K
+            for h in 0..c.num_heads {
+                let start = h * c.head_dim;
+                apply_rope_auto(
+                    &mut q_buf[start..start + c.head_dim],
+                    pos,
+                    c.head_dim,
+                    c.rope_theta,
+                    rope_freqs_ref,
+                    c.use_neox_rope(),
+                );
+            }
+            if owns_kv {
+                for h in 0..c.num_kv_heads {
+                    let start = h * c.head_dim;
+                    apply_rope_auto(
+                        &mut k_buf[start..start + c.head_dim],
+                        pos,
+                        c.head_dim,
+                        c.rope_theta,
+                        rope_freqs_ref,
+                        c.use_neox_rope(),
+                    );
+                }
+                // Store K, V in cache (skips write for shared layers internally).
+                self.kv_cache.append(layer_idx, &k_buf, &v_buf);
+            }
+
+            // GQA attention (uses layer_idx which the cache remaps to source layer)
+            gqa_attention(
+                &q_buf,
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.sliding_window_for_layer(layer_idx),
+                c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
+                &mut attn_out,
+            );
+
+            // Output projection
+            let layer = &self.layers[layer_idx];
+            layer.o_proj.matvec(&attn_out, &mut o_buf);
+
+            // Post-attention RMSNorm (Gemma-2/3n sandwich)
+            if let Some(w) = &layer.post_attn_norm {
+                rms_norm(&o_buf, w, c.norm_eps, &mut norm_buf);
+                o_buf.copy_from_slice(&norm_buf);
+            }
+
+            // cur = attn_output + active_prediction  (gated residual)
+            for i in 0..hidden_dim {
+                cur[i] = o_buf[i] + active_prediction[i];
+            }
+
+            // attn_laurel = (cur + laurel_out) / sqrt(2)
+            let inv_sqrt2 = 1.0f32 / 2.0f32.sqrt();
+            let mut attn_laurel = vec![0.0f32; hidden_dim];
+            for i in 0..hidden_dim {
+                attn_laurel[i] = (cur[i] + laurel_out[i]) * inv_sqrt2;
+            }
+
+            // ── FFN ────────────────────────────────────────────────────────
+            rms_norm(&attn_laurel, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
+            let q8_ffn = quantize_row_q8_k(&norm_buf);
+            layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
+            layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+
+            // Sparsity: gaussian_topk for first n_layer_sparsity layers
+            if layer_idx < n_layer_sparsity {
+                c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
+            }
+            // GELU + gate * up
+            for i in 0..c.intermediate_dim {
+                gate_buf[i] = gelu_approx(gate_buf[i]) * up_buf[i];
+            }
+            layer.down_proj.matvec(&gate_buf, &mut down_buf);
+
+            // Post-FFN RMSNorm
+            if let Some(w) = &layer.post_ffn_norm {
+                rms_norm(&down_buf, w, c.norm_eps, &mut norm_buf);
+                down_buf.copy_from_slice(&norm_buf);
+            }
+
+            // attn_ffw_laurel_gated = down_buf + attn_laurel
+            let mut ffn_out = attn_laurel.clone();
+            for i in 0..hidden_dim {
+                ffn_out[i] += down_buf[i];
+            }
+
+            // ── AltUp correct ──────────────────────────────────────────────
+            let mut corrected = self.altup_correct(&predictions, &ffn_out, layer_idx, n_altup);
+
+            // ── Per-layer first_prediction (bottom of layer) ──────────────
+            let first_prediction = self.gemma3n_first_prediction(
+                &corrected[i_altup_act],
+                layer_idx,
+                &inp_per_layer[layer_idx],
+                n_embd_altup,
+            );
+            // corrected[1..] += first_prediction  (skip active stream)
+            for a in 0..n_altup {
+                if a == i_altup_act {
+                    continue;
+                }
+                for i in 0..hidden_dim {
+                    corrected[a][i] += first_prediction[i];
+                }
+            }
+
+            streams = corrected;
+        }
+
+        // Advance KV cache position after all layers appended
+        self.kv_cache.advance();
+        let _ = inp_per_layer; // keep alive across loop
+
+        // ── Merge altup streams back to single via altup_unembd_proj ──────
+        let mut cur = streams[i_altup_act].clone();
+        let target_magnitude = l2_magnitude(&cur);
+        let altup_unembd_proj = self
+            .altup_unembd_proj
+            .as_ref()
+            .expect("Gemma3n: altup_unembd_proj missing");
+        // For each non-active stream, project + magnitude-preserve, then add.
+        for i_altup in 0..(n_altup - 1) {
+            let src_stream_idx = if i_altup < i_altup_act {
+                i_altup
+            } else {
+                i_altup + 1
+            };
+            let slab_start = i_altup * n_embd * n_embd;
+            let slab = &altup_unembd_proj[slab_start..slab_start + n_embd * n_embd];
+            let mut unembd = vec![0.0f32; n_embd];
+            mat_vec_f32(slab, n_embd, n_embd, &streams[src_stream_idx], &mut unembd);
+            let new_mag = l2_magnitude(&unembd);
+            if new_mag > 0.0 {
+                let factor = target_magnitude / new_mag;
+                for v in unembd.iter_mut() {
+                    *v *= factor;
+                }
+            }
+            for i in 0..hidden_dim {
+                cur[i] += unembd[i];
+            }
+        }
+        // Average (divide by n_altup)
+        let inv_n_altup = 1.0f32 / n_altup as f32;
+        for v in cur.iter_mut() {
+            *v *= inv_n_altup;
+        }
+
+        // Output norm
+        rms_norm(&cur, &self.output_norm, c.norm_eps, &mut norm_buf);
+
+        // Output logits
+        let mut logits = vec![0.0f32; c.vocab_size];
+        self.output_proj.matvec(&norm_buf, &mut logits);
+
+        // Final logit softcap (Gemma family)
+        if let Some(cap) = c.final_logit_softcap {
+            for l in &mut logits {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
+        logits
+    }
+
+    /// Compute per-layer input embeddings for a single token (Gemma 3n).
+    ///
+    /// Returns `Vec<Vec<f32>>` of shape `[n_layer][n_embd_altup]`.
+    fn gemma3n_per_layer_inputs(
+        &self,
+        token_id: u32,
+        inpl_scaled: &[f32],
+        n_embd_altup: usize,
+        n_layer: usize,
+    ) -> Vec<Vec<f32>> {
+        let c = &self.config;
+        // Step 1: Look up per_layer_token_embd row, scale by sqrt(n_embd_altup).
+        let raw = self
+            .per_layer_embedding_for_token(token_id)
+            .expect("Gemma3n: per_layer_token_embd");
+        assert_eq!(raw.len(), n_layer * n_embd_altup);
+        let tok_scale = (n_embd_altup as f32).sqrt();
+        let mut inp_per_layer_lookup: Vec<Vec<f32>> = (0..n_layer)
+            .map(|l| {
+                raw[l * n_embd_altup..(l + 1) * n_embd_altup]
+                    .iter()
+                    .map(|v| v * tok_scale)
+                    .collect()
+            })
+            .collect();
+
+        // Step 2: Project inpl_scaled through per_layer_model_proj to get
+        // per-layer contribution, then RMSNorm(per_layer_proj_norm), then add.
+        let proj = self
+            .per_layer_model_proj
+            .as_ref()
+            .expect("Gemma3n: per_layer_model_proj");
+        // proj shape: [hidden_dim, n_layer * n_embd_altup]. matvec computes
+        // `out[i] = sum_j W[i, j] * inpl[j]` where W is [rows=n_layer * n_embd_altup, cols=hidden_dim].
+        // WeightRef stores rows/cols as (out_dim, in_dim). We want out_dim = n_layer*n_embd_altup.
+        let mut per_layer_proj_flat = vec![0.0f32; n_layer * n_embd_altup];
+        proj.matvec(inpl_scaled, &mut per_layer_proj_flat);
+        // Scale by 1 / sqrt(n_embd) = 1 / sqrt(hidden_dim)
+        let proj_scale = 1.0f32 / (c.hidden_dim as f32).sqrt();
+        for v in per_layer_proj_flat.iter_mut() {
+            *v *= proj_scale;
+        }
+
+        // Step 3: RMSNorm per (n_embd_altup) slice with per_layer_proj_norm weight
+        let proj_norm_w = self
+            .per_layer_proj_norm
+            .as_ref()
+            .expect("Gemma3n: per_layer_proj_norm");
+        let mut per_layer_proj_normed = vec![0.0f32; n_layer * n_embd_altup];
+        for l in 0..n_layer {
+            let start = l * n_embd_altup;
+            rms_norm(
+                &per_layer_proj_flat[start..start + n_embd_altup],
+                proj_norm_w,
+                c.norm_eps,
+                &mut per_layer_proj_normed[start..start + n_embd_altup],
+            );
+        }
+
+        // Step 4: Add and scale by 1/sqrt(2)
+        let inv_sqrt2 = 1.0f32 / 2.0f32.sqrt();
+        for l in 0..n_layer {
+            for i in 0..n_embd_altup {
+                inp_per_layer_lookup[l][i] =
+                    (inp_per_layer_lookup[l][i] + per_layer_proj_normed[l * n_embd_altup + i])
+                        * inv_sqrt2;
+            }
+        }
+        inp_per_layer_lookup
+    }
+
+    /// AltUp router modalities: compute a per-altup-input activation vector
+    /// from the active stream (per llama.cpp `altup_compute_router_modalities`).
+    fn altup_router_modalities(&self, active: &[f32], layer_idx: usize, n_altup: usize) -> Vec<f32> {
+        let c = &self.config;
+        let layer = &self.layers[layer_idx];
+        let router_norm_w = layer
+            .altup_router_norm
+            .as_ref()
+            .expect("Gemma3n: altup_router_norm");
+        let router_w = layer
+            .altup_router
+            .as_ref()
+            .expect("Gemma3n: altup_router");
+        // router_inputs = RMSNorm(active, router_norm_w) / n_embd
+        let mut router_inputs = vec![0.0f32; c.hidden_dim];
+        rms_norm(active, router_norm_w, c.norm_eps, &mut router_inputs);
+        let scale = 1.0f32 / c.hidden_dim as f32;
+        for v in router_inputs.iter_mut() {
+            *v *= scale;
+        }
+        // router_w shape: [hidden_dim, n_altup]. But mat_vec_f32 expects row-major
+        // [rows=n_altup, cols=hidden_dim]. In ggml/f16 storage it's [ne0=hidden_dim, ne1=n_altup]
+        // == row-major with rows=n_altup, cols=hidden_dim. So matmul(w, x) →
+        // out[i] = sum_j w[i * hidden_dim + j] * x[j].
+        let mut modalities = vec![0.0f32; n_altup];
+        mat_vec_f32(router_w, n_altup, c.hidden_dim, &router_inputs, &mut modalities);
+        for v in modalities.iter_mut() {
+            *v = v.tanh();
+        }
+        modalities
+    }
+
+    /// AltUp predict step.
+    ///
+    /// Input:  `streams` — `[n_altup][hidden_dim]`, the current AltUp states.
+    /// Output: `predictions` — `[n_altup][hidden_dim]`, streams after prediction.
+    fn altup_predict(
+        &self,
+        streams: &[Vec<f32>],
+        layer_idx: usize,
+        n_altup: usize,
+    ) -> Vec<Vec<f32>> {
+        let c = &self.config;
+        let layer = &self.layers[layer_idx];
+        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let hidden_dim = c.hidden_dim;
+        let modalities = self.altup_router_modalities(&streams[i_altup_act], layer_idx, n_altup);
+        // predict_coef shape: [n_altup, n_altup * n_altup]. matmul with modalities
+        // gives a vector of length n_altup*n_altup. Reshape to [n_altup, n_altup]
+        // coefficient matrix (coef[i][j] = weight for using stream j to predict stream i).
+        let predict_coef = layer
+            .altup_predict_coef
+            .as_ref()
+            .expect("Gemma3n: altup_predict_coef");
+        let mut coef_flat = vec![0.0f32; n_altup * n_altup];
+        mat_vec_f32(predict_coef, n_altup * n_altup, n_altup, &modalities, &mut coef_flat);
+        // Coefficient matrix: `coef[out][in]`
+        // For each output stream: predictions[out] = sum_in coef[out][in] * streams[in] + streams[out]
+        let mut predictions: Vec<Vec<f32>> = vec![vec![0.0f32; hidden_dim]; n_altup];
+        for out_i in 0..n_altup {
+            for in_i in 0..n_altup {
+                let c_val = coef_flat[out_i * n_altup + in_i];
+                if c_val == 0.0 {
+                    continue;
+                }
+                for j in 0..hidden_dim {
+                    predictions[out_i][j] += c_val * streams[in_i][j];
+                }
+            }
+            // Add residual (streams[out_i])
+            for j in 0..hidden_dim {
+                predictions[out_i][j] += streams[out_i][j];
+            }
+        }
+        predictions
+    }
+
+    /// AltUp correct step.
+    ///
+    /// - `predictions`: `[n_altup][hidden_dim]` from `altup_predict`.
+    /// - `activated`: `[hidden_dim]` — the FFN output for the active stream.
+    ///
+    /// Output: `[n_altup][hidden_dim]` corrected streams.
+    fn altup_correct(
+        &self,
+        predictions: &[Vec<f32>],
+        activated: &[f32],
+        layer_idx: usize,
+        n_altup: usize,
+    ) -> Vec<Vec<f32>> {
+        let c = &self.config;
+        let layer = &self.layers[layer_idx];
+        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let hidden_dim = c.hidden_dim;
+        let modalities = self.altup_router_modalities(activated, layer_idx, n_altup);
+        let correct_coef = layer
+            .altup_correct_coef
+            .as_ref()
+            .expect("Gemma3n: altup_correct_coef");
+        let mut all_coefs = vec![0.0f32; n_altup];
+        mat_vec_f32(correct_coef, n_altup, n_altup, &modalities, &mut all_coefs);
+        // + 1.0 offset
+        for v in all_coefs.iter_mut() {
+            *v += 1.0;
+        }
+        // innovation = activated - predictions[i_altup_act]
+        let mut innovation = vec![0.0f32; hidden_dim];
+        for i in 0..hidden_dim {
+            innovation[i] = activated[i] - predictions[i_altup_act][i];
+        }
+        // corrected[a] = predictions[a] + all_coefs[a] * innovation
+        let mut corrected: Vec<Vec<f32>> = (0..n_altup).map(|a| predictions[a].clone()).collect();
+        for a in 0..n_altup {
+            let coef = all_coefs[a];
+            for j in 0..hidden_dim {
+                corrected[a][j] += coef * innovation[j];
+            }
+        }
+        corrected
+    }
+
+    /// Laurel branch: low-rank projection `laurel_r @ laurel_l @ cur` +
+    /// RMSNorm + residual add.
+    fn laurel(&self, cur: &[f32], layer_idx: usize) -> Vec<f32> {
+        let c = &self.config;
+        let layer = &self.layers[layer_idx];
+        let hidden_dim = c.hidden_dim;
+        let laurel_l = layer.laurel_l.as_ref().expect("Gemma3n: laurel_l");
+        let laurel_r = layer.laurel_r.as_ref().expect("Gemma3n: laurel_r");
+        let laurel_post_norm = layer
+            .laurel_post_norm
+            .as_ref()
+            .expect("Gemma3n: laurel_post_norm");
+        // laurel_l shape: [hidden_dim, laurel_rank] in ggml means
+        //   ne[0] = hidden_dim (fastest, = in-dim, cols)
+        //   ne[1] = laurel_rank (out-dim, rows)
+        // → matmul: out[i] = sum_j laurel_l[i * hidden_dim + j] * cur[j], out_dim = laurel_rank.
+        let laurel_rank = laurel_l.len() / hidden_dim;
+        let mut mid = vec![0.0f32; laurel_rank];
+        mat_vec_f32(laurel_l, laurel_rank, hidden_dim, cur, &mut mid);
+        // laurel_r shape: [laurel_rank, hidden_dim] → out_dim = hidden_dim.
+        let mut tmp = vec![0.0f32; hidden_dim];
+        mat_vec_f32(laurel_r, hidden_dim, laurel_rank, &mid, &mut tmp);
+        // RMSNorm with weight
+        let mut normed = vec![0.0f32; hidden_dim];
+        rms_norm(&tmp, laurel_post_norm, c.norm_eps, &mut normed);
+        // Residual add: laurel_out = normed + cur
+        for i in 0..hidden_dim {
+            normed[i] += cur[i];
+        }
+        normed
+    }
+
+    /// Per-layer first_prediction step (Gemma 3n bottom of layer):
+    ///
+    ///   fp = active_altup_stream * altup_correct_scale         (elementwise)
+    ///   fp = per_layer_inp_gate @ fp                           (hidden→altup_dim)
+    ///   fp = GELU(fp)
+    ///   fp = fp * inp_this_layer                               (elementwise, altup_dim)
+    ///   fp = per_layer_proj @ fp                               (altup_dim→hidden)
+    ///   fp = RMSNorm(fp, per_layer_post_norm)                  (aka post_norm)
+    fn gemma3n_first_prediction(
+        &self,
+        active_corrected: &[f32],
+        layer_idx: usize,
+        inp_this_layer: &[f32],
+        n_embd_altup: usize,
+    ) -> Vec<f32> {
+        let c = &self.config;
+        let layer = &self.layers[layer_idx];
+        let hidden_dim = c.hidden_dim;
+
+        let correct_scale = layer
+            .altup_correct_scale
+            .as_ref()
+            .expect("Gemma3n: altup_correct_scale");
+        // Scale
+        let mut scaled = vec![0.0f32; hidden_dim];
+        for i in 0..hidden_dim {
+            scaled[i] = active_corrected[i] * correct_scale[i];
+        }
+        // Gate matmul: inp_gate shape [hidden_dim, n_embd_altup] → out_dim=n_embd_altup
+        let inp_gate = layer.inp_gate.as_ref().expect("Gemma3n: inp_gate");
+        let mut gated = vec![0.0f32; n_embd_altup];
+        inp_gate.matvec(&scaled, &mut gated);
+        // GELU
+        for v in gated.iter_mut() {
+            *v = gelu_approx(*v);
+        }
+        // elementwise mul with per-layer input for this layer
+        for i in 0..n_embd_altup {
+            gated[i] *= inp_this_layer[i];
+        }
+        // Project up to hidden_dim via per_layer_proj (shape [n_embd_altup, hidden_dim])
+        let proj = layer.proj.as_ref().expect("Gemma3n: proj");
+        let mut projected = vec![0.0f32; hidden_dim];
+        proj.matvec(&gated, &mut projected);
+        // post_norm RMSNorm
+        let post_norm = layer.post_norm.as_ref().expect("Gemma3n: post_norm");
+        let mut normed = vec![0.0f32; hidden_dim];
+        rms_norm(&projected, post_norm, c.norm_eps, &mut normed);
+        normed
     }
 
     /// Forward multiple tokens sequentially, returning logits for each.
@@ -1461,6 +2437,7 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
                 &mut attn_out,
             );
 
@@ -1473,8 +2450,9 @@ impl<'a> Llama3Model<'a> {
             let q8_ffn = quantize_row_q8_k(&norm_buf);
             layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
@@ -2051,6 +3029,7 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
                 &mut attn_out,
             );
 
@@ -2063,8 +3042,9 @@ impl<'a> Llama3Model<'a> {
 
             ternary_matvec(&tl.gate_proj, &norm_buf, &mut gate_buf);
             ternary_matvec(&tl.up_proj, &norm_buf, &mut up_buf);
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
             ternary_matvec(&tl.down_proj, &gate_buf, &mut down_buf);
 
@@ -2300,6 +3280,7 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
                 &mut attn_out,
             );
 
@@ -2312,8 +3293,9 @@ impl<'a> Llama3Model<'a> {
 
             sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
             sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
             sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
 
@@ -2410,6 +3392,7 @@ impl<'a> Llama3Model<'a> {
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
                 c.attn_logit_softcap,
+                if c.arch == ModelArch::Gemma3n { Some(1.0) } else { None },
                 &mut attn_out,
             );
 
@@ -2422,8 +3405,9 @@ impl<'a> Llama3Model<'a> {
 
             sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
             sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
             sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
@@ -2710,8 +3694,9 @@ impl<'a> Llama3Model<'a> {
             layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
 
+            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
 
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
@@ -3025,6 +4010,42 @@ fn load_layer_weights<'a>(
     let post_attn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_attention_norm.weight"));
     let post_ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_ffw_norm.weight"));
 
+    // Gemma 3n per-layer tensors (None for other architectures).
+    let post_norm = gguf.tensor_to_f32(&format!("{prefix}.post_norm.weight"));
+    let laurel_l = gguf.tensor_to_f32(&format!("{prefix}.laurel_l.weight"));
+    let laurel_r = gguf.tensor_to_f32(&format!("{prefix}.laurel_r.weight"));
+    let laurel_post_norm = gguf.tensor_to_f32(&format!("{prefix}.laurel_post_norm.weight"));
+    let altup_router = gguf.tensor_to_f32(&format!("{prefix}.altup_router.weight"));
+    let altup_router_norm = gguf.tensor_to_f32(&format!("{prefix}.altup_router_norm.weight"));
+    let altup_predict_coef = gguf.tensor_to_f32(&format!("{prefix}.altup_predict_coef.weight"));
+    let altup_correct_coef = gguf.tensor_to_f32(&format!("{prefix}.altup_correct_coef.weight"));
+    let altup_correct_scale = gguf.tensor_to_f32(&format!("{prefix}.altup_correct_scale.weight"));
+
+    // Gemma 3n per-layer input embedding gate/proj (WeightRef, quantized).
+    //
+    // Convention (matches WeightRef.matvec): `rows = out_dim, cols = in_dim`.
+    //   - inp_gate.weight [n_embd, n_embd_altup] in ggml (ne0=in, ne1=out)
+    //     → in=hidden_dim, out=per_layer_dim → rows=per_layer_dim, cols=hidden_dim
+    //   - proj.weight     [n_embd_altup, n_embd] → in=per_layer_dim, out=hidden_dim
+    //     → rows=hidden_dim, cols=per_layer_dim
+    let (inp_gate, proj) = if let Some(per_layer_dim) = config.per_layer_input_embedding_dim {
+        let inp_gate = load_weight_ref(
+            gguf,
+            &format!("{prefix}.inp_gate.weight"),
+            per_layer_dim,      // rows = out_dim
+            config.hidden_dim,  // cols = in_dim
+        );
+        let proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.proj.weight"),
+            config.hidden_dim,  // rows = out_dim
+            per_layer_dim,      // cols = in_dim
+        );
+        (inp_gate, proj)
+    } else {
+        (None, None)
+    };
+
     Some(LayerWeights {
         attn_norm,
         q_proj,
@@ -3042,6 +4063,17 @@ fn load_layer_weights<'a>(
         gate_proj,
         up_proj,
         down_proj,
+        post_norm,
+        inp_gate,
+        proj,
+        laurel_l,
+        laurel_r,
+        laurel_post_norm,
+        altup_router,
+        altup_router_norm,
+        altup_predict_coef,
+        altup_correct_coef,
+        altup_correct_scale,
     })
 }
 
@@ -3345,5 +4377,259 @@ mod tests {
         let sparse_bits = mode_bits(LayerQuantMode::SparseTernary { n_keep: 8 });
         assert!(sparse_bits < 1.58, "sparse={sparse_bits}");
         assert!(sparse_bits > 0.5, "sparse={sparse_bits}");
+    }
+
+    // ── Gemma 3n activation sparsity (gaussian_topk) ─────────────────────────
+
+    fn gemma3n_config_with_sparsity(scales: Vec<f32>) -> Llama3Config {
+        Llama3Config {
+            arch: ModelArch::Gemma3n,
+            activation_sparsity_scale: Some(scales),
+            ..Llama3Config::llama3_8b()
+        }
+    }
+
+    #[test]
+    fn test_apply_ffn_sparsity_noop_non_gemma3n() {
+        // Non-Gemma3n architectures must not touch the buffer.
+        let c = Llama3Config::llama3_8b(); // arch = Llama
+        let mut buf = vec![1.0, 2.0, 3.0, 4.0];
+        c.apply_ffn_sparsity(0, &mut buf);
+        assert_eq!(buf, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_apply_ffn_sparsity_noop_dense_layer() {
+        // -inf scale means the layer is dense (no sparsity).
+        let c = gemma3n_config_with_sparsity(vec![f32::NEG_INFINITY; 4]);
+        let mut buf = vec![1.0, 2.0, 3.0, 4.0];
+        c.apply_ffn_sparsity(0, &mut buf);
+        assert_eq!(buf, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_apply_ffn_sparsity_gaussian_topk_math() {
+        // scale = 1.6448 with buf = [1,2,3,4,5]:
+        //   mean = 3.0
+        //   unbiased var = ((-2)^2 + (-1)^2 + 0 + 1 + 4) / 4 = 10/4 = 2.5
+        //   std = sqrt(2.5) ≈ 1.5811
+        //   cutoff = 3.0 + 1.6448 * 1.5811 ≈ 5.601
+        //   result = ReLU(x - 5.601) = [0, 0, 0, 0, 0]
+        // Only the extreme tail survives — with scale ~1.645 (Φ⁻¹(0.95)) on a
+        // uniform-ish buffer this should be all zeros.
+        let c = gemma3n_config_with_sparsity(vec![1.6448536; 4]);
+        let mut buf = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        c.apply_ffn_sparsity(0, &mut buf);
+        for &v in &buf {
+            assert!(v.abs() < 1e-5, "expected all zeros, got {buf:?}");
+        }
+    }
+
+    #[test]
+    fn test_apply_ffn_sparsity_preserves_extreme_tail() {
+        // With an outlier, only the outlier should survive.
+        //   buf = [0,0,0,0,0,0,0,0,0,10]
+        //   mean = 1.0
+        //   unbiased var = (9 * 1 + 81) / 9 = 90/9 = 10
+        //   std = sqrt(10) ≈ 3.162
+        //   cutoff = 1.0 + 1.6448 * 3.162 ≈ 6.201
+        //   result = [0, 0, ..., 0, ReLU(10 - 6.201) = 3.799]
+        let c = gemma3n_config_with_sparsity(vec![1.6448536; 4]);
+        let mut buf = vec![0.0; 10];
+        buf[9] = 10.0;
+        c.apply_ffn_sparsity(0, &mut buf);
+        for &v in &buf[..9] {
+            assert!(v.abs() < 1e-5, "prefix must be zero, got {buf:?}");
+        }
+        assert!(
+            (buf[9] - 3.799).abs() < 0.01,
+            "outlier survives with expected value, got {}",
+            buf[9]
+        );
+    }
+
+    #[test]
+    fn test_apply_ffn_sparsity_short_buffer_noop() {
+        // n < 2 → cannot compute unbiased variance, must be a no-op.
+        let c = gemma3n_config_with_sparsity(vec![1.6448; 4]);
+        let mut buf = vec![42.0];
+        c.apply_ffn_sparsity(0, &mut buf);
+        assert_eq!(buf, vec![42.0]);
+    }
+
+    #[test]
+    fn test_apply_ffn_act_gemma3n_always_gelu() {
+        // Gemma 3n uses GELU for all layers (sparse or dense) — never SiLU.
+        let c = gemma3n_config_with_sparsity(vec![1.6448, f32::NEG_INFINITY]);
+        let sparse_result = c.apply_ffn_act(0, 1.0);
+        let dense_result = c.apply_ffn_act(1, 1.0);
+        let expected_gelu = gelu_approx(1.0);
+        assert!((sparse_result - expected_gelu).abs() < 1e-6);
+        assert!((dense_result - expected_gelu).abs() < 1e-6);
+    }
+
+    // ── Gemma 3n shared KV cache ────────────────────────────────────────────
+
+    fn gemma3n_e2b_config() -> Llama3Config {
+        // Approximate Gemma 3n E2B: 30 layers, shared_kv_layers=10 (→ 20 unique),
+        // sliding_window_pattern with every 5th layer as full attention.
+        let pattern: Vec<bool> = (0..30).map(|i| i % 5 != 4).collect();
+        Llama3Config {
+            arch: ModelArch::Gemma3n,
+            num_layers: 30,
+            sliding_window: Some(512),
+            shared_kv_layers: Some(10),
+            sliding_window_pattern: Some(pattern),
+            ..Llama3Config::llama3_8b()
+        }
+    }
+
+    #[test]
+    fn test_kv_from_start_layers_non_gemma3n() {
+        // Non-Gemma3n: no shared KV, kv_from_start = num_layers.
+        let c = Llama3Config::llama3_8b();
+        assert_eq!(c.kv_from_start_layers(), c.num_layers);
+    }
+
+    #[test]
+    fn test_kv_from_start_layers_gemma3n_e2b() {
+        // Gemma 3n E2B: 30 layers, shared 10 → 20 unique roots.
+        let c = gemma3n_e2b_config();
+        assert_eq!(c.kv_from_start_layers(), 20);
+    }
+
+    #[test]
+    fn test_kv_source_layer_identity_for_roots() {
+        // Layers 0..20 map to themselves (own KV).
+        let c = gemma3n_e2b_config();
+        for i in 0..20 {
+            assert_eq!(c.kv_source_layer(i), i, "layer {i} should own its KV");
+        }
+    }
+
+    #[test]
+    fn test_kv_source_layer_shared_layers_gemma3n() {
+        // Layer 20+ redirects: SWA → 18, full attention → 19.
+        let c = gemma3n_e2b_config();
+        // Layer 20: pattern[20] = true (SWA) → 18
+        assert_eq!(c.kv_source_layer(20), 18, "layer 20 (SWA) should map to 18");
+        // Layer 24: pattern[24] = false (full attention) → 19
+        assert_eq!(c.kv_source_layer(24), 19, "layer 24 (full) should map to 19");
+        // Layer 29: pattern[29] = false (full attention) → 19
+        assert_eq!(c.kv_source_layer(29), 19, "layer 29 (full) should map to 19");
+        // Layer 21-23: SWA → 18
+        for i in 21..24 {
+            assert_eq!(c.kv_source_layer(i), 18, "layer {i} (SWA) should map to 18");
+        }
+    }
+
+    #[test]
+    fn test_kv_source_layer_non_gemma3n_identity() {
+        // Non-Gemma3n architectures return the layer unchanged.
+        let c = Llama3Config::llama3_8b();
+        for i in 0..c.num_layers {
+            assert_eq!(c.kv_source_layer(i), i);
+        }
+    }
+
+    #[test]
+    fn test_build_kv_layer_map_gemma3n() {
+        let c = gemma3n_e2b_config();
+        let map = c.build_kv_layer_map();
+        assert_eq!(map.len(), 30);
+        // Identity for 0..20
+        for (i, &m) in map.iter().enumerate().take(20) {
+            assert_eq!(m, i);
+        }
+        // Remapped for 20..30
+        assert_eq!(map[20], 18); // SWA
+        assert_eq!(map[24], 19); // full
+        assert_eq!(map[29], 19); // full
+    }
+
+    #[test]
+    fn test_kv_cache_shared_read_uses_source_layer() {
+        // Verify that reads from a shared layer return data written to its source.
+        let mut cache = KvCache::new(30, 8, 4);
+        // Install the Gemma3n E2B mapping.
+        let config = gemma3n_e2b_config();
+        cache.set_layer_map(config.build_kv_layer_map());
+
+        // Write unique data at layer 18 (source for shared SWA layers).
+        let k18 = vec![1.0, 2.0, 3.0, 4.0];
+        let v18 = vec![10.0, 20.0, 30.0, 40.0];
+        cache.append(18, &k18, &v18);
+        // Layer 19 (source for shared full-attention layers)
+        let k19 = vec![5.0, 6.0, 7.0, 8.0];
+        let v19 = vec![50.0, 60.0, 70.0, 80.0];
+        cache.append(19, &k19, &v19);
+        // "Write" to layer 20 (SWA shared) — should be no-op.
+        let sink_k = vec![99.0; 4];
+        let sink_v = vec![99.0; 4];
+        cache.append(20, &sink_k, &sink_v);
+        cache.advance();
+
+        // Reads from layer 20 (SWA shared) should return layer 18 data.
+        assert_eq!(cache.key_at(20, 0), k18.as_slice());
+        assert_eq!(cache.value_at(20, 0), v18.as_slice());
+        // Reads from layer 24 (full attention shared) should return layer 19 data.
+        assert_eq!(cache.key_at(24, 0), k19.as_slice());
+        assert_eq!(cache.value_at(24, 0), v19.as_slice());
+        // Layer 18 reads still return its own data (not overwritten).
+        assert_eq!(cache.key_at(18, 0), k18.as_slice());
+    }
+
+    #[test]
+    fn test_kv_cache_default_identity_map() {
+        // Without set_layer_map, KvCache should use identity (backward compat).
+        let mut cache = KvCache::new(3, 4, 2);
+        let k0 = vec![1.0, 2.0];
+        let k1 = vec![3.0, 4.0];
+        let k2 = vec![5.0, 6.0];
+        cache.append(0, &k0, &k0);
+        cache.append(1, &k1, &k1);
+        cache.append(2, &k2, &k2);
+        cache.advance();
+        assert_eq!(cache.key_at(0, 0), k0.as_slice());
+        assert_eq!(cache.key_at(1, 0), k1.as_slice());
+        assert_eq!(cache.key_at(2, 0), k2.as_slice());
+    }
+
+    // ── Q5_1 dequantization (Gemma 3n per_layer_token_embd) ─────────────────
+
+    #[test]
+    fn test_q5_1_dequant_zero_block() {
+        // A single all-zero block should dequantize to all zeros.
+        // Block layout (24 bytes): d f16, m f16, qh u32, qs [u8; 16]
+        // With d=0 and m=0, every element becomes 0*(0..0) + 0 = 0.
+        let data = vec![0u8; 24];
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q5_1(&data, &mut out);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_q5_1_dequant_constant_block() {
+        // Set m = 1.0, d = 0, qs = [0; 16], qh = 0. Every element should be
+        // 0 * 0 + 1.0 = 1.0.
+        let mut data = vec![0u8; 24];
+        // d = 0 (2 bytes), m = 1.0 as f16 (2 bytes)
+        // f16 1.0 = 0x3C00
+        data[2] = 0x00;
+        data[3] = 0x3C;
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q5_1(&data, &mut out);
+        for &v in &out {
+            assert!((v - 1.0).abs() < 1e-4, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_ggml_type_q5_1_block_layout() {
+        use crate::gguf::GgmlType;
+        assert_eq!(GgmlType::Q5_1.block_bytes(), 24);
+        assert_eq!(GgmlType::Q5_1.elements_per_block(), 32);
     }
 }

@@ -54,6 +54,7 @@ pub enum GgmlType {
     F16,
     Q4_0,
     Q4_1,
+    Q5_1,
     Q8_0,
     Q2_K,
     Q3_K,
@@ -70,6 +71,7 @@ impl GgmlType {
             1 => Self::F16,
             2 => Self::Q4_0,
             3 => Self::Q4_1,
+            7 => Self::Q5_1,
             8 => Self::Q8_0,
             10 => Self::Q2_K,
             11 => Self::Q3_K,
@@ -88,6 +90,8 @@ impl GgmlType {
             Self::F16 => 2,
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
+            // Q5_1: d (2) + m (2) + qh (4) + qs (16) = 24
+            Self::Q5_1 => 24,
             Self::Q8_0 => 34,
             Self::Q2_K => 84,
             Self::Q3_K => 110,
@@ -103,7 +107,7 @@ impl GgmlType {
     pub const fn elements_per_block(&self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => QK8_0,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => QK8_0,
             Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => QK_K,
             Self::Other(_) => 1,
         }
@@ -501,6 +505,7 @@ impl<'a> GgufFile<'a> {
                     out[i] = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
                 }
             }
+            GgmlType::Q5_1 => dequantize_q5_1(data, &mut out),
             GgmlType::Q8_0 => dequantize_q8_0(data, &mut out),
             GgmlType::Q2_K => dequantize_q2_k(data, &mut out),
             GgmlType::Q3_K => dequantize_q3_k(data, &mut out),
@@ -726,6 +731,50 @@ fn dequantize_q8_0(data: &[u8], out: &mut [f32]) {
             out[out_idx] = d * f32::from(data[off + 2 + l] as i8);
             out_idx += 1;
         }
+    }
+}
+
+// ─── Q5_1 dequantization ────────────────────────────────────────────────────
+//
+// Block layout (24 bytes / 32 elements):
+//   d:  f16 delta          (offset 0..2)
+//   m:  f16 min            (offset 2..4)
+//   qh: u32 high-bits mask (offset 4..8, little-endian)
+//   qs: [u8; 16] nibbles   (offset 8..24)
+//
+// Dequant per llama.cpp `dequantize_row_q5_1`:
+//   for j in 0..16:
+//     xh_0 = ((qh >>  j     ) << 4) & 0x10   // high bit for element j
+//     xh_1 = ((qh >> (j+12)))       & 0x10   // high bit for element j+16
+//     x0   = (qs[j] & 0x0F) | xh_0
+//     x1   = (qs[j] >>   4) | xh_1
+//     y[j]      = x0 * d + m
+//     y[j + 16] = x1 * d + m
+pub(crate) fn dequantize_q5_1(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 24;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let off = i * block_bytes;
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let m = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
+        let qh = u32::from_le_bytes([
+            data[off + 4],
+            data[off + 5],
+            data[off + 6],
+            data[off + 7],
+        ]);
+        for j in 0..16 {
+            let qs = data[off + 8 + j];
+            let xh_0 = ((qh >> j) << 4) & 0x10;
+            let xh_1 = (qh >> (j + 12)) & 0x10;
+            let x0 = ((qs & 0x0F) as u32) | xh_0;
+            let x1 = ((qs >> 4) as u32) | xh_1;
+            out[out_idx + j] = (x0 as f32) * d + m;
+            out[out_idx + j + 16] = (x1 as f32) * d + m;
+        }
+        out_idx += QK8_0;
     }
 }
 

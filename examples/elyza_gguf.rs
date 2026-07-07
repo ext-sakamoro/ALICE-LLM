@@ -95,7 +95,7 @@ fn main() {
         "qwen2" => format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         ),
-        "gemma2" | "gemma3" => format!(
+        "gemma2" | "gemma3" | "gemma3n" => format!(
             "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
         ),
         _ => format!(
