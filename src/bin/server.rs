@@ -485,6 +485,31 @@ fn main() {
         llm_config.vocab_size,
     );
 
+    // Gemma 3n uses per-layer input embeddings, AltUp residual streams,
+    // Laurel low-rank branch, shared KV cache, and activation sparsity, none
+    // of which are implemented in the GPU inference path (`GpuModel`).
+    // Serving Gemma 3n through the generic GPU pipeline yields incoherent
+    // output. Fail-fast to prevent misleading responses; use the CPU examples
+    // (`verify_gemma3n_forward`) instead until GPU support lands.
+    if llm_config.arch == alice_llm::llama3::ModelArch::Gemma3n {
+        eprintln!(
+            "\nError: Gemma 3n is not yet supported by the GPU inference server."
+        );
+        eprintln!(
+            "The GPU path (`GpuModel`) lacks the AltUp, Laurel, per-layer input"
+        );
+        eprintln!(
+            "embedding, shared-KV, and activation-sparsity mechanisms that Gemma 3n"
+        );
+        eprintln!(
+            "requires. Use the CPU example instead:"
+        );
+        eprintln!(
+            "\n  cargo run --release --example verify_gemma3n_forward -- {model_path}\n"
+        );
+        std::process::exit(2);
+    }
+
     let config = GpuModelConfig {
         num_layers: llm_config.num_layers,
         hidden_dim: llm_config.hidden_dim,
