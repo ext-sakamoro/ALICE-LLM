@@ -198,8 +198,7 @@ impl Llama3Config {
         // Fall back to hidden_dim/num_heads for models without this metadata (Llama, Mistral).
         let head_dim = gguf
             .meta_u32(&format!("{prefix}.attention.key_length"))
-            .map(|v| v as usize)
-            .unwrap_or(hidden_dim / num_heads);
+            .map_or(hidden_dim / num_heads, |v| v as usize);
 
         // Mistral: sliding window attention
         let sliding_window = gguf
@@ -445,7 +444,7 @@ impl Llama3Config {
     pub fn sliding_window_for_layer(&self, i: usize) -> Option<usize> {
         match self.arch {
             ModelArch::Gemma2 => {
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     self.sliding_window
                 } else {
                     None
@@ -1116,7 +1115,7 @@ fn silu(x: f32) -> f32 {
 /// Used by Gemma 2 (HF `gelu_pytorch_tanh` / llama.cpp `LLM_FFN_GELU`).
 #[inline]
 fn gelu_approx(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.7978_845_608_028_654;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
 
@@ -1503,7 +1502,7 @@ impl<'a> Llama3Model<'a> {
         // Q5_1: block size = 32 elements, block bytes = 24.
         let qk = crate::gguf::GgmlType::Q5_1.elements_per_block();
         let block_bytes = crate::gguf::GgmlType::Q5_1.block_bytes();
-        if elements_per_token % qk != 0 {
+        if !elements_per_token.is_multiple_of(qk) {
             return None;
         }
         let blocks_per_token = elements_per_token / qk;
@@ -1597,7 +1596,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
@@ -1776,8 +1775,7 @@ impl<'a> Llama3Model<'a> {
         let n_layer_sparsity = c
             .activation_sparsity_scale
             .as_ref()
-            .map(|arr| arr.iter().take_while(|s| s.is_finite()).count())
-            .unwrap_or(0);
+            .map_or(0, |arr| arr.iter().take_while(|s| s.is_finite()).count());
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
 
@@ -1785,7 +1783,7 @@ impl<'a> Llama3Model<'a> {
         let emb_start = token_id as usize * hidden_dim;
         let mut inpl: Vec<f32> = self.embedding[emb_start..emb_start + hidden_dim].to_vec();
         let scale = (hidden_dim as f32).sqrt();
-        for v in inpl.iter_mut() {
+        for v in &mut inpl {
             *v *= scale;
         }
 
@@ -1819,7 +1817,7 @@ impl<'a> Llama3Model<'a> {
             let new_mag = l2_magnitude(&added);
             if new_mag > 0.0 {
                 let factor = target_magnitude / new_mag;
-                for v in added.iter_mut() {
+                for v in &mut added {
                     *v *= factor;
                 }
             }
@@ -2025,7 +2023,7 @@ impl<'a> Llama3Model<'a> {
             let new_mag = l2_magnitude(&unembd);
             if new_mag > 0.0 {
                 let factor = target_magnitude / new_mag;
-                for v in unembd.iter_mut() {
+                for v in &mut unembd {
                     *v *= factor;
                 }
             }
@@ -2035,7 +2033,7 @@ impl<'a> Llama3Model<'a> {
         }
         // Average (divide by n_altup)
         let inv_n_altup = 1.0f32 / n_altup as f32;
-        for v in cur.iter_mut() {
+        for v in &mut cur {
             *v *= inv_n_altup;
         }
 
@@ -2094,7 +2092,7 @@ impl<'a> Llama3Model<'a> {
         proj.matvec(inpl_scaled, &mut per_layer_proj_flat);
         // Scale by 1 / sqrt(n_embd) = 1 / sqrt(hidden_dim)
         let proj_scale = 1.0f32 / (c.hidden_dim as f32).sqrt();
-        for v in per_layer_proj_flat.iter_mut() {
+        for v in &mut per_layer_proj_flat {
             *v *= proj_scale;
         }
 
@@ -2143,7 +2141,7 @@ impl<'a> Llama3Model<'a> {
         let mut router_inputs = vec![0.0f32; c.hidden_dim];
         rms_norm(active, router_norm_w, c.norm_eps, &mut router_inputs);
         let scale = 1.0f32 / c.hidden_dim as f32;
-        for v in router_inputs.iter_mut() {
+        for v in &mut router_inputs {
             *v *= scale;
         }
         // router_w shape: [hidden_dim, n_altup]. But mat_vec_f32 expects row-major
@@ -2152,7 +2150,7 @@ impl<'a> Llama3Model<'a> {
         // out[i] = sum_j w[i * hidden_dim + j] * x[j].
         let mut modalities = vec![0.0f32; n_altup];
         mat_vec_f32(router_w, n_altup, c.hidden_dim, &router_inputs, &mut modalities);
-        for v in modalities.iter_mut() {
+        for v in &mut modalities {
             *v = v.tanh();
         }
         modalities
@@ -2228,7 +2226,7 @@ impl<'a> Llama3Model<'a> {
         let mut all_coefs = vec![0.0f32; n_altup];
         mat_vec_f32(correct_coef, n_altup, n_altup, &modalities, &mut all_coefs);
         // + 1.0 offset
-        for v in all_coefs.iter_mut() {
+        for v in &mut all_coefs {
             *v += 1.0;
         }
         // innovation = activated - predictions[i_altup_act]
@@ -2312,7 +2310,7 @@ impl<'a> Llama3Model<'a> {
         let mut gated = vec![0.0f32; n_embd_altup];
         inp_gate.matvec(&scaled, &mut gated);
         // GELU
-        for v in gated.iter_mut() {
+        for v in &mut gated {
             *v = gelu_approx(*v);
         }
         // elementwise mul with per-layer input for this layer
@@ -2354,7 +2352,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
@@ -2968,7 +2966,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
@@ -3220,7 +3218,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
@@ -3332,7 +3330,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
@@ -3595,7 +3593,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
-            for h in hidden.iter_mut() {
+            for h in &mut hidden {
                 *h *= scale;
             }
         }
