@@ -112,7 +112,11 @@ impl ChatTemplate {
                 let mut out = String::new();
                 for m in messages {
                     // Gemma uses "model" instead of "assistant".
-                    let role = if m.role == "assistant" { "model" } else { m.role.as_str() };
+                    let role = if m.role == "assistant" {
+                        "model"
+                    } else {
+                        m.role.as_str()
+                    };
                     out.push_str(&format!(
                         "<start_of_turn>{}\n{}<end_of_turn>\n",
                         role, m.content
@@ -492,21 +496,11 @@ fn main() {
     // output. Fail-fast to prevent misleading responses; use the CPU examples
     // (`verify_gemma3n_forward`) instead until GPU support lands.
     if llm_config.arch == alice_llm::llama3::ModelArch::Gemma3n {
-        eprintln!(
-            "\nError: Gemma 3n is not yet supported by the GPU inference server."
-        );
-        eprintln!(
-            "The GPU path (`GpuModel`) lacks the AltUp, Laurel, per-layer input"
-        );
-        eprintln!(
-            "embedding, shared-KV, and activation-sparsity mechanisms that Gemma 3n"
-        );
-        eprintln!(
-            "requires. Use the CPU example instead:"
-        );
-        eprintln!(
-            "\n  cargo run --release --example verify_gemma3n_forward -- {model_path}\n"
-        );
+        eprintln!("\nError: Gemma 3n is not yet supported by the GPU inference server.");
+        eprintln!("The GPU path (`GpuModel`) lacks the AltUp, Laurel, per-layer input");
+        eprintln!("embedding, shared-KV, and activation-sparsity mechanisms that Gemma 3n");
+        eprintln!("requires. Use the CPU example instead:");
+        eprintln!("\n  cargo run --release --example verify_gemma3n_forward -- {model_path}\n");
         std::process::exit(2);
     }
 

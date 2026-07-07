@@ -759,12 +759,7 @@ pub(crate) fn dequantize_q5_1(data: &[u8], out: &mut [f32]) {
         let off = i * block_bytes;
         let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
         let m = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
-        let qh = u32::from_le_bytes([
-            data[off + 4],
-            data[off + 5],
-            data[off + 6],
-            data[off + 7],
-        ]);
+        let qh = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         for j in 0..16 {
             let qs = data[off + 8 + j];
             let xh_0 = ((qh >> j) << 4) & 0x10;

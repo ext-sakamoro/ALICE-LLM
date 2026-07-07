@@ -23,7 +23,11 @@ fn main() {
 
     let prompt = "<start_of_turn>user\nHello, what is 2+2?<end_of_turn>\n<start_of_turn>model\n";
     let tokens = tokenizer.encode(prompt);
-    eprintln!("Prompt tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(15)]);
+    eprintln!(
+        "Prompt tokens ({}): {:?}",
+        tokens.len(),
+        &tokens[..tokens.len().min(15)]
+    );
 
     // Prefill: single forward per token
     eprintln!("\nPrefill...");

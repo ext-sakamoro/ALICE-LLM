@@ -12,7 +12,10 @@ fn main() {
     let gguf = GgufFile::parse(&bytes).expect("parse gguf");
 
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("load tokenizer");
-    println!("Tokenizer loaded. bos_id={} eos_id={}", tokenizer.bos_id, tokenizer.eos_id);
+    println!(
+        "Tokenizer loaded. bos_id={} eos_id={}",
+        tokenizer.bos_id, tokenizer.eos_id
+    );
     println!("add_bos_token={}", tokenizer.add_bos_token);
 
     // Test 1: Basic English round-trip
@@ -41,7 +44,11 @@ fn main() {
     let chat_tokens = tokenizer.encode(&chat);
     println!("\n=== Chat template ===");
     println!("Text: {chat:?}");
-    println!("Tokens ({}): first 10 = {:?}", chat_tokens.len(), &chat_tokens[..chat_tokens.len().min(15)]);
+    println!(
+        "Tokens ({}): first 10 = {:?}",
+        chat_tokens.len(),
+        &chat_tokens[..chat_tokens.len().min(15)]
+    );
     let chat_decoded = tokenizer.decode(&chat_tokens);
     println!("Decoded: {chat_decoded:?}");
 
@@ -50,9 +57,12 @@ fn main() {
     // The prompt should have BOS token prepended when add_bos_token is true.
     let bos_check = tokenizer.encode("test");
     let has_bos = !bos_check.is_empty() && bos_check[0] == tokenizer.bos_id;
-    println!("First token of 'test' = {} (bos_id={}, add_bos={})",
+    println!(
+        "First token of 'test' = {} (bos_id={}, add_bos={})",
         bos_check.first().copied().unwrap_or(u32::MAX),
-        tokenizer.bos_id, tokenizer.add_bos_token);
+        tokenizer.bos_id,
+        tokenizer.add_bos_token
+    );
     println!("BOS prepended: {has_bos}");
 
     println!("\nPhase 6 verify OK.");
