@@ -233,6 +233,16 @@ impl Llama3Config {
         self.arch.use_neox_rope()
     }
 
+    /// Apply the FFN gate activation for this architecture.
+    /// Gemma 2 uses GELU (tanh approximation); all others use SiLU (SwiGLU).
+    #[inline]
+    pub fn apply_ffn_act(&self, x: f32) -> f32 {
+        match self.arch {
+            ModelArch::Gemma2 => gelu_approx(x),
+            _ => silu(x),
+        }
+    }
+
     /// Effective sliding window for layer `i`.
     /// - Gemma-2: even layers use sliding_window, odd layers use full attention.
     /// - Others: uniform sliding_window across all layers.
@@ -812,11 +822,21 @@ fn gqa_attention_paged(
     }
 }
 
-// ─── SwiGLU activation ──────────────────────────────────────────────────────
+// ─── FFN activations ────────────────────────────────────────────────────────
 
+/// SiLU (Swish) activation: `x / (1 + exp(-x))`. Used by Llama, Mistral,
+/// Qwen 2/3 for SwiGLU-style FFN.
 #[inline]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// GELU tanh approximation: `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`.
+/// Used by Gemma 2 (HF `gelu_pytorch_tanh` / llama.cpp `LLM_FFN_GELU`).
+#[inline]
+fn gelu_approx(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.7978_845_608_028_654;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
 
 // ─── Llama-3 model ──────────────────────────────────────────────────────────
@@ -1295,7 +1315,7 @@ impl<'a> Llama3Model<'a> {
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
 
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
 
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
@@ -1454,7 +1474,7 @@ impl<'a> Llama3Model<'a> {
             layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
@@ -2044,7 +2064,7 @@ impl<'a> Llama3Model<'a> {
             ternary_matvec(&tl.gate_proj, &norm_buf, &mut gate_buf);
             ternary_matvec(&tl.up_proj, &norm_buf, &mut up_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
             ternary_matvec(&tl.down_proj, &gate_buf, &mut down_buf);
 
@@ -2293,7 +2313,7 @@ impl<'a> Llama3Model<'a> {
             sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
             sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
             sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
 
@@ -2403,7 +2423,7 @@ impl<'a> Llama3Model<'a> {
             sparse_ternary_matvec(&sl.gate_proj, &norm_buf, &mut gate_buf);
             sparse_ternary_matvec(&sl.up_proj, &norm_buf, &mut up_buf);
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
             sparse_ternary_matvec(&sl.down_proj, &gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
@@ -2691,7 +2711,7 @@ impl<'a> Llama3Model<'a> {
             layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
 
             for i in 0..c.intermediate_dim {
-                gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                gate_buf[i] = c.apply_ffn_act(gate_buf[i]) * up_buf[i];
             }
 
             layer.down_proj.matvec(&gate_buf, &mut down_buf);
