@@ -1,3 +1,4 @@
 /target
 the project rules
 *.py
+/models/

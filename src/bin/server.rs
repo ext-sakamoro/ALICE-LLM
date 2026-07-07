@@ -38,6 +38,8 @@ enum ChatTemplate {
     Llama3,
     Qwen2,
     Mistral,
+    /// Gemma 2 / Gemma 3n: `<start_of_turn>role\n...<end_of_turn>\n` format.
+    Gemma,
     Generic,
 }
 
@@ -53,11 +55,17 @@ impl ChatTemplate {
             if tmpl.contains("[INST]") {
                 return Self::Mistral;
             }
+            if tmpl.contains("start_of_turn") {
+                return Self::Gemma;
+            }
         }
         match arch {
             alice_llm::llama3::ModelArch::Mistral => Self::Mistral,
             alice_llm::llama3::ModelArch::Qwen2 | alice_llm::llama3::ModelArch::Qwen3_5 => {
                 Self::Qwen2
+            }
+            alice_llm::llama3::ModelArch::Gemma2 | alice_llm::llama3::ModelArch::Gemma3n => {
+                Self::Gemma
             }
             _ => Self::Llama3,
         }
@@ -100,6 +108,19 @@ impl ChatTemplate {
                 }
                 out
             }
+            Self::Gemma => {
+                let mut out = String::new();
+                for m in messages {
+                    // Gemma uses "model" instead of "assistant".
+                    let role = if m.role == "assistant" { "model" } else { m.role.as_str() };
+                    out.push_str(&format!(
+                        "<start_of_turn>{}\n{}<end_of_turn>\n",
+                        role, m.content
+                    ));
+                }
+                out.push_str("<start_of_turn>model\n");
+                out
+            }
             Self::Generic => {
                 let mut out = String::new();
                 for m in messages {
@@ -116,6 +137,7 @@ impl ChatTemplate {
             Self::Llama3 => vec!["<|eot_id|>", "<|end_of_text|>"],
             Self::Qwen2 => vec!["<|im_end|>", "<|endoftext|>"],
             Self::Mistral => vec!["</s>"],
+            Self::Gemma => vec!["<end_of_turn>"],
             Self::Generic => vec![],
         }
     }
