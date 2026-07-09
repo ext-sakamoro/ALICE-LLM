@@ -22,6 +22,13 @@ pub enum ModelArch {
     /// Gemma 3n (E2B/E4B): AltUp + Laurel + per-layer input embedding +
     /// shared KV cache + activation sparsity for first N layers.
     Gemma3n,
+    /// Gemma 4 (E2B/E4B/26B_A4B/31B): simplified successor to Gemma 3n.
+    /// Retains per-layer input embedding, shared KV cache, GELU FFN, and
+    /// Gemma-family embedding scaling; **removes** AltUp, Laurel, and
+    /// activation sparsity. **Adds** per-layer FFN size, per-layer
+    /// head_dim / RoPE base for SWA vs full-attention layers, optional
+    /// per-layer `layer_output_scale`, and MoE (in 26B_A4B variant).
+    Gemma4,
     Qwen2,
     Qwen3,
     Qwen3_5,
@@ -34,6 +41,7 @@ impl ModelArch {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
             Some("gemma3n") => Self::Gemma3n,
+            Some("gemma4") => Self::Gemma4,
             Some("qwen3moe" | "qwen3") => {
                 if gguf.meta_u32("qwen3.full_attention_interval").is_some()
                     || gguf.meta_u32("qwen3moe.full_attention_interval").is_some()
@@ -55,6 +63,7 @@ impl ModelArch {
             Self::Mistral => "mistral",
             Self::Gemma2 => "gemma2",
             Self::Gemma3n => "gemma3n",
+            Self::Gemma4 => "gemma4",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 | Self::Qwen3_5 => "qwen3",
         }
@@ -70,7 +79,7 @@ impl ModelArch {
     pub const fn use_neox_rope(&self) -> bool {
         matches!(
             self,
-            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2 | Self::Gemma3n
+            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2 | Self::Gemma3n | Self::Gemma4
         )
     }
 
@@ -144,6 +153,17 @@ pub struct Llama3Config {
     pub altup_num_inputs: Option<usize>,
     /// Gemma 3n: AltUp active input index (0 for E2B).
     pub altup_active_idx: Option<usize>,
+    /// Gemma 4: SWA layer head dimension for K/V (typically half of full
+    /// `head_dim`). When `None`, all layers use `head_dim`.
+    pub head_dim_swa: Option<usize>,
+    /// Gemma 4: SWA layer RoPE base frequency (typically 10K for local
+    /// context, vs 1M for full-attention layers).
+    pub rope_theta_swa: Option<f32>,
+    /// Gemma 4: SWA layer RoPE dimension count.
+    pub rope_dim_swa: Option<usize>,
+    /// Gemma 4: per-layer FFN size array. When absent, `intermediate_dim`
+    /// applies uniformly. Gemma 4 E2B uses [6144×15, 12288×20].
+    pub ffn_size_per_layer: Option<Vec<usize>>,
 }
 
 impl Llama3Config {
@@ -281,6 +301,30 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.altup.active_idx"))
             .map(|v| v as usize);
 
+        // Gemma 4: SWA layers have their own head_dim / RoPE base / RoPE dim.
+        let head_dim_swa = gguf
+            .meta_u32(&format!("{prefix}.attention.key_length_swa"))
+            .map(|v| v as usize);
+        let rope_theta_swa = gguf.meta_f32(&format!("{prefix}.rope.freq_base_swa"));
+        let rope_dim_swa = gguf
+            .meta_u32(&format!("{prefix}.rope.dimension_count_swa"))
+            .map(|v| v as usize);
+
+        // Gemma 4: per-layer FFN size array (E2B: [6144×15, 12288×20]).
+        // When `feed_forward_length` scalar was used above, this remains None.
+        let ffn_size_per_layer = gguf
+            .meta(&format!("{prefix}.feed_forward_length"))
+            .and_then(|v| match v {
+                crate::gguf::MetaValue::Array(arr) if arr.len() == num_layers => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        out.push(item.as_u32()? as usize);
+                    }
+                    Some(out)
+                }
+                _ => None,
+            });
+
         Some(Self {
             arch,
             vocab_size,
@@ -308,6 +352,10 @@ impl Llama3Config {
             per_layer_input_embedding_dim,
             altup_num_inputs,
             altup_active_idx,
+            head_dim_swa,
+            rope_theta_swa,
+            rope_dim_swa,
+            ffn_size_per_layer,
         })
     }
 
@@ -332,15 +380,14 @@ impl Llama3Config {
     }
 
     /// Apply the FFN gate activation for this architecture at a given layer.
-    /// - Gemma 2: GELU (tanh approximation) uniformly.
-    /// - Gemma 3n: GELU uniformly (llama.cpp `ggml_gelu` matches HF exact GELU
-    ///   for Gemma 3n). Per-layer sparsity masking is applied **before** this
+    /// - Gemma 2 / Gemma 3n / Gemma 4: GELU (tanh approximation) uniformly.
+    ///   For Gemma 3n, per-layer sparsity masking is applied **before** this
     ///   step via `apply_ffn_sparsity`.
     /// - All others: SiLU (SwiGLU).
     #[inline]
     pub fn apply_ffn_act(&self, _layer_idx: usize, x: f32) -> f32 {
         match self.arch {
-            ModelArch::Gemma2 | ModelArch::Gemma3n => gelu_approx(x),
+            ModelArch::Gemma2 | ModelArch::Gemma3n | ModelArch::Gemma4 => gelu_approx(x),
             _ => silu(x),
         }
     }
@@ -401,7 +448,7 @@ impl Llama3Config {
     /// llama.cpp `hparams.n_layer_kv_from_start`.
     pub fn kv_from_start_layers(&self) -> usize {
         match (self.arch, self.shared_kv_layers) {
-            (ModelArch::Gemma3n, Some(shared)) if shared < self.num_layers => {
+            (ModelArch::Gemma3n | ModelArch::Gemma4, Some(shared)) if shared < self.num_layers => {
                 self.num_layers - shared
             }
             _ => self.num_layers,
@@ -416,7 +463,7 @@ impl Llama3Config {
     ///
     /// This matches the llama.cpp `layer_reuse_cb` for `LLM_ARCH_GEMMA3N`.
     pub fn kv_source_layer(&self, i: usize) -> usize {
-        if self.arch != ModelArch::Gemma3n {
+        if !matches!(self.arch, ModelArch::Gemma3n | ModelArch::Gemma4) {
             return i;
         }
         let root = self.kv_from_start_layers();
@@ -452,7 +499,7 @@ impl Llama3Config {
                     None
                 }
             }
-            ModelArch::Gemma3n => {
+            ModelArch::Gemma3n | ModelArch::Gemma4 => {
                 if let Some(pattern) = self.sliding_window_pattern.as_ref() {
                     if pattern.get(i).copied().unwrap_or(false) {
                         self.sliding_window
@@ -497,7 +544,56 @@ impl Llama3Config {
             per_layer_input_embedding_dim: None,
             altup_num_inputs: None,
             altup_active_idx: None,
+            head_dim_swa: None,
+            rope_theta_swa: None,
+            rope_dim_swa: None,
+            ffn_size_per_layer: None,
         }
+    }
+
+    /// Per-layer head dimension for K/V projections.
+    ///
+    /// For Gemma 4, SWA layers may use a smaller `head_dim_swa` (e.g. 256
+    /// vs 512 for full attention). Falls back to `head_dim` for all other
+    /// architectures / when `head_dim_swa` is absent.
+    pub fn head_dim_for_layer(&self, i: usize) -> usize {
+        match (self.arch, self.head_dim_swa) {
+            (ModelArch::Gemma4, Some(hs)) if self.sliding_window_for_layer(i).is_some() => hs,
+            _ => self.head_dim,
+        }
+    }
+
+    /// Per-layer RoPE base frequency.
+    ///
+    /// For Gemma 4, SWA layers use a lower `rope_theta_swa` (10K vs 1M for
+    /// full attention).
+    pub fn rope_theta_for_layer(&self, i: usize) -> f32 {
+        match (self.arch, self.rope_theta_swa) {
+            (ModelArch::Gemma4, Some(ts)) if self.sliding_window_for_layer(i).is_some() => ts,
+            _ => self.rope_theta,
+        }
+    }
+
+    /// Per-layer FFN intermediate dimension.
+    ///
+    /// For Gemma 4 with array metadata, returns per-layer size (e.g. 6144
+    /// for early layers, 12288 for later layers). Otherwise returns the
+    /// scalar `intermediate_dim`.
+    pub fn ffn_size_for_layer(&self, i: usize) -> usize {
+        self.ffn_size_per_layer
+            .as_ref()
+            .and_then(|arr| arr.get(i).copied())
+            .unwrap_or(self.intermediate_dim)
+    }
+
+    /// Q projection output dimension for layer `i` (= `num_heads * head_dim_for_layer(i)`).
+    pub fn q_dim_for_layer(&self, i: usize) -> usize {
+        self.num_heads * self.head_dim_for_layer(i)
+    }
+
+    /// K/V projection output dimension for layer `i` (= `num_kv_heads * head_dim_for_layer(i)`).
+    pub fn kv_dim_for_layer(&self, i: usize) -> usize {
+        self.num_kv_heads * self.head_dim_for_layer(i)
     }
 }
 
@@ -546,14 +642,25 @@ impl KvCache {
     }
 
     fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        // Skip writes for shared layers (Gemma 3n): the target KV cache was
-        // already populated by the "source" layer earlier in the forward pass.
+        // Skip writes for shared layers (Gemma 3n / Gemma 4): the target KV
+        // cache was already populated by the "source" layer earlier in the
+        // forward pass.
         if self.kv_layer_map[layer] != layer {
             return;
         }
         let off = self.offset(layer, self.seq_len);
-        self.keys[off..off + self.kv_dim].copy_from_slice(k);
-        self.values[off..off + self.kv_dim].copy_from_slice(v);
+        // Gemma 4 SWA layers may have a smaller actual kv_dim than the cache's
+        // allocated `kv_dim` (max across layers). Copy up to k.len() and
+        // zero-pad the remainder so stale data doesn't leak.
+        let n = k.len().min(self.kv_dim);
+        self.keys[off..off + n].copy_from_slice(&k[..n]);
+        self.values[off..off + n].copy_from_slice(&v[..n]);
+        if n < self.kv_dim {
+            for i in n..self.kv_dim {
+                self.keys[off + i] = 0.0;
+                self.values[off + i] = 0.0;
+            }
+        }
     }
 
     /// Call once after all layers have appended for a given position.
@@ -1164,8 +1271,12 @@ impl WeightRef<'_> {
 struct LayerWeights<'a> {
     attn_norm: Vec<f32>,
     q_proj: WeightRef<'a>,
-    k_proj: WeightRef<'a>,
-    v_proj: WeightRef<'a>,
+    /// K projection. Optional for Gemma 4 shared-KV layers (>= kv_from_start),
+    /// where the layer's KV cache is redirected to an earlier layer and no
+    /// K projection weight is stored in the GGUF.
+    k_proj: Option<WeightRef<'a>>,
+    /// V projection. Optional for Gemma 4 shared-KV layers.
+    v_proj: Option<WeightRef<'a>>,
     o_proj: WeightRef<'a>,
     /// Qwen 2/2.5 attention Q projection bias (None for Llama/Mistral/Gemma/Qwen 3).
     q_bias: Option<Vec<f32>>,
@@ -1210,6 +1321,13 @@ struct LayerWeights<'a> {
     altup_correct_coef: Option<Vec<f32>>,
     /// Gemma 3n AltUp correction scale [hidden_dim].
     altup_correct_scale: Option<Vec<f32>>,
+    // ── Gemma 4 per-layer tensors (None for other architectures) ──────────
+    /// Gemma 4: per-layer output scalar (`layer_output_scale`), typically [1].
+    /// Applied as `cur *= out_scale` at the end of each layer.
+    out_scale: Option<Vec<f32>>,
+    /// Gemma 4: per-full-attention-layer RoPE frequency factors (Llama 3.x
+    /// NTK-aware extension). Shape [head_dim / 2]. Absent for SWA layers.
+    rope_freqs: Option<Vec<f32>>,
 }
 
 // ─── Layerwise Mixed Precision ──────────────────────────────────────────────
@@ -1368,6 +1486,9 @@ pub struct Llama3Model<'a> {
     /// Kept as raw bytes for memory efficiency; slice-dequantize per token
     /// via [`Self::per_layer_embedding_for_token`].
     per_layer_token_embd_raw: Option<&'a [u8]>,
+    /// Quantization type of `per_layer_token_embd_raw`. Gemma 3n uses Q5_1,
+    /// Gemma 4 uses Q6_K; the slice extractor dispatches on this.
+    per_layer_token_embd_qtype: Option<crate::gguf::GgmlType>,
     /// Gemma 3n per-layer embedding projection
     /// [hidden_dim, num_layers * per_layer_input_embedding_dim].
     per_layer_model_proj: Option<WeightRef<'a>>,
@@ -1443,7 +1564,7 @@ impl<'a> Llama3Model<'a> {
             per_layer_proj_norm,
             altup_proj,
             altup_unembd_proj,
-        ) = if config.arch == ModelArch::Gemma3n {
+        ) = if matches!(config.arch, ModelArch::Gemma3n | ModelArch::Gemma4) {
             let per_layer_token_embd_raw = gguf.tensor_data("per_layer_token_embd.weight");
             // per_layer_model_proj.weight ggml shape {n_embd, n_layer * n_embd_altup}
             // (ne0=n_embd=in, ne1=n_layer*n_embd_altup=out)
@@ -1457,8 +1578,17 @@ impl<'a> Llama3Model<'a> {
                 )
             });
             let per_layer_proj_norm = gguf.tensor_to_f32("per_layer_proj_norm.weight");
-            let altup_proj = gguf.tensor_to_f32("altup_proj.weight");
-            let altup_unembd_proj = gguf.tensor_to_f32("altup_unembd_proj.weight");
+            // AltUp tensors are Gemma 3n only.
+            let altup_proj = if config.arch == ModelArch::Gemma3n {
+                gguf.tensor_to_f32("altup_proj.weight")
+            } else {
+                None
+            };
+            let altup_unembd_proj = if config.arch == ModelArch::Gemma3n {
+                gguf.tensor_to_f32("altup_unembd_proj.weight")
+            } else {
+                None
+            };
             (
                 per_layer_token_embd_raw,
                 per_layer_model_proj,
@@ -1470,6 +1600,9 @@ impl<'a> Llama3Model<'a> {
             (None, None, None, None, None)
         };
 
+        let per_layer_token_embd_qtype = gguf
+            .tensor_info("per_layer_token_embd.weight")
+            .map(|info| info.qtype);
         Some(Self {
             config,
             embedding,
@@ -1483,6 +1616,7 @@ impl<'a> Llama3Model<'a> {
             sparse_ternary_layers: None,
             sparse_ternary_output: None,
             per_layer_token_embd_raw,
+            per_layer_token_embd_qtype,
             per_layer_model_proj,
             per_layer_proj_norm,
             altup_proj,
@@ -1498,13 +1632,14 @@ impl<'a> Llama3Model<'a> {
     /// Memory-efficient: dequantizes only the requested token's slice (~30 KB)
     /// rather than materializing the full ~8 GB f32 table upfront.
     pub fn per_layer_embedding_for_token(&self, token_id: u32) -> Option<Vec<f32>> {
+        use crate::gguf::GgmlType;
         let raw = self.per_layer_token_embd_raw?;
+        let qtype = self.per_layer_token_embd_qtype?;
         let per_layer_dim = self.config.per_layer_input_embedding_dim?;
         let elements_per_token = self.config.num_layers * per_layer_dim;
-        // Q5_1: block size = 32 elements, block bytes = 24.
-        let qk = crate::gguf::GgmlType::Q5_1.elements_per_block();
-        let block_bytes = crate::gguf::GgmlType::Q5_1.block_bytes();
-        if !elements_per_token.is_multiple_of(qk) {
+        let qk = qtype.elements_per_block();
+        let block_bytes = qtype.block_bytes();
+        if qk == 0 || block_bytes == 0 || !elements_per_token.is_multiple_of(qk) {
             return None;
         }
         let blocks_per_token = elements_per_token / qk;
@@ -1514,7 +1649,11 @@ impl<'a> Llama3Model<'a> {
             return None;
         }
         let mut out = vec![0.0f32; elements_per_token];
-        crate::gguf::dequantize_q5_1(&raw[start..end], &mut out);
+        match qtype {
+            GgmlType::Q5_1 => crate::gguf::dequantize_q5_1(&raw[start..end], &mut out),
+            GgmlType::Q6_K => crate::gguf::dequantize_q6_k_public(&raw[start..end], &mut out),
+            _ => return None,
+        }
         Some(out)
     }
 
@@ -1535,8 +1674,24 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     threshold_ratio,
                 ),
-                k_proj: ternarize_weight(&layer.k_proj, kv_dim, c.hidden_dim, threshold_ratio),
-                v_proj: ternarize_weight(&layer.v_proj, kv_dim, c.hidden_dim, threshold_ratio),
+                k_proj: ternarize_weight(
+                    layer
+                        .k_proj
+                        .as_ref()
+                        .expect("k_proj required for ternarize"),
+                    kv_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
+                v_proj: ternarize_weight(
+                    layer
+                        .v_proj
+                        .as_ref()
+                        .expect("v_proj required for ternarize"),
+                    kv_dim,
+                    c.hidden_dim,
+                    threshold_ratio,
+                ),
                 o_proj: ternarize_weight(
                     &layer.o_proj,
                     c.hidden_dim,
@@ -1588,6 +1743,11 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::Gemma3n {
             return self.forward_gemma3n(token_id);
         }
+        // Gemma 4: dedicated forward path (per-layer FFN size, per-layer
+        // head_dim / RoPE base, shared KV, optional per-layer output scale).
+        if self.config.arch == ModelArch::Gemma4 {
+            return self.forward_gemma4(token_id);
+        }
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -1624,8 +1784,16 @@ impl<'a> Llama3Model<'a> {
             // Q, K, V projections (pre-quantize norm_buf once for all three)
             let q8_attn = quantize_row_q8_k(&norm_buf);
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
-            layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
-            layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            layer
+                .k_proj
+                .as_ref()
+                .expect("k_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut k_buf);
+            layer
+                .v_proj
+                .as_ref()
+                .expect("v_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
             if let Some(b) = &layer.q_bias {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
@@ -1872,8 +2040,16 @@ impl<'a> Llama3Model<'a> {
             // layers reuse a previous layer's cache).
             let owns_kv = self.kv_cache.kv_layer_map[layer_idx] == layer_idx;
             if owns_kv {
-                layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
-                layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+                layer
+                    .k_proj
+                    .as_ref()
+                    .expect("k_proj required for non-shared layer")
+                    .matvec_preq(&q8_attn, &mut k_buf);
+                layer
+                    .v_proj
+                    .as_ref()
+                    .expect("v_proj required for non-shared layer")
+                    .matvec_preq(&q8_attn, &mut v_buf);
             }
 
             // Q, K per-head RMSNorm (Gemma 3n uses them like Qwen 3)
@@ -2352,6 +2528,249 @@ impl<'a> Llama3Model<'a> {
         normed
     }
 
+    /// Gemma 4 forward pass. Mirrors llama.cpp
+    /// `llama_model_gemma4::graph::build_arch_graph`. Simpler than Gemma 3n:
+    /// AltUp, Laurel, and activation sparsity are all removed.
+    ///
+    /// New Gemma 4 mechanics vs Gemma 3n:
+    /// - Per-layer FFN size (`ffn_size_for_layer`).
+    /// - Per-layer head dimension (SWA layers halve `head_dim`).
+    /// - Per-layer RoPE base frequency (SWA layers use 10K vs 1M).
+    /// - Optional V projection (Gemma 4 26B_A4B; when absent, uses K as V).
+    /// - Optional per-layer `layer_output_scale` (multiplied at end of layer).
+    /// - Standard residual (Gemma 3n's gated + laurel merge is removed).
+    ///
+    /// # Panics
+    /// Panics if the model was not loaded with Gemma 4 architecture (missing
+    /// required per-layer input embedding tensors, etc.).
+    fn forward_gemma4(&mut self, token_id: u32) -> Vec<f32> {
+        let c = self.config.clone();
+        let hidden_dim = c.hidden_dim;
+        let n_embd_altup = c
+            .per_layer_input_embedding_dim
+            .expect("Gemma4: per_layer_input_embedding_dim");
+        let pos = self.kv_cache.seq_len();
+
+        // ── Embedding lookup + Gemma-style scale ────────────────────────────
+        let emb_start = token_id as usize * hidden_dim;
+        let mut inpl: Vec<f32> = self.embedding[emb_start..emb_start + hidden_dim].to_vec();
+        let embed_scale = (hidden_dim as f32).sqrt();
+        for v in &mut inpl {
+            *v *= embed_scale;
+        }
+
+        // ── Per-layer input embedding lookup + projection ───────────────────
+        // Gemma 4 reuses Gemma 3n's per-layer input embedding pipeline verbatim.
+        let inp_per_layer =
+            self.gemma3n_per_layer_inputs(token_id, &inpl, n_embd_altup, c.num_layers);
+
+        // Reusable buffers sized for the largest layer.
+        let max_head_dim = c.head_dim_swa.unwrap_or(c.head_dim).max(c.head_dim);
+        let max_q_dim = c.num_heads * max_head_dim;
+        let max_kv_dim = c.num_kv_heads * max_head_dim;
+        let max_ffn_size = c
+            .ffn_size_per_layer
+            .as_ref()
+            .map_or(c.intermediate_dim, |a| {
+                a.iter().copied().max().unwrap_or(c.intermediate_dim)
+            });
+        let mut norm_buf = vec![0.0f32; hidden_dim];
+        let mut q_buf = vec![0.0f32; max_q_dim];
+        let mut k_buf = vec![0.0f32; max_kv_dim];
+        let mut v_buf = vec![0.0f32; max_kv_dim];
+        // attn_out holds `num_heads * head_dim` values (q_dim, not hidden_dim);
+        // for Gemma 4 full-attention layers q_dim > hidden_dim (e.g. 4096 vs 1536).
+        let mut attn_out = vec![0.0f32; max_q_dim];
+        let mut o_buf = vec![0.0f32; hidden_dim];
+        let mut gate_buf = vec![0.0f32; max_ffn_size];
+        let mut up_buf = vec![0.0f32; max_ffn_size];
+        let mut down_buf = vec![0.0f32; hidden_dim];
+
+        for layer_idx in 0..c.num_layers {
+            let layer = &self.layers[layer_idx];
+            let head_dim = c.head_dim_for_layer(layer_idx);
+            let q_dim = c.num_heads * head_dim;
+            let kv_dim = c.num_kv_heads * head_dim;
+            let ffn_size = c.ffn_size_for_layer(layer_idx);
+            let freq_base = c.rope_theta_for_layer(layer_idx);
+
+            // ── attn_norm ──────────────────────────────────────────────────
+            rms_norm(&inpl, &layer.attn_norm, c.norm_eps, &mut norm_buf);
+
+            // ── Attention (Q, K, V projections + norms + RoPE) ─────────────
+            // Note: Q4_0 / Q5_0 (used by Gemma 4 QAT) don't support the
+            // pre-quantized Q8_K path, so we use `matvec` directly with the
+            // f32 normalized buffer.
+            layer.q_proj.matvec(&norm_buf, &mut q_buf[..q_dim]);
+            let owns_kv = self.kv_cache.kv_layer_map[layer_idx] == layer_idx;
+            if owns_kv {
+                let k_ref = layer
+                    .k_proj
+                    .as_ref()
+                    .expect("Gemma4: k_proj required for own-KV layer");
+                k_ref.matvec(&norm_buf, &mut k_buf[..kv_dim]);
+                // V projection is optional in Gemma 4: fall back to K if absent.
+                if let Some(v_ref) = layer.v_proj.as_ref() {
+                    v_ref.matvec(&norm_buf, &mut v_buf[..kv_dim]);
+                } else {
+                    v_buf[..kv_dim].copy_from_slice(&k_buf[..kv_dim]);
+                }
+            }
+
+            // Q, K per-head RMSNorm (Gemma 4 uses them like Qwen 3 / Gemma 3n).
+            if let Some(w) = &layer.q_norm {
+                apply_qk_norm(&mut q_buf[..q_dim], w, head_dim, c.norm_eps);
+            }
+            if owns_kv {
+                if let Some(w) = &layer.k_norm {
+                    apply_qk_norm(&mut k_buf[..kv_dim], w, head_dim, c.norm_eps);
+                }
+                // V RMSNorm without weight (identity gain), same as Gemma 3n.
+                apply_head_rms_norm_identity(&mut v_buf[..kv_dim], head_dim, c.norm_eps);
+            }
+
+            // Apply RoPE to Q and K (per-layer frequency base).
+            let rope_freqs_ref = layer.rope_freqs.as_deref();
+            for h in 0..c.num_heads {
+                let start = h * head_dim;
+                apply_rope_auto(
+                    &mut q_buf[start..start + head_dim],
+                    pos,
+                    head_dim,
+                    freq_base,
+                    rope_freqs_ref,
+                    c.use_neox_rope(),
+                );
+            }
+            if owns_kv {
+                for h in 0..c.num_kv_heads {
+                    let start = h * head_dim;
+                    apply_rope_auto(
+                        &mut k_buf[start..start + head_dim],
+                        pos,
+                        head_dim,
+                        freq_base,
+                        rope_freqs_ref,
+                        c.use_neox_rope(),
+                    );
+                }
+                self.kv_cache
+                    .append(layer_idx, &k_buf[..kv_dim], &v_buf[..kv_dim]);
+            }
+
+            // GQA attention (attention_scale = 1.0 for Gemma 4).
+            for v in &mut attn_out[..q_dim] {
+                *v = 0.0;
+            }
+            gqa_attention(
+                &q_buf[..q_dim],
+                &self.kv_cache,
+                layer_idx,
+                pos,
+                c.num_heads,
+                c.num_kv_heads,
+                head_dim,
+                c.sliding_window_for_layer(layer_idx),
+                c.attn_logit_softcap,
+                Some(1.0),
+                &mut attn_out[..q_dim],
+            );
+
+            // Output projection: [q_dim] → [hidden_dim].
+            let layer = &self.layers[layer_idx];
+            layer.o_proj.matvec(&attn_out[..q_dim], &mut o_buf);
+
+            // Post-attention RMSNorm (Gemma-family sandwich).
+            if let Some(w) = &layer.post_attn_norm {
+                rms_norm(&o_buf, w, c.norm_eps, &mut norm_buf);
+                o_buf.copy_from_slice(&norm_buf);
+            }
+
+            // Standard residual: attn_out = o + inpL. (Gemma 3n's gated
+            // residual and Laurel branch are absent in Gemma 4.)
+            let mut attn_out_local = vec![0.0f32; hidden_dim];
+            for i in 0..hidden_dim {
+                attn_out_local[i] = o_buf[i] + inpl[i];
+            }
+
+            // ── FFN ────────────────────────────────────────────────────────
+            rms_norm(&attn_out_local, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
+            layer.gate_proj.matvec(&norm_buf, &mut gate_buf[..ffn_size]);
+            layer.up_proj.matvec(&norm_buf, &mut up_buf[..ffn_size]);
+
+            for i in 0..ffn_size {
+                gate_buf[i] = gelu_approx(gate_buf[i]) * up_buf[i];
+            }
+            layer.down_proj.matvec(&gate_buf[..ffn_size], &mut down_buf);
+
+            // Post-FFN RMSNorm.
+            if let Some(w) = &layer.post_ffn_norm {
+                rms_norm(&down_buf, w, c.norm_eps, &mut norm_buf);
+                down_buf.copy_from_slice(&norm_buf);
+            }
+
+            // Standard residual: cur = ffn + attn_out.
+            let mut cur = vec![0.0f32; hidden_dim];
+            for i in 0..hidden_dim {
+                cur[i] = down_buf[i] + attn_out_local[i];
+            }
+
+            // ── Per-layer input embedding branch (Gemma 4 simplified) ──────
+            if layer.inp_gate.is_some() && layer.proj.is_some() && layer.post_norm.is_some() {
+                let pe_in = cur.clone();
+                // gate: [hidden_dim] → [n_embd_altup]
+                let inp_gate = layer.inp_gate.as_ref().unwrap();
+                let mut gated = vec![0.0f32; n_embd_altup];
+                inp_gate.matvec(&cur, &mut gated);
+                for v in &mut gated {
+                    *v = gelu_approx(*v);
+                }
+                // elementwise mul with per-layer input for this layer
+                for i in 0..n_embd_altup {
+                    gated[i] *= inp_per_layer[layer_idx][i];
+                }
+                // Project up to hidden_dim via per_layer_proj.
+                let proj = layer.proj.as_ref().unwrap();
+                let mut projected = vec![0.0f32; hidden_dim];
+                proj.matvec(&gated, &mut projected);
+                // post_norm RMSNorm.
+                let post_norm = layer.post_norm.as_ref().unwrap();
+                rms_norm(&projected, post_norm, c.norm_eps, &mut norm_buf);
+                // Residual add pe_in.
+                for i in 0..hidden_dim {
+                    cur[i] = norm_buf[i] + pe_in[i];
+                }
+            }
+
+            // ── Optional per-layer output scale ────────────────────────────
+            if let Some(scale) = layer.out_scale.as_ref() {
+                if let Some(&s) = scale.first() {
+                    for v in &mut cur {
+                        *v *= s;
+                    }
+                }
+            }
+
+            inpl = cur;
+        }
+
+        // Advance KV cache position.
+        self.kv_cache.advance();
+
+        // Output norm + logits.
+        rms_norm(&inpl, &self.output_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        self.output_proj.matvec(&norm_buf, &mut logits);
+
+        // Final logit softcap (Gemma family).
+        if let Some(cap) = c.final_logit_softcap {
+            for l in &mut logits {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
+        logits
+    }
+
     /// Forward multiple tokens sequentially, returning logits for each.
     /// More efficient than calling forward() in a loop because buffers are reused.
     pub fn forward_batch(&mut self, token_ids: &[u32]) -> Vec<Vec<f32>> {
@@ -2398,8 +2817,16 @@ impl<'a> Llama3Model<'a> {
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
             let q8_attn = quantize_row_q8_k(&norm_buf);
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
-            layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
-            layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            layer
+                .k_proj
+                .as_ref()
+                .expect("k_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut k_buf);
+            layer
+                .v_proj
+                .as_ref()
+                .expect("v_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
             if let Some(b) = &layer.q_bias {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
@@ -3172,14 +3599,14 @@ impl<'a> Llama3Model<'a> {
                     n_keep,
                 ),
                 k_proj: sparsify_weight(
-                    &layer.k_proj,
+                    layer.k_proj.as_ref().expect("k_proj required for sparsify"),
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
                 ),
                 v_proj: sparsify_weight(
-                    &layer.v_proj,
+                    layer.v_proj.as_ref().expect("v_proj required for sparsify"),
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -3656,8 +4083,16 @@ impl<'a> Llama3Model<'a> {
 
             let q8_attn = quantize_row_q8_k(&norm_buf);
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
-            layer.k_proj.matvec_preq(&q8_attn, &mut k_buf);
-            layer.v_proj.matvec_preq(&q8_attn, &mut v_buf);
+            layer
+                .k_proj
+                .as_ref()
+                .expect("k_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut k_buf);
+            layer
+                .v_proj
+                .as_ref()
+                .expect("v_proj required for non-shared layer")
+                .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
             if let Some(b) = &layer.q_bias {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
@@ -3985,9 +4420,11 @@ fn load_layer_weights<'a>(
 ) -> Option<LayerWeights<'a>> {
     let prefix = format!("blk.{layer}");
     // Gemma-2: num_heads * head_dim (= 2048) != hidden_dim (= 2304).
+    // Gemma 4: per-layer q_dim / kv_dim (SWA layers halve head_dim).
     // Other models: q_dim == hidden_dim (identity).
-    let q_dim = config.num_heads * config.head_dim;
-    let kv_dim = config.num_kv_heads * config.head_dim;
+    let q_dim = config.q_dim_for_layer(layer);
+    let kv_dim = config.kv_dim_for_layer(layer);
+    let ffn_size = config.ffn_size_for_layer(layer);
 
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
     let q_proj = load_weight_ref(
@@ -3996,18 +4433,28 @@ fn load_layer_weights<'a>(
         q_dim,
         config.hidden_dim,
     )?;
+    // Gemma 4: K/V weights are absent for shared-KV layers (>= kv_from_start).
+    // For all other architectures they are required.
+    let is_shared_layer =
+        matches!(config.arch, ModelArch::Gemma4) && layer >= config.kv_from_start_layers();
     let k_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_k.weight"),
         kv_dim,
         config.hidden_dim,
-    )?;
+    );
+    if k_proj.is_none() && !is_shared_layer {
+        return None;
+    }
     let v_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_v.weight"),
         kv_dim,
         config.hidden_dim,
-    )?;
+    );
+    if v_proj.is_none() && !is_shared_layer {
+        return None;
+    }
     let o_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_output.weight"),
@@ -4019,20 +4466,20 @@ fn load_layer_weights<'a>(
     let gate_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_gate.weight"),
-        config.intermediate_dim,
+        ffn_size,
         config.hidden_dim,
     )?;
     let up_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_up.weight"),
-        config.intermediate_dim,
+        ffn_size,
         config.hidden_dim,
     )?;
     let down_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_down.weight"),
         config.hidden_dim,
-        config.intermediate_dim,
+        ffn_size,
     )?;
 
     // Qwen 2/2.5: attention projection biases (absent for Llama/Mistral/Gemma/Qwen 3).
@@ -4058,6 +4505,10 @@ fn load_layer_weights<'a>(
     let altup_predict_coef = gguf.tensor_to_f32(&format!("{prefix}.altup_predict_coef.weight"));
     let altup_correct_coef = gguf.tensor_to_f32(&format!("{prefix}.altup_correct_coef.weight"));
     let altup_correct_scale = gguf.tensor_to_f32(&format!("{prefix}.altup_correct_scale.weight"));
+
+    // Gemma 4: per-layer output scale + per-full-attn RoPE freq factors.
+    let out_scale = gguf.tensor_to_f32(&format!("{prefix}.layer_output_scale.weight"));
+    let rope_freqs = gguf.tensor_to_f32(&format!("{prefix}.rope_freqs.weight"));
 
     // Gemma 3n per-layer input embedding gate/proj (WeightRef, quantized).
     //
@@ -4112,6 +4563,8 @@ fn load_layer_weights<'a>(
         altup_predict_coef,
         altup_correct_coef,
         altup_correct_scale,
+        out_scale,
+        rope_freqs,
     })
 }
 
