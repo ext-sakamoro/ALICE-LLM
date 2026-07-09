@@ -147,6 +147,16 @@ pub struct Llama3Config {
     /// beyond the main stack (used for speculative decoding). Load only,
     /// inference not currently used.
     pub n_layer_nextn: Option<usize>,
+    /// MoE: total number of experts per MoE layer (Qwen3 MoE: 4-128,
+    /// Mixtral: 8, DeepSeek: up to 256). None = dense (non-MoE) model.
+    pub num_experts: Option<usize>,
+    /// MoE: number of experts activated per token (top-k routing; typically
+    /// 2 or 8). None = dense.
+    pub num_experts_active: Option<usize>,
+    /// MoE: per-expert FFN intermediate dimension. Often equals
+    /// `intermediate_dim`, but some models (DeepSeek, Gemma 4 26B_A4B) use
+    /// smaller values so total active parameters stay reasonable.
+    pub expert_ffn_size: Option<usize>,
     /// Gemma 3n: per-layer sliding window boolean pattern. When Some,
     /// entry `i = true` means layer `i` uses SWA, `false` = full attention.
     /// Supersedes Gemma 2 even/odd alternation.
@@ -284,6 +294,20 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.nextn.predict_layers"))
             .map(|v| v as usize);
 
+        // MoE parameters (Qwen3 MoE / Mixtral / Gemma 4 26B_A4B):
+        //   `{prefix}.expert_count` — total experts per layer
+        //   `{prefix}.expert_used_count` — top-k routing count
+        //   `{prefix}.expert_feed_forward_length` — per-expert FFN size
+        let num_experts = gguf
+            .meta_u32(&format!("{prefix}.expert_count"))
+            .map(|v| v as usize);
+        let num_experts_active = gguf
+            .meta_u32(&format!("{prefix}.expert_used_count"))
+            .map(|v| v as usize);
+        let expert_ffn_size = gguf
+            .meta_u32(&format!("{prefix}.expert_feed_forward_length"))
+            .map(|v| v as usize);
+
         // Gemma 3n: per-layer sliding window boolean pattern
         let sliding_window_pattern = gguf
             .meta(&format!("{prefix}.attention.sliding_window_pattern"))
@@ -386,6 +410,9 @@ impl Llama3Config {
             ssm_group_count,
             ssm_time_step_rank,
             n_layer_nextn,
+            num_experts,
+            num_experts_active,
+            expert_ffn_size,
             sliding_window_pattern,
             activation_sparsity_scale,
             shared_kv_layers,
@@ -583,6 +610,9 @@ impl Llama3Config {
             ssm_group_count: None,
             ssm_time_step_rank: None,
             n_layer_nextn: None,
+            num_experts: None,
+            num_experts_active: None,
+            expert_ffn_size: None,
             sliding_window_pattern: None,
             activation_sparsity_scale: None,
             shared_kv_layers: None,
@@ -1338,9 +1368,13 @@ struct LayerWeights<'a> {
     /// Gemma-2 post-FFN RMSNorm (before residual add).
     post_ffn_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
-    gate_proj: WeightRef<'a>,
-    up_proj: WeightRef<'a>,
-    down_proj: WeightRef<'a>,
+    /// Standard FFN gate projection. `None` for MoE layers, where the FFN
+    /// is replaced by expert routing (`ffn_gate_inp` + `ffn_*_exps`).
+    gate_proj: Option<WeightRef<'a>>,
+    /// Standard FFN up projection. `None` for MoE layers.
+    up_proj: Option<WeightRef<'a>>,
+    /// Standard FFN down projection. `None` for MoE layers.
+    down_proj: Option<WeightRef<'a>>,
     // ── Gemma 3n per-layer tensors (None for other architectures) ──────────
     /// Gemma 3n: extra RMSNorm applied at the end of layer (post_norm).
     post_norm: Option<Vec<f32>>,
@@ -1373,6 +1407,16 @@ struct LayerWeights<'a> {
     /// Gemma 4: per-full-attention-layer RoPE frequency factors (Llama 3.x
     /// NTK-aware extension). Shape [head_dim / 2]. Absent for SWA layers.
     rope_freqs: Option<Vec<f32>>,
+    // ── MoE tensors (Qwen3 MoE / Mixtral / Gemma 4 26B_A4B, optional) ─────
+    /// MoE router weight: `[hidden_dim, n_expert]`. F32 dense.
+    ffn_gate_inp: Option<Vec<f32>>,
+    /// MoE gate expert weights: 3D `[hidden_dim, expert_ffn_size, n_expert]`.
+    /// Stored expert-major so each expert's 2D slab is contiguous.
+    ffn_gate_exps: Option<WeightRef<'a>>,
+    /// MoE up expert weights: same layout as `ffn_gate_exps`.
+    ffn_up_exps: Option<WeightRef<'a>>,
+    /// MoE down expert weights: 3D `[expert_ffn_size, hidden_dim, n_expert]`.
+    ffn_down_exps: Option<WeightRef<'a>>,
 }
 
 // ─── Layerwise Mixed Precision ──────────────────────────────────────────────
@@ -1745,19 +1789,28 @@ impl<'a> Llama3Model<'a> {
                 ),
                 ffn_norm: layer.ffn_norm.clone(),
                 gate_proj: ternarize_weight(
-                    &layer.gate_proj,
+                    layer
+                        .gate_proj
+                        .as_ref()
+                        .expect("gate_proj required for ternarize"),
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
                 ),
                 up_proj: ternarize_weight(
-                    &layer.up_proj,
+                    layer
+                        .up_proj
+                        .as_ref()
+                        .expect("up_proj required for ternarize"),
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
                 ),
                 down_proj: ternarize_weight(
-                    &layer.down_proj,
+                    layer
+                        .down_proj
+                        .as_ref()
+                        .expect("down_proj required for ternarize"),
                     c.hidden_dim,
                     c.intermediate_dim,
                     threshold_ratio,
@@ -1834,10 +1887,13 @@ impl<'a> Llama3Model<'a> {
         // Reusable buffers
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
+        let q_dim = c.num_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; q_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; c.hidden_dim];
+        // attn_out holds `num_heads * head_dim` = q_dim values, which may
+        // exceed hidden_dim (e.g. Qwen 3 MoE 4x0.6B: q_dim=2048, hidden=1024).
+        let mut attn_out = vec![0.0f32; q_dim.max(c.hidden_dim)];
         let mut o_buf = vec![0.0f32; c.hidden_dim];
         let mut gate_buf = vec![0.0f32; c.intermediate_dim];
         let mut up_buf = vec![0.0f32; c.intermediate_dim];
@@ -1950,17 +2006,36 @@ impl<'a> Llama3Model<'a> {
             // FFN norm
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
 
-            // SwiGLU FFN (pre-quantize norm_buf once for gate+up)
-            let q8_ffn = quantize_row_q8_k(&norm_buf);
-            layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
-            layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+            // MoE dispatch: layers with `ffn_gate_inp` use expert routing
+            // instead of a monolithic SwiGLU FFN. Both paths write their
+            // hidden-dim output into `down_buf`.
+            if layer.ffn_gate_inp.is_some() {
+                forward_moe_layer(c, layer, &norm_buf, &mut down_buf);
+            } else {
+                // SwiGLU FFN (pre-quantize norm_buf once for gate+up)
+                let q8_ffn = quantize_row_q8_k(&norm_buf);
+                layer
+                    .gate_proj
+                    .as_ref()
+                    .expect("gate_proj required for non-MoE layer")
+                    .matvec_preq(&q8_ffn, &mut gate_buf);
+                layer
+                    .up_proj
+                    .as_ref()
+                    .expect("up_proj required for non-MoE layer")
+                    .matvec_preq(&q8_ffn, &mut up_buf);
 
-            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
-            for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
+                c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
+                for i in 0..c.intermediate_dim {
+                    gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
+                }
+
+                layer
+                    .down_proj
+                    .as_ref()
+                    .expect("down_proj required for non-MoE layer")
+                    .matvec(&gate_buf, &mut down_buf);
             }
-
-            layer.down_proj.matvec(&gate_buf, &mut down_buf);
 
             // Gemma-2 post-FFN RMSNorm (before residual add; no-op for others)
             if let Some(w) = &layer.post_ffn_norm {
@@ -2204,8 +2279,16 @@ impl<'a> Llama3Model<'a> {
             // ── FFN ────────────────────────────────────────────────────────
             rms_norm(&attn_laurel, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
             let q8_ffn = quantize_row_q8_k(&norm_buf);
-            layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
-            layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+            layer
+                .gate_proj
+                .as_ref()
+                .expect("gate_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut gate_buf);
+            layer
+                .up_proj
+                .as_ref()
+                .expect("up_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut up_buf);
 
             // Sparsity: gaussian_topk for first n_layer_sparsity layers
             if layer_idx < n_layer_sparsity {
@@ -2215,7 +2298,11 @@ impl<'a> Llama3Model<'a> {
             for i in 0..c.intermediate_dim {
                 gate_buf[i] = gelu_approx(gate_buf[i]) * up_buf[i];
             }
-            layer.down_proj.matvec(&gate_buf, &mut down_buf);
+            layer
+                .down_proj
+                .as_ref()
+                .expect("down_proj required for non-MoE layer")
+                .matvec(&gate_buf, &mut down_buf);
 
             // Post-FFN RMSNorm
             if let Some(w) = &layer.post_ffn_norm {
@@ -2763,13 +2850,25 @@ impl<'a> Llama3Model<'a> {
 
             // ── FFN ────────────────────────────────────────────────────────
             rms_norm(&attn_out_local, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
-            layer.gate_proj.matvec(&norm_buf, &mut gate_buf[..ffn_size]);
-            layer.up_proj.matvec(&norm_buf, &mut up_buf[..ffn_size]);
+            layer
+                .gate_proj
+                .as_ref()
+                .expect("gate_proj required for non-MoE Gemma 4 layer")
+                .matvec(&norm_buf, &mut gate_buf[..ffn_size]);
+            layer
+                .up_proj
+                .as_ref()
+                .expect("up_proj required for non-MoE Gemma 4 layer")
+                .matvec(&norm_buf, &mut up_buf[..ffn_size]);
 
             for i in 0..ffn_size {
                 gate_buf[i] = gelu_approx(gate_buf[i]) * up_buf[i];
             }
-            layer.down_proj.matvec(&gate_buf[..ffn_size], &mut down_buf);
+            layer
+                .down_proj
+                .as_ref()
+                .expect("down_proj required for non-MoE Gemma 4 layer")
+                .matvec(&gate_buf[..ffn_size], &mut down_buf);
 
             // Post-FFN RMSNorm.
             if let Some(w) = &layer.post_ffn_norm {
@@ -2969,13 +3068,25 @@ impl<'a> Llama3Model<'a> {
 
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
             let q8_ffn = quantize_row_q8_k(&norm_buf);
-            layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
-            layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+            layer
+                .gate_proj
+                .as_ref()
+                .expect("gate_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut gate_buf);
+            layer
+                .up_proj
+                .as_ref()
+                .expect("up_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut up_buf);
             c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
                 gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
-            layer.down_proj.matvec(&gate_buf, &mut down_buf);
+            layer
+                .down_proj
+                .as_ref()
+                .expect("down_proj required for non-MoE layer")
+                .matvec(&gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
             }
@@ -3689,21 +3800,30 @@ impl<'a> Llama3Model<'a> {
                 ),
                 ffn_norm: layer.ffn_norm.clone(),
                 gate_proj: sparsify_weight(
-                    &layer.gate_proj,
+                    layer
+                        .gate_proj
+                        .as_ref()
+                        .expect("gate_proj required for sparsify"),
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
                 ),
                 up_proj: sparsify_weight(
-                    &layer.up_proj,
+                    layer
+                        .up_proj
+                        .as_ref()
+                        .expect("up_proj required for sparsify"),
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
                 ),
                 down_proj: sparsify_weight(
-                    &layer.down_proj,
+                    layer
+                        .down_proj
+                        .as_ref()
+                        .expect("down_proj required for sparsify"),
                     c.hidden_dim,
                     c.intermediate_dim,
                     threshold_ratio,
@@ -4135,10 +4255,13 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
+        let q_dim = c.num_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; q_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; c.hidden_dim];
+        // attn_out holds `num_heads * head_dim` = q_dim values, which may
+        // exceed hidden_dim (e.g. Qwen 3 MoE 4x0.6B: q_dim=2048, hidden=1024).
+        let mut attn_out = vec![0.0f32; q_dim.max(c.hidden_dim)];
         let mut o_buf = vec![0.0f32; c.hidden_dim];
         let mut gate_buf = vec![0.0f32; c.intermediate_dim];
         let mut up_buf = vec![0.0f32; c.intermediate_dim];
@@ -4232,15 +4355,27 @@ impl<'a> Llama3Model<'a> {
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
 
             let q8_ffn = quantize_row_q8_k(&norm_buf);
-            layer.gate_proj.matvec_preq(&q8_ffn, &mut gate_buf);
-            layer.up_proj.matvec_preq(&q8_ffn, &mut up_buf);
+            layer
+                .gate_proj
+                .as_ref()
+                .expect("gate_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut gate_buf);
+            layer
+                .up_proj
+                .as_ref()
+                .expect("up_proj required for non-MoE layer")
+                .matvec_preq(&q8_ffn, &mut up_buf);
 
             c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
             for i in 0..c.intermediate_dim {
                 gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
             }
 
-            layer.down_proj.matvec(&gate_buf, &mut down_buf);
+            layer
+                .down_proj
+                .as_ref()
+                .expect("down_proj required for non-MoE layer")
+                .matvec(&gate_buf, &mut down_buf);
 
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
@@ -4481,6 +4616,160 @@ fn load_weight_ref<'a>(
     })
 }
 
+/// Run one MoE layer's expert dispatch.
+///
+/// - `norm_buf`: the RMS-normalised hidden state, `[hidden_dim]`.
+/// - `output`: `[hidden_dim]` — the layer's FFN output, overwritten in place.
+///
+/// Algorithm (Qwen3 MoE / Mixtral / generic top-k softmax MoE):
+/// 1. Router logits `= ffn_gate_inp @ norm_buf` (dense F32 matmul).
+/// 2. `softmax(router_logits)` → per-expert probabilities.
+/// 3. Select top-`num_experts_active` experts by probability.
+/// 4. Renormalise the selected probabilities to sum to 1.
+/// 5. For each selected expert:
+///    - `gate = ffn_gate_exps[e] @ norm_buf`
+///    - `up   = ffn_up_exps[e]   @ norm_buf`
+///    - `expert_out = ffn_down_exps[e] @ (SiLU(gate) * up)`
+/// 6. Sum weighted `expert_out` into `output`.
+fn forward_moe_layer(
+    c: &Llama3Config,
+    layer: &LayerWeights<'_>,
+    norm_buf: &[f32],
+    output: &mut [f32],
+) {
+    let n_expert = c
+        .num_experts
+        .expect("MoE layer requires num_experts in config");
+    let n_active = c
+        .num_experts_active
+        .expect("MoE layer requires num_experts_active in config");
+    let expert_ffn = c.expert_ffn_size.unwrap_or(c.intermediate_dim);
+    let hidden_dim = c.hidden_dim;
+
+    // Step 1: router logits = ffn_gate_inp @ norm_buf.
+    // ffn_gate_inp shape (F32 dense): [hidden_dim, n_expert] row-major with
+    // ne0 = hidden_dim (fast) and ne1 = n_expert. Compute
+    // `router_logits[e] = sum_h weights[e * hidden_dim + h] * norm_buf[h]`.
+    let router_w = layer
+        .ffn_gate_inp
+        .as_ref()
+        .expect("MoE layer requires ffn_gate_inp");
+    assert_eq!(
+        router_w.len(),
+        n_expert * hidden_dim,
+        "ffn_gate_inp shape mismatch"
+    );
+    let mut router_logits = vec![0.0f32; n_expert];
+    for e in 0..n_expert {
+        let mut acc = 0.0f32;
+        let base = e * hidden_dim;
+        for h in 0..hidden_dim {
+            acc += router_w[base + h] * norm_buf[h];
+        }
+        router_logits[e] = acc;
+    }
+
+    // Step 2 + 3: softmax then top-k selection.
+    let max_logit = router_logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = router_logits
+        .iter()
+        .map(|&v| (v - max_logit).exp())
+        .collect();
+    let sum_exp: f32 = probs.iter().sum();
+    for p in &mut probs {
+        *p /= sum_exp;
+    }
+
+    // Sort indices by probability descending; keep top-k.
+    let mut idx_prob: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    idx_prob.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx_prob.truncate(n_active);
+
+    // Step 4: renormalise top-k probabilities.
+    let top_k_sum: f32 = idx_prob.iter().map(|(_, p)| *p).sum();
+    if top_k_sum > 0.0 {
+        for (_, p) in &mut idx_prob {
+            *p /= top_k_sum;
+        }
+    }
+
+    // Step 5+6: expert dispatch. Extract each expert's slab from the 3D
+    // WeightRef and run three matvecs.
+    let gate_exps = layer
+        .ffn_gate_exps
+        .as_ref()
+        .expect("MoE layer requires ffn_gate_exps");
+    let up_exps = layer
+        .ffn_up_exps
+        .as_ref()
+        .expect("MoE layer requires ffn_up_exps");
+    let down_exps = layer
+        .ffn_down_exps
+        .as_ref()
+        .expect("MoE layer requires ffn_down_exps");
+
+    let gate_expert_bytes = expert_slab_bytes(gate_exps, expert_ffn, hidden_dim);
+    let up_expert_bytes = expert_slab_bytes(up_exps, expert_ffn, hidden_dim);
+    let down_expert_bytes = expert_slab_bytes(down_exps, hidden_dim, expert_ffn);
+
+    for v in output.iter_mut() {
+        *v = 0.0;
+    }
+    let mut gate_buf = vec![0.0f32; expert_ffn];
+    let mut up_buf = vec![0.0f32; expert_ffn];
+    let mut expert_out = vec![0.0f32; hidden_dim];
+
+    for &(e, weight) in &idx_prob {
+        let gate_slab = &gate_exps.data[e * gate_expert_bytes..(e + 1) * gate_expert_bytes];
+        let up_slab = &up_exps.data[e * up_expert_bytes..(e + 1) * up_expert_bytes];
+        let down_slab = &down_exps.data[e * down_expert_bytes..(e + 1) * down_expert_bytes];
+
+        crate::gguf::quantized_matvec(
+            norm_buf,
+            gate_slab,
+            gate_exps.qtype,
+            expert_ffn,
+            hidden_dim,
+            &mut gate_buf,
+        );
+        crate::gguf::quantized_matvec(
+            norm_buf,
+            up_slab,
+            up_exps.qtype,
+            expert_ffn,
+            hidden_dim,
+            &mut up_buf,
+        );
+        for i in 0..expert_ffn {
+            gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+        }
+        crate::gguf::quantized_matvec(
+            &gate_buf,
+            down_slab,
+            down_exps.qtype,
+            hidden_dim,
+            expert_ffn,
+            &mut expert_out,
+        );
+
+        for i in 0..hidden_dim {
+            output[i] += weight * expert_out[i];
+        }
+    }
+}
+
+/// Byte size of a single expert's 2D slab within a 3D expert WeightRef.
+fn expert_slab_bytes(w: &WeightRef<'_>, rows_per_expert: usize, cols_per_expert: usize) -> usize {
+    let elems = rows_per_expert * cols_per_expert;
+    let epb = w.qtype.elements_per_block();
+    let bpb = w.qtype.block_bytes();
+    assert!(epb > 0 && bpb > 0, "unsupported qtype for expert slab");
+    (elems / epb) * bpb
+}
+
 fn load_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -4531,24 +4820,26 @@ fn load_layer_weights<'a>(
     )?;
 
     let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+    // Standard FFN weights are optional: MoE layers omit them in favour of
+    // expert-dispatched ffn_gate_inp + ffn_{gate,up,down}_exps tensors.
     let gate_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_gate.weight"),
         ffn_size,
         config.hidden_dim,
-    )?;
+    );
     let up_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_up.weight"),
         ffn_size,
         config.hidden_dim,
-    )?;
+    );
     let down_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ffn_down.weight"),
         config.hidden_dim,
         ffn_size,
-    )?;
+    );
 
     // Qwen 2/2.5: attention projection biases (absent for Llama/Mistral/Gemma/Qwen 3).
     let q_bias = gguf.tensor_to_f32(&format!("{prefix}.attn_q.bias"));
@@ -4577,6 +4868,41 @@ fn load_layer_weights<'a>(
     // Gemma 4: per-layer output scale + per-full-attn RoPE freq factors.
     let out_scale = gguf.tensor_to_f32(&format!("{prefix}.layer_output_scale.weight"));
     let rope_freqs = gguf.tensor_to_f32(&format!("{prefix}.rope_freqs.weight"));
+
+    // MoE tensors (present per-layer in Qwen3 MoE, absent in dense models).
+    // Shape convention (row/col = out/in as usual, per-expert slabs
+    // concatenated along the expert axis in the raw bytes):
+    //   ffn_gate_exps [hidden, ffn_size, n_expert] → rows=ffn_size, cols=hidden
+    //   ffn_up_exps   [hidden, ffn_size, n_expert] → rows=ffn_size, cols=hidden
+    //   ffn_down_exps [ffn_size, hidden, n_expert] → rows=hidden, cols=ffn_size
+    // The per-expert slab is loaded on-demand via `WeightRef::expert_slab`
+    // in `forward_moe`.
+    let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"));
+    let expert_ffn = config.expert_ffn_size.unwrap_or(ffn_size);
+    let (ffn_gate_exps, ffn_up_exps, ffn_down_exps) =
+        if let (Some(_), Some(n_expert)) = (ffn_gate_inp.as_ref(), config.num_experts) {
+            let gate = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_gate_exps.weight"),
+                expert_ffn * n_expert, // total rows across all experts (out * n_expert)
+                config.hidden_dim,     // per-expert cols (in)
+            );
+            let up = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_up_exps.weight"),
+                expert_ffn * n_expert,
+                config.hidden_dim,
+            );
+            let down = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_down_exps.weight"),
+                config.hidden_dim * n_expert, // total rows: hidden per expert × n_expert
+                expert_ffn,                   // per-expert cols (in = expert_ffn)
+            );
+            (gate, up, down)
+        } else {
+            (None, None, None)
+        };
 
     // Gemma 3n per-layer input embedding gate/proj (WeightRef, quantized).
     //
@@ -4633,6 +4959,10 @@ fn load_layer_weights<'a>(
         altup_correct_scale,
         out_scale,
         rope_freqs,
+        ffn_gate_inp,
+        ffn_gate_exps,
+        ffn_up_exps,
+        ffn_down_exps,
     })
 }
 
