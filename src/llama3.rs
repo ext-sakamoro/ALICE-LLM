@@ -1746,6 +1746,27 @@ impl<'a> Llama3Model<'a> {
         Some(out)
     }
 
+    /// Current KV-cache position (number of tokens processed since last reset).
+    /// Exposed for speculative decoding coordination between draft and main
+    /// models.
+    #[must_use]
+    pub fn kv_seq_len(&self) -> usize {
+        self.kv_cache.seq_len()
+    }
+
+    /// Rewind the KV-cache to a previous position. Used by speculative
+    /// decoding to discard rejected draft tokens from the draft model's
+    /// cache when the main model disagrees.
+    pub fn kv_rollback_to(&mut self, pos: usize) {
+        self.kv_cache.rollback_to(pos);
+    }
+
+    /// Reset the KV cache. Equivalent to `kv_rollback_to(0)` but conveys
+    /// intent for restart-from-scratch use cases.
+    pub fn reset(&mut self) {
+        self.kv_cache.clear();
+    }
+
     /// Ternarize all weights for ternary inference mode.
     /// threshold_ratio controls sparsity (0.7 = ~50% zero weights).
     pub fn load_ternary(&mut self, threshold_ratio: f32) {
@@ -4770,6 +4791,182 @@ fn expert_slab_bytes(w: &WeightRef<'_>, rows_per_expert: usize, cols_per_expert:
     (elems / epb) * bpb
 }
 
+// ─── Speculative decoding ──────────────────────────────────────────────────
+
+/// Result of a speculative-decoding run.
+#[derive(Debug, Clone)]
+pub struct SpeculativeResult {
+    /// The greedy-generated tokens (excluding the prompt).
+    pub tokens: Vec<u32>,
+    /// Total draft tokens produced by the draft model.
+    pub draft_tokens_produced: usize,
+    /// Draft tokens accepted by the main model's verification.
+    pub draft_tokens_accepted: usize,
+    /// Bonus tokens (main-model argmax when all-accepted or the replacement
+    /// token when the main model diverges from a draft prediction).
+    pub bonus_tokens: usize,
+}
+
+impl SpeculativeResult {
+    /// Fraction of draft tokens that survived main-model verification.
+    /// `1.0` means the draft matched the main model everywhere (which
+    /// happens by construction for a same-model speculative run).
+    #[must_use]
+    pub fn acceptance_rate(&self) -> f32 {
+        if self.draft_tokens_produced == 0 {
+            0.0
+        } else {
+            self.draft_tokens_accepted as f32 / self.draft_tokens_produced as f32
+        }
+    }
+}
+
+/// Speculative decoding (greedy verification).
+///
+/// The `draft` model (typically small and fast) proposes `n_draft` candidate
+/// tokens each iteration by greedy sampling. The `main` model (large and
+/// slow, considered the source of truth) verifies each candidate by
+/// comparing its greedy prediction to the draft's. All matching tokens are
+/// accepted in a single main-model pass; the first mismatch is replaced by
+/// the main model's own argmax. When every draft token is accepted, the main
+/// model contributes a bonus token, yielding up to `n_draft + 1` tokens per
+/// iteration.
+///
+/// Both models MUST share the same tokenizer vocabulary. When `draft` and
+/// `main` are the same instance (or two clones), acceptance rate is exactly
+/// 100% (each iteration produces `n_draft + 1` tokens), which makes for a
+/// deterministic correctness fixture.
+///
+/// # Arguments
+/// * `draft` – the proposal model (`&mut Llama3Model`).
+/// * `main` – the verification model (`&mut Llama3Model`).
+/// * `prompt` – the prompt tokens. Both models MUST have empty KV caches on
+///   entry (call `reset()` beforehand if reusing them).
+/// * `n_draft` – number of speculative tokens per iteration (typically 4–8).
+///   Larger values amortise verification cost across more candidates but
+///   discard more work on mismatches.
+/// * `max_new_tokens` – hard upper bound on emitted tokens.
+/// * `eos_id` – optional EOS token id. Generation stops when the accepted
+///   token equals this value.
+pub fn speculative_decode(
+    draft: &mut Llama3Model<'_>,
+    main: &mut Llama3Model<'_>,
+    prompt: &[u32],
+    n_draft: usize,
+    max_new_tokens: usize,
+    eos_id: Option<u32>,
+) -> SpeculativeResult {
+    assert!(n_draft >= 1, "n_draft must be at least 1");
+    assert!(!prompt.is_empty(), "prompt must be non-empty");
+
+    // Prefill both models with prompt[..len-1]; hold the final prompt token
+    // as `last_tok` to start the first draft/verify cycle.
+    for &tok in prompt.iter().take(prompt.len() - 1) {
+        let _ = draft.forward(tok);
+        let _ = main.forward(tok);
+    }
+    let mut last_tok = *prompt.last().unwrap();
+    let mut result = SpeculativeResult {
+        tokens: Vec::with_capacity(max_new_tokens),
+        draft_tokens_produced: 0,
+        draft_tokens_accepted: 0,
+        bonus_tokens: 0,
+    };
+
+    while result.tokens.len() < max_new_tokens {
+        // ── 1. Draft phase ────────────────────────────────────────────────
+        let mut draft_tokens = Vec::with_capacity(n_draft);
+        let mut curr = last_tok;
+        for _ in 0..n_draft {
+            let logits = draft.forward(curr);
+            let argmax = greedy_argmax(&logits);
+            draft_tokens.push(argmax);
+            curr = argmax;
+        }
+        result.draft_tokens_produced += n_draft;
+
+        // ── 2. Verify phase ────────────────────────────────────────────────
+        let mut accepted = 0usize;
+        let mut mismatch_replacement: Option<u32> = None;
+        curr = last_tok;
+        for &draft_tok in &draft_tokens {
+            let logits = main.forward(curr);
+            let main_argmax = greedy_argmax(&logits);
+            if main_argmax == draft_tok {
+                result.tokens.push(draft_tok);
+                accepted += 1;
+                curr = draft_tok;
+                if result.tokens.len() >= max_new_tokens {
+                    break;
+                }
+                if eos_id == Some(draft_tok) {
+                    break;
+                }
+            } else {
+                result.tokens.push(main_argmax);
+                result.bonus_tokens += 1;
+                mismatch_replacement = Some(main_argmax);
+                break;
+            }
+        }
+        result.draft_tokens_accepted += accepted;
+
+        // ── 3. Sync draft KV cache to main's position ─────────────────────
+        // Invariant after sync: draft.kv_seq_len() == main.kv_seq_len() and
+        // both caches hold the same token sequence. `last_tok` is pending
+        // forward on both models in the next iteration.
+        if let Some(replacement) = mismatch_replacement {
+            // Main advanced by `accepted + 1`; draft advanced by `n_draft`.
+            // Rollback draft to main's exact position — both caches now hold
+            // the same accepted prefix. `replacement` is pending forward on
+            // both in the next iteration; do NOT pre-forward it on draft.
+            let target = main.kv_seq_len();
+            draft.kv_rollback_to(target);
+            last_tok = replacement;
+        } else if accepted == n_draft && result.tokens.len() < max_new_tokens {
+            // All-accepted bonus. After verify, both caches are aligned at
+            // seq_len = start + n_draft (draft phase forwarded last_tok,
+            // d_0, ..., d_{n_draft-2}; verify phase did the same on main).
+            // curr = d_{n_draft-1}. Draft must forward curr to stay aligned
+            // with main after main's bonus forward.
+            let _ = draft.forward(curr);
+            let logits = main.forward(curr);
+            let bonus = greedy_argmax(&logits);
+            result.tokens.push(bonus);
+            result.bonus_tokens += 1;
+            last_tok = bonus;
+        } else {
+            // Loop-cap or eos-mid-verify with partial acceptance.
+            // Main advanced by `accepted`, draft by `n_draft`. Rollback
+            // draft to main's position; last accepted token is pending
+            // forward on both.
+            let target = main.kv_seq_len();
+            draft.kv_rollback_to(target);
+            last_tok = *result.tokens.last().unwrap_or(&last_tok);
+        }
+
+        if eos_id.is_some_and(|e| Some(&e) == result.tokens.last()) {
+            break;
+        }
+    }
+
+    // Truncate to the requested budget.
+    result.tokens.truncate(max_new_tokens);
+    result
+}
+
+fn greedy_argmax(logits: &[f32]) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx as u32
+}
+
 fn load_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -5737,5 +5934,68 @@ mod tests {
     fn test_qwen35_use_neox_rope() {
         // Qwen 3.5 / 3.6 inherits NEOX RoPE from the Qwen 3 family.
         assert!(ModelArch::Qwen3_5.use_neox_rope());
+    }
+
+    // ─── Phase JJJ: Speculative decoding helper tests ─────────────────────
+
+    #[test]
+    fn test_greedy_argmax_basic() {
+        let logits = [0.1_f32, 0.5, 0.3, 0.7, 0.2];
+        assert_eq!(greedy_argmax(&logits), 3);
+    }
+
+    #[test]
+    fn test_greedy_argmax_first_wins_on_tie() {
+        // First occurrence wins because subsequent equal values do not
+        // satisfy strict `>` comparison.
+        let logits = [0.7_f32, 0.5, 0.7, 0.3];
+        assert_eq!(greedy_argmax(&logits), 0);
+    }
+
+    #[test]
+    fn test_greedy_argmax_single_element() {
+        let logits = [42.0_f32];
+        assert_eq!(greedy_argmax(&logits), 0);
+    }
+
+    #[test]
+    fn test_greedy_argmax_negative_values() {
+        let logits = [-3.0_f32, -1.5, -2.0, -0.5];
+        assert_eq!(greedy_argmax(&logits), 3);
+    }
+
+    #[test]
+    fn test_speculative_result_acceptance_rate_empty() {
+        let r = SpeculativeResult {
+            tokens: vec![],
+            draft_tokens_produced: 0,
+            draft_tokens_accepted: 0,
+            bonus_tokens: 0,
+        };
+        // No draft tokens produced → rate is defined as 0.0 (not NaN).
+        assert_eq!(r.acceptance_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_speculative_result_acceptance_rate_full() {
+        let r = SpeculativeResult {
+            tokens: vec![1, 2, 3, 4, 5],
+            draft_tokens_produced: 4,
+            draft_tokens_accepted: 4,
+            bonus_tokens: 1,
+        };
+        assert!((r.acceptance_rate() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_speculative_result_acceptance_rate_partial() {
+        let r = SpeculativeResult {
+            tokens: vec![1, 2, 3],
+            draft_tokens_produced: 8,
+            draft_tokens_accepted: 2,
+            bonus_tokens: 1,
+        };
+        // 2 / 8 = 0.25
+        assert!((r.acceptance_rate() - 0.25).abs() < 1e-6);
     }
 }
