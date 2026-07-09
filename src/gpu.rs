@@ -12,6 +12,7 @@ const MATVEC_Q6K_SHADER: &str = include_str!("shaders/dequant_matvec_q6k.wgsl");
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
+const ADD_BIAS_SHADER: &str = include_str!("shaders/add_bias.wgsl");
 const ROPE_SHADER: &str = include_str!("shaders/rope.wgsl");
 const ATTENTION_SHADER: &str = include_str!("shaders/attention.wgsl");
 const KV_CACHE_APPEND_SHADER: &str = include_str!("shaders/kv_cache_append.wgsl");
@@ -126,6 +127,8 @@ pub struct GpuEngine {
     rmsnorm_pipeline: wgpu::ComputePipeline,
     silu_mul_pipeline: wgpu::ComputePipeline,
     residual_add_pipeline: wgpu::ComputePipeline,
+    /// Element-wise bias add (Qwen 2 / 2.5 attention QKV biases).
+    add_bias_pipeline: wgpu::ComputePipeline,
     rope_pipeline: wgpu::ComputePipeline,
     attention_pipeline: wgpu::ComputePipeline,
     kv_cache_append_pipeline: wgpu::ComputePipeline,
@@ -287,6 +290,7 @@ impl GpuEngine {
                 "residual_add",
                 "residual_add",
             ),
+            add_bias_pipeline: make_pipeline(ADD_BIAS_SHADER, "add_bias", "add_bias"),
             rope_pipeline: make_pipeline(ROPE_SHADER, "rope", "rope"),
             attention_pipeline: make_pipeline(ATTENTION_SHADER, "attention", "attention"),
             kv_cache_append_pipeline: make_pipeline(
@@ -1061,6 +1065,10 @@ struct LayerBGs {
     k_proj: MatvecBG,
     v_proj: MatvecBG,
     o_proj: MatvecBG,
+    /// Qwen 2 / 2.5 QKV bias-add bind groups (None for arch without biases).
+    q_bias_bg: Option<wgpu::BindGroup>,
+    k_bias_bg: Option<wgpu::BindGroup>,
+    v_bias_bg: Option<wgpu::BindGroup>,
     kv_append_bg: wgpu::BindGroup,
     attention_bg: wgpu::BindGroup,
     ffn_norm_bg: wgpu::BindGroup,
@@ -1075,6 +1083,12 @@ struct LayerWeightBufs {
     k_proj: GpuWeightBuffer,
     v_proj: GpuWeightBuffer,
     o_proj: GpuWeightBuffer,
+    /// Qwen 2 / 2.5 attention QKV projection biases (absent for Llama / Mistral /
+    /// Gemma / Qwen 3+ which removed biases). Added element-wise to q/k/v projection
+    /// outputs before RoPE.
+    q_bias: Option<GpuBuffer>,
+    k_bias: Option<GpuBuffer>,
+    v_bias: Option<GpuBuffer>,
     ffn_norm: GpuBuffer,
     gate_proj: GpuWeightBuffer,
     up_proj: GpuWeightBuffer,
@@ -1188,6 +1202,10 @@ pub struct GpuModel {
     rope_q_dispatch_x: u32,
     rope_k_dispatch_x: u32,
     kv_dispatch_x: u32,
+    /// Q bias add dispatch: `ceil(hidden_dim / 256)`.
+    q_bias_dispatch_x: u32,
+    /// K / V bias add dispatch: `ceil(kv_dim / 256)`.
+    kv_bias_dispatch_x: u32,
 
     // CPU data
     embedding: Vec<f32>,
@@ -1305,6 +1323,30 @@ impl GpuModel {
             dispatch_y,
             quant: w.quant,
         }
+    }
+
+    /// Build bind group for element-wise `acc_buf[i] += bias[i]`.
+    /// Layout: binding 0 read_write acc_buf, binding 1 read bias.
+    fn build_add_bias_bg(
+        engine: &GpuEngine,
+        acc_buf: &GpuBuffer,
+        bias: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        let layout = engine.add_bias_pipeline.get_bind_group_layout(0);
+        engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: acc_buf.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bias.buffer.as_entire_binding(),
+                },
+            ],
+        })
     }
 
     fn build_rmsnorm_bg(
@@ -1475,6 +1517,15 @@ impl GpuModel {
                             config.hidden_dim,
                             config.hidden_dim,
                         ),
+                        q_bias: gguf
+                            .tensor_to_f32(&format!("blk.{i}.attn_q.bias"))
+                            .map(|v| engine.upload_f32(&v)),
+                        k_bias: gguf
+                            .tensor_to_f32(&format!("blk.{i}.attn_k.bias"))
+                            .map(|v| engine.upload_f32(&v)),
+                        v_bias: gguf
+                            .tensor_to_f32(&format!("blk.{i}.attn_v.bias"))
+                            .map(|v| engine.upload_f32(&v)),
                         ffn_norm: engine.upload_f32(
                             &gguf
                                 .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
@@ -1569,6 +1620,9 @@ impl GpuModel {
                         k_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         v_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         o_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        q_bias: None,
+                        k_bias: None,
+                        v_bias: None,
                         ffn_norm: engine.alloc_f32(1),
                         gate_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         up_proj: engine.upload_weights(&[0u8; 256], 1, 1),
@@ -1810,6 +1864,21 @@ impl GpuModel {
                     let v_proj = Self::build_matvec_bg(&engine, &lw.v_proj, &norm_buf, &v_buf);
                     let o_proj = Self::build_matvec_bg(&engine, &lw.o_proj, &attn_out, &o_buf);
 
+                    // Qwen 2 / 2.5 attention QKV biases (None for Llama / Mistral /
+                    // Gemma / Qwen 3+ which do not carry attention biases).
+                    let q_bias_bg = lw
+                        .q_bias
+                        .as_ref()
+                        .map(|b| Self::build_add_bias_bg(&engine, &q_buf, b));
+                    let k_bias_bg = lw
+                        .k_bias
+                        .as_ref()
+                        .map(|b| Self::build_add_bias_bg(&engine, &k_buf, b));
+                    let v_bias_bg = lw
+                        .v_bias
+                        .as_ref()
+                        .map(|b| Self::build_add_bias_bg(&engine, &v_buf, b));
+
                     let ffn_norm_bg = Self::build_rmsnorm_bg(
                         &engine,
                         &hidden,
@@ -1889,6 +1958,9 @@ impl GpuModel {
                         k_proj,
                         v_proj,
                         o_proj,
+                        q_bias_bg,
+                        k_bias_bg,
+                        v_bias_bg,
                         kv_append_bg,
                         attention_bg,
                         ffn_norm_bg,
@@ -2067,6 +2139,10 @@ impl GpuModel {
                             &attn_out,
                             &o_buf,
                         ),
+                        // DeltaNet layers do not carry attention biases (unused placeholder).
+                        q_bias_bg: None,
+                        k_bias_bg: None,
+                        v_bias_bg: None,
                         kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: None,
                             layout: &kv_append_layout,
@@ -2151,6 +2227,9 @@ impl GpuModel {
         let rope_q_dispatch_x = (config.num_heads * config.head_dim / 2 + 255) / 256;
         let rope_k_dispatch_x = (config.num_kv_heads * config.head_dim / 2 + 255) / 256;
         let kv_dispatch_x = ((kv_dim as u32) + 255) / 256;
+        // Q bias is added over hidden_dim elements; K/V bias over kv_dim.
+        let q_bias_dispatch_x = ((config.hidden_dim as u32) + 255) / 256;
+        let kv_bias_dispatch_x = ((kv_dim as u32) + 255) / 256;
 
         let total_bgs = layer_bgs.len() * 10 + 7;
         eprintln!("[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs");
@@ -2194,6 +2273,8 @@ impl GpuModel {
             rope_q_dispatch_x,
             rope_k_dispatch_x,
             kv_dispatch_x,
+            q_bias_dispatch_x,
+            kv_bias_dispatch_x,
             embedding,
             vocab_size,
             seq_len: 0,
@@ -2222,6 +2303,27 @@ impl GpuModel {
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
+
+                    // Qwen 2 / 2.5 attention biases: add pointwise to Q/K/V before RoPE.
+                    // No-op for arch without biases (Llama / Mistral / Gemma / Qwen 3+).
+                    if lbg.q_bias_bg.is_some()
+                        || lbg.k_bias_bg.is_some()
+                        || lbg.v_bias_bg.is_some()
+                    {
+                        cp.set_pipeline(&self.engine.add_bias_pipeline);
+                        if let Some(bg) = &lbg.q_bias_bg {
+                            cp.set_bind_group(0, bg, &[]);
+                            cp.dispatch_workgroups(self.q_bias_dispatch_x, 1, 1);
+                        }
+                        if let Some(bg) = &lbg.k_bias_bg {
+                            cp.set_bind_group(0, bg, &[]);
+                            cp.dispatch_workgroups(self.kv_bias_dispatch_x, 1, 1);
+                        }
+                        if let Some(bg) = &lbg.v_bias_bg {
+                            cp.set_bind_group(0, bg, &[]);
+                            cp.dispatch_workgroups(self.kv_bias_dispatch_x, 1, 1);
+                        }
+                    }
 
                     cp.set_pipeline(&self.engine.rope_pipeline);
                     cp.set_bind_group(0, &self.rope_q_bg, &[]);
@@ -2527,6 +2629,24 @@ impl GpuModel {
                 }
             }
 
+            // Qwen 2 / 2.5 attention biases (add-bias timing absorbed into residual_us
+            // since add_bias and residual_add share the same shape / cost profile).
+            if let Some(bg) = &lbg.q_bias_bg {
+                r.residual_us +=
+                    timed_dispatch(e, &e.add_bias_pipeline, bg, self.q_bias_dispatch_x, 1, 1);
+                r.residual_n += 1;
+            }
+            if let Some(bg) = &lbg.k_bias_bg {
+                r.residual_us +=
+                    timed_dispatch(e, &e.add_bias_pipeline, bg, self.kv_bias_dispatch_x, 1, 1);
+                r.residual_n += 1;
+            }
+            if let Some(bg) = &lbg.v_bias_bg {
+                r.residual_us +=
+                    timed_dispatch(e, &e.add_bias_pipeline, bg, self.kv_bias_dispatch_x, 1, 1);
+                r.residual_n += 1;
+            }
+
             r.rope_us += timed_dispatch(
                 e,
                 &e.rope_pipeline,
@@ -2684,6 +2804,24 @@ impl GpuModel {
             Self::dispatch_mv_batch4(&self.engine, &mut cp, &lbg.k_proj);
             Self::dispatch_mv_batch4(&self.engine, &mut cp, &lbg.v_proj);
 
+            // Qwen 2 / 2.5 attention biases: broadcast bias across the batch dim
+            // (wid.y iterates 0..bs, add_bias shader indexes acc_buf[bs_idx * bias_len + elem]).
+            if lbg.q_bias_bg.is_some() || lbg.k_bias_bg.is_some() || lbg.v_bias_bg.is_some() {
+                cp.set_pipeline(&self.engine.add_bias_pipeline);
+                if let Some(bg) = &lbg.q_bias_bg {
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(self.q_bias_dispatch_x, bs, 1);
+                }
+                if let Some(bg) = &lbg.k_bias_bg {
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(self.kv_bias_dispatch_x, bs, 1);
+                }
+                if let Some(bg) = &lbg.v_bias_bg {
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(self.kv_bias_dispatch_x, bs, 1);
+                }
+            }
+
             // RoPE: wid.y = batch index
             cp.set_pipeline(&self.engine.rope_pipeline);
             cp.set_bind_group(0, &self.rope_q_bg, &[]);
@@ -2827,10 +2965,20 @@ impl GpuModel {
         self.update_uniforms(pos, seq_len);
         self.upload_embedding(token_id);
 
-        // 14 dispatches per layer × num_layers + 2 output head = total dispatches
+        // 14 dispatches per layer × num_layers + 2 output head + optional
+        // Qwen 2 / 2.5 QKV bias adds (per attention layer with biases present).
         let ops_per_layer: u32 = 14;
         let n_layers = self.config.num_layers as u32;
-        let total_dispatches = ops_per_layer * n_layers + 2;
+        let bias_dispatches: u32 = self
+            .layer_bgs
+            .iter()
+            .map(|lbg| {
+                u32::from(lbg.q_bias_bg.is_some())
+                    + u32::from(lbg.k_bias_bg.is_some())
+                    + u32::from(lbg.v_bias_bg.is_some())
+            })
+            .sum();
+        let total_dispatches = ops_per_layer * n_layers + bias_dispatches + 2;
         // Each dispatch uses 2 query slots (beginning + end of compute pass)
         let num_queries = total_dispatches * 2;
 
@@ -2919,6 +3067,37 @@ impl GpuModel {
             ts_dispatch_mv!(lbg.q_proj);
             ts_dispatch_mv!(lbg.k_proj);
             ts_dispatch_mv!(lbg.v_proj);
+            // Qwen 2 / 2.5 attention biases (add-bias tagged as `7u8` residual).
+            if let Some(bg) = &lbg.q_bias_bg {
+                ts_dispatch!(
+                    &self.engine.add_bias_pipeline,
+                    bg,
+                    self.q_bias_dispatch_x,
+                    1,
+                    1,
+                    7u8
+                );
+            }
+            if let Some(bg) = &lbg.k_bias_bg {
+                ts_dispatch!(
+                    &self.engine.add_bias_pipeline,
+                    bg,
+                    self.kv_bias_dispatch_x,
+                    1,
+                    1,
+                    7u8
+                );
+            }
+            if let Some(bg) = &lbg.v_bias_bg {
+                ts_dispatch!(
+                    &self.engine.add_bias_pipeline,
+                    bg,
+                    self.kv_bias_dispatch_x,
+                    1,
+                    1,
+                    7u8
+                );
+            }
             ts_dispatch!(
                 &self.engine.rope_pipeline,
                 &self.rope_q_bg,
