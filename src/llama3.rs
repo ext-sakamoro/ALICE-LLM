@@ -4967,6 +4967,335 @@ fn greedy_argmax(logits: &[f32]) -> u32 {
     best_idx as u32
 }
 
+// ─── Phase JJJ v0.2: Sampling distribution replay ─────────────────────────
+//
+// Reference: Leviathan et al. 2023 ("Fast Inference from Transformers via
+// Speculative Decoding"), Chen et al. 2023, and Cognition SWE-1.7 (2026)
+// which emphasises the importance of preserving inference-time entropy
+// (top-p) and explicit sampling distribution replay to avoid KL mismatch
+// between draft and main.
+//
+// Rejection sampling: draft samples x ~ p_draft, main computes p_main.
+// Accept x with probability min(1, p_main(x) / p_draft(x)). Reject →
+// sample x' ~ residual_dist(p_main, p_draft) where residual is
+// max(0, p_main - p_draft) renormalised. This is mathematically
+// equivalent to sampling directly from p_main (unbiased).
+
+/// Configuration for [`speculative_decode_v2`].
+///
+/// When `temperature` is `None`, the function performs pure greedy
+/// verification (equivalent to [`speculative_decode`]).
+///
+/// When `temperature` is `Some(t)`, the function performs rejection
+/// sampling: draft samples from `top_p(softmax(logits / t))`, main
+/// accepts each sample with probability `min(1, p_main / p_draft)`, and
+/// rejects fall back to the residual distribution.
+#[derive(Debug, Clone)]
+pub struct SpeculativeConfig {
+    /// Number of tokens the draft model proposes per iteration.
+    pub n_draft: usize,
+    /// Hard cap on emitted tokens.
+    pub max_new_tokens: usize,
+    /// Optional EOS token id. Generation stops when this token is emitted.
+    pub eos_id: Option<u32>,
+    /// `None` → greedy verify. `Some(t > 0)` → temperature-scaled softmax
+    /// + rejection sampling.
+    pub temperature: Option<f32>,
+    /// `None` or `Some(1.0)` → no top-p filter. Otherwise keeps the
+    /// smallest set of tokens whose cumulative probability reaches `p`.
+    pub top_p: Option<f32>,
+    /// Seed for the sampling RNG (`splitmix64`). Only used when
+    /// `temperature` is `Some`. `None` → seeded with 0 (deterministic).
+    pub sample_seed: Option<u64>,
+}
+
+impl Default for SpeculativeConfig {
+    fn default() -> Self {
+        Self {
+            n_draft: 4,
+            max_new_tokens: 128,
+            eos_id: None,
+            temperature: None,
+            top_p: None,
+            sample_seed: None,
+        }
+    }
+}
+
+/// Deterministic 64-bit PRNG (splitmix64). Adequate for token sampling and
+/// gives bit-exact reproducibility across platforms without pulling in an
+/// external RNG dependency.
+#[derive(Debug, Clone, Copy)]
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn next_unit_f32(&mut self) -> f32 {
+        // Take top 24 bits of u64 → uniform in [0, 1).
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (self.next_u64() >> 40) as f32 / f32::from(1u16 << 8) / f32::from(1u16 << 8) / 256.0
+        }
+    }
+}
+
+/// Apply temperature scaling + softmax + optional top-p filter.
+/// Returns a proper probability distribution (sums to 1.0).
+///
+/// * `temperature` must be strictly positive.
+/// * `top_p = None` or `Some(t) where t >= 1.0` disables top-p filtering.
+/// * `top_p = Some(t) where 0 < t < 1` keeps the smallest set of tokens
+///   whose cumulative probability >= t (nucleus sampling).
+fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f32>) -> Vec<f32> {
+    assert!(
+        temperature > 0.0 && temperature.is_finite(),
+        "temperature must be positive and finite"
+    );
+    let inv_t = 1.0 / temperature;
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&l| ((l - max_logit) * inv_t).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    assert!(
+        sum > 0.0 && sum.is_finite(),
+        "softmax normaliser is degenerate"
+    );
+    for p in &mut probs {
+        *p /= sum;
+    }
+
+    if let Some(p_thresh) = top_p {
+        if p_thresh > 0.0 && p_thresh < 1.0 - 1e-6 {
+            let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut cum = 0.0f32;
+            let mut keep_mask = vec![false; probs.len()];
+            for &(orig_idx, prob) in &indexed {
+                keep_mask[orig_idx] = true;
+                cum += prob;
+                if cum >= p_thresh {
+                    break;
+                }
+            }
+            for (i, p) in probs.iter_mut().enumerate() {
+                if !keep_mask[i] {
+                    *p = 0.0;
+                }
+            }
+            let sum: f32 = probs.iter().sum();
+            if sum > 0.0 {
+                for p in &mut probs {
+                    *p /= sum;
+                }
+            }
+        }
+    }
+    probs
+}
+
+/// Sample one index from a probability distribution using inverse CDF.
+/// The distribution must sum to (approximately) 1.0.
+fn sample_multinomial(dist: &[f32], rng: &mut SplitMix64) -> u32 {
+    let u = rng.next_unit_f32();
+    let mut cum = 0.0f32;
+    for (i, &p) in dist.iter().enumerate() {
+        cum += p;
+        if u < cum {
+            return u32::try_from(i).expect("index fits in u32");
+        }
+    }
+    // Fallback for float precision: return last non-zero index.
+    for (i, &p) in dist.iter().enumerate().rev() {
+        if p > 0.0 {
+            return u32::try_from(i).expect("index fits in u32");
+        }
+    }
+    0
+}
+
+/// Residual distribution used when a draft sample is rejected.
+/// r(x) = max(0, p_main(x) - p_draft(x)), renormalised.
+/// When the residual mass is zero (degenerate case), falls back to `p_main`.
+fn residual_dist(p_main: &[f32], p_draft: &[f32]) -> Vec<f32> {
+    assert_eq!(
+        p_main.len(),
+        p_draft.len(),
+        "distributions must match length"
+    );
+    let mut r: Vec<f32> = p_main
+        .iter()
+        .zip(p_draft.iter())
+        .map(|(&m, &d)| (m - d).max(0.0))
+        .collect();
+    let sum: f32 = r.iter().sum();
+    if sum > 0.0 {
+        for x in &mut r {
+            *x /= sum;
+        }
+    } else {
+        r.clone_from_slice(p_main);
+    }
+    r
+}
+
+/// Speculative decoding with rejection sampling (v0.2).
+///
+/// When `cfg.temperature` is `None`, behaves identically to
+/// [`speculative_decode`] (greedy verify).
+///
+/// When `cfg.temperature` is `Some(t)`:
+/// * Draft samples each proposed token from `top_p(softmax(logits / t))`.
+/// * For each draft sample `x` with draft probability `p_draft`, the main
+///   model computes `p_main`. Accept with probability `min(1, p_main / p_draft)`.
+/// * On reject, sample the replacement from the residual distribution
+///   `renorm(max(0, p_main - p_draft))`.
+/// * All-accepted iterations produce a bonus token sampled from `p_main`.
+///
+/// This procedure is mathematically equivalent to sampling from `p_main`
+/// directly, but amortises the main-model cost across up to `n_draft + 1`
+/// tokens per iteration.
+///
+/// Both models must share the tokenizer vocabulary and be entering the
+/// call with empty KV caches (call [`Llama3Model::reset`] beforehand if
+/// reusing them).
+pub fn speculative_decode_v2(
+    draft: &mut Llama3Model<'_>,
+    main: &mut Llama3Model<'_>,
+    prompt: &[u32],
+    cfg: &SpeculativeConfig,
+) -> SpeculativeResult {
+    assert!(cfg.n_draft >= 1, "n_draft must be at least 1");
+    assert!(!prompt.is_empty(), "prompt must be non-empty");
+
+    // Delegate to the greedy path for backward-compatible behaviour.
+    if cfg.temperature.is_none() {
+        return speculative_decode(
+            draft,
+            main,
+            prompt,
+            cfg.n_draft,
+            cfg.max_new_tokens,
+            cfg.eos_id,
+        );
+    }
+
+    let temperature = cfg.temperature.expect("checked above");
+    let top_p = cfg.top_p;
+    let mut rng = SplitMix64::new(cfg.sample_seed.unwrap_or(0));
+
+    // Prefill both models with prompt[..len-1].
+    for &tok in prompt.iter().take(prompt.len() - 1) {
+        let _ = draft.forward(tok);
+        let _ = main.forward(tok);
+    }
+    let mut last_tok = *prompt.last().expect("non-empty prompt");
+    let mut result = SpeculativeResult {
+        tokens: Vec::with_capacity(cfg.max_new_tokens),
+        draft_tokens_produced: 0,
+        draft_tokens_accepted: 0,
+        bonus_tokens: 0,
+    };
+
+    while result.tokens.len() < cfg.max_new_tokens {
+        // ── 1. Draft phase ────────────────────────────────────────────────
+        let mut draft_tokens = Vec::with_capacity(cfg.n_draft);
+        let mut draft_probs_at_pick: Vec<f32> = Vec::with_capacity(cfg.n_draft);
+        // We also cache the full draft distribution at each verify position
+        // so the verify phase does not need to re-forward the draft.
+        let mut draft_dists: Vec<Vec<f32>> = Vec::with_capacity(cfg.n_draft);
+        let mut curr = last_tok;
+        for _ in 0..cfg.n_draft {
+            let logits = draft.forward(curr);
+            let dist = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let sample = sample_multinomial(&dist, &mut rng);
+            let p_at = dist[sample as usize];
+            draft_probs_at_pick.push(p_at);
+            draft_dists.push(dist);
+            draft_tokens.push(sample);
+            curr = sample;
+        }
+        result.draft_tokens_produced += cfg.n_draft;
+
+        // ── 2. Verify phase (rejection sampling) ─────────────────────────
+        let mut accepted = 0usize;
+        let mut rejected_replacement: Option<u32> = None;
+        curr = last_tok;
+        for (idx, &draft_tok) in draft_tokens.iter().enumerate() {
+            let logits = main.forward(curr);
+            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let p_draft = &draft_dists[idx];
+            let p_m = p_main[draft_tok as usize];
+            let p_d = draft_probs_at_pick[idx];
+            let ratio = if p_d > 0.0 { (p_m / p_d).min(1.0) } else { 0.0 };
+            let u = rng.next_unit_f32();
+            if u < ratio {
+                result.tokens.push(draft_tok);
+                accepted += 1;
+                curr = draft_tok;
+                if result.tokens.len() >= cfg.max_new_tokens {
+                    break;
+                }
+                if cfg.eos_id == Some(draft_tok) {
+                    break;
+                }
+            } else {
+                let residual = residual_dist(&p_main, p_draft);
+                let replacement = sample_multinomial(&residual, &mut rng);
+                result.tokens.push(replacement);
+                result.bonus_tokens += 1;
+                rejected_replacement = Some(replacement);
+                break;
+            }
+        }
+        result.draft_tokens_accepted += accepted;
+
+        // ── 3. Sync draft KV cache to main's position ─────────────────────
+        // Invariant: after sync, draft.kv_seq_len() == main.kv_seq_len(),
+        // both caches hold the same token sequence, and `last_tok` is
+        // pending forward on both.
+        if let Some(replacement) = rejected_replacement {
+            let target = main.kv_seq_len();
+            draft.kv_rollback_to(target);
+            last_tok = replacement;
+        } else if accepted == cfg.n_draft && result.tokens.len() < cfg.max_new_tokens {
+            // All-accepted bonus: sample from main's distribution after
+            // main advances by one more step (forward on curr = last draft).
+            let _ = draft.forward(curr);
+            let logits = main.forward(curr);
+            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let bonus = sample_multinomial(&p_main, &mut rng);
+            result.tokens.push(bonus);
+            result.bonus_tokens += 1;
+            last_tok = bonus;
+        } else {
+            let target = main.kv_seq_len();
+            draft.kv_rollback_to(target);
+            last_tok = *result.tokens.last().unwrap_or(&last_tok);
+        }
+
+        if cfg.eos_id.is_some_and(|e| Some(&e) == result.tokens.last()) {
+            break;
+        }
+    }
+
+    result.tokens.truncate(cfg.max_new_tokens);
+    result
+}
+
 fn load_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -5997,5 +6326,134 @@ mod tests {
         };
         // 2 / 8 = 0.25
         assert!((r.acceptance_rate() - 0.25).abs() < 1e-6);
+    }
+
+    // ─── Phase JJJ v0.2: Sampling helper tests ────────────────────────────
+
+    #[test]
+    fn test_splitmix64_deterministic() {
+        let mut a = SplitMix64::new(42);
+        let mut b = SplitMix64::new(42);
+        for _ in 0..10 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn test_splitmix64_next_unit_f32_range() {
+        let mut rng = SplitMix64::new(7);
+        for _ in 0..1000 {
+            let x = rng.next_unit_f32();
+            assert!((0.0..1.0).contains(&x), "sample {x} out of [0, 1)");
+        }
+    }
+
+    #[test]
+    fn test_apply_temperature_and_top_p_uniform_at_high_temp() {
+        // Very high temperature → distribution approaches uniform.
+        let logits = [1.0f32, 2.0, 3.0, 4.0];
+        let dist = apply_temperature_and_top_p(&logits, 1000.0, None);
+        let sum: f32 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4);
+        for &p in &dist {
+            // With t=1000, exp((l - max) / 1000) ≈ 1 for all → near-uniform
+            assert!((p - 0.25).abs() < 0.01, "prob {p} not near uniform");
+        }
+    }
+
+    #[test]
+    fn test_apply_temperature_and_top_p_argmax_at_low_temp() {
+        // Very low temperature → distribution collapses to argmax.
+        let logits = [1.0f32, 5.0, 2.0, 3.0];
+        let dist = apply_temperature_and_top_p(&logits, 0.001, None);
+        // Argmax is index 1.
+        assert!(dist[1] > 0.999, "argmax prob {} not near 1", dist[1]);
+        for (i, &p) in dist.iter().enumerate() {
+            if i != 1 {
+                assert!(p < 1e-3, "non-argmax prob {p} at {i} too high");
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_temperature_and_top_p_sums_to_one() {
+        let logits = [0.5f32, -1.0, 2.5, 0.1, -0.3];
+        let dist = apply_temperature_and_top_p(&logits, 1.0, None);
+        let sum: f32 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_temperature_and_top_p_filter_keeps_head() {
+        // Distribution: [0.5, 0.3, 0.15, 0.05] after softmax; top-p 0.7
+        // should keep the top 2 (cum 0.8 >= 0.7) and drop the rest.
+        // Build logits so softmax approximates the above distribution.
+        // ln(0.5)=-0.693, ln(0.3)=-1.204, ln(0.15)=-1.897, ln(0.05)=-2.996
+        let logits = [-0.693f32, -1.204, -1.897, -2.996];
+        let dist = apply_temperature_and_top_p(&logits, 1.0, Some(0.7));
+        assert!(dist[0] > 0.0);
+        assert!(dist[1] > 0.0);
+        assert!(dist[2].abs() < 1e-6, "tail should be zero, got {}", dist[2]);
+        assert!(dist[3].abs() < 1e-6, "tail should be zero, got {}", dist[3]);
+        let sum: f32 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_sample_multinomial_respects_zero_prob() {
+        // Only index 2 has non-zero prob → always sampled.
+        let dist = [0.0f32, 0.0, 1.0, 0.0];
+        let mut rng = SplitMix64::new(1234);
+        for _ in 0..100 {
+            assert_eq!(sample_multinomial(&dist, &mut rng), 2);
+        }
+    }
+
+    #[test]
+    fn test_sample_multinomial_matches_expected_frequency() {
+        // 50/50 distribution — sample 10k times, expect ~50/50 split.
+        let dist = [0.5f32, 0.5, 0.0, 0.0];
+        let mut rng = SplitMix64::new(1);
+        let mut counts = [0usize; 4];
+        for _ in 0..10_000 {
+            let idx = sample_multinomial(&dist, &mut rng) as usize;
+            counts[idx] += 1;
+        }
+        assert!(counts[0].abs_diff(5000) < 300, "counts[0]={}", counts[0]);
+        assert!(counts[1].abs_diff(5000) < 300, "counts[1]={}", counts[1]);
+        assert_eq!(counts[2], 0);
+        assert_eq!(counts[3], 0);
+    }
+
+    #[test]
+    fn test_residual_dist_basic() {
+        let p_main = [0.5f32, 0.3, 0.15, 0.05];
+        let p_draft = [0.1f32, 0.4, 0.4, 0.1];
+        // Residual before normalise: [0.4, 0, 0, 0] → renorm [1, 0, 0, 0]
+        let r = residual_dist(&p_main, &p_draft);
+        assert!((r[0] - 1.0).abs() < 1e-5);
+        assert!(r[1].abs() < 1e-6);
+        assert!(r[2].abs() < 1e-6);
+        assert!(r[3].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_residual_dist_degenerate_falls_back_to_main() {
+        // If p_main == p_draft, residual is all zero → fallback to p_main.
+        let p = [0.25f32, 0.25, 0.25, 0.25];
+        let r = residual_dist(&p, &p);
+        for (i, &v) in r.iter().enumerate() {
+            assert!((v - 0.25).abs() < 1e-5, "residual[{i}]={v} != 0.25");
+        }
+    }
+
+    #[test]
+    fn test_speculative_config_default() {
+        let cfg = SpeculativeConfig::default();
+        assert_eq!(cfg.n_draft, 4);
+        assert_eq!(cfg.max_new_tokens, 128);
+        assert!(cfg.temperature.is_none());
+        assert!(cfg.top_p.is_none());
+        assert!(cfg.sample_seed.is_none());
     }
 }
