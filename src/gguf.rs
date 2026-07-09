@@ -941,6 +941,12 @@ pub(crate) fn dequantize_iq4_xs(data: &[u8], out: &mut [f32]) {
 
 // ─── Q6_K dequantization ────────────────────────────────────────────────────
 
+/// Public wrapper for external slice-based callers (Gemma 4 per-layer input
+/// embedding lookup).
+pub(crate) fn dequantize_q6_k_public(data: &[u8], out: &mut [f32]) {
+    dequantize_q6_k(data, out);
+}
+
 fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
     let block_bytes = 210;
     let n_blocks = data.len() / block_bytes;
