@@ -1800,7 +1800,8 @@ impl<'a> Llama3Model<'a> {
         // recurrence, ~500-800 lines). Until it lands, fail fast with a
         // clear message so users don't get silent garbage from a fallback
         // path that treats DeltaNet layers as standard attention.
-        assert!(!(self.config.arch == ModelArch::Qwen3_5 && self.config.is_hybrid()), 
+        assert!(
+            !(self.config.arch == ModelArch::Qwen3_5 && self.config.is_hybrid()),
             "Qwen 3.5 / 3.6 hybrid attention (DeltaNet SSM + full attention) inference \
              is not yet implemented in ALICE-LLM. The model loads successfully so metadata \
              and per-layer weights can be inspected, but the forward path requires \
