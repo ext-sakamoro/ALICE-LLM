@@ -51,6 +51,10 @@ impl ModelArch {
                     Self::Qwen3
                 }
             }
+            // Qwen 3.5 and Qwen 3.6 share the same architecture family
+            // (llama.cpp `qwen35.cpp` handles both). GGUF metadata prefix is
+            // `qwen35.*` for both versions.
+            Some("qwen35" | "qwen35moe") => Self::Qwen3_5,
             Some(s) if s.starts_with("qwen") => Self::Qwen2,
             _ => Self::Llama,
         }
@@ -131,6 +135,18 @@ pub struct Llama3Config {
     pub linear_num_v_heads: Option<usize>,
     /// Qwen3.5 DeltaNet: causal conv1d kernel size (typically 4).
     pub linear_conv_kernel_dim: Option<usize>,
+    /// Qwen 3.5/3.6 SSM (DeltaNet linear attention) — inner projection size.
+    pub ssm_inner_size: Option<usize>,
+    /// Qwen 3.5/3.6 SSM — state vector dimensionality.
+    pub ssm_state_size: Option<usize>,
+    /// Qwen 3.5/3.6 SSM — group count (parallel state groups).
+    pub ssm_group_count: Option<usize>,
+    /// Qwen 3.5/3.6 SSM — time-step projection rank.
+    pub ssm_time_step_rank: Option<usize>,
+    /// Qwen 3.5/3.6 NextN / MTP — number of extra decoder blocks appended
+    /// beyond the main stack (used for speculative decoding). Load only,
+    /// inference not currently used.
+    pub n_layer_nextn: Option<usize>,
     /// Gemma 3n: per-layer sliding window boolean pattern. When Some,
     /// entry `i = true` means layer `i` uses SWA, `false` = full attention.
     /// Supersedes Gemma 2 even/odd alternation.
@@ -249,6 +265,25 @@ impl Llama3Config {
             .meta_u32(&format!("{prefix}.linear_conv_kernel_dim"))
             .map(|v| v as usize);
 
+        // Qwen 3.5 / 3.6 DeltaNet SSM parameters (arch prefix `qwen35`).
+        // Names follow `qwen35.ssm.*` in GGUF metadata.
+        let ssm_inner_size = gguf
+            .meta_u32(&format!("{prefix}.ssm.inner_size"))
+            .map(|v| v as usize);
+        let ssm_state_size = gguf
+            .meta_u32(&format!("{prefix}.ssm.state_size"))
+            .map(|v| v as usize);
+        let ssm_group_count = gguf
+            .meta_u32(&format!("{prefix}.ssm.group_count"))
+            .map(|v| v as usize);
+        let ssm_time_step_rank = gguf
+            .meta_u32(&format!("{prefix}.ssm.time_step_rank"))
+            .map(|v| v as usize);
+        // Qwen 3.5 / 3.6 NextN / MTP layer count.
+        let n_layer_nextn = gguf
+            .meta_u32(&format!("{prefix}.nextn.predict_layers"))
+            .map(|v| v as usize);
+
         // Gemma 3n: per-layer sliding window boolean pattern
         let sliding_window_pattern = gguf
             .meta(&format!("{prefix}.attention.sliding_window_pattern"))
@@ -346,6 +381,11 @@ impl Llama3Config {
             linear_kv_head_dim,
             linear_num_v_heads,
             linear_conv_kernel_dim,
+            ssm_inner_size,
+            ssm_state_size,
+            ssm_group_count,
+            ssm_time_step_rank,
+            n_layer_nextn,
             sliding_window_pattern,
             activation_sparsity_scale,
             shared_kv_layers,
@@ -538,6 +578,11 @@ impl Llama3Config {
             linear_kv_head_dim: None,
             linear_num_v_heads: None,
             linear_conv_kernel_dim: None,
+            ssm_inner_size: None,
+            ssm_state_size: None,
+            ssm_group_count: None,
+            ssm_time_step_rank: None,
+            n_layer_nextn: None,
             sliding_window_pattern: None,
             activation_sparsity_scale: None,
             shared_kv_layers: None,
@@ -1748,6 +1793,28 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::Gemma4 {
             return self.forward_gemma4(token_id);
         }
+        // Qwen 3.5 / Qwen 3.6 hybrid: contains DeltaNet linear attention
+        // layers (SSM) mixed with full-attention layers, indicated by
+        // `full_attention_interval`. Full DeltaNet inference is a substantial
+        // separate implementation (gated delta rule + causal conv1d + state
+        // recurrence, ~500-800 lines). Until it lands, fail fast with a
+        // clear message so users don't get silent garbage from a fallback
+        // path that treats DeltaNet layers as standard attention.
+        assert!(!(self.config.arch == ModelArch::Qwen3_5 && self.config.is_hybrid()), 
+            "Qwen 3.5 / 3.6 hybrid attention (DeltaNet SSM + full attention) inference \
+             is not yet implemented in ALICE-LLM. The model loads successfully so metadata \
+             and per-layer weights can be inspected, but the forward path requires \
+             gated_delta_rule + causal conv1d + state recurrence which is planned as a \
+             dedicated phase (~500-800 lines, 1-2 weeks). \
+             Config: {} full-attention layers among {} total (interval {}). \
+             SSM: inner_size={:?}, state_size={:?}, group_count={:?}",
+            self.config.num_layers / self.config.full_attention_interval.unwrap_or(1),
+            self.config.num_layers,
+            self.config.full_attention_interval.unwrap_or(0),
+            self.config.ssm_inner_size,
+            self.config.ssm_state_size,
+            self.config.ssm_group_count,
+        );
         let c = &self.config;
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -5273,5 +5340,71 @@ mod tests {
         for &v in out.iter().take(32) {
             assert!((v - 4064.0).abs() < 1.0, "expected ~4064, got {v}");
         }
+    }
+
+    // ── Phase M4: Qwen 3.5 / 3.6 arch detection ─────────────────────────────
+
+    #[test]
+    fn test_qwen35_config_defaults_none() {
+        // Baseline Llama config should have no SSM/NextN fields set.
+        let c = Llama3Config::llama3_8b();
+        assert!(c.ssm_inner_size.is_none());
+        assert!(c.ssm_state_size.is_none());
+        assert!(c.ssm_group_count.is_none());
+        assert!(c.ssm_time_step_rank.is_none());
+        assert!(c.n_layer_nextn.is_none());
+    }
+
+    fn qwen35_hybrid_config() -> Llama3Config {
+        Llama3Config {
+            arch: ModelArch::Qwen3_5,
+            num_layers: 64,
+            full_attention_interval: Some(4),
+            ssm_inner_size: Some(6144),
+            ssm_state_size: Some(128),
+            ssm_group_count: Some(16),
+            ssm_time_step_rank: Some(48),
+            ..Llama3Config::llama3_8b()
+        }
+    }
+
+    #[test]
+    fn test_qwen35_is_hybrid() {
+        let c = qwen35_hybrid_config();
+        assert!(
+            c.is_hybrid(),
+            "Qwen 3.5/3.6 with full_attention_interval is hybrid"
+        );
+    }
+
+    #[test]
+    fn test_qwen35_is_deltanet_layer_pattern() {
+        // interval=4: layers 0,1,2 → DeltaNet; layer 3 → full attention; repeat.
+        let c = qwen35_hybrid_config();
+        assert!(c.is_deltanet_layer(0), "layer 0 should be DeltaNet");
+        assert!(c.is_deltanet_layer(1), "layer 1 should be DeltaNet");
+        assert!(c.is_deltanet_layer(2), "layer 2 should be DeltaNet");
+        assert!(
+            !c.is_deltanet_layer(3),
+            "layer 3 (i+1 % 4 == 0) should be full"
+        );
+        assert!(c.is_deltanet_layer(4), "layer 4 should be DeltaNet again");
+        assert!(!c.is_deltanet_layer(7), "layer 7 should be full");
+    }
+
+    #[test]
+    fn test_qwen35_pure_attention_not_hybrid() {
+        // Without full_attention_interval, treat as pure attention (Qwen 3 base).
+        let c = Llama3Config {
+            arch: ModelArch::Qwen3,
+            ..Llama3Config::llama3_8b()
+        };
+        assert!(!c.is_hybrid());
+    }
+
+    #[test]
+    fn test_qwen35_use_neox_rope() {
+        // Qwen 3.5 / 3.6 inherits NEOX RoPE from the Qwen 3 family.
+        assert!(ModelArch::Qwen3_5.use_neox_rope());
     }
 }
