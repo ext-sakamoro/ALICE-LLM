@@ -54,6 +54,7 @@ pub enum GgmlType {
     F16,
     Q4_0,
     Q4_1,
+    Q5_0,
     Q5_1,
     Q8_0,
     Q2_K,
@@ -61,6 +62,7 @@ pub enum GgmlType {
     Q4_K,
     Q5_K,
     Q6_K,
+    IQ4_XS,
     Other(u32),
 }
 
@@ -71,6 +73,7 @@ impl GgmlType {
             1 => Self::F16,
             2 => Self::Q4_0,
             3 => Self::Q4_1,
+            6 => Self::Q5_0,
             7 => Self::Q5_1,
             8 => Self::Q8_0,
             10 => Self::Q2_K,
@@ -78,6 +81,7 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            23 => Self::IQ4_XS,
             other => Self::Other(other),
         }
     }
@@ -88,8 +92,12 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
+            // Q4_0: d (2) + qs (16) = 18
             Self::Q4_0 => 18,
+            // Q4_1: d (2) + m (2) + qs (16) = 20
             Self::Q4_1 => 20,
+            // Q5_0: d (2) + qh (4) + qs (16) = 22
+            Self::Q5_0 => 22,
             // Q5_1: d (2) + m (2) + qh (4) + qs (16) = 24
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
@@ -98,6 +106,8 @@ impl GgmlType {
             Self::Q4_K => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
+            // IQ4_XS: d (2) + scales_h (2) + scales_l (QK_K/64=4) + qs (QK_K/2=128) = 136
+            Self::IQ4_XS => 136,
             Self::Other(_) => 0,
         }
     }
@@ -107,8 +117,8 @@ impl GgmlType {
     pub const fn elements_per_block(&self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => QK8_0,
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => QK_K,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => QK8_0,
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => QK_K,
             Self::Other(_) => 1,
         }
     }
@@ -505,14 +515,18 @@ impl<'a> GgufFile<'a> {
                     out[i] = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
                 }
             }
+            GgmlType::Q4_0 => dequantize_q4_0(data, &mut out),
+            GgmlType::Q4_1 => dequantize_q4_1(data, &mut out),
+            GgmlType::Q5_0 => dequantize_q5_0(data, &mut out),
             GgmlType::Q5_1 => dequantize_q5_1(data, &mut out),
+            GgmlType::IQ4_XS => dequantize_iq4_xs(data, &mut out),
             GgmlType::Q8_0 => dequantize_q8_0(data, &mut out),
             GgmlType::Q2_K => dequantize_q2_k(data, &mut out),
             GgmlType::Q3_K => dequantize_q3_k(data, &mut out),
             GgmlType::Q4_K => dequantize_q4_k(data, &mut out),
             GgmlType::Q5_K => dequantize_q5_k(data, &mut out),
             GgmlType::Q6_K => dequantize_q6_k(data, &mut out),
-            _ => return None,
+            GgmlType::Other(_) => return None,
         }
 
         Some(out)
@@ -770,6 +784,158 @@ pub(crate) fn dequantize_q5_1(data: &[u8], out: &mut [f32]) {
             out[out_idx + j + 16] = (x1 as f32) * d + m;
         }
         out_idx += QK8_0;
+    }
+}
+
+// ─── Q4_0 dequantization ────────────────────────────────────────────────────
+//
+// Block layout (18 bytes / 32 elements):
+//   d:  f16 delta          (offset 0..2)
+//   qs: [u8; 16] nibbles   (offset 2..18)
+//
+// Dequant per llama.cpp `dequantize_row_q4_0`:
+//   for j in 0..16:
+//     x0 = (qs[j] & 0x0F) - 8   (signed 4-bit)
+//     x1 = (qs[j] >>   4) - 8
+//     y[j]      = d * x0
+//     y[j + 16] = d * x1
+pub(crate) fn dequantize_q4_0(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 18;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let off = i * block_bytes;
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for j in 0..16 {
+            let qs = data[off + 2 + j];
+            let x0 = ((qs & 0x0F) as i32) - 8;
+            let x1 = ((qs >> 4) as i32) - 8;
+            out[out_idx + j] = (x0 as f32) * d;
+            out[out_idx + j + 16] = (x1 as f32) * d;
+        }
+        out_idx += QK8_0;
+    }
+}
+
+// ─── Q4_1 dequantization ────────────────────────────────────────────────────
+//
+// Block layout (20 bytes / 32 elements):
+//   d:  f16 delta          (offset 0..2)
+//   m:  f16 min            (offset 2..4)
+//   qs: [u8; 16] nibbles   (offset 4..20)
+//
+// Dequant per llama.cpp `dequantize_row_q4_1`:
+//   for j in 0..16:
+//     y[j]      = d * (qs[j] & 0x0F) + m
+//     y[j + 16] = d * (qs[j] >> 4)   + m
+pub(crate) fn dequantize_q4_1(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 20;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let off = i * block_bytes;
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let m = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
+        for j in 0..16 {
+            let qs = data[off + 4 + j];
+            let x0 = (qs & 0x0F) as f32;
+            let x1 = (qs >> 4) as f32;
+            out[out_idx + j] = x0 * d + m;
+            out[out_idx + j + 16] = x1 * d + m;
+        }
+        out_idx += QK8_0;
+    }
+}
+
+// ─── Q5_0 dequantization ────────────────────────────────────────────────────
+//
+// Block layout (22 bytes / 32 elements):
+//   d:  f16 delta          (offset 0..2)
+//   qh: u32 high-bits mask (offset 2..6, little-endian)
+//   qs: [u8; 16] nibbles   (offset 6..22)
+//
+// Dequant per llama.cpp `dequantize_row_q5_0`:
+//   for j in 0..16:
+//     xh_0 = ((qh >>  j     ) << 4) & 0x10
+//     xh_1 = ((qh >> (j+12)))       & 0x10
+//     x0   = ((qs[j] & 0x0F) | xh_0) - 16   (signed 5-bit)
+//     x1   = ((qs[j] >>   4) | xh_1) - 16
+//     y[j]      = d * x0
+//     y[j + 16] = d * x1
+pub(crate) fn dequantize_q5_0(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 22;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let off = i * block_bytes;
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let qh = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]);
+        for j in 0..16 {
+            let qs = data[off + 6 + j];
+            let xh_0 = ((qh >> j) << 4) & 0x10;
+            let xh_1 = (qh >> (j + 12)) & 0x10;
+            let x0 = (((qs & 0x0F) as u32) | xh_0) as i32 - 16;
+            let x1 = (((qs >> 4) as u32) | xh_1) as i32 - 16;
+            out[out_idx + j] = (x0 as f32) * d;
+            out[out_idx + j + 16] = (x1 as f32) * d;
+        }
+        out_idx += QK8_0;
+    }
+}
+
+// ─── IQ4_XS dequantization ──────────────────────────────────────────────────
+//
+// IQ4_XS is a 4-bit importance-weighted quantization with 6-bit sub-block
+// scales, commonly produced by unsloth/bartowski for smaller-than-Q4_K models.
+//
+// Block layout (136 bytes / QK_K=256 elements = 8 sub-blocks × 32 elements):
+//   d:        f16                (offset 0..2)
+//   scales_h: u16 little-endian  (offset 2..4)
+//   scales_l: [u8; 4]            (offset 4..8)
+//   qs:       [u8; 128] nibbles  (offset 8..136)
+//
+// Dequant per llama.cpp `dequantize_row_iq4_xs`:
+//   for ib in 0..8:
+//     ls  = ((scales_l[ib/2] >> (4*(ib%2))) & 0xF) | (((scales_h >> (2*ib)) & 3) << 4)
+//     dl  = d * (ls - 32)         (6-bit scale offset by -32)
+//     for j in 0..16:
+//       y[ib*32 + j]      = dl * KVALUES_IQ4NL[qs[ib*16 + j] & 0xF]
+//       y[ib*32 + j + 16] = dl * KVALUES_IQ4NL[qs[ib*16 + j] >> 4]
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+pub(crate) fn dequantize_iq4_xs(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 136;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+
+    for i in 0..n_blocks {
+        let off = i * block_bytes;
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let scales_h = u16::from_le_bytes([data[off + 2], data[off + 3]]);
+        let scales_l = [data[off + 4], data[off + 5], data[off + 6], data[off + 7]];
+        let qs = &data[off + 8..off + 8 + 128];
+
+        for ib in 0..8 {
+            let ls_lo = (scales_l[ib / 2] >> (4 * (ib as u8 & 1))) & 0x0F;
+            let ls_hi = ((scales_h >> (2 * ib)) & 0x3) as u8;
+            let ls = ((ls_hi << 4) | ls_lo) as i32;
+            let dl = d * ((ls - 32) as f32);
+            let qs_base = ib * 16;
+            let out_base = out_idx + ib * 32;
+            for j in 0..16 {
+                let byte = qs[qs_base + j];
+                let n0 = (byte & 0x0F) as usize;
+                let n1 = (byte >> 4) as usize;
+                out[out_base + j] = dl * f32::from(KVALUES_IQ4NL[n0]);
+                out[out_base + j + 16] = dl * f32::from(KVALUES_IQ4NL[n1]);
+            }
+        }
+        out_idx += QK_K;
     }
 }
 
@@ -1646,6 +1812,180 @@ pub fn q8_0_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output:
     }
 }
 
+/// Fused Q4_0 dequantize + matrix-vector multiply.
+pub fn q4_0_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK8_0;
+    let block_bytes = 18;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let col_base = bi * QK8_0;
+
+            for j in 0..16 {
+                let qs = row_data[off + 2 + j];
+                let x0 = ((qs & 0x0F) as i32) - 8;
+                let x1 = ((qs >> 4) as i32) - 8;
+                acc += d * (x0 as f32) * input[col_base + j];
+                acc += d * (x1 as f32) * input[col_base + j + 16];
+            }
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// Fused Q4_1 dequantize + matrix-vector multiply.
+pub fn q4_1_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK8_0;
+    let block_bytes = 20;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let m = f16_to_f32(u16::from_le_bytes([row_data[off + 2], row_data[off + 3]]));
+            let col_base = bi * QK8_0;
+
+            for j in 0..16 {
+                let qs = row_data[off + 4 + j];
+                let x0 = (qs & 0x0F) as f32;
+                let x1 = (qs >> 4) as f32;
+                acc += (d * x0 + m) * input[col_base + j];
+                acc += (d * x1 + m) * input[col_base + j + 16];
+            }
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// Fused Q5_0 dequantize + matrix-vector multiply.
+pub fn q5_0_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK8_0;
+    let block_bytes = 22;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let qh = u32::from_le_bytes([
+                row_data[off + 2],
+                row_data[off + 3],
+                row_data[off + 4],
+                row_data[off + 5],
+            ]);
+            let col_base = bi * QK8_0;
+
+            for j in 0..16 {
+                let qs = row_data[off + 6 + j];
+                let xh_0 = ((qh >> j) << 4) & 0x10;
+                let xh_1 = (qh >> (j + 12)) & 0x10;
+                let x0 = (((qs & 0x0F) as u32) | xh_0) as i32 - 16;
+                let x1 = (((qs >> 4) as u32) | xh_1) as i32 - 16;
+                acc += d * (x0 as f32) * input[col_base + j];
+                acc += d * (x1 as f32) * input[col_base + j + 16];
+            }
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// Fused Q5_1 dequantize + matrix-vector multiply.
+pub fn q5_1_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK8_0;
+    let block_bytes = 24;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let m = f16_to_f32(u16::from_le_bytes([row_data[off + 2], row_data[off + 3]]));
+            let qh = u32::from_le_bytes([
+                row_data[off + 4],
+                row_data[off + 5],
+                row_data[off + 6],
+                row_data[off + 7],
+            ]);
+            let col_base = bi * QK8_0;
+
+            for j in 0..16 {
+                let qs = row_data[off + 8 + j];
+                let xh_0 = ((qh >> j) << 4) & 0x10;
+                let xh_1 = (qh >> (j + 12)) & 0x10;
+                let x0 = ((qs & 0x0F) as u32) | xh_0;
+                let x1 = ((qs >> 4) as u32) | xh_1;
+                acc += (d * (x0 as f32) + m) * input[col_base + j];
+                acc += (d * (x1 as f32) + m) * input[col_base + j + 16];
+            }
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// Fused IQ4_XS dequantize + matrix-vector multiply.
+pub fn iq4_xs_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 136;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let scales_h = u16::from_le_bytes([row_data[off + 2], row_data[off + 3]]);
+            let scales_l = [
+                row_data[off + 4],
+                row_data[off + 5],
+                row_data[off + 6],
+                row_data[off + 7],
+            ];
+            let qs = &row_data[off + 8..off + 8 + 128];
+            let col_base = bi * QK_K;
+
+            for ib in 0..8 {
+                let ls_lo = (scales_l[ib / 2] >> (4 * (ib as u8 & 1))) & 0x0F;
+                let ls_hi = ((scales_h >> (2 * ib)) & 0x3) as u8;
+                let ls = ((ls_hi << 4) | ls_lo) as i32;
+                let dl = d * ((ls - 32) as f32);
+                let qs_base = ib * 16;
+                let sub_col_base = col_base + ib * 32;
+                for j in 0..16 {
+                    let byte = qs[qs_base + j];
+                    let n0 = (byte & 0x0F) as usize;
+                    let n1 = (byte >> 4) as usize;
+                    acc += dl * f32::from(KVALUES_IQ4NL[n0]) * input[sub_col_base + j];
+                    acc += dl * f32::from(KVALUES_IQ4NL[n1]) * input[sub_col_base + j + 16];
+                }
+            }
+        }
+
+        output[row] = acc;
+    }
+}
+
 /// Fused F16 matvec.
 pub fn f16_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
     for row in 0..rows {
@@ -1724,6 +2064,90 @@ pub fn q6k_matvec_preq(
     }
 }
 
+/// IQ4_XS block × Q8_K block dot product.
+///
+/// Each IQ4_XS block encodes 256 elements as 8 sub-blocks of 32 elements,
+/// each sub-block sharing a 6-bit scale and 4-bit indices into
+/// [`KVALUES_IQ4NL`]. The 6-bit scale is offset by −32 to allow signed
+/// values (roughly −32..31). The final dequantized weight for element `k`
+/// in sub-block `ib` is `d * (ls[ib] - 32) * KVALUES_IQ4NL[nibble_k]`.
+///
+/// The dot product accumulates in `i32` per sub-block, then applies the
+/// per-block scale factors (`d_w * d_i`) once at the end.
+fn iq4_xs_q8k_dot(iq4_xs_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    let d_w = f16_to_f32(u16::from_le_bytes([iq4_xs_block[0], iq4_xs_block[1]]));
+    let scales_h = u16::from_le_bytes([iq4_xs_block[2], iq4_xs_block[3]]);
+    let scales_l = [
+        iq4_xs_block[4],
+        iq4_xs_block[5],
+        iq4_xs_block[6],
+        iq4_xs_block[7],
+    ];
+    let qs = &iq4_xs_block[8..8 + 128];
+
+    let mut sum_i32 = 0i64;
+    for ib in 0..8 {
+        let ls_lo = (scales_l[ib / 2] >> (4 * (ib as u8 & 1))) & 0x0F;
+        let ls_hi = ((scales_h >> (2 * ib)) & 0x3) as u8;
+        let ls = (((ls_hi << 4) | ls_lo) as i32) - 32;
+        let qs_base = ib * 16;
+        let q8_base = ib * 32;
+        let mut sub_dot = 0i32;
+        for j in 0..16 {
+            let byte = qs[qs_base + j];
+            let n0 = (byte & 0x0F) as usize;
+            let n1 = (byte >> 4) as usize;
+            sub_dot += i32::from(KVALUES_IQ4NL[n0]) * i32::from(q8k.qs[q8_base + j]);
+            sub_dot += i32::from(KVALUES_IQ4NL[n1]) * i32::from(q8k.qs[q8_base + j + 16]);
+        }
+        sum_i32 += i64::from(ls) * i64::from(sub_dot);
+    }
+    d_w * q8k.d * (sum_i32 as f32)
+}
+
+/// Fused IQ4_XS matvec with pre-quantized Q8_K input.
+pub fn iq4_xs_matvec_preq(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 136;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        output.par_iter_mut().enumerate().for_each(|(row, out)| {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            let mut sumf = 0.0f32;
+            for bi in 0..blocks_per_row {
+                sumf += iq4_xs_q8k_dot(
+                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                    &q8_blocks[bi],
+                );
+            }
+            *out = sumf;
+        });
+        return;
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        let mut sumf = 0.0f32;
+        for bi in 0..blocks_per_row {
+            sumf += iq4_xs_q8k_dot(
+                &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                &q8_blocks[bi],
+            );
+        }
+        output[row] = sumf;
+    }
+}
+
 /// Dispatch matvec based on quantization type.
 pub fn quantized_matvec(
     input: &[f32],
@@ -1739,10 +2163,15 @@ pub fn quantized_matvec(
         GgmlType::Q4_K => q4k_matvec(input, data, rows, cols, output),
         GgmlType::Q5_K => q5k_matvec(input, data, rows, cols, output),
         GgmlType::Q6_K => q6k_matvec(input, data, rows, cols, output),
+        GgmlType::Q4_0 => q4_0_matvec(input, data, rows, cols, output),
+        GgmlType::Q4_1 => q4_1_matvec(input, data, rows, cols, output),
+        GgmlType::Q5_0 => q5_0_matvec(input, data, rows, cols, output),
+        GgmlType::Q5_1 => q5_1_matvec(input, data, rows, cols, output),
+        GgmlType::IQ4_XS => iq4_xs_matvec(input, data, rows, cols, output),
         GgmlType::Q8_0 => q8_0_matvec(input, data, rows, cols, output),
         GgmlType::F16 => f16_matvec(input, data, rows, cols, output),
         GgmlType::F32 => f32_matvec(input, data, rows, cols, output),
-        _ => panic!("unsupported quantization type: {qtype:?}"),
+        GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
     }
 }
 
@@ -1762,7 +2191,8 @@ pub fn quantized_matvec_preq(
         GgmlType::Q4_K => q4k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q5_K => q5k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q6_K => q6k_matvec_preq(data, rows, cols, q8_blocks, output),
-        _ => panic!("quantized_matvec_preq only supports Q2_K-Q6_K, got {qtype:?}"),
+        GgmlType::IQ4_XS => iq4_xs_matvec_preq(data, rows, cols, q8_blocks, output),
+        _ => panic!("quantized_matvec_preq only supports Q2_K-Q6_K and IQ4_XS, got {qtype:?}"),
     }
 }
 

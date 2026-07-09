@@ -4678,4 +4678,147 @@ mod tests {
         assert_eq!(GgmlType::Q5_1.block_bytes(), 24);
         assert_eq!(GgmlType::Q5_1.elements_per_block(), 32);
     }
+
+    // ── Phase M1: Q4_0 / Q4_1 / Q5_0 / IQ4_XS ───────────────────────────────
+
+    /// f16 encoding of 1.0 in little-endian bytes.
+    const F16_ONE_LE: [u8; 2] = [0x00, 0x3C];
+
+    #[test]
+    fn test_ggml_type_q4_0_layout() {
+        use crate::gguf::GgmlType;
+        assert_eq!(GgmlType::Q4_0.block_bytes(), 18);
+        assert_eq!(GgmlType::Q4_0.elements_per_block(), 32);
+    }
+
+    #[test]
+    fn test_ggml_type_q4_1_layout() {
+        use crate::gguf::GgmlType;
+        assert_eq!(GgmlType::Q4_1.block_bytes(), 20);
+        assert_eq!(GgmlType::Q4_1.elements_per_block(), 32);
+    }
+
+    #[test]
+    fn test_ggml_type_q5_0_layout() {
+        use crate::gguf::GgmlType;
+        assert_eq!(GgmlType::Q5_0.block_bytes(), 22);
+        assert_eq!(GgmlType::Q5_0.elements_per_block(), 32);
+    }
+
+    #[test]
+    fn test_ggml_type_iq4_xs_layout() {
+        use crate::gguf::GgmlType;
+        assert_eq!(GgmlType::IQ4_XS.block_bytes(), 136);
+        assert_eq!(GgmlType::IQ4_XS.elements_per_block(), 256);
+    }
+
+    #[test]
+    fn test_q4_0_dequant_zero_block() {
+        // d=0, qs=0 → all zeros.
+        let data = vec![0u8; 18];
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q4_0(&data, &mut out);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_q4_0_dequant_signed_range() {
+        // d=1.0, qs[0]=0x80 (nibbles 0 and 8):
+        //   x0 = 0 - 8 = -8, x1 = 8 - 8 = 0
+        // qs[1..15]=0 → x0=x1=-8 for those slots.
+        let mut data = vec![0u8; 18];
+        data[0] = F16_ONE_LE[0];
+        data[1] = F16_ONE_LE[1];
+        data[2] = 0x80; // nibbles: lo=0, hi=8
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q4_0(&data, &mut out);
+        assert!((out[0] - (-8.0)).abs() < 1e-4);
+        assert!((out[16] - 0.0).abs() < 1e-4);
+        // qs[1..16]=0 → nibbles 0,0 → (0-8)*d = -8
+        assert!((out[1] - (-8.0)).abs() < 1e-4);
+        assert!((out[17] - (-8.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_q4_1_dequant_min_offset() {
+        // d=0, m=1.0, qs=0 → every element = 0*x + 1 = 1.
+        let mut data = vec![0u8; 20];
+        data[2] = F16_ONE_LE[0];
+        data[3] = F16_ONE_LE[1];
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q4_1(&data, &mut out);
+        for &v in &out {
+            assert!((v - 1.0).abs() < 1e-4, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_q4_1_dequant_unsigned_range() {
+        // d=1.0, m=0.0, qs[0]=0xF3 → x0=3, x1=15.
+        let mut data = vec![0u8; 20];
+        data[0] = F16_ONE_LE[0];
+        data[1] = F16_ONE_LE[1];
+        data[4] = 0xF3;
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q4_1(&data, &mut out);
+        assert!((out[0] - 3.0).abs() < 1e-4);
+        assert!((out[16] - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_q5_0_dequant_signed_5bit_range() {
+        // d=1.0, qh=0 → high bit off, so 4-bit range only.
+        // qs[0]=0x0F (nibbles 15,0) → x0 = 15 - 16 = -1, x1 = 0 - 16 = -16.
+        let mut data = vec![0u8; 22];
+        data[0] = F16_ONE_LE[0];
+        data[1] = F16_ONE_LE[1];
+        data[6] = 0x0F;
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q5_0(&data, &mut out);
+        assert!((out[0] - (-1.0)).abs() < 1e-4);
+        assert!((out[16] - (-16.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_q5_0_dequant_high_bit() {
+        // d=1.0, qs[0]=0x0F, qh bit 0 set → high bit adds 16.
+        // x0 = (15 | 16) - 16 = 15.
+        let mut data = vec![0u8; 22];
+        data[0] = F16_ONE_LE[0];
+        data[1] = F16_ONE_LE[1];
+        data[2] = 0x01; // qh bit 0 set → high bit for element 0
+        data[6] = 0x0F;
+        let mut out = vec![0.0f32; 32];
+        crate::gguf::dequantize_q5_0(&data, &mut out);
+        assert!((out[0] - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_iq4_xs_dequant_zero_block() {
+        // d=0, everything else → all zeros.
+        let data = vec![0u8; 136];
+        let mut out = vec![0.0f32; 256];
+        crate::gguf::dequantize_iq4_xs(&data, &mut out);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_iq4_xs_dequant_lookup_table() {
+        // d=1.0, scales all zero → ls=0, dl = 1*(0-32) = -32.
+        // qs[0]=0x00 → both nibbles = 0 → KVALUES_IQ4NL[0] = -127.
+        // y[0] = -32 * -127 = 4064.
+        let mut data = vec![0u8; 136];
+        data[0] = F16_ONE_LE[0];
+        data[1] = F16_ONE_LE[1];
+        let mut out = vec![0.0f32; 256];
+        crate::gguf::dequantize_iq4_xs(&data, &mut out);
+        // First sub-block: all elements should be -32 * -127 = 4064.
+        for &v in out.iter().take(32) {
+            assert!((v - 4064.0).abs() < 1.0, "expected ~4064, got {v}");
+        }
+    }
 }
