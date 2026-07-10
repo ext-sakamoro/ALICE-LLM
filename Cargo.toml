@@ -78,6 +78,10 @@ required-features = ["gguf", "gpu"]
 name = "speculative_dual_gpu"
 required-features = ["gguf", "gpu"]
 
+[[example]]
+name = "qwen_gpu"
+required-features = ["gguf", "gpu"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
