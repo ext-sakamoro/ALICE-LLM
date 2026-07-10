@@ -2239,6 +2239,65 @@ fn gpt2_char_to_byte() -> HashMap<char, u8> {
 
 // ─── Tokenizer ──────────────────────────────────────────────────────────────
 
+// GGUF token type discriminants (per llama.cpp `enum llama_token_type` in
+// `include/llama.h`). Populated in the `tokenizer.ggml.token_type` metadata
+// array. See:
+// https://github.com/ggerganov/llama.cpp/blob/master/include/llama.h
+//
+// The full set is declared for spec fidelity even when a variant is not
+// currently referenced by production paths.
+#[allow(dead_code)]
+pub(crate) const TOKEN_TYPE_NORMAL: u32 = 1;
+#[allow(dead_code)]
+pub(crate) const TOKEN_TYPE_UNKNOWN: u32 = 2;
+pub(crate) const TOKEN_TYPE_CONTROL: u32 = 3;
+pub(crate) const TOKEN_TYPE_USER_DEFINED: u32 = 4;
+#[allow(dead_code)]
+pub(crate) const TOKEN_TYPE_UNUSED: u32 = 5;
+#[allow(dead_code)]
+pub(crate) const TOKEN_TYPE_BYTE: u32 = 6;
+
+// SentencePiece byte fallback token format: `<0xNN>` where NN is a 2-digit
+// uppercase or lowercase hex value. Used by SPM tokenizers (Llama-1/2, Gemma 2)
+// to represent raw bytes that fall outside the vocabulary.
+pub(crate) const SPM_BYTE_FALLBACK_PREFIX: &str = "<0x";
+pub(crate) const SPM_BYTE_FALLBACK_SUFFIX: &str = ">";
+pub(crate) const SPM_BYTE_FALLBACK_HEX_LEN: usize = 2;
+
+// GPT-2 / HuggingFace special token pattern: `<|xxx|>` (e.g. `<|endoftext|>`,
+// `<|im_start|>`). Used as a fallback when `tokenizer.ggml.token_type` is
+// absent from the GGUF (older Llama-3 conversions).
+pub(crate) const GPT2_SPECIAL_PREFIX: &str = "<|";
+pub(crate) const GPT2_SPECIAL_SUFFIX: &str = "|>";
+
+/// Parse a SentencePiece byte fallback token `<0xNN>` into its raw byte value.
+///
+/// Returns `None` if `s` does not match the exact `<0xNN>` format with
+/// 2 hex digits.
+pub(crate) fn parse_spm_byte_fallback(s: &str) -> Option<u8> {
+    let hex = s
+        .strip_prefix(SPM_BYTE_FALLBACK_PREFIX)?
+        .strip_suffix(SPM_BYTE_FALLBACK_SUFFIX)?;
+    if hex.len() != SPM_BYTE_FALLBACK_HEX_LEN {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// Returns true if the given GGUF `token_type` discriminant marks the token
+/// as an atomic special token that must not be split by BPE
+/// (e.g. Qwen 3 `<think>` / `</think>`, `<tool_call>`).
+pub(crate) const fn is_atomic_special_token(token_type: u32) -> bool {
+    matches!(token_type, TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED)
+}
+
+/// Returns true if `s` is a GPT-2 / HuggingFace style special token
+/// (`<|xxx|>`), used as a fallback special-token heuristic when the GGUF
+/// omits `tokenizer.ggml.token_type`.
+pub(crate) fn is_gpt2_special_marker(s: &str) -> bool {
+    s.starts_with(GPT2_SPECIAL_PREFIX) && s.ends_with(GPT2_SPECIAL_SUFFIX)
+}
+
 /// GGUF tokenizer model type.
 /// Detected from `tokenizer.ggml.model` metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2355,20 +2414,16 @@ impl GgufTokenizer {
             tokens.push(bytes);
 
             let is_special = match &token_types {
-                Some(types) => matches!(types.get(i).copied(), Some(3 | 4)),
-                None => t.starts_with("<|") && t.ends_with("|>"),
+                Some(types) => types.get(i).copied().is_some_and(is_atomic_special_token),
+                None => is_gpt2_special_marker(t),
             };
             if is_special {
                 special_tokens.push((t.to_string(), i as u32));
             }
 
             // SPM byte fallback: parse `<0xNN>` token strings.
-            if model_type == TokenizerModel::Spm
-                && t.len() == 6
-                && t.starts_with("<0x")
-                && t.ends_with('>')
-            {
-                if let Ok(b) = u8::from_str_radix(&t[3..5], 16) {
+            if model_type == TokenizerModel::Spm {
+                if let Some(b) = parse_spm_byte_fallback(t) {
                     byte_to_id[b as usize] = Some(i as u32);
                 }
             }
@@ -2670,24 +2725,22 @@ impl GgufTokenizer {
                 continue;
             };
             // Skip GPT-2 control tokens.
-            if s.starts_with("<|") && s.ends_with("|>") {
+            if is_gpt2_special_marker(s) {
                 continue;
             }
             // Skip SPM special tokens (single-piece `<...>` control markers).
             if self.model_type == TokenizerModel::Spm
                 && s.starts_with('<')
-                && s.ends_with('>')
-                && !s.starts_with("<0x")
+                && s.ends_with(SPM_BYTE_FALLBACK_SUFFIX)
+                && !s.starts_with(SPM_BYTE_FALLBACK_PREFIX)
                 && !s.contains('\u{2581}')
             {
                 continue;
             }
             // Byte fallback token `<0xNN>` — output raw byte.
-            if s.starts_with("<0x") && s.ends_with('>') && s.len() == 6 {
-                if let Ok(byte_val) = u8::from_str_radix(&s[3..5], 16) {
-                    bytes.push(byte_val);
-                    continue;
-                }
+            if let Some(byte_val) = parse_spm_byte_fallback(s) {
+                bytes.push(byte_val);
+                continue;
             }
             match self.model_type {
                 TokenizerModel::Spm => {
@@ -4143,5 +4196,69 @@ mod tests {
             // Each lane adds 1*2 + 1*2 + 1*2 + 1*2 = 8 to the seed.
             assert_eq!(out, [108, 208, 308, 408]);
         }
+    }
+
+    // ─── Tokenizer const + helper regression tests (Issue #14) ──────────────
+
+    #[test]
+    fn token_type_constants_stable() {
+        // Regression detection: llama.cpp `enum llama_token_type` in llama.h
+        // The GGUF spec pins these discriminants, so accidental drift here
+        // silently breaks special-token detection for every GGUF ever produced.
+        assert_eq!(TOKEN_TYPE_NORMAL, 1);
+        assert_eq!(TOKEN_TYPE_UNKNOWN, 2);
+        assert_eq!(TOKEN_TYPE_CONTROL, 3);
+        assert_eq!(TOKEN_TYPE_USER_DEFINED, 4);
+        assert_eq!(TOKEN_TYPE_UNUSED, 5);
+        assert_eq!(TOKEN_TYPE_BYTE, 6);
+    }
+
+    #[test]
+    fn is_atomic_special_token_matches_control_and_user_defined() {
+        assert!(is_atomic_special_token(TOKEN_TYPE_CONTROL));
+        assert!(is_atomic_special_token(TOKEN_TYPE_USER_DEFINED));
+        assert!(!is_atomic_special_token(TOKEN_TYPE_NORMAL));
+        assert!(!is_atomic_special_token(TOKEN_TYPE_UNKNOWN));
+        assert!(!is_atomic_special_token(TOKEN_TYPE_UNUSED));
+        assert!(!is_atomic_special_token(TOKEN_TYPE_BYTE));
+    }
+
+    #[test]
+    fn parse_spm_byte_fallback_valid() {
+        assert_eq!(parse_spm_byte_fallback("<0x00>"), Some(0x00));
+        assert_eq!(parse_spm_byte_fallback("<0xFF>"), Some(0xFF));
+        assert_eq!(parse_spm_byte_fallback("<0xAB>"), Some(0xAB));
+        // Lowercase hex is accepted by `u8::from_str_radix`.
+        assert_eq!(parse_spm_byte_fallback("<0xab>"), Some(0xAB));
+        assert_eq!(parse_spm_byte_fallback("<0xA5>"), Some(0xA5));
+    }
+
+    #[test]
+    fn parse_spm_byte_fallback_rejects_invalid() {
+        // Non-hex digit
+        assert_eq!(parse_spm_byte_fallback("<0xG0>"), None);
+        // Too short (1 hex digit)
+        assert_eq!(parse_spm_byte_fallback("<0x0>"), None);
+        // Too long (3 hex digits)
+        assert_eq!(parse_spm_byte_fallback("<0x000>"), None);
+        // Missing wrapping angle brackets
+        assert_eq!(parse_spm_byte_fallback("0xFF"), None);
+        // GPT-2 special marker (starts with `<|`)
+        assert_eq!(parse_spm_byte_fallback("<|endoftext|>"), None);
+        // Empty
+        assert_eq!(parse_spm_byte_fallback(""), None);
+        // SPM special marker (`<...>` but not `<0x`)
+        assert_eq!(parse_spm_byte_fallback("<unk>"), None);
+    }
+
+    #[test]
+    fn is_gpt2_special_marker_matches_expected_pattern() {
+        assert!(is_gpt2_special_marker("<|endoftext|>"));
+        assert!(is_gpt2_special_marker("<|im_start|>"));
+        assert!(is_gpt2_special_marker("<|im_end|>"));
+        assert!(!is_gpt2_special_marker("<unk>"));
+        assert!(!is_gpt2_special_marker("<0xFF>"));
+        assert!(!is_gpt2_special_marker("hello"));
+        assert!(!is_gpt2_special_marker(""));
     }
 }
