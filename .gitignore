@@ -2,3 +2,4 @@
 the project rules
 *.py
 /models/
+.DS_Store
