@@ -13,6 +13,7 @@ const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
 const ADD_BIAS_SHADER: &str = include_str!("shaders/add_bias.wgsl");
+const QK_NORM_SHADER: &str = include_str!("shaders/qk_norm.wgsl");
 const ROPE_SHADER: &str = include_str!("shaders/rope.wgsl");
 const ATTENTION_SHADER: &str = include_str!("shaders/attention.wgsl");
 const KV_CACHE_APPEND_SHADER: &str = include_str!("shaders/kv_cache_append.wgsl");
@@ -133,6 +134,8 @@ pub struct GpuEngine {
     residual_add_pipeline: wgpu::ComputePipeline,
     /// Element-wise bias add (Qwen 2 / 2.5 attention QKV biases).
     add_bias_pipeline: wgpu::ComputePipeline,
+    /// Per-head RMSNorm on Q / K (Qwen 3 architecture family).
+    qk_norm_pipeline: wgpu::ComputePipeline,
     rope_pipeline: wgpu::ComputePipeline,
     attention_pipeline: wgpu::ComputePipeline,
     kv_cache_append_pipeline: wgpu::ComputePipeline,
@@ -297,6 +300,7 @@ impl GpuEngine {
                 "residual_add",
             ),
             add_bias_pipeline: make_pipeline(ADD_BIAS_SHADER, "add_bias", "add_bias"),
+            qk_norm_pipeline: make_pipeline(QK_NORM_SHADER, "qk_norm", "qk_norm"),
             rope_pipeline: make_pipeline(ROPE_SHADER, "rope", "rope"),
             attention_pipeline: make_pipeline(ATTENTION_SHADER, "attention", "attention"),
             kv_cache_append_pipeline: make_pipeline(
@@ -1076,6 +1080,9 @@ struct LayerBGs {
     q_bias_bg: Option<wgpu::BindGroup>,
     k_bias_bg: Option<wgpu::BindGroup>,
     v_bias_bg: Option<wgpu::BindGroup>,
+    /// Qwen 3 per-head QK RMSNorm bind groups (None for arch without QK norm).
+    q_norm_bg: Option<wgpu::BindGroup>,
+    k_norm_bg: Option<wgpu::BindGroup>,
     kv_append_bg: wgpu::BindGroup,
     attention_bg: wgpu::BindGroup,
     ffn_norm_bg: wgpu::BindGroup,
@@ -1096,6 +1103,10 @@ struct LayerWeightBufs {
     q_bias: Option<GpuBuffer>,
     k_bias: Option<GpuBuffer>,
     v_bias: Option<GpuBuffer>,
+    /// Qwen 3 per-head Q / K RMSNorm weights (`head_dim` elements each, shared across heads).
+    /// Absent for Llama / Mistral / Gemma / Qwen 2 / Qwen 2.5.
+    q_norm: Option<GpuBuffer>,
+    k_norm: Option<GpuBuffer>,
     ffn_norm: GpuBuffer,
     gate_proj: GpuWeightBuffer,
     up_proj: GpuWeightBuffer,
@@ -1441,6 +1452,36 @@ impl GpuModel {
         })
     }
 
+    /// Build bind group for per-head RMSNorm (Qwen 3 QK norm).
+    /// In-place on `buf` (both Q and K reuse this pattern with different dispatch counts).
+    /// Layout: binding 0 read_write buf, binding 1 read weight, binding 2 uniform params.
+    fn build_qk_norm_bg(
+        engine: &GpuEngine,
+        buf: &GpuBuffer,
+        weight: &GpuBuffer,
+        params: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let layout = engine.qk_norm_pipeline.get_bind_group_layout(0);
+        engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     fn build_rmsnorm_bg(
         engine: &GpuEngine,
         input: &GpuBuffer,
@@ -1657,6 +1698,12 @@ impl GpuModel {
                         v_bias: gguf
                             .tensor_to_f32(&format!("blk.{i}.attn_v.bias"))
                             .map(|v| engine.upload_f32(&v)),
+                        q_norm: gguf
+                            .tensor_to_f32(&format!("blk.{i}.attn_q_norm.weight"))
+                            .map(|v| engine.upload_f32(&v)),
+                        k_norm: gguf
+                            .tensor_to_f32(&format!("blk.{i}.attn_k_norm.weight"))
+                            .map(|v| engine.upload_f32(&v)),
                         ffn_norm: engine.upload_f32(
                             &gguf
                                 .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
@@ -1754,6 +1801,8 @@ impl GpuModel {
                         q_bias: None,
                         k_bias: None,
                         v_bias: None,
+                        q_norm: None,
+                        k_norm: None,
                         ffn_norm: engine.alloc_f32(1),
                         gate_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         up_proj: engine.upload_weights(&[0u8; 256], 1, 1),
@@ -1942,6 +1991,14 @@ impl GpuModel {
             _pad3: 0,
         });
 
+        // Per-head QK RMSNorm params (Qwen 3): shared across all layers, `dim = head_dim`.
+        let qk_norm_params_buf = engine.make_persistent_uniform(&RmsnormParams {
+            dim: config.head_dim,
+            eps: config.eps,
+            batch_size: 1,
+            _pad3: 0,
+        });
+
         // Output head: separate rmsnorm + matvec
         let output_norm_bg = Self::build_rmsnorm_bg(
             &engine,
@@ -2009,6 +2066,16 @@ impl GpuModel {
                         .v_bias
                         .as_ref()
                         .map(|b| Self::build_add_bias_bg(&engine, &v_buf, b));
+
+                    // Qwen 3 per-head QK RMSNorm (None for arch without QK norms).
+                    let q_norm_bg = lw
+                        .q_norm
+                        .as_ref()
+                        .map(|w| Self::build_qk_norm_bg(&engine, &q_buf, w, &qk_norm_params_buf));
+                    let k_norm_bg = lw
+                        .k_norm
+                        .as_ref()
+                        .map(|w| Self::build_qk_norm_bg(&engine, &k_buf, w, &qk_norm_params_buf));
 
                     let ffn_norm_bg = Self::build_rmsnorm_bg(
                         &engine,
@@ -2092,6 +2159,8 @@ impl GpuModel {
                         q_bias_bg,
                         k_bias_bg,
                         v_bias_bg,
+                        q_norm_bg,
+                        k_norm_bg,
                         kv_append_bg,
                         attention_bg,
                         ffn_norm_bg,
@@ -2274,6 +2343,9 @@ impl GpuModel {
                         q_bias_bg: None,
                         k_bias_bg: None,
                         v_bias_bg: None,
+                        // DeltaNet layers do not carry per-head QK norms (unused placeholder).
+                        q_norm_bg: None,
+                        k_norm_bg: None,
                         kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: None,
                             layout: &kv_append_layout,
@@ -2451,6 +2523,20 @@ impl GpuModel {
                         if let Some(bg) = &lbg.v_bias_bg {
                             cp.set_bind_group(0, bg, &[]);
                             cp.dispatch_workgroups(self.kv_bias_dispatch_x, 1, 1);
+                        }
+                    }
+
+                    // Qwen 3 per-head QK RMSNorm: applied after bias, before RoPE.
+                    // No-op for arch without QK norms.
+                    if lbg.q_norm_bg.is_some() || lbg.k_norm_bg.is_some() {
+                        cp.set_pipeline(&self.engine.qk_norm_pipeline);
+                        if let Some(bg) = &lbg.q_norm_bg {
+                            cp.set_bind_group(0, bg, &[]);
+                            cp.dispatch_workgroups(self.config.num_heads, 1, 1);
+                        }
+                        if let Some(bg) = &lbg.k_norm_bg {
+                            cp.set_bind_group(0, bg, &[]);
+                            cp.dispatch_workgroups(self.config.num_kv_heads, 1, 1);
                         }
                     }
 
@@ -2776,6 +2862,18 @@ impl GpuModel {
                 r.residual_n += 1;
             }
 
+            // Qwen 3 per-head QK RMSNorm (timing absorbed into rmsnorm_us).
+            if let Some(bg) = &lbg.q_norm_bg {
+                r.rmsnorm_us +=
+                    timed_dispatch(e, &e.qk_norm_pipeline, bg, self.config.num_heads, 1, 1);
+                r.rmsnorm_n += 1;
+            }
+            if let Some(bg) = &lbg.k_norm_bg {
+                r.rmsnorm_us +=
+                    timed_dispatch(e, &e.qk_norm_pipeline, bg, self.config.num_kv_heads, 1, 1);
+                r.rmsnorm_n += 1;
+            }
+
             r.rope_us += timed_dispatch(
                 e,
                 &e.rope_pipeline,
@@ -2951,6 +3049,21 @@ impl GpuModel {
                 }
             }
 
+            // Qwen 3 per-head QK RMSNorm: dispatch head_count * bs workgroups (each covers
+            // one head's head_dim elements across all batches). Assumes data layout
+            // [bs, heads, head_dim] contiguous.
+            if lbg.q_norm_bg.is_some() || lbg.k_norm_bg.is_some() {
+                cp.set_pipeline(&self.engine.qk_norm_pipeline);
+                if let Some(bg) = &lbg.q_norm_bg {
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(self.config.num_heads * bs, 1, 1);
+                }
+                if let Some(bg) = &lbg.k_norm_bg {
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(self.config.num_kv_heads * bs, 1, 1);
+                }
+            }
+
             // RoPE: wid.y = batch index
             cp.set_pipeline(&self.engine.rope_pipeline);
             cp.set_bind_group(0, &self.rope_q_bg, &[]);
@@ -3095,7 +3208,7 @@ impl GpuModel {
         self.upload_embedding(token_id);
 
         // 14 dispatches per layer × num_layers + 2 output head + optional
-        // Qwen 2 / 2.5 QKV bias adds (per attention layer with biases present).
+        // Qwen 2 / 2.5 QKV bias adds + optional Qwen 3 per-head QK norms.
         let ops_per_layer: u32 = 14;
         let n_layers = self.config.num_layers as u32;
         let bias_dispatches: u32 = self
@@ -3107,7 +3220,12 @@ impl GpuModel {
                     + u32::from(lbg.v_bias_bg.is_some())
             })
             .sum();
-        let total_dispatches = ops_per_layer * n_layers + bias_dispatches + 2;
+        let qk_norm_dispatches: u32 = self
+            .layer_bgs
+            .iter()
+            .map(|lbg| u32::from(lbg.q_norm_bg.is_some()) + u32::from(lbg.k_norm_bg.is_some()))
+            .sum();
+        let total_dispatches = ops_per_layer * n_layers + bias_dispatches + qk_norm_dispatches + 2;
         // Each dispatch uses 2 query slots (beginning + end of compute pass)
         let num_queries = total_dispatches * 2;
 
@@ -3225,6 +3343,27 @@ impl GpuModel {
                     1,
                     1,
                     7u8
+                );
+            }
+            // Qwen 3 per-head QK RMSNorm (tagged as `0u8` rmsnorm).
+            if let Some(bg) = &lbg.q_norm_bg {
+                ts_dispatch!(
+                    &self.engine.qk_norm_pipeline,
+                    bg,
+                    self.config.num_heads,
+                    1,
+                    1,
+                    0u8
+                );
+            }
+            if let Some(bg) = &lbg.k_norm_bg {
+                ts_dispatch!(
+                    &self.engine.qk_norm_pipeline,
+                    bg,
+                    self.config.num_kv_heads,
+                    1,
+                    1,
+                    0u8
                 );
             }
             ts_dispatch!(
