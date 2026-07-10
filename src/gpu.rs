@@ -122,6 +122,10 @@ pub struct GpuEngine {
     queue: wgpu::Queue,
     /// Nanoseconds per GPU timestamp tick (0.0 if timestamps not supported).
     pub timestamp_period: f32,
+    /// Adapter type — used by `GpuModel::load` for OOM prevention heuristics.
+    /// `IntegratedGpu` = unified memory (Jetson / Apple Silicon / AMD APU / Intel iGPU),
+    /// requires higher peak memory factor since wgpu Vulkan / Metal double-allocates.
+    pub device_type: wgpu::DeviceType,
     matvec_q4k_pipeline: wgpu::ComputePipeline,
     matvec_q6k_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
@@ -169,6 +173,8 @@ impl GpuEngine {
 
         let info = adapter.get_info();
         eprintln!("[gpu] adapter: {} ({:?})", info.name, info.backend);
+        let device_type = info.device_type;
+        eprintln!("[gpu] device_type: {device_type:?}");
 
         let adapter_limits = adapter.limits();
         let has_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
@@ -313,6 +319,7 @@ impl GpuEngine {
                 "gated_deltanet",
             ),
             timestamp_period,
+            device_type,
             device,
             queue,
         }
@@ -1269,6 +1276,91 @@ fn timed_mv(engine: &GpuEngine, mv: &MatvecBG) -> (f64, GpuQuantType) {
     (us, mv.quant)
 }
 
+/// Memory estimate for GPU model load — used by `GpuModel::estimate_load_memory`.
+///
+/// Fields are in bytes. Reported via `[GpuModel] estimated peak memory:` log line at load time.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuMemoryEstimate {
+    /// Sum of GGUF tensor byte sizes (weights + biases + norms + embeddings).
+    pub weight_bytes: u64,
+    /// KV cache in device memory: `2 (K, V) × num_layers × num_kv_heads × head_dim × max_seq_len × 4 bytes`.
+    pub kv_cache_bytes: u64,
+    /// Intermediate / staging / bind group overhead estimate.
+    pub overhead_bytes: u64,
+    /// Projected peak memory. For `IntegratedGpu`, weight bytes counted at 2× (mmap + Vulkan buffer copy).
+    /// For `DiscreteGpu`, weight bytes counted at 1.2× (device memory + small transient staging).
+    pub peak_bytes: u64,
+    /// Whether the adapter uses unified memory (peak factor is higher).
+    pub is_integrated_gpu: bool,
+}
+
+/// Query system available memory in bytes on Linux via `/proc/meminfo`.
+/// Returns `None` on other platforms or on read failure.
+#[cfg(target_os = "linux")]
+fn query_available_memory_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_available_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// Compute memory estimate for loading a GGUF model on the given adapter type.
+#[cfg(feature = "gguf")]
+#[must_use]
+pub fn estimate_gpu_load_memory(
+    device_type: wgpu::DeviceType,
+    gguf: &crate::gguf::GgufFile,
+    config: &GpuModelConfig,
+) -> GpuMemoryEstimate {
+    let is_integrated_gpu = matches!(
+        device_type,
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+    );
+
+    // Sum tensor bytes from GGUF metadata.
+    let weight_bytes: u64 = gguf
+        .tensors
+        .values()
+        .map(|info| info.data_size() as u64)
+        .sum();
+
+    // KV cache: 2 (K + V) × num_layers × num_kv_heads × head_dim × max_seq_len × 4 (f32).
+    let kv_cache_bytes = 2u64
+        * config.num_layers as u64
+        * u64::from(config.num_kv_heads)
+        * u64::from(config.head_dim)
+        * config.max_seq_len as u64
+        * 4;
+
+    // Fixed overhead: hidden buffers, intermediate SwiGLU / attention output, bind groups.
+    let overhead_bytes = 200 * 1024 * 1024;
+
+    // Peak factor. iGPU on wgpu Vulkan / Metal typically 2× (GGUF mmap + Vulkan buffer copy).
+    // Discrete GPU 1.2× (device allocation + transient staging).
+    let peak_bytes = if is_integrated_gpu {
+        weight_bytes * 2 + kv_cache_bytes + overhead_bytes
+    } else {
+        weight_bytes * 12 / 10 + kv_cache_bytes + overhead_bytes
+    };
+
+    GpuMemoryEstimate {
+        weight_bytes,
+        kv_cache_bytes,
+        overhead_bytes,
+        peak_bytes,
+        is_integrated_gpu,
+    }
+}
+
 impl GpuModel {
     // --- Static helpers for bind group construction ---
 
@@ -1449,6 +1541,45 @@ impl GpuModel {
         config: GpuModelConfig,
     ) -> Self {
         use crate::gguf::GgmlType;
+
+        // OOM prevention: estimate peak memory usage and log warning if projected
+        // to exceed available system memory. On integrated GPU (Jetson / Apple Silicon /
+        // AMD APU / Intel iGPU), wgpu Vulkan / Metal typically double-allocates weight
+        // memory (GGUF mmap + Vulkan buffer copy), so peak is ~2x GGUF size.
+        let estimate = estimate_gpu_load_memory(engine.device_type, gguf, &config);
+        let peak_gb = estimate.peak_bytes as f64 / 1e9;
+        eprintln!(
+            "[GpuModel] estimated peak memory: {peak_gb:.2} GB (weights {:.2} GB{}, KV cache {:.2} GB, overhead {:.2} GB)",
+            estimate.weight_bytes as f64 / 1e9,
+            if estimate.is_integrated_gpu {
+                " x2 iGPU"
+            } else {
+                " x1.2 dGPU"
+            },
+            estimate.kv_cache_bytes as f64 / 1e9,
+            estimate.overhead_bytes as f64 / 1e9,
+        );
+        if let Some(available) = query_available_memory_bytes() {
+            let available_gb = available as f64 / 1e9;
+            eprintln!("[GpuModel] system available memory: {available_gb:.2} GB");
+            if estimate.peak_bytes > available * 90 / 100 {
+                eprintln!(
+                    "[GpuModel] WARNING: projected peak ({peak_gb:.2} GB) exceeds 90% of available ({available_gb:.2} GB)"
+                );
+                eprintln!(
+                    "[GpuModel] WARNING: kernel OOM Kill likely during weight upload. Consider:"
+                );
+                eprintln!(
+                    "[GpuModel] WARNING:   1) Smaller model (Q4_K 1.5B-3B on 8 GB unified memory)"
+                );
+                eprintln!(
+                    "[GpuModel] WARNING:   2) CPU inference via `Llama3Model::from_gguf` (mmap zero-copy)"
+                );
+                eprintln!(
+                    "[GpuModel] WARNING:   3) llama.cpp with Vulkan backend (unified memory zero-copy)"
+                );
+            }
+        }
 
         let kv_dim = (config.num_kv_heads * config.head_dim) as usize;
 
