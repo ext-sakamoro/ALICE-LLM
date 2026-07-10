@@ -2306,9 +2306,7 @@ impl GpuModel {
 
                     // Qwen 2 / 2.5 attention biases: add pointwise to Q/K/V before RoPE.
                     // No-op for arch without biases (Llama / Mistral / Gemma / Qwen 3+).
-                    if lbg.q_bias_bg.is_some()
-                        || lbg.k_bias_bg.is_some()
-                        || lbg.v_bias_bg.is_some()
+                    if lbg.q_bias_bg.is_some() || lbg.k_bias_bg.is_some() || lbg.v_bias_bg.is_some()
                     {
                         cp.set_pipeline(&self.engine.add_bias_pipeline);
                         if let Some(bg) = &lbg.q_bias_bg {

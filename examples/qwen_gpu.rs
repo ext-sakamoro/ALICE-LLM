@@ -54,8 +54,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let model_path = parse_arg::<String>(&args, "--model").expect("Usage: --model <path.gguf>");
-    let raw_prompt =
-        parse_arg::<String>(&args, "--prompt").unwrap_or_else(|| "Hello".to_string());
+    let raw_prompt = parse_arg::<String>(&args, "--prompt").unwrap_or_else(|| "Hello".to_string());
     let max_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(256);
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let top_k: usize = parse_arg(&args, "--top-k").unwrap_or(40);
@@ -109,9 +108,7 @@ fn main() {
         // --- Tokenize ---
         let prompt_tokens = tokenizer.encode(&formatted);
         println!("  Prompt: {} tokens", prompt_tokens.len());
-        println!(
-            "  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})"
-        );
+        println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
         println!("---");
 
         // --- Prefill: process all prompt tokens except the last ---
