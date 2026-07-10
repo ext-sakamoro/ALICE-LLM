@@ -102,28 +102,28 @@ impl ModelArch {
 // ─── Model config ───────────────────────────────────────────────────────────
 
 /// Model configuration extracted from GGUF metadata.
-/// Supports Llama-3, Mistral, and Gemma-2 architectures.
+/// Attention softcap + sliding window extras (Mistral / Gemma-2).
+///
+/// Grouped so the core [`Llama3Config`] doesn't carry three loosely
+/// related `Option<...>` fields at the top level. Absent when the model
+/// uses vanilla full-attention with no softcapping (Llama-3, Qwen 2/3, ...).
 #[derive(Debug, Clone)]
-pub struct Llama3Config {
-    pub arch: ModelArch,
-    pub vocab_size: usize,
-    pub hidden_dim: usize,
-    pub intermediate_dim: usize,
-    pub num_heads: usize,
-    pub num_kv_heads: usize,
-    pub num_layers: usize,
-    pub max_seq_len: usize,
-    pub head_dim: usize,
-    pub rope_theta: f32,
-    pub norm_eps: f32,
+pub struct AttentionExtrasConfig {
     /// Mistral: sliding window size (None = full attention).
     pub sliding_window: Option<usize>,
     /// Gemma-2: attention logit softcapping value (None = no capping).
     pub attn_logit_softcap: Option<f32>,
     /// Gemma-2: final logit softcapping value (None = no capping).
     pub final_logit_softcap: Option<f32>,
+}
+
+/// Qwen 3.5 / 3.6 SSM (DeltaNet) linear-attention hybrid config.
+///
+/// All fields are populated together for Qwen 3.5 / 3.6 hybrid models and
+/// absent for every other architecture.
+#[derive(Debug, Clone)]
+pub struct SsmDeltaNetConfig {
     /// Qwen3.5: full attention interval (e.g. 4 = every 4th layer is full attention).
-    /// None for pure attention models.
     pub full_attention_interval: Option<usize>,
     /// Qwen3.5 DeltaNet: number of QK heads for linear attention.
     pub linear_num_kv_heads: Option<usize>,
@@ -147,16 +147,27 @@ pub struct Llama3Config {
     /// beyond the main stack (used for speculative decoding). Load only,
     /// inference not currently used.
     pub n_layer_nextn: Option<usize>,
+}
+
+/// Mixture-of-experts config (Qwen 3 MoE / Mixtral / DeepSeek / Gemma 4 26B_A4B).
+#[derive(Debug, Clone)]
+pub struct MoeConfig {
     /// MoE: total number of experts per MoE layer (Qwen3 MoE: 4-128,
-    /// Mixtral: 8, DeepSeek: up to 256). None = dense (non-MoE) model.
+    /// Mixtral: 8, DeepSeek: up to 256).
     pub num_experts: Option<usize>,
     /// MoE: number of experts activated per token (top-k routing; typically
-    /// 2 or 8). None = dense.
+    /// 2 or 8).
     pub num_experts_active: Option<usize>,
     /// MoE: per-expert FFN intermediate dimension. Often equals
     /// `intermediate_dim`, but some models (DeepSeek, Gemma 4 26B_A4B) use
     /// smaller values so total active parameters stay reasonable.
     pub expert_ffn_size: Option<usize>,
+}
+
+/// Gemma 3n architecture-specific config (Laurel / AltUp / per-layer
+/// input-embedding branch / activation sparsity / shared-KV).
+#[derive(Debug, Clone)]
+pub struct Gemma3nConfig {
     /// Gemma 3n: per-layer sliding window boolean pattern. When Some,
     /// entry `i = true` means layer `i` uses SWA, `false` = full attention.
     /// Supersedes Gemma 2 even/odd alternation.
@@ -166,19 +177,19 @@ pub struct Llama3Config {
     /// (dense, no sparsity). Absent → all layers dense (SiLU for non-Gemma).
     pub activation_sparsity_scale: Option<Vec<f32>>,
     /// Gemma 3n: number of layers with unique KV cache. Later layers reuse
-    /// KV cache from earlier layers (layer_i for i >= shared_kv_layers
-    /// shares cache with layer_(i - shared_kv_layers) or similar mapping,
-    /// exact scheme confirmed in Phase 4).
+    /// KV cache from earlier layers.
     pub shared_kv_layers: Option<usize>,
     /// Gemma 3n: per-layer input embedding dimension (256 for E2B).
-    /// Additional embedding table `per_layer_token_embd.weight` projected
-    /// and added to hidden state at each layer.
     pub per_layer_input_embedding_dim: Option<usize>,
-    /// Gemma 3n: number of AltUp residual streams (4 for E2B). Enables the
-    /// AltUp mechanism (alternative up-projection with router + correct/predict).
+    /// Gemma 3n: number of AltUp residual streams (4 for E2B).
     pub altup_num_inputs: Option<usize>,
     /// Gemma 3n: AltUp active input index (0 for E2B).
     pub altup_active_idx: Option<usize>,
+}
+
+/// Gemma 4 architecture-specific config (SWA half head_dim, per-layer FFN size).
+#[derive(Debug, Clone)]
+pub struct Gemma4Config {
     /// Gemma 4: SWA layer head dimension for K/V (typically half of full
     /// `head_dim`). When `None`, all layers use `head_dim`.
     pub head_dim_swa: Option<usize>,
@@ -192,7 +203,204 @@ pub struct Llama3Config {
     pub ffn_size_per_layer: Option<Vec<usize>>,
 }
 
+/// Supports Llama-3, Mistral, and Gemma-2 architectures.
+///
+/// Architecture-specific extensions are grouped into 5 sub-configs
+/// (Issue #11 Part 2). Backward-compat accessor methods on `Llama3Config`
+/// mirror the previous flat field names, so callers can keep the old
+/// syntax (`c.sliding_window()` instead of `c.sliding_window()`).
+#[derive(Debug, Clone)]
+pub struct Llama3Config {
+    // ── Core (always populated) ───────────────────────────────────────
+    pub arch: ModelArch,
+    pub vocab_size: usize,
+    pub hidden_dim: usize,
+    pub intermediate_dim: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub num_layers: usize,
+    pub max_seq_len: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+
+    // ── Grouped arch-specific extensions (5 sub-configs) ──────────────
+    /// Attention softcap + sliding window (Mistral / Gemma-2).
+    pub attention_extras: Option<AttentionExtrasConfig>,
+    /// Qwen 3.5 / 3.6 SSM DeltaNet linear-attention hybrid config.
+    pub ssm: Option<SsmDeltaNetConfig>,
+    /// Mixture-of-experts routing sizes.
+    pub moe: Option<MoeConfig>,
+    /// Gemma 3n augmentations (Laurel / AltUp / per-layer embedding).
+    pub gemma3n: Option<Gemma3nConfig>,
+    /// Gemma 4 augmentations (SWA half head_dim, per-layer FFN size).
+    pub gemma4: Option<Gemma4Config>,
+}
+
 impl Llama3Config {
+    // ── Backward-compat accessors for fields moved into sub-configs ────
+    // Same names as the pre-refactor flat `pub` fields, so migrating a
+    // caller is a single-character change (`.foo` → `.foo()`).
+
+    // AttentionExtrasConfig (Mistral / Gemma-2)
+
+    #[inline]
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.attention_extras
+            .as_ref()
+            .and_then(|a| a.sliding_window)
+    }
+
+    #[inline]
+    pub fn attn_logit_softcap(&self) -> Option<f32> {
+        self.attention_extras
+            .as_ref()
+            .and_then(|a| a.attn_logit_softcap)
+    }
+
+    #[inline]
+    pub fn final_logit_softcap(&self) -> Option<f32> {
+        self.attention_extras
+            .as_ref()
+            .and_then(|a| a.final_logit_softcap)
+    }
+
+    // SsmDeltaNetConfig (Qwen 3.5 / 3.6)
+
+    #[inline]
+    pub fn full_attention_interval(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.full_attention_interval)
+    }
+
+    #[inline]
+    pub fn linear_num_kv_heads(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.linear_num_kv_heads)
+    }
+
+    #[inline]
+    pub fn linear_qk_head_dim(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.linear_qk_head_dim)
+    }
+
+    #[inline]
+    pub fn linear_kv_head_dim(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.linear_kv_head_dim)
+    }
+
+    #[inline]
+    pub fn linear_num_v_heads(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.linear_num_v_heads)
+    }
+
+    #[inline]
+    pub fn linear_conv_kernel_dim(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.linear_conv_kernel_dim)
+    }
+
+    #[inline]
+    pub fn ssm_inner_size(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.ssm_inner_size)
+    }
+
+    #[inline]
+    pub fn ssm_state_size(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.ssm_state_size)
+    }
+
+    #[inline]
+    pub fn ssm_group_count(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.ssm_group_count)
+    }
+
+    #[inline]
+    pub fn ssm_time_step_rank(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.ssm_time_step_rank)
+    }
+
+    #[inline]
+    pub fn n_layer_nextn(&self) -> Option<usize> {
+        self.ssm.as_ref().and_then(|s| s.n_layer_nextn)
+    }
+
+    // MoeConfig
+
+    #[inline]
+    pub fn num_experts(&self) -> Option<usize> {
+        self.moe.as_ref().and_then(|m| m.num_experts)
+    }
+
+    #[inline]
+    pub fn num_experts_active(&self) -> Option<usize> {
+        self.moe.as_ref().and_then(|m| m.num_experts_active)
+    }
+
+    #[inline]
+    pub fn expert_ffn_size(&self) -> Option<usize> {
+        self.moe.as_ref().and_then(|m| m.expert_ffn_size)
+    }
+
+    // Gemma3nConfig
+
+    #[inline]
+    pub fn sliding_window_pattern(&self) -> Option<&[bool]> {
+        self.gemma3n
+            .as_ref()
+            .and_then(|g| g.sliding_window_pattern.as_deref())
+    }
+
+    #[inline]
+    pub fn activation_sparsity_scale(&self) -> Option<&[f32]> {
+        self.gemma3n
+            .as_ref()
+            .and_then(|g| g.activation_sparsity_scale.as_deref())
+    }
+
+    #[inline]
+    pub fn shared_kv_layers(&self) -> Option<usize> {
+        self.gemma3n.as_ref().and_then(|g| g.shared_kv_layers)
+    }
+
+    #[inline]
+    pub fn per_layer_input_embedding_dim(&self) -> Option<usize> {
+        self.gemma3n
+            .as_ref()
+            .and_then(|g| g.per_layer_input_embedding_dim)
+    }
+
+    #[inline]
+    pub fn altup_num_inputs(&self) -> Option<usize> {
+        self.gemma3n.as_ref().and_then(|g| g.altup_num_inputs)
+    }
+
+    #[inline]
+    pub fn altup_active_idx(&self) -> Option<usize> {
+        self.gemma3n.as_ref().and_then(|g| g.altup_active_idx)
+    }
+
+    // Gemma4Config
+
+    #[inline]
+    pub fn head_dim_swa(&self) -> Option<usize> {
+        self.gemma4.as_ref().and_then(|g| g.head_dim_swa)
+    }
+
+    #[inline]
+    pub fn rope_theta_swa(&self) -> Option<f32> {
+        self.gemma4.as_ref().and_then(|g| g.rope_theta_swa)
+    }
+
+    #[inline]
+    pub fn rope_dim_swa(&self) -> Option<usize> {
+        self.gemma4.as_ref().and_then(|g| g.rope_dim_swa)
+    }
+
+    #[inline]
+    pub fn ffn_size_per_layer(&self) -> Option<&[usize]> {
+        self.gemma4
+            .as_ref()
+            .and_then(|g| g.ffn_size_per_layer.as_deref())
+    }
+
     /// Load config from GGUF metadata (auto-detects architecture).
     pub fn from_gguf(gguf: &GgufFile<'_>) -> Option<Self> {
         let arch = ModelArch::from_gguf(gguf);
@@ -384,6 +592,97 @@ impl Llama3Config {
                 _ => None,
             });
 
+        // Bundle arch-specific fields into their respective sub-configs.
+        // Each sub-config is `Some(...)` whenever _any_ of its fields is
+        // populated — keeps the semantic that non-target architectures see
+        // the whole sub-config as `None`.
+        let attention_extras = if sliding_window.is_some()
+            || attn_logit_softcap.is_some()
+            || final_logit_softcap.is_some()
+        {
+            Some(AttentionExtrasConfig {
+                sliding_window,
+                attn_logit_softcap,
+                final_logit_softcap,
+            })
+        } else {
+            None
+        };
+
+        let ssm = if full_attention_interval.is_some()
+            || linear_num_kv_heads.is_some()
+            || linear_qk_head_dim.is_some()
+            || linear_kv_head_dim.is_some()
+            || linear_num_v_heads.is_some()
+            || linear_conv_kernel_dim.is_some()
+            || ssm_inner_size.is_some()
+            || ssm_state_size.is_some()
+            || ssm_group_count.is_some()
+            || ssm_time_step_rank.is_some()
+            || n_layer_nextn.is_some()
+        {
+            Some(SsmDeltaNetConfig {
+                full_attention_interval,
+                linear_num_kv_heads,
+                linear_qk_head_dim,
+                linear_kv_head_dim,
+                linear_num_v_heads,
+                linear_conv_kernel_dim,
+                ssm_inner_size,
+                ssm_state_size,
+                ssm_group_count,
+                ssm_time_step_rank,
+                n_layer_nextn,
+            })
+        } else {
+            None
+        };
+
+        let moe =
+            if num_experts.is_some() || num_experts_active.is_some() || expert_ffn_size.is_some() {
+                Some(MoeConfig {
+                    num_experts,
+                    num_experts_active,
+                    expert_ffn_size,
+                })
+            } else {
+                None
+            };
+
+        let gemma3n = if sliding_window_pattern.is_some()
+            || activation_sparsity_scale.is_some()
+            || shared_kv_layers.is_some()
+            || per_layer_input_embedding_dim.is_some()
+            || altup_num_inputs.is_some()
+            || altup_active_idx.is_some()
+        {
+            Some(Gemma3nConfig {
+                sliding_window_pattern,
+                activation_sparsity_scale,
+                shared_kv_layers,
+                per_layer_input_embedding_dim,
+                altup_num_inputs,
+                altup_active_idx,
+            })
+        } else {
+            None
+        };
+
+        let gemma4 = if head_dim_swa.is_some()
+            || rope_theta_swa.is_some()
+            || rope_dim_swa.is_some()
+            || ffn_size_per_layer.is_some()
+        {
+            Some(Gemma4Config {
+                head_dim_swa,
+                rope_theta_swa,
+                rope_dim_swa,
+                ffn_size_per_layer,
+            })
+        } else {
+            None
+        };
+
         Some(Self {
             arch,
             vocab_size,
@@ -396,45 +695,23 @@ impl Llama3Config {
             head_dim,
             rope_theta,
             norm_eps,
-            sliding_window,
-            attn_logit_softcap,
-            final_logit_softcap,
-            full_attention_interval,
-            linear_num_kv_heads,
-            linear_qk_head_dim,
-            linear_kv_head_dim,
-            linear_num_v_heads,
-            linear_conv_kernel_dim,
-            ssm_inner_size,
-            ssm_state_size,
-            ssm_group_count,
-            ssm_time_step_rank,
-            n_layer_nextn,
-            num_experts,
-            num_experts_active,
-            expert_ffn_size,
-            sliding_window_pattern,
-            activation_sparsity_scale,
-            shared_kv_layers,
-            per_layer_input_embedding_dim,
-            altup_num_inputs,
-            altup_active_idx,
-            head_dim_swa,
-            rope_theta_swa,
-            rope_dim_swa,
-            ffn_size_per_layer,
+            attention_extras,
+            ssm,
+            moe,
+            gemma3n,
+            gemma4,
         })
     }
 
     /// Returns true if this is a hybrid DeltaNet model (Qwen3.5).
-    pub const fn is_hybrid(&self) -> bool {
-        self.full_attention_interval.is_some()
+    pub fn is_hybrid(&self) -> bool {
+        self.full_attention_interval().is_some()
     }
 
     /// Returns true if layer `i` is a DeltaNet (linear attention) layer.
     /// Full attention layers are at indices where `(i + 1) % interval == 0`.
-    pub const fn is_deltanet_layer(&self, i: usize) -> bool {
-        match self.full_attention_interval {
+    pub fn is_deltanet_layer(&self, i: usize) -> bool {
+        match self.full_attention_interval() {
             Some(interval) => !(i + 1).is_multiple_of(interval),
             None => false,
         }
@@ -475,8 +752,7 @@ impl Llama3Config {
             return;
         }
         let scale = match self
-            .activation_sparsity_scale
-            .as_ref()
+            .activation_sparsity_scale()
             .and_then(|arr| arr.get(layer_idx))
         {
             Some(s) if s.is_finite() => *s,
@@ -514,7 +790,7 @@ impl Llama3Config {
     /// per the metadata (E2B: 30 - 10 = 20, E4B: 35 - 15 = 20). Matches
     /// llama.cpp `hparams.n_layer_kv_from_start`.
     pub fn kv_from_start_layers(&self) -> usize {
-        match (self.arch, self.shared_kv_layers) {
+        match (self.arch, self.shared_kv_layers()) {
             (ModelArch::Gemma3n | ModelArch::Gemma4, Some(shared)) if shared < self.num_layers => {
                 self.num_layers - shared
             }
@@ -561,23 +837,23 @@ impl Llama3Config {
         match self.arch {
             ModelArch::Gemma2 => {
                 if i.is_multiple_of(2) {
-                    self.sliding_window
+                    self.sliding_window()
                 } else {
                     None
                 }
             }
             ModelArch::Gemma3n | ModelArch::Gemma4 => {
-                if let Some(pattern) = self.sliding_window_pattern.as_ref() {
+                if let Some(pattern) = self.sliding_window_pattern().as_ref() {
                     if pattern.get(i).copied().unwrap_or(false) {
-                        self.sliding_window
+                        self.sliding_window()
                     } else {
                         None
                     }
                 } else {
-                    self.sliding_window
+                    self.sliding_window()
                 }
             }
-            _ => self.sliding_window,
+            _ => self.sliding_window(),
         }
     }
 
@@ -596,33 +872,11 @@ impl Llama3Config {
             head_dim: 128,
             rope_theta: 500_000.0,
             norm_eps: 1e-5,
-            sliding_window: None,
-            attn_logit_softcap: None,
-            final_logit_softcap: None,
-            full_attention_interval: None,
-            linear_num_kv_heads: None,
-            linear_qk_head_dim: None,
-            linear_kv_head_dim: None,
-            linear_num_v_heads: None,
-            linear_conv_kernel_dim: None,
-            ssm_inner_size: None,
-            ssm_state_size: None,
-            ssm_group_count: None,
-            ssm_time_step_rank: None,
-            n_layer_nextn: None,
-            num_experts: None,
-            num_experts_active: None,
-            expert_ffn_size: None,
-            sliding_window_pattern: None,
-            activation_sparsity_scale: None,
-            shared_kv_layers: None,
-            per_layer_input_embedding_dim: None,
-            altup_num_inputs: None,
-            altup_active_idx: None,
-            head_dim_swa: None,
-            rope_theta_swa: None,
-            rope_dim_swa: None,
-            ffn_size_per_layer: None,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
         }
     }
 
@@ -632,7 +886,7 @@ impl Llama3Config {
     /// vs 512 for full attention). Falls back to `head_dim` for all other
     /// architectures / when `head_dim_swa` is absent.
     pub fn head_dim_for_layer(&self, i: usize) -> usize {
-        match (self.arch, self.head_dim_swa) {
+        match (self.arch, self.head_dim_swa()) {
             (ModelArch::Gemma4, Some(hs)) if self.sliding_window_for_layer(i).is_some() => hs,
             _ => self.head_dim,
         }
@@ -643,7 +897,7 @@ impl Llama3Config {
     /// For Gemma 4, SWA layers use a lower `rope_theta_swa` (10K vs 1M for
     /// full attention).
     pub fn rope_theta_for_layer(&self, i: usize) -> f32 {
-        match (self.arch, self.rope_theta_swa) {
+        match (self.arch, self.rope_theta_swa()) {
             (ModelArch::Gemma4, Some(ts)) if self.sliding_window_for_layer(i).is_some() => ts,
             _ => self.rope_theta,
         }
@@ -655,7 +909,7 @@ impl Llama3Config {
     /// for early layers, 12288 for later layers). Otherwise returns the
     /// scalar `intermediate_dim`.
     pub fn ffn_size_for_layer(&self, i: usize) -> usize {
-        self.ffn_size_per_layer
+        self.ffn_size_per_layer()
             .as_ref()
             .and_then(|arr| arr.get(i).copied())
             .unwrap_or(self.intermediate_dim)
@@ -2130,11 +2384,11 @@ impl<'a> Llama3Model<'a> {
 
         // Per-DeltaNet-layer recurrent state and conv1d ring buffer allocation.
         // Sized from the config so the first forward pass finds them ready.
-        let dn_num_kv_heads_state = config.linear_num_kv_heads.unwrap_or(config.num_kv_heads);
-        let dn_qk_dim_state = config.linear_qk_head_dim.unwrap_or(128);
-        let dn_v_dim_state = config.linear_kv_head_dim.unwrap_or(128);
-        let dn_num_v_heads_state = config.linear_num_v_heads.unwrap_or(config.num_heads);
-        let dn_conv_kernel = config.linear_conv_kernel_dim.unwrap_or(4);
+        let dn_num_kv_heads_state = config.linear_num_kv_heads().unwrap_or(config.num_kv_heads);
+        let dn_qk_dim_state = config.linear_qk_head_dim().unwrap_or(128);
+        let dn_v_dim_state = config.linear_kv_head_dim().unwrap_or(128);
+        let dn_num_v_heads_state = config.linear_num_v_heads().unwrap_or(config.num_heads);
+        let dn_conv_kernel = config.linear_conv_kernel_dim().unwrap_or(4);
         let dn_conv_dim_state =
             dn_qk_dim_state * dn_num_kv_heads_state * 2 + dn_v_dim_state * dn_num_v_heads_state;
         let dn_state_elems = dn_num_kv_heads_state * dn_qk_dim_state * dn_v_dim_state;
@@ -2183,7 +2437,7 @@ impl<'a> Llama3Model<'a> {
             // per_layer_model_proj.weight ggml shape {n_embd, n_layer * n_embd_altup}
             // (ne0=n_embd=in, ne1=n_layer*n_embd_altup=out)
             // → rows=n_layer*n_embd_altup, cols=n_embd.
-            let per_layer_model_proj = config.per_layer_input_embedding_dim.and_then(|dim| {
+            let per_layer_model_proj = config.per_layer_input_embedding_dim().and_then(|dim| {
                 load_weight_ref(
                     gguf,
                     "per_layer_model_proj.weight",
@@ -2254,7 +2508,7 @@ impl<'a> Llama3Model<'a> {
         use crate::gguf::GgmlType;
         let raw = self.per_layer_token_embd_raw?;
         let qtype = self.per_layer_token_embd_qtype?;
-        let per_layer_dim = self.config.per_layer_input_embedding_dim?;
+        let per_layer_dim = self.config.per_layer_input_embedding_dim()?;
         let elements_per_token = self.config.num_layers * per_layer_dim;
         let qk = qtype.elements_per_block();
         let block_bytes = qtype.block_bytes();
@@ -2434,11 +2688,11 @@ impl<'a> Llama3Model<'a> {
         // DeltaNet scratch buffers (Qwen 3.5 hybrid). Zero-sized for models
         // without DeltaNet layers so they cost only the Vec header.
         let is_hybrid = self.deltanet_layers.is_some();
-        let dn_qk_dim = c.linear_qk_head_dim.unwrap_or(0);
-        let dn_v_dim = c.linear_kv_head_dim.unwrap_or(0);
-        let dn_num_kv_heads = c.linear_num_kv_heads.unwrap_or(0);
-        let dn_num_v_heads = c.linear_num_v_heads.unwrap_or(0);
-        let dn_conv_kernel = c.linear_conv_kernel_dim.unwrap_or(0);
+        let dn_qk_dim = c.linear_qk_head_dim().unwrap_or(0);
+        let dn_v_dim = c.linear_kv_head_dim().unwrap_or(0);
+        let dn_num_kv_heads = c.linear_num_kv_heads().unwrap_or(0);
+        let dn_num_v_heads = c.linear_num_v_heads().unwrap_or(0);
+        let dn_conv_kernel = c.linear_conv_kernel_dim().unwrap_or(0);
         let dn_conv_dim = dn_qk_dim * dn_num_kv_heads * 2 + dn_v_dim * dn_num_v_heads;
         let dn_in_proj_out = dn_conv_dim + dn_v_dim * dn_num_v_heads; // + z
         let dn_v_out_dim = dn_v_dim * dn_num_v_heads;
@@ -2641,7 +2895,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -2724,7 +2978,7 @@ impl<'a> Llama3Model<'a> {
         self.output_proj.matvec(&norm_buf, &mut logits);
 
         // Gemma-2: final logit softcapping
-        if let Some(cap) = c.final_logit_softcap {
+        if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
                 *l = cap * (*l / cap).tanh();
             }
@@ -2746,14 +3000,13 @@ impl<'a> Llama3Model<'a> {
     fn forward_gemma3n(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
-        let n_altup = c.altup_num_inputs.expect("Gemma3n: altup_num_inputs");
+        let n_altup = c.altup_num_inputs().expect("Gemma3n: altup_num_inputs");
         let n_embd_altup = c
-            .per_layer_input_embedding_dim
+            .per_layer_input_embedding_dim()
             .expect("Gemma3n: per_layer_input_embedding_dim");
-        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let i_altup_act = c.altup_active_idx().unwrap_or(0);
         let n_layer_sparsity = c
-            .activation_sparsity_scale
-            .as_ref()
+            .activation_sparsity_scale()
             .map_or(0, |arr| arr.iter().take_while(|s| s.is_finite()).count());
         let pos = self.kv_cache.seq_len();
         let rope_freqs_ref = self.rope_freqs.as_deref();
@@ -2907,7 +3160,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -3048,7 +3301,7 @@ impl<'a> Llama3Model<'a> {
         self.output_proj.matvec(&norm_buf, &mut logits);
 
         // Final logit softcap (Gemma family)
-        if let Some(cap) = c.final_logit_softcap {
+        if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
                 *l = cap * (*l / cap).tanh();
             }
@@ -3178,7 +3431,7 @@ impl<'a> Llama3Model<'a> {
     ) -> Vec<Vec<f32>> {
         let c = &self.config;
         let layer = &self.layers[layer_idx];
-        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let i_altup_act = c.altup_active_idx().unwrap_or(0);
         let hidden_dim = c.hidden_dim;
         let modalities = self.altup_router_modalities(&streams[i_altup_act], layer_idx, n_altup);
         // predict_coef shape: [n_altup, n_altup * n_altup]. matmul with modalities
@@ -3231,7 +3484,7 @@ impl<'a> Llama3Model<'a> {
     ) -> Vec<Vec<f32>> {
         let c = &self.config;
         let layer = &self.layers[layer_idx];
-        let i_altup_act = c.altup_active_idx.unwrap_or(0);
+        let i_altup_act = c.altup_active_idx().unwrap_or(0);
         let hidden_dim = c.hidden_dim;
         let modalities = self.altup_router_modalities(activated, layer_idx, n_altup);
         let correct_coef = layer
@@ -3357,7 +3610,7 @@ impl<'a> Llama3Model<'a> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
         let n_embd_altup = c
-            .per_layer_input_embedding_dim
+            .per_layer_input_embedding_dim()
             .expect("Gemma4: per_layer_input_embedding_dim");
         let pos = self.kv_cache.seq_len();
 
@@ -3375,15 +3628,12 @@ impl<'a> Llama3Model<'a> {
             self.gemma3n_per_layer_inputs(token_id, &inpl, n_embd_altup, c.num_layers);
 
         // Reusable buffers sized for the largest layer.
-        let max_head_dim = c.head_dim_swa.unwrap_or(c.head_dim).max(c.head_dim);
+        let max_head_dim = c.head_dim_swa().unwrap_or(c.head_dim).max(c.head_dim);
         let max_q_dim = c.num_heads * max_head_dim;
         let max_kv_dim = c.num_kv_heads * max_head_dim;
-        let max_ffn_size = c
-            .ffn_size_per_layer
-            .as_ref()
-            .map_or(c.intermediate_dim, |a| {
-                a.iter().copied().max().unwrap_or(c.intermediate_dim)
-            });
+        let max_ffn_size = c.ffn_size_per_layer().map_or(c.intermediate_dim, |a| {
+            a.iter().copied().max().unwrap_or(c.intermediate_dim)
+        });
         let mut norm_buf = vec![0.0f32; hidden_dim];
         let mut q_buf = vec![0.0f32; max_q_dim];
         let mut k_buf = vec![0.0f32; max_kv_dim];
@@ -3481,7 +3731,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 Some(1.0),
                 &mut attn_out[..q_dim],
             );
@@ -3585,7 +3835,7 @@ impl<'a> Llama3Model<'a> {
         self.output_proj.matvec(&norm_buf, &mut logits);
 
         // Final logit softcap (Gemma family).
-        if let Some(cap) = c.final_logit_softcap {
+        if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
                 *l = cap * (*l / cap).tanh();
             }
@@ -3707,7 +3957,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -4315,7 +4565,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -4579,7 +4829,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -4695,7 +4945,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 if c.arch == ModelArch::Gemma3n {
                     Some(1.0)
                 } else {
@@ -4997,7 +5247,7 @@ impl<'a> Llama3Model<'a> {
                 c.num_kv_heads,
                 c.head_dim,
                 c.sliding_window_for_layer(layer_idx),
-                c.attn_logit_softcap,
+                c.attn_logit_softcap(),
                 &mut attn_out,
             );
 
@@ -5044,7 +5294,7 @@ impl<'a> Llama3Model<'a> {
         let mut logits = vec![0.0f32; c.vocab_size];
         self.output_proj.matvec(&norm_buf, &mut logits);
 
-        if let Some(cap) = c.final_logit_softcap {
+        if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
                 *l = cap * (*l / cap).tanh();
             }
@@ -5293,12 +5543,12 @@ fn forward_moe_layer(
     output: &mut [f32],
 ) {
     let n_expert = c
-        .num_experts
+        .num_experts()
         .expect("MoE layer requires num_experts in config");
     let n_active = c
-        .num_experts_active
+        .num_experts_active()
         .expect("MoE layer requires num_experts_active in config");
-    let expert_ffn = c.expert_ffn_size.unwrap_or(c.intermediate_dim);
+    let expert_ffn = c.expert_ffn_size().unwrap_or(c.intermediate_dim);
     let hidden_dim = c.hidden_dim;
 
     // Step 1: router logits = ffn_gate_inp @ norm_buf.
@@ -6032,9 +6282,9 @@ fn load_layer_weights<'a>(
     // The per-expert slab is loaded on-demand via `WeightRef::expert_slab`
     // in `forward_moe`.
     let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"));
-    let expert_ffn = config.expert_ffn_size.unwrap_or(ffn_size);
+    let expert_ffn = config.expert_ffn_size().unwrap_or(ffn_size);
     let (ffn_gate_exps, ffn_up_exps, ffn_down_exps) =
-        if let (Some(_), Some(n_expert)) = (ffn_gate_inp.as_ref(), config.num_experts) {
+        if let (Some(_), Some(n_expert)) = (ffn_gate_inp.as_ref(), config.num_experts()) {
             let gate = load_weight_ref(
                 gguf,
                 &format!("{prefix}.ffn_gate_exps.weight"),
@@ -6065,7 +6315,7 @@ fn load_layer_weights<'a>(
     //     → in=hidden_dim, out=per_layer_dim → rows=per_layer_dim, cols=hidden_dim
     //   - proj.weight     [n_embd_altup, n_embd] → in=per_layer_dim, out=hidden_dim
     //     → rows=hidden_dim, cols=per_layer_dim
-    let (inp_gate, proj) = if let Some(per_layer_dim) = config.per_layer_input_embedding_dim {
+    let (inp_gate, proj) = if let Some(per_layer_dim) = config.per_layer_input_embedding_dim() {
         let inp_gate = load_weight_ref(
             gguf,
             &format!("{prefix}.inp_gate.weight"),
@@ -6193,10 +6443,10 @@ fn load_deltanet_layer_weights<'a>(
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
 
     // DeltaNet dimensions derived from the config metadata.
-    let qk_dim = config.linear_qk_head_dim.unwrap_or(128);
-    let v_dim = config.linear_kv_head_dim.unwrap_or(128);
-    let num_kv_heads = config.linear_num_kv_heads.unwrap_or(config.num_kv_heads);
-    let num_v_heads = config.linear_num_v_heads.unwrap_or(config.num_heads);
+    let qk_dim = config.linear_qk_head_dim().unwrap_or(128);
+    let v_dim = config.linear_kv_head_dim().unwrap_or(128);
+    let num_kv_heads = config.linear_num_kv_heads().unwrap_or(config.num_kv_heads);
+    let num_v_heads = config.linear_num_v_heads().unwrap_or(config.num_heads);
     // Fused in_proj output: q + k (both num_kv_heads * qk_dim) + v + z (both num_v_heads * v_dim).
     let in_proj_out = qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2;
 
@@ -6570,7 +6820,14 @@ mod tests {
     fn gemma3n_config_with_sparsity(scales: Vec<f32>) -> Llama3Config {
         Llama3Config {
             arch: ModelArch::Gemma3n,
-            activation_sparsity_scale: Some(scales),
+            gemma3n: Some(Gemma3nConfig {
+                sliding_window_pattern: None,
+                activation_sparsity_scale: Some(scales),
+                shared_kv_layers: None,
+                per_layer_input_embedding_dim: None,
+                altup_num_inputs: None,
+                altup_active_idx: None,
+            }),
             ..Llama3Config::llama3_8b()
         }
     }
@@ -6663,9 +6920,19 @@ mod tests {
         Llama3Config {
             arch: ModelArch::Gemma3n,
             num_layers: 30,
-            sliding_window: Some(512),
-            shared_kv_layers: Some(10),
-            sliding_window_pattern: Some(pattern),
+            attention_extras: Some(AttentionExtrasConfig {
+                sliding_window: Some(512),
+                attn_logit_softcap: None,
+                final_logit_softcap: None,
+            }),
+            gemma3n: Some(Gemma3nConfig {
+                sliding_window_pattern: Some(pattern),
+                activation_sparsity_scale: None,
+                shared_kv_layers: Some(10),
+                per_layer_input_embedding_dim: None,
+                altup_num_inputs: None,
+                altup_active_idx: None,
+            }),
             ..Llama3Config::llama3_8b()
         }
     }
@@ -6976,22 +7243,30 @@ mod tests {
     fn test_qwen35_config_defaults_none() {
         // Baseline Llama config should have no SSM/NextN fields set.
         let c = Llama3Config::llama3_8b();
-        assert!(c.ssm_inner_size.is_none());
-        assert!(c.ssm_state_size.is_none());
-        assert!(c.ssm_group_count.is_none());
-        assert!(c.ssm_time_step_rank.is_none());
-        assert!(c.n_layer_nextn.is_none());
+        assert!(c.ssm_inner_size().is_none());
+        assert!(c.ssm_state_size().is_none());
+        assert!(c.ssm_group_count().is_none());
+        assert!(c.ssm_time_step_rank().is_none());
+        assert!(c.n_layer_nextn().is_none());
     }
 
     fn qwen35_hybrid_config() -> Llama3Config {
         Llama3Config {
             arch: ModelArch::Qwen3_5,
             num_layers: 64,
-            full_attention_interval: Some(4),
-            ssm_inner_size: Some(6144),
-            ssm_state_size: Some(128),
-            ssm_group_count: Some(16),
-            ssm_time_step_rank: Some(48),
+            ssm: Some(SsmDeltaNetConfig {
+                full_attention_interval: Some(4),
+                linear_num_kv_heads: None,
+                linear_qk_head_dim: None,
+                linear_kv_head_dim: None,
+                linear_num_v_heads: None,
+                linear_conv_kernel_dim: None,
+                ssm_inner_size: Some(6144),
+                ssm_state_size: Some(128),
+                ssm_group_count: Some(16),
+                ssm_time_step_rank: Some(48),
+                n_layer_nextn: None,
+            }),
             ..Llama3Config::llama3_8b()
         }
     }
@@ -7582,5 +7857,134 @@ mod tests {
         assert!(lw.altup_router().is_none());
         assert!(lw.ffn_gate_inp().is_none());
         assert!(!lw.is_moe_layer());
+    }
+
+    // ── Llama3Config sub-config accessors (Issue #11 Part 2) ─────────────
+
+    #[test]
+    fn config_baseline_llama_has_no_arch_extras() {
+        let c = Llama3Config::llama3_8b();
+        assert!(c.attention_extras.is_none());
+        assert!(c.ssm.is_none());
+        assert!(c.moe.is_none());
+        assert!(c.gemma3n.is_none());
+        assert!(c.gemma4.is_none());
+        // All accessor methods return None when sub-configs are absent.
+        assert!(c.sliding_window().is_none());
+        assert!(c.attn_logit_softcap().is_none());
+        assert!(c.final_logit_softcap().is_none());
+        assert!(c.full_attention_interval().is_none());
+        assert!(c.linear_qk_head_dim().is_none());
+        assert!(c.ssm_inner_size().is_none());
+        assert!(c.num_experts().is_none());
+        assert!(c.num_experts_active().is_none());
+        assert!(c.expert_ffn_size().is_none());
+        assert!(c.altup_num_inputs().is_none());
+        assert!(c.altup_active_idx().is_none());
+        assert!(c.shared_kv_layers().is_none());
+        assert!(c.per_layer_input_embedding_dim().is_none());
+        assert!(c.sliding_window_pattern().is_none());
+        assert!(c.activation_sparsity_scale().is_none());
+        assert!(c.head_dim_swa().is_none());
+        assert!(c.rope_theta_swa().is_none());
+        assert!(c.rope_dim_swa().is_none());
+        assert!(c.ffn_size_per_layer().is_none());
+        assert!(!c.is_hybrid());
+    }
+
+    #[test]
+    fn config_attention_extras_accessors_read_populated_sub_config() {
+        let mut c = Llama3Config::llama3_8b();
+        c.attention_extras = Some(AttentionExtrasConfig {
+            sliding_window: Some(4096),
+            attn_logit_softcap: Some(30.0),
+            final_logit_softcap: Some(30.0),
+        });
+        assert_eq!(c.sliding_window(), Some(4096));
+        assert_eq!(c.attn_logit_softcap(), Some(30.0));
+        assert_eq!(c.final_logit_softcap(), Some(30.0));
+        // Sibling sub-configs still return None.
+        assert!(c.ssm_inner_size().is_none());
+        assert!(c.num_experts().is_none());
+    }
+
+    #[test]
+    fn config_ssm_accessors_read_populated_sub_config() {
+        let mut c = Llama3Config::llama3_8b();
+        c.ssm = Some(SsmDeltaNetConfig {
+            full_attention_interval: Some(4),
+            linear_num_kv_heads: Some(16),
+            linear_qk_head_dim: Some(128),
+            linear_kv_head_dim: Some(128),
+            linear_num_v_heads: Some(32),
+            linear_conv_kernel_dim: Some(4),
+            ssm_inner_size: Some(6144),
+            ssm_state_size: Some(128),
+            ssm_group_count: Some(16),
+            ssm_time_step_rank: Some(48),
+            n_layer_nextn: Some(1),
+        });
+        assert_eq!(c.full_attention_interval(), Some(4));
+        assert_eq!(c.linear_num_kv_heads(), Some(16));
+        assert_eq!(c.linear_qk_head_dim(), Some(128));
+        assert_eq!(c.linear_kv_head_dim(), Some(128));
+        assert_eq!(c.linear_num_v_heads(), Some(32));
+        assert_eq!(c.linear_conv_kernel_dim(), Some(4));
+        assert_eq!(c.ssm_inner_size(), Some(6144));
+        assert_eq!(c.ssm_state_size(), Some(128));
+        assert_eq!(c.ssm_group_count(), Some(16));
+        assert_eq!(c.ssm_time_step_rank(), Some(48));
+        assert_eq!(c.n_layer_nextn(), Some(1));
+        assert!(c.is_hybrid());
+    }
+
+    #[test]
+    fn config_moe_accessors_read_populated_sub_config() {
+        let mut c = Llama3Config::llama3_8b();
+        c.moe = Some(MoeConfig {
+            num_experts: Some(8),
+            num_experts_active: Some(2),
+            expert_ffn_size: Some(2048),
+        });
+        assert_eq!(c.num_experts(), Some(8));
+        assert_eq!(c.num_experts_active(), Some(2));
+        assert_eq!(c.expert_ffn_size(), Some(2048));
+    }
+
+    #[test]
+    fn config_gemma3n_accessors_read_populated_sub_config() {
+        let mut c = Llama3Config::llama3_8b();
+        c.gemma3n = Some(Gemma3nConfig {
+            sliding_window_pattern: Some(vec![true, false, true]),
+            activation_sparsity_scale: Some(vec![1.5, f32::NEG_INFINITY]),
+            shared_kv_layers: Some(10),
+            per_layer_input_embedding_dim: Some(256),
+            altup_num_inputs: Some(4),
+            altup_active_idx: Some(0),
+        });
+        assert_eq!(c.sliding_window_pattern(), Some(&[true, false, true][..]));
+        assert_eq!(
+            c.activation_sparsity_scale(),
+            Some(&[1.5f32, f32::NEG_INFINITY][..])
+        );
+        assert_eq!(c.shared_kv_layers(), Some(10));
+        assert_eq!(c.per_layer_input_embedding_dim(), Some(256));
+        assert_eq!(c.altup_num_inputs(), Some(4));
+        assert_eq!(c.altup_active_idx(), Some(0));
+    }
+
+    #[test]
+    fn config_gemma4_accessors_read_populated_sub_config() {
+        let mut c = Llama3Config::llama3_8b();
+        c.gemma4 = Some(Gemma4Config {
+            head_dim_swa: Some(64),
+            rope_theta_swa: Some(10_000.0),
+            rope_dim_swa: Some(64),
+            ffn_size_per_layer: Some(vec![6144, 12_288]),
+        });
+        assert_eq!(c.head_dim_swa(), Some(64));
+        assert_eq!(c.rope_theta_swa(), Some(10_000.0));
+        assert_eq!(c.rope_dim_swa(), Some(64));
+        assert_eq!(c.ffn_size_per_layer(), Some(&[6144usize, 12_288][..]));
     }
 }
