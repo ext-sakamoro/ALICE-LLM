@@ -1141,6 +1141,10 @@ struct DeltaNetLayerWeightBufs {
 struct DeltaNetLayerBGs {
     attn_norm_bg: wgpu::BindGroup,
     ssm_in_proj: MatvecBG,
+    /// alpha decay-gate projection: `norm_buf → alpha_buf` (`[num_kv_heads]`).
+    alpha_proj_mv: MatvecBG,
+    /// beta update-rate projection: `norm_buf → beta_buf` (`[num_kv_heads]`).
+    beta_proj_mv: MatvecBG,
     conv1d_bg: wgpu::BindGroup,
     deltanet_bg: wgpu::BindGroup,
     ssm_out_proj: MatvecBG,
@@ -1181,6 +1185,12 @@ pub struct GpuModel {
     _o_buf: GpuBuffer,
     _gate_buf: GpuBuffer,
     _down_buf: GpuBuffer,
+    // DeltaNet scratch: alpha decay-gate `[num_kv_heads]`, beta update-rate
+    // `[num_kv_heads]`. Populated by `alpha_proj_mv` / `beta_proj_mv` on each
+    // DeltaNet layer step. Kept as owned scratch to prevent GPU buffer
+    // deallocation while `deltanet_bg` still references them.
+    _alpha_buf: GpuBuffer,
+    _beta_buf: GpuBuffer,
     logits: GpuBuffer,
     staging: wgpu::Buffer,
 
@@ -1853,6 +1863,14 @@ impl GpuModel {
         let o_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
         let gate_buf = engine.alloc_f32(MAX_BATCH * config.intermediate_dim);
         let down_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
+        // DeltaNet decay-gate / update-rate scratch (Qwen 3.5 hybrid). Sized to
+        // `linear_num_kv_heads` (per-head scalar) with MAX_BATCH lanes reserved
+        // for future batch-inference support. Reused across all DeltaNet
+        // layers within a single forward pass.
+        let dn_num_kv_heads_scratch =
+            config.linear_num_kv_heads.unwrap_or(config.num_kv_heads) as usize;
+        let alpha_buf = engine.alloc_f32(MAX_BATCH * dn_num_kv_heads_scratch);
+        let beta_buf = engine.alloc_f32(MAX_BATCH * dn_num_kv_heads_scratch);
         let logits = engine.alloc_f32(MAX_BATCH * vocab_size);
         let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("logits_staging"),
@@ -2181,6 +2199,10 @@ impl GpuModel {
                     );
                     let ssm_in_proj =
                         Self::build_matvec_bg(&engine, &dlw.ssm_in, &norm_buf, &q_buf);
+                    let alpha_proj_mv =
+                        Self::build_matvec_bg(&engine, &dlw.alpha_proj, &norm_buf, &alpha_buf);
+                    let beta_proj_mv =
+                        Self::build_matvec_bg(&engine, &dlw.beta_proj, &norm_buf, &beta_buf);
 
                     // Conv1d bind group: x=q_buf, state=conv_state, weight/bias, out=k_buf
                     let conv1d_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2234,12 +2256,12 @@ impl GpuModel {
                             }, // v
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: q_buf.buffer.as_entire_binding(),
-                            }, // alpha (placeholder, will use alpha_proj output)
+                                resource: alpha_buf.buffer.as_entire_binding(),
+                            }, // alpha (populated by alpha_proj_mv)
                             wgpu::BindGroupEntry {
                                 binding: 4,
-                                resource: k_buf.buffer.as_entire_binding(),
-                            }, // beta (placeholder)
+                                resource: beta_buf.buffer.as_entire_binding(),
+                            }, // beta (populated by beta_proj_mv)
                             wgpu::BindGroupEntry {
                                 binding: 5,
                                 resource: v_buf.buffer.as_entire_binding(),
@@ -2283,6 +2305,8 @@ impl GpuModel {
                     deltanet_bgs.push(DeltaNetLayerBGs {
                         attn_norm_bg,
                         ssm_in_proj,
+                        alpha_proj_mv,
+                        beta_proj_mv,
                         conv1d_bg,
                         deltanet_bg,
                         ssm_out_proj,
@@ -2452,6 +2476,8 @@ impl GpuModel {
             _o_buf: o_buf,
             _gate_buf: gate_buf,
             _down_buf: down_buf,
+            _alpha_buf: alpha_buf,
+            _beta_buf: beta_buf,
             logits,
             staging,
             k_caches,
@@ -2571,6 +2597,11 @@ impl GpuModel {
 
                     // 2. Fused in_proj: norm_buf → q_buf (contains q, k, v, z packed)
                     Self::dispatch_mv(&self.engine, &mut cp, &dbg.ssm_in_proj);
+
+                    // 2a. Alpha decay-gate projection: norm_buf → alpha_buf ([num_kv_heads]).
+                    Self::dispatch_mv(&self.engine, &mut cp, &dbg.alpha_proj_mv);
+                    // 2b. Beta update-rate projection: norm_buf → beta_buf ([num_kv_heads]).
+                    Self::dispatch_mv(&self.engine, &mut cp, &dbg.beta_proj_mv);
 
                     // 3. Causal conv1d: q_buf → k_buf (preprocessed q, k, v)
                     let dn_conv_dim = self.config.linear_qk_head_dim.unwrap_or(128)
