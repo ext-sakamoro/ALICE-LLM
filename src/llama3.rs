@@ -1558,6 +1558,7 @@ fn gelu_approx(x: f32) -> f32 {
 // ─── Llama-3 model ──────────────────────────────────────────────────────────
 
 /// Weight reference pointing into GGUF mmap'd data.
+#[derive(Clone)]
 struct WeightRef<'a> {
     data: &'a [u8],
     qtype: GgmlType,
@@ -1594,8 +1595,75 @@ impl WeightRef<'_> {
     }
 }
 
+/// Qwen 2 / 2.5 attention projection biases.
+///
+/// Present as a single `Option<QwenAttentionBiases>` on [`LayerWeights`]
+/// rather than three independent `Option<Vec<f32>>` fields so the shape
+/// of the layer struct signals "these three either all exist or none do".
+/// Individual biases are still logically grouped: a layer either lacks
+/// them entirely (Llama / Mistral / Gemma / Qwen 3) or carries all three.
+#[allow(clippy::struct_field_names)]
+struct QwenAttentionBiases {
+    q_bias: Vec<f32>,
+    k_bias: Vec<f32>,
+    v_bias: Vec<f32>,
+}
+
+/// Qwen 3 per-head RMSNorm weights applied to Q and K before RoPE.
+///
+/// Kept as a pair so callers cannot end up with a Q norm without a K norm
+/// (or vice versa). Absent for Qwen 2 / Llama / Mistral / Gemma.
+struct QwenAttentionNorms {
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+}
+
+/// Gemma 3n per-layer augmentation tensors.
+///
+/// Bundles the eleven layer-scoped weights the Gemma 3n forward path
+/// consumes (post-norm plus Laurel branch plus per-layer input-embedding
+/// branch plus AltUp bank). Grouping them lets non-Gemma-3n forward paths
+/// ignore a single field instead of eleven, matching Issue #11's
+/// God-object reduction goal.
+struct Gemma3nLayerAugmentations<'a> {
+    post_norm: Vec<f32>,
+    inp_gate: WeightRef<'a>,
+    proj: WeightRef<'a>,
+    laurel_l: Vec<f32>,
+    laurel_r: Vec<f32>,
+    laurel_post_norm: Vec<f32>,
+    altup_router: Vec<f32>,
+    altup_router_norm: Vec<f32>,
+    altup_predict_coef: Vec<f32>,
+    altup_correct_coef: Vec<f32>,
+    altup_correct_scale: Vec<f32>,
+}
+
+/// Mixture-of-experts routing weights (Qwen 3 MoE / Mixtral / Gemma 4
+/// 26B_A4B). Absent when the layer runs the standard SwiGLU FFN.
+#[allow(clippy::struct_field_names)]
+struct MoeExpertWeights<'a> {
+    /// MoE router weight: `[hidden_dim, n_expert]`. F32 dense.
+    ffn_gate_inp: Vec<f32>,
+    /// MoE gate expert weights: 3D `[hidden_dim, expert_ffn_size, n_expert]`.
+    /// Stored expert-major so each expert's 2D slab is contiguous.
+    ffn_gate_exps: WeightRef<'a>,
+    /// MoE up expert weights: same layout as `ffn_gate_exps`.
+    ffn_up_exps: WeightRef<'a>,
+    /// MoE down expert weights: 3D `[expert_ffn_size, hidden_dim, n_expert]`.
+    ffn_down_exps: WeightRef<'a>,
+}
+
 /// Layer weight references (zero-copy from GGUF).
+///
+/// Architecture-specific extensions are grouped into sub-structs
+/// ([`QwenAttentionBiases`], [`QwenAttentionNorms`],
+/// [`Gemma3nLayerAugmentations`], [`MoeExpertWeights`]) so the field
+/// count stays manageable (Issue #11). Callers keep the pre-refactor
+/// access syntax via accessor methods on `LayerWeights` — see
+/// `q_bias`, `laurel_l`, `ffn_gate_inp`, etc.
 struct LayerWeights<'a> {
+    // ── Core attention ────────────────────────────────────────────────
     attn_norm: Vec<f32>,
     q_proj: WeightRef<'a>,
     /// K projection. Optional for Gemma 4 shared-KV layers (>= kv_from_start),
@@ -1605,70 +1673,167 @@ struct LayerWeights<'a> {
     /// V projection. Optional for Gemma 4 shared-KV layers.
     v_proj: Option<WeightRef<'a>>,
     o_proj: WeightRef<'a>,
-    /// Qwen 2/2.5 attention Q projection bias (None for Llama/Mistral/Gemma/Qwen 3).
-    q_bias: Option<Vec<f32>>,
-    /// Qwen 2/2.5 attention K projection bias.
-    k_bias: Option<Vec<f32>>,
-    /// Qwen 2/2.5 attention V projection bias.
-    v_bias: Option<Vec<f32>>,
-    /// Qwen 3 per-head RMSNorm applied to Q before RoPE (None for other arch).
-    q_norm: Option<Vec<f32>>,
-    /// Qwen 3 per-head RMSNorm applied to K before RoPE.
-    k_norm: Option<Vec<f32>>,
-    /// Gemma-2 post-attention RMSNorm (before residual add).
-    post_attn_norm: Option<Vec<f32>>,
-    /// Gemma-2 post-FFN RMSNorm (before residual add).
-    post_ffn_norm: Option<Vec<f32>>,
+
+    // ── Core FFN (standard SwiGLU; absent for MoE layers) ─────────────
     ffn_norm: Vec<f32>,
     /// Standard FFN gate projection. `None` for MoE layers, where the FFN
-    /// is replaced by expert routing (`ffn_gate_inp` + `ffn_*_exps`).
+    /// is replaced by expert routing.
     gate_proj: Option<WeightRef<'a>>,
     /// Standard FFN up projection. `None` for MoE layers.
     up_proj: Option<WeightRef<'a>>,
     /// Standard FFN down projection. `None` for MoE layers.
     down_proj: Option<WeightRef<'a>>,
-    // ── Gemma 3n per-layer tensors (None for other architectures) ──────────
-    /// Gemma 3n: extra RMSNorm applied at the end of layer (post_norm).
-    post_norm: Option<Vec<f32>>,
-    /// Gemma 3n: per-layer input embedding gate projection.
-    /// Shape [hidden_dim, per_layer_input_embedding_dim].
-    inp_gate: Option<WeightRef<'a>>,
-    /// Gemma 3n: extra projection connecting the per-layer embedding branch.
-    /// Shape [per_layer_input_embedding_dim, hidden_dim].
-    proj: Option<WeightRef<'a>>,
-    /// Gemma 3n Laurel left projection [hidden_dim, laurel_rank=64].
-    laurel_l: Option<Vec<f32>>,
-    /// Gemma 3n Laurel right projection [laurel_rank=64, hidden_dim].
-    laurel_r: Option<Vec<f32>>,
-    /// Gemma 3n Laurel post-branch RMSNorm [hidden_dim].
-    laurel_post_norm: Option<Vec<f32>>,
-    /// Gemma 3n AltUp router [hidden_dim, altup_num_inputs].
-    altup_router: Option<Vec<f32>>,
-    /// Gemma 3n AltUp router pre-RMSNorm [hidden_dim].
-    altup_router_norm: Option<Vec<f32>>,
-    /// Gemma 3n AltUp predict coefficient matrix [altup_num_inputs, altup_num_inputs^2].
-    altup_predict_coef: Option<Vec<f32>>,
-    /// Gemma 3n AltUp correct coefficient matrix [altup_num_inputs, altup_num_inputs].
-    altup_correct_coef: Option<Vec<f32>>,
-    /// Gemma 3n AltUp correction scale [hidden_dim].
-    altup_correct_scale: Option<Vec<f32>>,
-    // ── Gemma 4 per-layer tensors (None for other architectures) ──────────
+
+    // ── Gemma-2 post-norms (small, kept flat) ─────────────────────────
+    /// Gemma-2 post-attention RMSNorm (before residual add).
+    post_attn_norm: Option<Vec<f32>>,
+    /// Gemma-2 post-FFN RMSNorm (before residual add).
+    post_ffn_norm: Option<Vec<f32>>,
+
+    // ── Gemma-4 extras (small, kept flat) ─────────────────────────────
     /// Gemma 4: per-layer output scalar (`layer_output_scale`), typically [1].
     /// Applied as `cur *= out_scale` at the end of each layer.
     out_scale: Option<Vec<f32>>,
     /// Gemma 4: per-full-attention-layer RoPE frequency factors (Llama 3.x
     /// NTK-aware extension). Shape [head_dim / 2]. Absent for SWA layers.
     rope_freqs: Option<Vec<f32>>,
-    // ── MoE tensors (Qwen3 MoE / Mixtral / Gemma 4 26B_A4B, optional) ─────
-    /// MoE router weight: `[hidden_dim, n_expert]`. F32 dense.
-    ffn_gate_inp: Option<Vec<f32>>,
-    /// MoE gate expert weights: 3D `[hidden_dim, expert_ffn_size, n_expert]`.
-    /// Stored expert-major so each expert's 2D slab is contiguous.
-    ffn_gate_exps: Option<WeightRef<'a>>,
-    /// MoE up expert weights: same layout as `ffn_gate_exps`.
-    ffn_up_exps: Option<WeightRef<'a>>,
-    /// MoE down expert weights: 3D `[expert_ffn_size, hidden_dim, n_expert]`.
-    ffn_down_exps: Option<WeightRef<'a>>,
+
+    // ── Grouped arch-specific extensions ──────────────────────────────
+    /// Qwen 2 / 2.5 QKV projection biases (all three or none).
+    qwen_biases: Option<QwenAttentionBiases>,
+    /// Qwen 3 per-head QK RMSNorm pair.
+    qwen_norms: Option<QwenAttentionNorms>,
+    /// Gemma 3n per-layer augmentations (11 weights: Laurel / AltUp /
+    /// per-layer embedding branch).
+    gemma3n: Option<Gemma3nLayerAugmentations<'a>>,
+    /// Mixture-of-experts routing + expert weights (only when this layer
+    /// uses expert dispatch instead of a monolithic SwiGLU FFN).
+    moe: Option<MoeExpertWeights<'a>>,
+}
+
+impl<'a> LayerWeights<'a> {
+    // ── Qwen 2 / 2.5 attention bias accessors ─────────────────────────
+
+    #[inline]
+    fn q_bias(&self) -> Option<&[f32]> {
+        self.qwen_biases.as_ref().map(|b| b.q_bias.as_slice())
+    }
+
+    #[inline]
+    fn k_bias(&self) -> Option<&[f32]> {
+        self.qwen_biases.as_ref().map(|b| b.k_bias.as_slice())
+    }
+
+    #[inline]
+    fn v_bias(&self) -> Option<&[f32]> {
+        self.qwen_biases.as_ref().map(|b| b.v_bias.as_slice())
+    }
+
+    // ── Qwen 3 per-head QK RMSNorm accessors ──────────────────────────
+
+    #[inline]
+    fn q_norm(&self) -> Option<&[f32]> {
+        self.qwen_norms.as_ref().map(|n| n.q_norm.as_slice())
+    }
+
+    #[inline]
+    fn k_norm(&self) -> Option<&[f32]> {
+        self.qwen_norms.as_ref().map(|n| n.k_norm.as_slice())
+    }
+
+    // ── Gemma 3n augmentation accessors ───────────────────────────────
+
+    #[inline]
+    fn post_norm(&self) -> Option<&[f32]> {
+        self.gemma3n.as_ref().map(|g| g.post_norm.as_slice())
+    }
+
+    #[inline]
+    fn inp_gate(&self) -> Option<&WeightRef<'a>> {
+        self.gemma3n.as_ref().map(|g| &g.inp_gate)
+    }
+
+    #[inline]
+    fn proj(&self) -> Option<&WeightRef<'a>> {
+        self.gemma3n.as_ref().map(|g| &g.proj)
+    }
+
+    #[inline]
+    fn laurel_l(&self) -> Option<&[f32]> {
+        self.gemma3n.as_ref().map(|g| g.laurel_l.as_slice())
+    }
+
+    #[inline]
+    fn laurel_r(&self) -> Option<&[f32]> {
+        self.gemma3n.as_ref().map(|g| g.laurel_r.as_slice())
+    }
+
+    #[inline]
+    fn laurel_post_norm(&self) -> Option<&[f32]> {
+        self.gemma3n.as_ref().map(|g| g.laurel_post_norm.as_slice())
+    }
+
+    #[inline]
+    fn altup_router(&self) -> Option<&[f32]> {
+        self.gemma3n.as_ref().map(|g| g.altup_router.as_slice())
+    }
+
+    #[inline]
+    fn altup_router_norm(&self) -> Option<&[f32]> {
+        self.gemma3n
+            .as_ref()
+            .map(|g| g.altup_router_norm.as_slice())
+    }
+
+    #[inline]
+    fn altup_predict_coef(&self) -> Option<&[f32]> {
+        self.gemma3n
+            .as_ref()
+            .map(|g| g.altup_predict_coef.as_slice())
+    }
+
+    #[inline]
+    fn altup_correct_coef(&self) -> Option<&[f32]> {
+        self.gemma3n
+            .as_ref()
+            .map(|g| g.altup_correct_coef.as_slice())
+    }
+
+    #[inline]
+    fn altup_correct_scale(&self) -> Option<&[f32]> {
+        self.gemma3n
+            .as_ref()
+            .map(|g| g.altup_correct_scale.as_slice())
+    }
+
+    // ── MoE accessors ────────────────────────────────────────────────
+
+    #[inline]
+    fn ffn_gate_inp(&self) -> Option<&[f32]> {
+        self.moe.as_ref().map(|m| m.ffn_gate_inp.as_slice())
+    }
+
+    #[inline]
+    fn ffn_gate_exps(&self) -> Option<&WeightRef<'a>> {
+        self.moe.as_ref().map(|m| &m.ffn_gate_exps)
+    }
+
+    #[inline]
+    fn ffn_up_exps(&self) -> Option<&WeightRef<'a>> {
+        self.moe.as_ref().map(|m| &m.ffn_up_exps)
+    }
+
+    #[inline]
+    fn ffn_down_exps(&self) -> Option<&WeightRef<'a>> {
+        self.moe.as_ref().map(|m| &m.ffn_down_exps)
+    }
+
+    /// Convenience: true when this layer runs the MoE FFN path.
+    #[inline]
+    #[allow(dead_code)]
+    fn is_moe_layer(&self) -> bool {
+        self.moe.is_some()
+    }
 }
 
 /// DeltaNet layer weight references (Qwen 3.5 / 3.6 Gated Linear Attention).
@@ -2416,26 +2581,26 @@ impl<'a> Llama3Model<'a> {
                 .expect("v_proj required for non-shared layer")
                 .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
-            if let Some(b) = &layer.q_bias {
+            if let Some(b) = layer.q_bias() {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
                     *q += bi;
                 }
             }
-            if let Some(b) = &layer.k_bias {
+            if let Some(b) = layer.k_bias() {
                 for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
                     *k += bi;
                 }
             }
-            if let Some(b) = &layer.v_bias {
+            if let Some(b) = layer.v_bias() {
                 for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
                     *v += bi;
                 }
             }
             // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
-            if let Some(w) = &layer.q_norm {
+            if let Some(w) = layer.q_norm() {
                 apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
             }
-            if let Some(w) = &layer.k_norm {
+            if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
             }
 
@@ -2506,7 +2671,7 @@ impl<'a> Llama3Model<'a> {
             // MoE dispatch: layers with `ffn_gate_inp` use expert routing
             // instead of a monolithic SwiGLU FFN. Both paths write their
             // hidden-dim output into `down_buf`.
-            if layer.ffn_gate_inp.is_some() {
+            if layer.ffn_gate_inp().is_some() {
                 forward_moe_layer(c, layer, &norm_buf, &mut down_buf);
             } else {
                 // SwiGLU FFN (pre-quantize norm_buf once for gate+up)
@@ -2693,11 +2858,11 @@ impl<'a> Llama3Model<'a> {
             }
 
             // Q, K per-head RMSNorm (Gemma 3n uses them like Qwen 3)
-            if let Some(w) = &layer.q_norm {
+            if let Some(w) = layer.q_norm() {
                 apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
             }
             if owns_kv {
-                if let Some(w) = &layer.k_norm {
+                if let Some(w) = layer.k_norm() {
                     apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
                 }
                 // V RMSNorm without weight (identity gain)
@@ -2973,10 +3138,9 @@ impl<'a> Llama3Model<'a> {
         let c = &self.config;
         let layer = &self.layers[layer_idx];
         let router_norm_w = layer
-            .altup_router_norm
-            .as_ref()
+            .altup_router_norm()
             .expect("Gemma3n: altup_router_norm");
-        let router_w = layer.altup_router.as_ref().expect("Gemma3n: altup_router");
+        let router_w = layer.altup_router().expect("Gemma3n: altup_router");
         // router_inputs = RMSNorm(active, router_norm_w) / n_embd
         let mut router_inputs = vec![0.0f32; c.hidden_dim];
         rms_norm(active, router_norm_w, c.norm_eps, &mut router_inputs);
@@ -3021,8 +3185,7 @@ impl<'a> Llama3Model<'a> {
         // gives a vector of length n_altup*n_altup. Reshape to [n_altup, n_altup]
         // coefficient matrix (coef[i][j] = weight for using stream j to predict stream i).
         let predict_coef = layer
-            .altup_predict_coef
-            .as_ref()
+            .altup_predict_coef()
             .expect("Gemma3n: altup_predict_coef");
         let mut coef_flat = vec![0.0f32; n_altup * n_altup];
         mat_vec_f32(
@@ -3072,8 +3235,7 @@ impl<'a> Llama3Model<'a> {
         let hidden_dim = c.hidden_dim;
         let modalities = self.altup_router_modalities(activated, layer_idx, n_altup);
         let correct_coef = layer
-            .altup_correct_coef
-            .as_ref()
+            .altup_correct_coef()
             .expect("Gemma3n: altup_correct_coef");
         let mut all_coefs = vec![0.0f32; n_altup];
         mat_vec_f32(correct_coef, n_altup, n_altup, &modalities, &mut all_coefs);
@@ -3103,12 +3265,9 @@ impl<'a> Llama3Model<'a> {
         let c = &self.config;
         let layer = &self.layers[layer_idx];
         let hidden_dim = c.hidden_dim;
-        let laurel_l = layer.laurel_l.as_ref().expect("Gemma3n: laurel_l");
-        let laurel_r = layer.laurel_r.as_ref().expect("Gemma3n: laurel_r");
-        let laurel_post_norm = layer
-            .laurel_post_norm
-            .as_ref()
-            .expect("Gemma3n: laurel_post_norm");
+        let laurel_l = layer.laurel_l().expect("Gemma3n: laurel_l");
+        let laurel_r = layer.laurel_r().expect("Gemma3n: laurel_r");
+        let laurel_post_norm = layer.laurel_post_norm().expect("Gemma3n: laurel_post_norm");
         // laurel_l shape: [hidden_dim, laurel_rank] in ggml means
         //   ne[0] = hidden_dim (fastest, = in-dim, cols)
         //   ne[1] = laurel_rank (out-dim, rows)
@@ -3149,8 +3308,7 @@ impl<'a> Llama3Model<'a> {
         let hidden_dim = c.hidden_dim;
 
         let correct_scale = layer
-            .altup_correct_scale
-            .as_ref()
+            .altup_correct_scale()
             .expect("Gemma3n: altup_correct_scale");
         // Scale
         let mut scaled = vec![0.0f32; hidden_dim];
@@ -3158,7 +3316,7 @@ impl<'a> Llama3Model<'a> {
             scaled[i] = active_corrected[i] * correct_scale[i];
         }
         // Gate matmul: inp_gate shape [hidden_dim, n_embd_altup] → out_dim=n_embd_altup
-        let inp_gate = layer.inp_gate.as_ref().expect("Gemma3n: inp_gate");
+        let inp_gate = layer.inp_gate().expect("Gemma3n: inp_gate");
         let mut gated = vec![0.0f32; n_embd_altup];
         inp_gate.matvec(&scaled, &mut gated);
         // GELU
@@ -3170,11 +3328,11 @@ impl<'a> Llama3Model<'a> {
             gated[i] *= inp_this_layer[i];
         }
         // Project up to hidden_dim via per_layer_proj (shape [n_embd_altup, hidden_dim])
-        let proj = layer.proj.as_ref().expect("Gemma3n: proj");
+        let proj = layer.proj().expect("Gemma3n: proj");
         let mut projected = vec![0.0f32; hidden_dim];
         proj.matvec(&gated, &mut projected);
         // post_norm RMSNorm
-        let post_norm = layer.post_norm.as_ref().expect("Gemma3n: post_norm");
+        let post_norm = layer.post_norm().expect("Gemma3n: post_norm");
         let mut normed = vec![0.0f32; hidden_dim];
         rms_norm(&projected, post_norm, c.norm_eps, &mut normed);
         normed
@@ -3270,11 +3428,11 @@ impl<'a> Llama3Model<'a> {
             }
 
             // Q, K per-head RMSNorm (Gemma 4 uses them like Qwen 3 / Gemma 3n).
-            if let Some(w) = &layer.q_norm {
+            if let Some(w) = layer.q_norm() {
                 apply_qk_norm(&mut q_buf[..q_dim], w, head_dim, c.norm_eps);
             }
             if owns_kv {
-                if let Some(w) = &layer.k_norm {
+                if let Some(w) = layer.k_norm() {
                     apply_qk_norm(&mut k_buf[..kv_dim], w, head_dim, c.norm_eps);
                 }
                 // V RMSNorm without weight (identity gain), same as Gemma 3n.
@@ -3380,10 +3538,10 @@ impl<'a> Llama3Model<'a> {
             }
 
             // ── Per-layer input embedding branch (Gemma 4 simplified) ──────
-            if layer.inp_gate.is_some() && layer.proj.is_some() && layer.post_norm.is_some() {
+            if layer.inp_gate().is_some() && layer.proj().is_some() && layer.post_norm().is_some() {
                 let pe_in = cur.clone();
                 // gate: [hidden_dim] → [n_embd_altup]
-                let inp_gate = layer.inp_gate.as_ref().unwrap();
+                let inp_gate = layer.inp_gate().unwrap();
                 let mut gated = vec![0.0f32; n_embd_altup];
                 inp_gate.matvec(&cur, &mut gated);
                 for v in &mut gated {
@@ -3394,11 +3552,11 @@ impl<'a> Llama3Model<'a> {
                     gated[i] *= inp_per_layer[layer_idx][i];
                 }
                 // Project up to hidden_dim via per_layer_proj.
-                let proj = layer.proj.as_ref().unwrap();
+                let proj = layer.proj().unwrap();
                 let mut projected = vec![0.0f32; hidden_dim];
                 proj.matvec(&gated, &mut projected);
                 // post_norm RMSNorm.
-                let post_norm = layer.post_norm.as_ref().unwrap();
+                let post_norm = layer.post_norm().unwrap();
                 rms_norm(&projected, post_norm, c.norm_eps, &mut norm_buf);
                 // Residual add pe_in.
                 for i in 0..hidden_dim {
@@ -3492,26 +3650,26 @@ impl<'a> Llama3Model<'a> {
                 .expect("v_proj required for non-shared layer")
                 .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
-            if let Some(b) = &layer.q_bias {
+            if let Some(b) = layer.q_bias() {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
                     *q += bi;
                 }
             }
-            if let Some(b) = &layer.k_bias {
+            if let Some(b) = layer.k_bias() {
                 for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
                     *k += bi;
                 }
             }
-            if let Some(b) = &layer.v_bias {
+            if let Some(b) = layer.v_bias() {
                 for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
                     *v += bi;
                 }
             }
             // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
-            if let Some(w) = &layer.q_norm {
+            if let Some(w) = layer.q_norm() {
                 apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
             }
-            if let Some(w) = &layer.k_norm {
+            if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
             }
 
@@ -4782,26 +4940,26 @@ impl<'a> Llama3Model<'a> {
                 .expect("v_proj required for non-shared layer")
                 .matvec_preq(&q8_attn, &mut v_buf);
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
-            if let Some(b) = &layer.q_bias {
+            if let Some(b) = layer.q_bias() {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
                     *q += bi;
                 }
             }
-            if let Some(b) = &layer.k_bias {
+            if let Some(b) = layer.k_bias() {
                 for (k, bi) in k_buf.iter_mut().zip(b.iter()) {
                     *k += bi;
                 }
             }
-            if let Some(b) = &layer.v_bias {
+            if let Some(b) = layer.v_bias() {
                 for (v, bi) in v_buf.iter_mut().zip(b.iter()) {
                     *v += bi;
                 }
             }
             // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
-            if let Some(w) = &layer.q_norm {
+            if let Some(w) = layer.q_norm() {
                 apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
             }
-            if let Some(w) = &layer.k_norm {
+            if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
             }
 
@@ -5148,8 +5306,7 @@ fn forward_moe_layer(
     // ne0 = hidden_dim (fast) and ne1 = n_expert. Compute
     // `router_logits[e] = sum_h weights[e * hidden_dim + h] * norm_buf[h]`.
     let router_w = layer
-        .ffn_gate_inp
-        .as_ref()
+        .ffn_gate_inp()
         .expect("MoE layer requires ffn_gate_inp");
     assert_eq!(
         router_w.len(),
@@ -5196,16 +5353,11 @@ fn forward_moe_layer(
     // Step 5+6: expert dispatch. Extract each expert's slab from the 3D
     // WeightRef and run three matvecs.
     let gate_exps = layer
-        .ffn_gate_exps
-        .as_ref()
+        .ffn_gate_exps()
         .expect("MoE layer requires ffn_gate_exps");
-    let up_exps = layer
-        .ffn_up_exps
-        .as_ref()
-        .expect("MoE layer requires ffn_up_exps");
+    let up_exps = layer.ffn_up_exps().expect("MoE layer requires ffn_up_exps");
     let down_exps = layer
-        .ffn_down_exps
-        .as_ref()
+        .ffn_down_exps()
         .expect("MoE layer requires ffn_down_exps");
 
     let gate_expert_bytes = expert_slab_bytes(gate_exps, expert_ffn, hidden_dim);
@@ -5931,23 +6083,25 @@ fn load_layer_weights<'a>(
         (None, None)
     };
 
-    Some(LayerWeights {
-        attn_norm,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
-        q_bias,
-        k_bias,
-        v_bias,
-        q_norm,
-        k_norm,
-        post_attn_norm,
-        post_ffn_norm,
-        ffn_norm,
-        gate_proj,
-        up_proj,
-        down_proj,
+    // Group Qwen 2 / 2.5 biases together: they either all exist or none do.
+    let qwen_biases = match (q_bias, k_bias, v_bias) {
+        (Some(q_bias), Some(k_bias), Some(v_bias)) => Some(QwenAttentionBiases {
+            q_bias,
+            k_bias,
+            v_bias,
+        }),
+        _ => None,
+    };
+
+    // Group Qwen 3 per-head QK norms together.
+    let qwen_norms = match (q_norm, k_norm) {
+        (Some(q_norm), Some(k_norm)) => Some(QwenAttentionNorms { q_norm, k_norm }),
+        _ => None,
+    };
+
+    // Group Gemma 3n augmentations: 11 fields either all populated (Gemma 3n)
+    // or all absent (any other arch). Partial population is a load bug.
+    let gemma3n = match (
         post_norm,
         inp_gate,
         proj,
@@ -5959,12 +6113,67 @@ fn load_layer_weights<'a>(
         altup_predict_coef,
         altup_correct_coef,
         altup_correct_scale,
+    ) {
+        (
+            Some(post_norm),
+            Some(inp_gate),
+            Some(proj),
+            Some(laurel_l),
+            Some(laurel_r),
+            Some(laurel_post_norm),
+            Some(altup_router),
+            Some(altup_router_norm),
+            Some(altup_predict_coef),
+            Some(altup_correct_coef),
+            Some(altup_correct_scale),
+        ) => Some(Gemma3nLayerAugmentations {
+            post_norm,
+            inp_gate,
+            proj,
+            laurel_l,
+            laurel_r,
+            laurel_post_norm,
+            altup_router,
+            altup_router_norm,
+            altup_predict_coef,
+            altup_correct_coef,
+            altup_correct_scale,
+        }),
+        _ => None,
+    };
+
+    // Group MoE weights: router + three expert tensors either all present
+    // (this is a MoE layer) or all absent (dense SwiGLU).
+    let moe = match (ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps) {
+        (Some(ffn_gate_inp), Some(ffn_gate_exps), Some(ffn_up_exps), Some(ffn_down_exps)) => {
+            Some(MoeExpertWeights {
+                ffn_gate_inp,
+                ffn_gate_exps,
+                ffn_up_exps,
+                ffn_down_exps,
+            })
+        }
+        _ => None,
+    };
+
+    Some(LayerWeights {
+        attn_norm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        ffn_norm,
+        gate_proj,
+        up_proj,
+        down_proj,
+        post_attn_norm,
+        post_ffn_norm,
         out_scale,
         rope_freqs,
-        ffn_gate_inp,
-        ffn_gate_exps,
-        ffn_up_exps,
-        ffn_down_exps,
+        qwen_biases,
+        qwen_norms,
+        gemma3n,
+        moe,
     })
 }
 
@@ -7240,5 +7449,138 @@ mod tests {
         for (i, (a, s)) in state_actual.iter().zip(state_serial.iter()).enumerate() {
             assert!((a - s).abs() < 1e-6, "state[{i}]: parallel {a} serial {s}");
         }
+    }
+
+    // ── LayerWeights sub-struct accessors (Issue #11) ────────────────────
+
+    /// Reusable fixture that only sets the fields required to construct
+    /// a `LayerWeights`. The refactor moved arch-specific fields into
+    /// nested sub-structs; every accessor below verifies the None → Some
+    /// transition when the relevant sub-struct is populated.
+    fn empty_layer_weights<'a>() -> LayerWeights<'a> {
+        // Reuse the byte buffer for every `WeightRef` — the accessor tests
+        // only inspect Option-ness, not the underlying quantised bytes.
+        static ZERO: [u8; 256] = [0u8; 256];
+        let core_weight = WeightRef {
+            data: &ZERO,
+            qtype: crate::gguf::GgmlType::F32,
+            rows: 0,
+            cols: 0,
+        };
+        LayerWeights {
+            attn_norm: Vec::new(),
+            q_proj: core_weight.clone(),
+            k_proj: None,
+            v_proj: None,
+            o_proj: core_weight,
+            ffn_norm: Vec::new(),
+            gate_proj: None,
+            up_proj: None,
+            down_proj: None,
+            post_attn_norm: None,
+            post_ffn_norm: None,
+            out_scale: None,
+            rope_freqs: None,
+            qwen_biases: None,
+            qwen_norms: None,
+            gemma3n: None,
+            moe: None,
+        }
+    }
+
+    #[test]
+    fn layer_weights_accessors_return_none_when_sub_structs_absent() {
+        let lw = empty_layer_weights();
+        assert!(lw.q_bias().is_none());
+        assert!(lw.k_bias().is_none());
+        assert!(lw.v_bias().is_none());
+        assert!(lw.q_norm().is_none());
+        assert!(lw.k_norm().is_none());
+        assert!(lw.post_norm().is_none());
+        assert!(lw.laurel_l().is_none());
+        assert!(lw.laurel_r().is_none());
+        assert!(lw.laurel_post_norm().is_none());
+        assert!(lw.altup_router().is_none());
+        assert!(lw.altup_router_norm().is_none());
+        assert!(lw.altup_predict_coef().is_none());
+        assert!(lw.altup_correct_coef().is_none());
+        assert!(lw.altup_correct_scale().is_none());
+        assert!(lw.inp_gate().is_none());
+        assert!(lw.proj().is_none());
+        assert!(lw.ffn_gate_inp().is_none());
+        assert!(lw.ffn_gate_exps().is_none());
+        assert!(lw.ffn_up_exps().is_none());
+        assert!(lw.ffn_down_exps().is_none());
+        assert!(!lw.is_moe_layer());
+    }
+
+    #[test]
+    fn layer_weights_qwen_biases_visible_through_accessors() {
+        let mut lw = empty_layer_weights();
+        lw.qwen_biases = Some(QwenAttentionBiases {
+            q_bias: vec![1.0, 2.0],
+            k_bias: vec![3.0, 4.0],
+            v_bias: vec![5.0, 6.0],
+        });
+        assert_eq!(lw.q_bias(), Some(&[1.0f32, 2.0][..]));
+        assert_eq!(lw.k_bias(), Some(&[3.0f32, 4.0][..]));
+        assert_eq!(lw.v_bias(), Some(&[5.0f32, 6.0][..]));
+        // Qwen 3 norms are a separate sub-struct — still None.
+        assert!(lw.q_norm().is_none());
+        assert!(lw.k_norm().is_none());
+    }
+
+    #[test]
+    fn layer_weights_qwen_norms_visible_through_accessors() {
+        let mut lw = empty_layer_weights();
+        lw.qwen_norms = Some(QwenAttentionNorms {
+            q_norm: vec![0.1, 0.2],
+            k_norm: vec![0.3, 0.4],
+        });
+        assert_eq!(lw.q_norm(), Some(&[0.1f32, 0.2][..]));
+        assert_eq!(lw.k_norm(), Some(&[0.3f32, 0.4][..]));
+        // Biases are a separate sub-struct — still None.
+        assert!(lw.q_bias().is_none());
+    }
+
+    #[test]
+    fn layer_weights_moe_visible_through_accessors_and_flag() {
+        static ZERO: [u8; 256] = [0u8; 256];
+        let expert_weight = WeightRef {
+            data: &ZERO,
+            qtype: crate::gguf::GgmlType::F32,
+            rows: 0,
+            cols: 0,
+        };
+        let mut lw = empty_layer_weights();
+        lw.moe = Some(MoeExpertWeights {
+            ffn_gate_inp: vec![9.0, 8.0, 7.0],
+            ffn_gate_exps: expert_weight.clone(),
+            ffn_up_exps: expert_weight.clone(),
+            ffn_down_exps: expert_weight,
+        });
+        assert_eq!(lw.ffn_gate_inp(), Some(&[9.0f32, 8.0, 7.0][..]));
+        assert!(lw.ffn_gate_exps().is_some());
+        assert!(lw.ffn_up_exps().is_some());
+        assert!(lw.ffn_down_exps().is_some());
+        assert!(lw.is_moe_layer());
+    }
+
+    /// Explicit check that non-MoE / non-Qwen field groups stay None when
+    /// only one arch group is populated — protects against the God-object
+    /// regression where a stray `Some(...)` bleeds across arch families.
+    #[test]
+    fn layer_weights_arch_groups_are_independent() {
+        let mut lw = empty_layer_weights();
+        lw.qwen_biases = Some(QwenAttentionBiases {
+            q_bias: vec![0.0],
+            k_bias: vec![0.0],
+            v_bias: vec![0.0],
+        });
+        // Setting Qwen biases must not leak into Gemma3n / MoE accessors.
+        assert!(lw.laurel_l().is_none());
+        assert!(lw.altup_router().is_none());
+        assert!(lw.ffn_gate_inp().is_none());
+        assert!(!lw.is_moe_layer());
     }
 }
