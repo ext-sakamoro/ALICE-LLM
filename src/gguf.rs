@@ -1396,21 +1396,59 @@ mod avx2_dot {
         }
 
         // Per-sub-block SIMD dot × scale, accumulated as i32.
+        //
+        // Layout note: the scalar path packs `aux8` so that sub-block `2k`
+        // is the **low nibbles** of `q4[k*32 : k*32+32]` and sub-block
+        // `2k+1` is the **high nibbles** of the same 32 packed bytes.
+        // Iterating on `q4[is*16 : is*16+16]` per sub-block reads the
+        // wrong window entirely (initial implementation bug caught by CI),
+        // so we stride by 32 bytes (64 nibbles) and produce two 32-lane
+        // dots per iteration.
         let mut total: i32 = 0;
-        // Q4_K has 8 sub-blocks of 32 elements. Each iteration processes
-        // one sub-block: unpack 16 nibble bytes → 32 nibbles → dot with
-        // 32 q8 signed activations → weight by scales[is].
-        for is in 0..8 {
-            let q4_ptr = q4.as_ptr().add(is * 16);
-            let q8_ptr = q8k.qs.as_ptr().add(is * 32);
-            let nib32 = unpack_16_q4_nibbles(q4_ptr);
-            let acc0 = _mm256_setzero_si256();
-            let acc = dot_32_u4_i8_from_nibbles(acc0, nib32, q8_ptr);
-            let sub_dot = hsum_i32_avx2(acc);
-            total += scales[is] as i32 * sub_dot;
+        for g in 0..4 {
+            let q4_ptr = q4.as_ptr().add(g * 32);
+            // Load 32 packed bytes = 64 nibbles.
+            let bytes = _mm256_loadu_si256(q4_ptr.cast());
+            let mask = _mm256_set1_epi8(0x0F);
+            let lo_nibbles = _mm256_and_si256(bytes, mask);
+            // `_mm256_srli_epi16` shifts each u16 lane by 4; after masking
+            // with 0x0F the surviving bits are exactly the per-byte high
+            // nibbles.
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+
+            // Sub-block 2g: low nibbles × q8[g*64 .. g*64+32], scaled by scales[2g].
+            let q8_ptr_a = q8k.qs.as_ptr().add(g * 64);
+            let acc_a = _mm256_setzero_si256();
+            let acc_a = dot_32_u4_i8_from_nibbles(acc_a, lo_nibbles, q8_ptr_a);
+            let dot_a = hsum_i32_avx2(acc_a);
+            total += scales[2 * g] as i32 * dot_a;
+
+            // Sub-block 2g+1: high nibbles × q8[g*64+32 .. g*64+64].
+            let q8_ptr_b = q8k.qs.as_ptr().add(g * 64 + 32);
+            let acc_b = _mm256_setzero_si256();
+            let acc_b = dot_32_u4_i8_from_nibbles(acc_b, hi_nibbles, q8_ptr_b);
+            let dot_b = hsum_i32_avx2(acc_b);
+            total += scales[2 * g + 1] as i32 * dot_b;
         }
 
         d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
+    }
+
+    /// AVX2 signed dot product of 16 i8 values via sign-extension.
+    ///
+    /// Widens each i8 to i16 first, then relies on `_mm256_madd_epi16`
+    /// (which multiplies i16 pairs and sums adjacent lanes to i32 with
+    /// **no saturation**). Slightly more expensive than the `maddubs`
+    /// sign trick but immune to the i16 intermediate saturation risk
+    /// for signed×signed dots, and its per-sub-block granularity matches
+    /// the scalar Q6_K layout exactly.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_16_i8_widened(acc: __m256i, w: *const i8, x: *const i8) -> __m256i {
+        let w16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.cast()));
+        let x16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.cast()));
+        let prod32 = _mm256_madd_epi16(w16, x16);
+        _mm256_add_epi32(acc, prod32)
     }
 
     /// Q6_K × Q8_K dot product using AVX2.
@@ -1448,39 +1486,16 @@ mod avx2_dot {
             qh_off += 32;
         }
 
+        // Q6_K has 16 sub-blocks of 16 elements — perfectly matched to a
+        // 16-lane SIMD dot after i8→i16 sign extension.
         let mut total: i32 = 0;
-        // Q6_K has 16 sub-blocks of 16 elements. Two sub-blocks pack into
-        // one 32-lane AVX2 register, so we stride by 32 and split the
-        // resulting dot between the two scales.
-        for is_pair in 0..8 {
-            let a_ptr = aux8.as_ptr().add(is_pair * 32);
-            let q8_ptr = q8k.qs.as_ptr().add(is_pair * 32);
-            // Compute dot for lanes 0..16 and 16..32 separately so each
-            // half can be weighted by its own scale.
-            let acc_lo = _mm256_setzero_si256();
-            let dot_lo = {
-                // Zero the upper half by masking after the maddubs. Cheapest
-                // portable route: two separate 16-byte dots via `dot_32`
-                // on padded arrays. To keep this readable, fall back to
-                // scalar for the split.
-                let acc = dot_32_i8_signed(acc_lo, a_ptr, q8_ptr);
-                hsum_i32_avx2(acc)
-            };
-            // dot_lo covers all 32 elements; we still need per-16-element
-            // splitting to weight by scales[2 * is_pair] and [2 * is_pair + 1].
-            // The scalar fallback for the split keeps the code obvious:
-            let mut d0 = 0i32;
-            let mut d1 = 0i32;
-            for l in 0..16 {
-                d0 += aux8[is_pair * 32 + l] as i32 * q8k.qs[is_pair * 32 + l] as i32;
-            }
-            for l in 0..16 {
-                d1 += aux8[is_pair * 32 + 16 + l] as i32 * q8k.qs[is_pair * 32 + 16 + l] as i32;
-            }
-            // Sanity: SIMD dot equals scalar split total (regression guard).
-            debug_assert_eq!(dot_lo, d0 + d1);
-            total += scales[2 * is_pair] as i8 as i32 * d0;
-            total += scales[2 * is_pair + 1] as i8 as i32 * d1;
+        for is in 0..16 {
+            let a_ptr = aux8.as_ptr().add(is * 16);
+            let q8_ptr = q8k.qs.as_ptr().add(is * 16);
+            let acc0 = _mm256_setzero_si256();
+            let acc = dot_16_i8_widened(acc0, a_ptr, q8_ptr);
+            let sub_dot = hsum_i32_avx2(acc);
+            total += scales[is] as i8 as i32 * sub_dot;
         }
 
         d * q8k.d * total as f32
