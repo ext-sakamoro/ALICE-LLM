@@ -1500,6 +1500,110 @@ mod avx2_dot {
 
         d * q8k.d * total as f32
     }
+
+    /// AVX2 dot of 32 unsigned u8 values × 32 signed i8 values.
+    ///
+    /// Sign-extends both operands to i16 first (u8 has a natural 0-padded
+    /// promotion, so `_mm256_cvtepu8_epi16` is safe) and uses
+    /// `_mm256_madd_epi16` to accumulate into i32 without saturation.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_32_u8_i8_widened(acc: __m256i, u: __m256i, x: *const i8) -> __m256i {
+        let xv = _mm256_loadu_si256(x.cast());
+        // Split each 32-lane u8 vector into two 128-bit halves, then
+        // zero-extend to 16 x i16 per half so subsequent multiplies stay
+        // in i16-safe range and the following `madd_epi16` produces
+        // saturation-free i32 sums.
+        let u_lo128 = _mm256_castsi256_si128(u);
+        let u_hi128 = _mm256_extracti128_si256(u, 1);
+        let x_lo128 = _mm256_castsi256_si128(xv);
+        let x_hi128 = _mm256_extracti128_si256(xv, 1);
+        let u_lo = _mm256_cvtepu8_epi16(u_lo128);
+        let u_hi = _mm256_cvtepu8_epi16(u_hi128);
+        let x_lo = _mm256_cvtepi8_epi16(x_lo128);
+        let x_hi = _mm256_cvtepi8_epi16(x_hi128);
+        let sum_lo = _mm256_madd_epi16(u_lo, x_lo);
+        let sum_hi = _mm256_madd_epi16(u_hi, x_hi);
+        _mm256_add_epi32(acc, _mm256_add_epi32(sum_lo, sum_hi))
+    }
+
+    /// Q5_K × Q8_K dot product using AVX2.
+    ///
+    /// Q5_K packs each 5-bit value as `(qs nibble) | (qh bit << 4)` so the
+    /// per-element range is `[0, 31]` — still unsigned, so no sign trick
+    /// is needed. Four groups (`im=0..4`), each processing 64 elements:
+    /// low nibbles + qh bit `2*im` fill even sub-block, high nibbles +
+    /// qh bit `2*im+1` fill odd sub-block. The single 32-byte qh load is
+    /// reused across all four `im` iterations by shifting/masking to
+    /// isolate the target bit.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn q5k_q8k_dot(q5k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        let d = f16_to_f32(u16::from_le_bytes([q5k_block[0], q5k_block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q5k_block[2], q5k_block[3]]));
+        let scales_raw = &q5k_block[4..16];
+        let qh = &q5k_block[16..48];
+        let qs = &q5k_block[48..176];
+
+        // 32-byte qh loaded once and reused across all four `im` iterations —
+        // each iteration selects a different bit position via `srli_epi16`
+        // + `and` (the u16-lane shift is safe because the AND with 0x01
+        // masks off any bits that leaked from the neighbouring byte).
+        let qh_v = _mm256_loadu_si256(qh.as_ptr().cast());
+        let mask_lo4 = _mm256_set1_epi8(0x0F);
+        let mask_bit0 = _mm256_set1_epi8(1);
+
+        let mut sumf = 0.0f32;
+        for im in 0..4u8 {
+            let (sc1, m1) = get_scale_min_k4((im as usize) * 2, scales_raw);
+            let (sc2, m2) = get_scale_min_k4((im as usize) * 2 + 1, scales_raw);
+
+            // 32 packed qs bytes = 64 nibbles for this `im` group.
+            let qs_group = _mm256_loadu_si256(qs.as_ptr().add((im as usize) * 32).cast());
+            let lo_nibbles = _mm256_and_si256(qs_group, mask_lo4);
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(qs_group, 4), mask_lo4);
+
+            // Runtime-variable shifts (`_mm256_srli_epi16` requires a
+            // compile-time immediate, so we use the sibling `_srl_` form
+            // which takes a `__m128i` shift amount whose low 64 bits
+            // control every lane).
+            let shift_even = _mm_cvtsi32_si128(i32::from(im) * 2);
+            let shift_odd = _mm_cvtsi32_si128(i32::from(im) * 2 + 1);
+
+            // Even sub-block: qh bit `2*im` broadcasted into the top nibble.
+            let hbits_even = _mm256_and_si256(_mm256_srl_epi16(qh_v, shift_even), mask_bit0);
+            let hbits_even_hi = _mm256_slli_epi16(hbits_even, 4);
+            let q_even = _mm256_or_si256(lo_nibbles, hbits_even_hi);
+
+            // Odd sub-block: qh bit `2*im + 1`.
+            let hbits_odd = _mm256_and_si256(_mm256_srl_epi16(qh_v, shift_odd), mask_bit0);
+            let hbits_odd_hi = _mm256_slli_epi16(hbits_odd, 4);
+            let q_odd = _mm256_or_si256(hi_nibbles, hbits_odd_hi);
+
+            // Dot products against 64 q8 activations (32 for each sub-block).
+            let q8_ptr_a = q8k.qs.as_ptr().add((im as usize) * 64);
+            let acc_a = _mm256_setzero_si256();
+            let acc_a = dot_32_u8_i8_widened(acc_a, q_even, q8_ptr_a);
+            let dot_a = hsum_i32_avx2(acc_a);
+
+            let q8_ptr_b = q8k.qs.as_ptr().add((im as usize) * 64 + 32);
+            let acc_b = _mm256_setzero_si256();
+            let acc_b = dot_32_u8_i8_widened(acc_b, q_odd, q8_ptr_b);
+            let dot_b = hsum_i32_avx2(acc_b);
+
+            // The bias-correction `sum_i = Σ q8[i]` for each 32-element
+            // sub-block reuses the pre-computed `bsums[j]` (each covers
+            // 16 q8 values, so two consecutive entries make a 32-lane sum).
+            let sum1 =
+                q8k.bsums[(im as usize) * 4] as i32 + q8k.bsums[(im as usize) * 4 + 1] as i32;
+            let sum2 =
+                q8k.bsums[(im as usize) * 4 + 2] as i32 + q8k.bsums[(im as usize) * 4 + 3] as i32;
+
+            sumf += d * sc1 as f32 * dot_a as f32 - dmin * m1 as f32 * sum1 as f32;
+            sumf += d * sc2 as f32 * dot_b as f32 - dmin * m2 as f32 * sum2 as f32;
+        }
+        sumf * q8k.d
+    }
 }
 
 // ─── x86_64 AVX-512 SIMD dot products (Issue #13) ───────────────────────────
@@ -1713,6 +1817,129 @@ mod avx512_dot {
 
         d * q8k.d * total as f32
     }
+
+    /// Q5_K × Q8_K dot product using AVX-512BW.
+    ///
+    /// Reuses the AVX2 Q5_K algorithm but doubles the lane count: each `im`
+    /// iteration handles all 64 elements in a single AVX-512 register.
+    /// The qh bit extraction moves to 64-lane shift+mask, and the dot is
+    /// computed via widened `i8 → i16 → i32` madd (saturation-safe).
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    pub(super) unsafe fn q5k_q8k_dot(q5k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        let d = f16_to_f32(u16::from_le_bytes([q5k_block[0], q5k_block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q5k_block[2], q5k_block[3]]));
+        let scales_raw = &q5k_block[4..16];
+        let qh = &q5k_block[16..48];
+        let qs = &q5k_block[48..176];
+
+        // qh: 32 bytes — fits in the low half of a 64-lane AVX-512 register.
+        // For AVX-512BW we need the same 32 bytes duplicated in both halves
+        // so the OR against `[low_nibbles | high_nibbles]` (also 64 lanes,
+        // built from a single 32-byte qs load) reaches the intended byte
+        // positions.
+        let qh256 = _mm256_loadu_si256(qh.as_ptr().cast());
+        let qh_v = _mm512_broadcast_i32x8(qh256);
+        let mask_lo4 = _mm512_set1_epi8(0x0F);
+        let mask_bit0 = _mm512_set1_epi8(1);
+
+        let mut sumf = 0.0f32;
+        for im in 0..4u8 {
+            let (sc1, m1) = get_scale_min_k4((im as usize) * 2, scales_raw);
+            let (sc2, m2) = get_scale_min_k4((im as usize) * 2 + 1, scales_raw);
+
+            // Load 32 packed qs bytes = 64 nibbles.
+            let qs256 = _mm256_loadu_si256(qs.as_ptr().add((im as usize) * 32).cast());
+            let qs_lo = _mm256_and_si256(qs256, _mm256_set1_epi8(0x0F));
+            let qs_hi = _mm256_and_si256(_mm256_srli_epi16(qs256, 4), _mm256_set1_epi8(0x0F));
+            // Concatenate low + high nibbles into a single 64-lane register.
+            let nibbles64 = _mm512_inserti64x4(_mm512_castsi256_si512(qs_lo), qs_hi, 1);
+
+            // Runtime-variable shifts via the `_srl_` sibling form
+            // (`_mm512_srli_epi16` requires a const-imm shift amount).
+            let shift_even = _mm_cvtsi32_si128(i32::from(im) * 2);
+            let shift_odd = _mm_cvtsi32_si128(i32::from(im) * 2 + 1);
+            let hbits = _mm512_and_si512(_mm512_srl_epi16(qh_v, shift_even), mask_bit0);
+            let hbits_odd = _mm512_and_si512(_mm512_srl_epi16(qh_v, shift_odd), mask_bit0);
+            // Assemble the 5th-bit mask so low-half bytes get the even bit
+            // and high-half bytes get the odd bit.
+            let hbits_pack = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm512_castsi512_si256(hbits)),
+                _mm512_castsi512_si256(hbits_odd),
+                1,
+            );
+            let hbits_hi = _mm512_slli_epi16(hbits_pack, 4);
+            let q_all = _mm512_or_si512(nibbles64, hbits_hi);
+
+            // Dot with 64 q8 activations via widened i16 accumulation, then
+            // split the running sum by pulling the low/high 32 lanes apart
+            // and hsumming each independently so scales[2*im] and
+            // scales[2*im+1] can weight their own sub-blocks.
+            let q_lo = _mm512_castsi512_si256(q_all);
+            let q_hi = _mm512_extracti64x4_epi64(q_all, 1);
+            let q8_ptr_a = q8k.qs.as_ptr().add((im as usize) * 64);
+            let q8_ptr_b = q8k.qs.as_ptr().add((im as usize) * 64 + 32);
+
+            let dot_a = {
+                let acc0 = _mm256_setzero_si256();
+                let acc = super::avx2_dot_bridge_u8_i8(acc0, q_lo, q8_ptr_a);
+                super::avx2_hsum_i32_bridge(acc)
+            };
+            let dot_b = {
+                let acc0 = _mm256_setzero_si256();
+                let acc = super::avx2_dot_bridge_u8_i8(acc0, q_hi, q8_ptr_b);
+                super::avx2_hsum_i32_bridge(acc)
+            };
+
+            let sum1 =
+                q8k.bsums[(im as usize) * 4] as i32 + q8k.bsums[(im as usize) * 4 + 1] as i32;
+            let sum2 =
+                q8k.bsums[(im as usize) * 4 + 2] as i32 + q8k.bsums[(im as usize) * 4 + 3] as i32;
+
+            sumf += d * sc1 as f32 * dot_a as f32 - dmin * m1 as f32 * sum1 as f32;
+            sumf += d * sc2 as f32 * dot_b as f32 - dmin * m2 as f32 * sum2 as f32;
+        }
+        sumf * q8k.d
+    }
+}
+
+// ─── AVX2 helpers used by AVX-512 kernels (bridge) ──────────────────────────
+//
+// AVX-512BW machines by definition also have AVX2 (VEX-encoded AVX-512
+// implies AVX2). The Q5_K AVX-512 kernel calls these AVX2 helpers to reuse
+// the widened i16 dot without duplicating the intrinsics dance in both
+// modules.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_dot_bridge_u8_i8(
+    acc: std::arch::x86_64::__m256i,
+    u: std::arch::x86_64::__m256i,
+    x: *const i8,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let xv = _mm256_loadu_si256(x.cast());
+    let u_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(u));
+    let u_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(u, 1));
+    let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(xv));
+    let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(xv, 1));
+    let sum_lo = _mm256_madd_epi16(u_lo, x_lo);
+    let sum_hi = _mm256_madd_epi16(u_hi, x_hi);
+    _mm256_add_epi32(acc, _mm256_add_epi32(sum_lo, sum_hi))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_hsum_i32_bridge(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    let sum128 = _mm_add_epi32(lo, hi);
+    let sh = _mm_shuffle_epi32(sum128, 0b1110);
+    let sum64 = _mm_add_epi32(sum128, sh);
+    let sh2 = _mm_shufflelo_epi16(sum64, 0b1110);
+    let sum32 = _mm_add_epi32(sum64, sh2);
+    _mm_cvtsi128_si32(sum32)
 }
 
 // ─── Runtime CPU feature cache (Issue #13) ──────────────────────────────────
@@ -2026,8 +2253,27 @@ fn q2k_q8k_dot(q2k_block: &[u8], q8k: &BlockQ8K) -> f32 {
 }
 
 /// Q5_K × Q8_K dot product.
+///
+/// Runtime-dispatched: AVX-512BW → AVX2 → scalar fallback on x86_64.
+/// See `q4k_q8k_dot` for the design rationale.
 #[inline]
 fn q5k_q8k_dot(q5k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: intrinsics gated on cached runtime CPU detection.
+        if x86_avx512bw_supported() {
+            return unsafe { avx512_dot::q5k_q8k_dot(q5k_block, q8k) };
+        }
+        if x86_avx2_supported() {
+            return unsafe { avx2_dot::q5k_q8k_dot(q5k_block, q8k) };
+        }
+    }
+    q5k_q8k_dot_fallback_scalar(q5k_block, q8k)
+}
+
+/// Q5_K × Q8_K scalar fallback body.
+#[inline]
+fn q5k_q8k_dot_fallback_scalar(q5k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let d = f16_to_f32(u16::from_le_bytes([q5k_block[0], q5k_block[1]]));
     let dmin = f16_to_f32(u16::from_le_bytes([q5k_block[2], q5k_block[3]]));
     let scales_raw = &q5k_block[4..16];
@@ -4941,5 +5187,71 @@ mod tests {
         let first_512 = x86_avx512bw_supported();
         let second_512 = x86_avx512bw_supported();
         assert_eq!(first_512, second_512);
+    }
+
+    /// Build a deterministic Q5_K block (176 bytes) so the qh + qs
+    /// combined 5-bit path is exercised on both scalar and SIMD paths.
+    #[cfg(target_arch = "x86_64")]
+    fn make_q5k_block(seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 176];
+        // d, dmin: small non-zero f16.
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes()); // f16(0.5)
+        block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // f16(0.25)
+                                                               // 12-byte scales/mins packed header.
+        for i in 0..12 {
+            block[4 + i] = seed.wrapping_add(i as u8);
+        }
+        // qh: 32 bytes — 5th bit per element, varied so every im iteration
+        // touches a different bit-position pattern.
+        for i in 0..32 {
+            block[16 + i] = seed.wrapping_mul(7).wrapping_add(i as u8);
+        }
+        // qs: 128 packed nibble bytes.
+        for i in 0..128 {
+            block[48 + i] = seed.wrapping_mul(3).wrapping_add(i as u8);
+        }
+        block
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5k_avx2_matches_scalar_bit_exact() {
+        if !x86_avx2_supported() {
+            eprintln!("SKIP: AVX2 unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q5k = make_q5k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(17));
+            let scalar = q5k_q8k_dot_fallback_scalar(&q5k, &q8k);
+            // SAFETY: guarded by AVX2 detection.
+            let simd = unsafe { avx2_dot::q5k_q8k_dot(&q5k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5k_avx512_matches_scalar_bit_exact() {
+        if !x86_avx512bw_supported() {
+            eprintln!("SKIP: AVX-512BW unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q5k = make_q5k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(17));
+            let scalar = q5k_q8k_dot_fallback_scalar(&q5k, &q8k);
+            // SAFETY: guarded by AVX-512BW detection.
+            let simd = unsafe { avx512_dot::q5k_q8k_dot(&q5k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
     }
 }
