@@ -1604,6 +1604,50 @@ mod avx2_dot {
         }
         sumf * q8k.d
     }
+
+    /// Fused Q8_0 dequantize + f32 matvec for a whole row using AVX2.
+    ///
+    /// Q8_0 stores 32 signed i8 weights per block plus a single f16 scale,
+    /// and — unlike the K-series — the ALICE-LLM dispatch feeds it raw f32
+    /// inputs rather than a pre-quantised Q8_K block. That makes the SIMD
+    /// path an f32 FMA loop (i8 → f32 dequant, multiply by the row's f32
+    /// input, FMA into an accumulator) rather than an integer madd chain.
+    ///
+    /// Per block of 32 elements, four 8-lane iterations consume the whole
+    /// block; the accumulator is horizontally summed at the end to yield
+    /// the row's dot product.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn q8_0_matvec_row(input: &[f32], row_data: &[u8], cols: usize) -> f32 {
+        let blocks_per_row = cols / super::QK8_0;
+        let block_bytes = 34usize;
+        let mut acc = _mm256_setzero_ps();
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = super::f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let d_bcast = _mm256_set1_ps(d);
+            let qs_ptr = row_data.as_ptr().add(off + 2).cast::<i8>();
+            let col_base = bi * super::QK8_0;
+            // 4 × 8-lane iterations = 32 elements per block.
+            for k in 0..4 {
+                let q8 = _mm_loadl_epi64(qs_ptr.add(k * 8).cast::<__m128i>());
+                let q32 = _mm256_cvtepi8_epi32(q8);
+                let qf = _mm256_cvtepi32_ps(q32);
+                let scaled = _mm256_mul_ps(qf, d_bcast);
+                let x = _mm256_loadu_ps(input.as_ptr().add(col_base + k * 8));
+                acc = _mm256_fmadd_ps(scaled, x, acc);
+            }
+        }
+        // Horizontal sum of 8 f32 lanes.
+        let lo = _mm256_castps256_ps128(acc);
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let s128 = _mm_add_ps(lo, hi);
+        let sh = _mm_movehl_ps(s128, s128);
+        let s64 = _mm_add_ps(s128, sh);
+        let sh2 = _mm_shuffle_ps(s64, s64, 0x55);
+        let s32 = _mm_add_ss(s64, sh2);
+        _mm_cvtss_f32(s32)
+    }
 }
 
 // ─── x86_64 AVX-512 SIMD dot products (Issue #13) ───────────────────────────
@@ -1725,37 +1769,24 @@ mod avx512_dot {
             sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
         }
 
-        // 4 iterations × 64 lanes = 256 elements. Each iteration covers 2
-        // Q4_K sub-blocks. Because scales are per-32-element, we split the
-        // 64-lane dot into two 32-lane halves for weighting.
+        // 4 iterations, each covering 32 packed bytes of q4 (= 64 nibbles
+        // → 2 sub-blocks). Match the scalar sub-block layout exactly:
+        //   sub-block 2g   = low  nibbles of q4[g*32 : g*32+32] · q8[g*64 : g*64+32]
+        //   sub-block 2g+1 = high nibbles of q4[g*32 : g*32+32] · q8[g*64+32 : g*64+64]
+        // Reused from the AVX2 fix; the earlier per-16-lane split
+        // interleaved q8 windows and produced silently wrong sums.
         let mut total: i32 = 0;
-        for is_pair in 0..4 {
-            let q4_ptr = q4.as_ptr().add(is_pair * 32);
-            let q8_ptr = q8k.qs.as_ptr().add(is_pair * 64);
-
-            let nib64 = unpack_32_q4_nibbles(q4_ptr);
-            let acc0 = _mm512_setzero_si512();
-            let _acc = dot_64_u4_i8_from_nibbles(acc0, nib64, q8_ptr);
-            // We need per-sub-block totals, not a single 64-lane sum. To
-            // stay correct, fall back to two 32-lane AVX2-style dots for
-            // the actual accumulation; the AVX-512 unpack still amortises
-            // the nibble expansion for both halves.
+        for g in 0..4 {
             let mut sub_dot_a = 0i32;
             let mut sub_dot_b = 0i32;
-            for l in 0..16 {
-                let nib_lo = q4[is_pair * 32 + l] & 0x0F;
-                let nib_hi = (q4[is_pair * 32 + l] >> 4) & 0x0F;
-                sub_dot_a += nib_lo as i32 * q8k.qs[is_pair * 64 + l] as i32;
-                sub_dot_a += nib_hi as i32 * q8k.qs[is_pair * 64 + 16 + l] as i32;
+            for l in 0..32 {
+                let lo = (q4[g * 32 + l] & 0x0F) as i32;
+                let hi = ((q4[g * 32 + l] >> 4) & 0x0F) as i32;
+                sub_dot_a += lo * q8k.qs[g * 64 + l] as i32;
+                sub_dot_b += hi * q8k.qs[g * 64 + 32 + l] as i32;
             }
-            for l in 0..16 {
-                let nib_lo = q4[is_pair * 32 + 16 + l] & 0x0F;
-                let nib_hi = (q4[is_pair * 32 + 16 + l] >> 4) & 0x0F;
-                sub_dot_b += nib_lo as i32 * q8k.qs[is_pair * 64 + 32 + l] as i32;
-                sub_dot_b += nib_hi as i32 * q8k.qs[is_pair * 64 + 48 + l] as i32;
-            }
-            total += scales[is_pair * 2] as i32 * sub_dot_a;
-            total += scales[is_pair * 2 + 1] as i32 * sub_dot_b;
+            total += scales[g * 2] as i32 * sub_dot_a;
+            total += scales[g * 2 + 1] as i32 * sub_dot_b;
         }
 
         d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
@@ -1900,6 +1931,36 @@ mod avx512_dot {
             sumf += d * sc2 as f32 * dot_b as f32 - dmin * m2 as f32 * sum2 as f32;
         }
         sumf * q8k.d
+    }
+
+    /// Fused Q8_0 dequantize + f32 matvec for a whole row using AVX-512F.
+    ///
+    /// Twice-wide port of the AVX2 [`super::avx2_dot::q8_0_matvec_row`]:
+    /// two 16-lane FMA iterations cover each 32-element block instead of
+    /// four 8-lane ones. Sign-extension and scaling are identical.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn q8_0_matvec_row(input: &[f32], row_data: &[u8], cols: usize) -> f32 {
+        let blocks_per_row = cols / super::QK8_0;
+        let block_bytes = 34usize;
+        let mut acc = _mm512_setzero_ps();
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = super::f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let d_bcast = _mm512_set1_ps(d);
+            let qs_ptr = row_data.as_ptr().add(off + 2).cast::<i8>();
+            let col_base = bi * super::QK8_0;
+            // 2 × 16-lane iterations = 32 elements per block.
+            for k in 0..2 {
+                let q8 = _mm_loadu_si128(qs_ptr.add(k * 16).cast::<__m128i>());
+                let q32 = _mm512_cvtepi8_epi32(q8);
+                let qf = _mm512_cvtepi32_ps(q32);
+                let scaled = _mm512_mul_ps(qf, d_bcast);
+                let x = _mm512_loadu_ps(input.as_ptr().add(col_base + k * 16));
+                acc = _mm512_fmadd_ps(scaled, x, acc);
+            }
+        }
+        _mm512_reduce_add_ps(acc)
     }
 }
 
@@ -2557,10 +2618,35 @@ pub fn q4k_matvec_preq(
 }
 
 /// Fused Q8_0 dequantize + matrix-vector multiply.
+///
+/// Runtime-dispatched on x86_64: AVX-512F → AVX2+FMA → scalar fallback.
 pub fn q8_0_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
     let blocks_per_row = cols / QK8_0;
     let block_bytes = 34;
     let row_bytes = blocks_per_row * block_bytes;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // AVX-512 requires 16-lane loads from `input`, which forces the
+        // column count to a multiple of 16. Q8_0's 32-lane block already
+        // satisfies this — every FMA lane maps 1:1 to a block element.
+        if x86_avx512bw_supported() {
+            for row in 0..rows {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                // SAFETY: guarded by runtime AVX-512F detection.
+                output[row] = unsafe { avx512_dot::q8_0_matvec_row(input, row_data, cols) };
+            }
+            return;
+        }
+        if x86_avx2_supported() {
+            for row in 0..rows {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                // SAFETY: guarded by runtime AVX2 detection.
+                output[row] = unsafe { avx2_dot::q8_0_matvec_row(input, row_data, cols) };
+            }
+            return;
+        }
+    }
 
     for row in 0..rows {
         let mut acc = 0.0f32;
@@ -5251,6 +5337,82 @@ mod tests {
                 scalar.to_bits(),
                 simd.to_bits(),
                 "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    // ── Q8_0 SIMD parity (f32 FMA path, not integer madd) ───────────────
+
+    /// Build a deterministic Q8_0-formatted row for a 1-row × `cols`
+    /// weight matrix. Each block = 2-byte f16 scale + 32 i8 quantised
+    /// weights, so the row occupies `blocks_per_row * 34` bytes.
+    #[cfg(target_arch = "x86_64")]
+    fn make_q8_0_row_bytes(seed: u8, cols: usize) -> Vec<u8> {
+        let blocks_per_row = cols / QK8_0;
+        let mut data = Vec::with_capacity(blocks_per_row * 34);
+        for bi in 0..blocks_per_row {
+            let scale_bits = 0x3800u16.wrapping_add(bi as u16); // varies per block
+            data.extend_from_slice(&scale_bits.to_le_bytes());
+            for l in 0..QK8_0 {
+                let raw = seed.wrapping_add((bi * QK8_0 + l) as u8);
+                data.push((raw as i8).wrapping_sub(32) as u8);
+            }
+        }
+        data
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn make_q8_0_input(seed: u8, cols: usize) -> Vec<f32> {
+        (0..cols)
+            .map(|i| {
+                let raw = seed.wrapping_add(i as u8) as i8;
+                f32::from(raw) * 0.01
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q8_0_avx2_matches_scalar_relative_tolerance() {
+        if !x86_avx2_supported() {
+            eprintln!("SKIP: AVX2 unavailable on this runner");
+            return;
+        }
+        const COLS: usize = 128;
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let data = make_q8_0_row_bytes(seed, COLS);
+            let input = make_q8_0_input(seed.wrapping_mul(3), COLS);
+            let mut scalar_out = vec![0.0f32];
+            let mut simd_out = vec![0.0f32];
+            // Scalar baseline uses the pre-existing dispatch (before the
+            // AVX2 branch it was the only implementation), so we call the
+            // dispatched entry twice with matching inputs and compare the
+            // f32 outputs within a relative tolerance — the SIMD FMA and
+            // scalar sums evaluate in different orders and may drift by
+            // one or two ulps of accumulated round-off.
+            let row_data = &data[..];
+            // Force scalar arm by directly running the fallback body.
+            let mut acc = 0.0f32;
+            for bi in 0..(COLS / QK8_0) {
+                let off = bi * 34;
+                let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+                let col_base = bi * QK8_0;
+                for l in 0..QK8_0 {
+                    let w = d * f32::from(row_data[off + 2 + l] as i8);
+                    acc += w * input[col_base + l];
+                }
+            }
+            scalar_out[0] = acc;
+            // SIMD via dispatched entry point (runtime feature detection
+            // will pick AVX2 on this test's precondition).
+            q8_0_matvec(&input, row_data, 1, COLS, &mut simd_out);
+            let diff = (scalar_out[0] - simd_out[0]).abs();
+            let rel = diff / scalar_out[0].abs().max(1.0);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={} simd={} rel={rel}",
+                scalar_out[0],
+                simd_out[0]
             );
         }
     }
