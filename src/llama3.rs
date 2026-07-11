@@ -1026,6 +1026,234 @@ impl KvCache {
     }
 }
 
+// ─── KV cache persistence (colibri `.coli_kv` 参考、Issue: warm restart) ────
+//
+// Binary file format (little-endian):
+//
+//   Magic:             "ALICEKV1" (8 bytes)
+//   Version:           u32
+//   Config fingerprint: u64 (hash of hidden_dim/num_layers/num_kv_heads/head_dim/kv_dim)
+//   num_layers:        u64
+//   max_seq_len:       u64
+//   kv_dim:            u64
+//   seq_len:           u64 (valid entries; may be 0..=max_seq_len)
+//   kv_layer_map:      num_layers × u32
+//   Data (per layer):
+//     if kv_layer_map[i] == i:
+//       keys:   seq_len × kv_dim × 4 bytes (f32 LE)
+//       values: seq_len × kv_dim × 4 bytes (f32 LE)
+//     else:
+//       skip — shared-KV layers redirect their reads to `map[i]`.
+//
+// The fingerprint hash rejects mismatched-model loads (loading a Llama-3 cache
+// into a Qwen 3 model would produce silent garbage otherwise).
+
+const KV_MAGIC: &[u8; 8] = b"ALICEKV1";
+const KV_FORMAT_VERSION: u32 = 1;
+
+/// Errors returned by [`Llama3Model::load_kv_cache`]. Distinguishes the
+/// three usual failure modes (I/O, corrupted file, config mismatch) so
+/// callers can decide whether to retry, log, or abort.
+#[derive(Debug)]
+pub enum KvCacheLoadError {
+    /// Underlying `std::io::Error` (open / read / EOF).
+    Io(std::io::Error),
+    /// File does not start with the ALICE-LLM KV magic bytes.
+    BadMagic { got: [u8; 8] },
+    /// File version is not supported by this build.
+    UnsupportedVersion { got: u32, expected: u32 },
+    /// The config fingerprint recorded in the file does not match the
+    /// current model. Loading anyway would produce garbage output.
+    FingerprintMismatch { got: u64, expected: u64 },
+    /// Cache metadata (num_layers / kv_dim / max_seq_len) disagrees with
+    /// the current model.
+    ShapeMismatch(String),
+    /// `seq_len` in the file exceeds `max_seq_len`.
+    OverflowSeqLen { got: u64, max: usize },
+}
+
+impl std::fmt::Display for KvCacheLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "kv cache load: {e}"),
+            Self::BadMagic { got } => {
+                write!(f, "kv cache load: expected magic {KV_MAGIC:?}, got {got:?}")
+            }
+            Self::UnsupportedVersion { got, expected } => write!(
+                f,
+                "kv cache load: unsupported version {got} (expected {expected})"
+            ),
+            Self::FingerprintMismatch { got, expected } => write!(
+                f,
+                "kv cache load: model config fingerprint mismatch (got {got:#x}, expected {expected:#x})"
+            ),
+            Self::ShapeMismatch(msg) => write!(f, "kv cache load: shape mismatch — {msg}"),
+            Self::OverflowSeqLen { got, max } => write!(
+                f,
+                "kv cache load: seq_len {got} exceeds max_seq_len {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KvCacheLoadError {}
+
+impl From<std::io::Error> for KvCacheLoadError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Compact fingerprint of the shape-critical config fields — anything that
+/// affects the KV cache layout. Uses `std::hash::DefaultHasher` for a
+/// dependency-free stable hash. The fingerprint is written into the KV
+/// file header and checked on load; a mismatch aborts loading.
+fn kv_cache_fingerprint(config: &Llama3Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Only fields that change the KV cache layout. If two models agree on
+    // these, the KV bytes are interchangeable byte-for-byte.
+    (config.num_layers as u64).hash(&mut hasher);
+    (config.num_kv_heads as u64).hash(&mut hasher);
+    (config.head_dim as u64).hash(&mut hasher);
+    (config.hidden_dim as u64).hash(&mut hasher);
+    (config.max_seq_len as u64).hash(&mut hasher);
+    // Arch flavour affects the KV write pattern (Gemma 3n shared-KV / Gemma
+    // 4 SWA half head_dim), so bake it in.
+    format!("{:?}", config.arch).hash(&mut hasher);
+    hasher.finish()
+}
+
+impl KvCache {
+    /// Serialise the cache to `writer`. Fingerprint is provided by the
+    /// caller so `Llama3Model::save_kv_cache` can inject the current
+    /// config's hash without exposing `KvCache` externally.
+    fn write_to(&self, writer: &mut impl std::io::Write, fingerprint: u64) -> std::io::Result<()> {
+        writer.write_all(KV_MAGIC)?;
+        writer.write_all(&KV_FORMAT_VERSION.to_le_bytes())?;
+        writer.write_all(&fingerprint.to_le_bytes())?;
+        writer.write_all(&(self._num_layers as u64).to_le_bytes())?;
+        writer.write_all(&(self.max_seq_len as u64).to_le_bytes())?;
+        writer.write_all(&(self.kv_dim as u64).to_le_bytes())?;
+        writer.write_all(&(self.seq_len as u64).to_le_bytes())?;
+        // Layer map (u32 each so Gemma 3n's up to num_layers ≪ 2^32 fits).
+        for &src in &self.kv_layer_map {
+            writer.write_all(&(src as u32).to_le_bytes())?;
+        }
+        // Per-layer data. Skip shared-KV layers so the file mirrors what
+        // the forward pass actually needs to reconstruct on load.
+        let n = self.seq_len * self.kv_dim;
+        for layer in 0..self._num_layers {
+            if self.kv_layer_map[layer] != layer {
+                continue;
+            }
+            let off = self.offset(layer, 0);
+            let keys_bytes = f32_slice_as_bytes(&self.keys[off..off + n]);
+            let values_bytes = f32_slice_as_bytes(&self.values[off..off + n]);
+            writer.write_all(keys_bytes)?;
+            writer.write_all(values_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reset this cache in place from `reader`. `expected_fingerprint` is
+    /// the caller's current model fingerprint; if the file's stored
+    /// fingerprint disagrees the load is refused.
+    fn read_from(
+        &mut self,
+        reader: &mut impl std::io::Read,
+        expected_fingerprint: u64,
+    ) -> Result<(), KvCacheLoadError> {
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != KV_MAGIC {
+            return Err(KvCacheLoadError::BadMagic { got: magic });
+        }
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != KV_FORMAT_VERSION {
+            return Err(KvCacheLoadError::UnsupportedVersion {
+                got: version,
+                expected: KV_FORMAT_VERSION,
+            });
+        }
+        reader.read_exact(&mut buf8)?;
+        let file_fingerprint = u64::from_le_bytes(buf8);
+        if file_fingerprint != expected_fingerprint {
+            return Err(KvCacheLoadError::FingerprintMismatch {
+                got: file_fingerprint,
+                expected: expected_fingerprint,
+            });
+        }
+        reader.read_exact(&mut buf8)?;
+        let num_layers = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let max_seq_len = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let kv_dim = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let seq_len = u64::from_le_bytes(buf8);
+
+        if num_layers != self._num_layers
+            || max_seq_len != self.max_seq_len
+            || kv_dim != self.kv_dim
+        {
+            return Err(KvCacheLoadError::ShapeMismatch(format!(
+                "file num_layers/max_seq_len/kv_dim = {num_layers}/{max_seq_len}/{kv_dim}, \
+                 model = {}/{}/{}",
+                self._num_layers, self.max_seq_len, self.kv_dim
+            )));
+        }
+        if (seq_len as usize) > max_seq_len {
+            return Err(KvCacheLoadError::OverflowSeqLen {
+                got: seq_len,
+                max: max_seq_len,
+            });
+        }
+        let seq_len = seq_len as usize;
+
+        // Layer map.
+        let mut layer_map = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            reader.read_exact(&mut buf4)?;
+            layer_map.push(u32::from_le_bytes(buf4) as usize);
+        }
+        self.kv_layer_map = layer_map;
+
+        // Data. Same skip-shared-layers pattern as `write_to`.
+        let n = seq_len * kv_dim;
+        for layer in 0..num_layers {
+            if self.kv_layer_map[layer] != layer {
+                continue;
+            }
+            let off = self.offset(layer, 0);
+            let keys_bytes = f32_slice_as_bytes_mut(&mut self.keys[off..off + n]);
+            reader.read_exact(keys_bytes)?;
+            let values_bytes = f32_slice_as_bytes_mut(&mut self.values[off..off + n]);
+            reader.read_exact(values_bytes)?;
+        }
+        self.seq_len = seq_len;
+        Ok(())
+    }
+}
+
+/// Reinterpret an `&[f32]` as an `&[u8]` for I/O. Endianness of the caller
+/// is baked into the file — the format is defined as little-endian, so on
+/// LE hosts (all Rust targets we care about) this cast is exact. Big-endian
+/// support would need per-element byte swap and is left as future work.
+fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
+    // SAFETY: `f32` is `Copy` + has no drop; `[f32]` and `[u8]` have the
+    // same lifetime and provenance. The byte length is `s.len() * 4`.
+    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
+}
+
+fn f32_slice_as_bytes_mut(s: &mut [f32]) -> &mut [u8] {
+    // SAFETY: same as `f32_slice_as_bytes`, plus we hold `&mut`.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
+}
+
 // ─── Paged KV Cache ─────────────────────────────────────────────────────────
 
 const PAGE_SIZE: usize = 16;
@@ -2495,6 +2723,54 @@ impl<'a> Llama3Model<'a> {
             deltanet_conv_state,
             deltanet_conv_ring_pos,
         })
+    }
+
+    /// Serialise the current KV cache to `path` (colibri-style warm restart).
+    ///
+    /// Writes an `ALICEKV1` header + config fingerprint + per-layer
+    /// K/V bytes so a later session can resume with zero re-prefill. Only the
+    /// `seq_len` prefix that was actually written is persisted; unused capacity
+    /// is skipped. Shared-KV layers (Gemma 3n) are also skipped in the file to
+    /// keep the payload small.
+    ///
+    /// The fingerprint is computed from shape-critical config fields
+    /// ([`Llama3Config::num_layers`], `num_kv_heads`, `head_dim`, `hidden_dim`,
+    /// `max_seq_len`, and the arch flavour). Loading into a model with a
+    /// different fingerprint is refused by [`Llama3Model::load_kv_cache`].
+    pub fn save_kv_cache(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let fingerprint = kv_cache_fingerprint(&self.config);
+        self.kv_cache.write_to(&mut writer, fingerprint)?;
+        use std::io::Write;
+        writer.flush()
+    }
+
+    /// Restore the KV cache previously written by [`Self::save_kv_cache`].
+    ///
+    /// Refuses to load if the file's config fingerprint does not match the
+    /// current model — this catches "loading a Llama-3 cache into a Qwen 3
+    /// model" scenarios which would otherwise produce silent garbage.
+    /// Returns [`KvCacheLoadError::FingerprintMismatch`] in that case.
+    ///
+    /// On success the model's KV cache is byte-identical to the moment
+    /// `save_kv_cache` was called, and `forward()` can continue from
+    /// `seq_len()` without re-prefilling the prompt.
+    pub fn load_kv_cache(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), KvCacheLoadError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let fingerprint = kv_cache_fingerprint(&self.config);
+        self.kv_cache.read_from(&mut reader, fingerprint)?;
+        Ok(())
+    }
+
+    /// Current cached token position (0-based). Callable after
+    /// [`Self::load_kv_cache`] to inspect where generation would resume.
+    pub fn kv_cache_seq_len(&self) -> usize {
+        self.kv_cache.seq_len()
     }
 
     /// Gemma 3n: dequantize the per-layer input embedding slice for a single
@@ -7986,5 +8262,131 @@ mod tests {
         assert_eq!(c.rope_theta_swa(), Some(10_000.0));
         assert_eq!(c.rope_dim_swa(), Some(64));
         assert_eq!(c.ffn_size_per_layer(), Some(&[6144usize, 12_288][..]));
+    }
+
+    // ── KV cache persistence (colibri `.coli_kv` 参考) ────────────────
+
+    /// Populate a `KvCache` deterministically from `seed` so both save/load
+    /// and mismatch tests can produce reproducible content without needing
+    /// to run an actual forward pass.
+    fn make_populated_kv_cache(
+        num_layers: usize,
+        max_seq_len: usize,
+        kv_dim: usize,
+        active_seq_len: usize,
+        seed: u32,
+    ) -> KvCache {
+        let mut cache = KvCache::new(num_layers, max_seq_len, kv_dim);
+        for pos in 0..active_seq_len {
+            for layer in 0..num_layers {
+                let k: Vec<f32> = (0..kv_dim)
+                    .map(|i| {
+                        f32::from(
+                            seed.wrapping_add(pos as u32 * 7 + layer as u32 * 3 + i as u32) as u16
+                                as i16,
+                        ) * 0.001
+                    })
+                    .collect();
+                let v: Vec<f32> = (0..kv_dim)
+                    .map(|i| {
+                        f32::from(
+                            seed.wrapping_add(pos as u32 * 11 + layer as u32 * 5 + i as u32) as u16
+                                as i16,
+                        ) * 0.001
+                    })
+                    .collect();
+                cache.append(layer, &k, &v);
+            }
+            cache.advance();
+        }
+        cache
+    }
+
+    #[test]
+    fn kv_cache_save_load_roundtrip_bit_exact() {
+        let num_layers = 4;
+        let max_seq_len = 16;
+        let kv_dim = 32;
+        let active_seq_len = 7;
+        let cache = make_populated_kv_cache(num_layers, max_seq_len, kv_dim, active_seq_len, 42);
+        let fingerprint = 0xDEAD_BEEF_CAFE_F00D_u64;
+
+        // Serialise to a `Vec<u8>` (skips filesystem for a hermetic test).
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, fingerprint).expect("write ok");
+
+        // Deserialise into a fresh cache of matching shape.
+        let mut restored = KvCache::new(num_layers, max_seq_len, kv_dim);
+        restored
+            .read_from(&mut bytes.as_slice(), fingerprint)
+            .expect("read ok");
+
+        assert_eq!(cache.seq_len, restored.seq_len);
+        assert_eq!(cache.kv_layer_map, restored.kv_layer_map);
+        // Only the active prefix is persisted; the tail past `active_seq_len`
+        // stays zero in `restored`, so comparing the full buffer would fail
+        // on the tail. Compare only the persisted region.
+        for layer in 0..num_layers {
+            let n = active_seq_len * kv_dim;
+            let off = cache.offset(layer, 0);
+            assert_eq!(&cache.keys[off..off + n], &restored.keys[off..off + n]);
+            assert_eq!(&cache.values[off..off + n], &restored.values[off..off + n]);
+        }
+    }
+
+    #[test]
+    fn kv_cache_load_rejects_bad_magic() {
+        let mut restored = KvCache::new(4, 16, 32);
+        let mut buf: Vec<u8> = b"NOTMAGIC".to_vec();
+        buf.extend_from_slice(&[0u8; 64]);
+        let err = restored
+            .read_from(&mut buf.as_slice(), 0)
+            .expect_err("bad magic must fail");
+        assert!(
+            matches!(err, KvCacheLoadError::BadMagic { .. }),
+            "expected BadMagic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kv_cache_load_rejects_fingerprint_mismatch() {
+        let cache = make_populated_kv_cache(2, 8, 16, 3, 7);
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, 0x1111).expect("write ok");
+        let mut restored = KvCache::new(2, 8, 16);
+        let err = restored
+            .read_from(&mut bytes.as_slice(), 0x2222)
+            .expect_err("fingerprint mismatch must fail");
+        assert!(
+            matches!(err, KvCacheLoadError::FingerprintMismatch { .. }),
+            "expected FingerprintMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kv_cache_load_rejects_shape_mismatch() {
+        let cache = make_populated_kv_cache(4, 16, 32, 3, 7);
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, 0x1234).expect("write ok");
+        // Cache with a different num_layers must reject the load.
+        let mut restored = KvCache::new(8, 16, 32);
+        let err = restored
+            .read_from(&mut bytes.as_slice(), 0x1234)
+            .expect_err("shape mismatch must fail");
+        assert!(
+            matches!(err, KvCacheLoadError::ShapeMismatch(_)),
+            "expected ShapeMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kv_cache_fingerprint_is_deterministic_and_config_sensitive() {
+        let base = Llama3Config::llama3_8b();
+        let mut variant = Llama3Config::llama3_8b();
+        variant.num_layers += 1;
+        // Same config → same fingerprint (order-independent).
+        assert_eq!(kv_cache_fingerprint(&base), kv_cache_fingerprint(&base));
+        // A single shape-critical field change must move the fingerprint.
+        assert_ne!(kv_cache_fingerprint(&base), kv_cache_fingerprint(&variant));
     }
 }
