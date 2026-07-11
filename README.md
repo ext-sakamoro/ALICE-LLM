@@ -2,11 +2,13 @@
 
 **English** | [日本語](README_JP.md)
 
-Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 156 tests.
+Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 246 tests.
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
 **CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro.**
+
+**x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary all get AVX2 and AVX-512BW/F kernels with runtime dispatch, matching the existing NEON parity on Apple Silicon.**
 
 ## Quick Start
 
@@ -34,17 +36,20 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **GGUF v3 parser** — zero-copy mmap weight loading
 - **Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32** quantization (all GGML K-quant types)
 - **llama.cpp-compatible** — Q2_K–Q6_K×Q8_K integer dot product (matches `ggml_vec_dot_q*_K_q8_K`, ±0.03 logits)
-- **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), auto-detected
+- **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), **Qwen 2 / 2.5 (QKV bias), Qwen 3 (per-head QK RMSNorm), Qwen 3.5 hybrid (DeltaNet linear attention + full attention), Gemma 3n (Laurel / AltUp / per-layer embedding), Gemma 4 (SWA half head_dim), MoE (Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B)** — all auto-detected
+- **DeltaNet CPU forward** — Qwen 3.5 Gated Linear Attention (causal conv1d + gated delta rule + recurrent state), matches the WGSL GPU shader bit-for-bit
 - **Tied embeddings** — Llama-3.2-1B/3B output projection via quantized `token_embd.weight` (Q6_K matvec)
-- **BPE tokenizer** — GPT-2 byte encoding from GGUF metadata
+- **BPE tokenizer** — GPT-2 byte encoding from GGUF metadata, named constants for GGUF `token_type` and SentencePiece byte-fallback
 - **Contiguous + Paged KV cache** — flat buffer with rollback, or 16-tok/page on-demand allocation
 - **Continuous batching** — round-robin scheduler, per-request PagedKvCache
 - **Speculative decoding** — layer-skip draft + dual-model (1B→8B) + probabilistic sampling (Leviathan et al.)
 - **RoPE frequency scaling** — NTK-aware context extension via `rope_freqs.weight` tensor (Llama-3.1/3.2)
 - **LLVM auto-vectorization** — `target-cpu=native` generates ARM SDOT instructions (37 sdot in Q4_K dot product)
+- **x86_64 SIMD (AVX2 + AVX-512BW/F)** — Q4_K / Q5_K / Q6_K / Q8_0 / Ternary dot products with runtime CPU-feature dispatch (`is_x86_feature_detected!` cached in `OnceLock`); AVX-512 uses `__mmask16` for the Ternary bitmask path
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
-- **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K/Q6_K dequant-fused matvec, fused SwiGLU, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction
+- **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K/Q6_K dequant-fused matvec, fused SwiGLU, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction, **DeltaNet SSM path (alpha / beta / conv1d / gated delta rule) for Qwen 3.5 hybrid**
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
+- **God-object–free config** — `Llama3Config` (38 → 16 fields) and `LayerWeights` (33 → 17 fields) split into cohesive sub-structs (`AttentionExtrasConfig`, `SsmDeltaNetConfig`, `MoeConfig`, `Gemma3nConfig`, `Gemma4Config`, `QwenAttentionBiases`, `QwenAttentionNorms`, `Gemma3nLayerAugmentations`, `MoeExpertWeights`) with backward-compat accessor methods
 - **Flat cache-aligned `Matrix<T>`** — single contiguous `Vec<T>` row-major layout replaces `Vec<Vec<T>>`, `matmul_flat` uses FMA `mul_add` on a `j`-contiguous inner loop for cache-line coalescing
 - **Partial-sort sampling** — `top_k_filter` uses `select_nth_unstable_by` for O(N) K-th selection, keeps large vocabularies (100k+) affordable
 - **Optional SIMD (`--features simd`)** — `wide::f32x8` chunked dot product with FMA `mul_add` and scalar tail handling; ARM NEON and x86_64 AVX2 both routed through `wide`
