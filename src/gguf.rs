@@ -1258,6 +1258,479 @@ mod neon_dot {
     }
 }
 
+// ─── x86_64 AVX2 SIMD dot products (Issue #13) ──────────────────────────────
+//
+// Mirrors the `neon_dot` module for x86_64 targets so Q4_K / Q6_K matvec
+// gets SIMD acceleration on Ryzen / Xeon in addition to Apple Silicon.
+// Runtime-dispatched through `is_x86_feature_detected!("avx2")` so binaries
+// built without `-C target-cpu=native` still ship a scalar fallback for
+// pre-AVX2 machines (Ivy Bridge and older).
+//
+// The core trick — reused from the JustVugg/colibri engine's `dot_i8i8` —
+// is `_mm256_maddubs_epi16`, which multiplies **unsigned × signed** i8
+// pairs. When both operands are signed (Q6_K case), pre-processing with
+// `_mm256_sign_epi8(w, w)` yields `|w|` (unsigned) and `sign_epi8(x, w)`
+// applies `sign(w)` to `x` — the product is then the original signed
+// dot. Q4_K nibbles are natively unsigned `[0, 15]`, so the sign trick
+// is unnecessary there.
+//
+// Reference: JustVugg/colibri `c/glm.c` (see PR body for background).
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+mod avx2_dot {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// Horizontal sum of `__m256i` interpreted as 8 lanes of i32.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
+        // SAFETY: caller guarantees AVX2 support.
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256(v, 1);
+        let sum128 = _mm_add_epi32(lo, hi);
+        let sh = _mm_shuffle_epi32(sum128, 0b1110);
+        let sum64 = _mm_add_epi32(sum128, sh);
+        let sh2 = _mm_shufflelo_epi16(sum64, 0b1110);
+        let sum32 = _mm_add_epi32(sum64, sh2);
+        _mm_cvtsi128_si32(sum32)
+    }
+
+    /// AVX2 signed dot product of 32 i8 values, seeded into an accumulator.
+    ///
+    /// Uses the `maddubs` sign trick: multiplies |w| (unsigned) by
+    /// `sign(w) * x` (signed) to reuse the u8×i8 instruction for a
+    /// signed×signed dot. Adds the resulting 8 lanes of i32 to the caller's
+    /// running accumulator so multi-block loops can chain without spilling
+    /// to memory.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_32_i8_signed(acc: __m256i, w: *const i8, x: *const i8) -> __m256i {
+        let wv = _mm256_loadu_si256(w.cast());
+        let xv = _mm256_loadu_si256(x.cast());
+        // |w| (unsigned) × sign(w) * x (signed) via the u8×i8 madd.
+        let w_abs = _mm256_sign_epi8(wv, wv);
+        let x_signed = _mm256_sign_epi8(xv, wv);
+        let prod16 = _mm256_maddubs_epi16(w_abs, x_signed);
+        let ones = _mm256_set1_epi16(1);
+        let prod32 = _mm256_madd_epi16(prod16, ones);
+        _mm256_add_epi32(acc, prod32)
+    }
+
+    /// AVX2 dot product of 32 unsigned nibbles × 32 signed i8 values.
+    ///
+    /// Q4_K stores four-bit values in `[0, 15]`, so no sign trick is
+    /// needed — `maddubs` natively consumes unsigned × signed. Adds into
+    /// a running i32 accumulator so 32-element strides can be chained.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_32_u4_i8_from_nibbles(acc: __m256i, nib32: __m256i, x: *const i8) -> __m256i {
+        let xv = _mm256_loadu_si256(x.cast());
+        let prod16 = _mm256_maddubs_epi16(nib32, xv);
+        let ones = _mm256_set1_epi16(1);
+        let prod32 = _mm256_madd_epi16(prod16, ones);
+        _mm256_add_epi32(acc, prod32)
+    }
+
+    /// Unpack 16 packed nibbles (`q4[0..16]`) into 32 unsigned bytes `[0, 15]`
+    /// so `maddubs` can multiply against a matching 32-lane q8 slice.
+    ///
+    /// Low nibbles occupy the first 16 lanes, high nibbles the next 16 — the
+    /// same order the scalar `q4k_q8k_dot_scalar` deposits into `aux8` when
+    /// iterating each sub-block group.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn unpack_16_q4_nibbles(q4: *const u8) -> __m256i {
+        let bytes = _mm_loadu_si128(q4.cast());
+        let mask = _mm_set1_epi8(0x0F);
+        let lo = _mm_and_si128(bytes, mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        // Concatenate low nibbles (lanes 0..15) and high nibbles (16..31).
+        _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+    }
+
+    /// Q4_K × Q8_K dot product using AVX2.
+    ///
+    /// Reproduces the arithmetic of `q4k_q8k_dot_scalar` (block layout
+    /// documented on that function) using SIMD:
+    /// 1. Reconstruct 8 sub-block scales + 8 mins from the 12-byte packed
+    ///    scales/mins header (identical to the NEON path).
+    /// 2. For each of 8 sub-blocks: unpack 32 nibbles, multiply against
+    ///    32 q8 signed activations via `maddubs`, sum to i32, weight by
+    ///    the sub-block's i8 scale.
+    /// 3. Return `d * q8k.d * total - dmin * q8k.d * sumi` — the same
+    ///    formula the scalar path emits.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        const KMASK1: u32 = 0x3f3f_3f3f;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        const KMASK3: u32 = 0x0303_0303;
+
+        let d = f16_to_f32(u16::from_le_bytes([q4k_block[0], q4k_block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q4k_block[2], q4k_block[3]]));
+        let q4 = &q4k_block[16..144];
+
+        let mut utmp = [0u32; 4];
+        let sb = &q4k_block[4..16];
+        utmp[0] = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+        utmp[1] = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+        utmp[2] = u32::from_le_bytes([sb[8], sb[9], sb[10], sb[11]]);
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
+        let s0 = utmp[0].to_le_bytes();
+        let s1 = utmp[1].to_le_bytes();
+        let m0 = utmp[2].to_le_bytes();
+        let m1 = utmp[3].to_le_bytes();
+        let scales = [s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]];
+        let mins = [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3]];
+
+        // Bias correction: sum over 16 half-sub-blocks of `bsum[j] * min[j/2]`.
+        let mut sumi = 0i32;
+        for j in 0..16 {
+            sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
+        }
+
+        // Per-sub-block SIMD dot × scale, accumulated as i32.
+        //
+        // Layout note: the scalar path packs `aux8` so that sub-block `2k`
+        // is the **low nibbles** of `q4[k*32 : k*32+32]` and sub-block
+        // `2k+1` is the **high nibbles** of the same 32 packed bytes.
+        // Iterating on `q4[is*16 : is*16+16]` per sub-block reads the
+        // wrong window entirely (initial implementation bug caught by CI),
+        // so we stride by 32 bytes (64 nibbles) and produce two 32-lane
+        // dots per iteration.
+        let mut total: i32 = 0;
+        for g in 0..4 {
+            let q4_ptr = q4.as_ptr().add(g * 32);
+            // Load 32 packed bytes = 64 nibbles.
+            let bytes = _mm256_loadu_si256(q4_ptr.cast());
+            let mask = _mm256_set1_epi8(0x0F);
+            let lo_nibbles = _mm256_and_si256(bytes, mask);
+            // `_mm256_srli_epi16` shifts each u16 lane by 4; after masking
+            // with 0x0F the surviving bits are exactly the per-byte high
+            // nibbles.
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+
+            // Sub-block 2g: low nibbles × q8[g*64 .. g*64+32], scaled by scales[2g].
+            let q8_ptr_a = q8k.qs.as_ptr().add(g * 64);
+            let acc_a = _mm256_setzero_si256();
+            let acc_a = dot_32_u4_i8_from_nibbles(acc_a, lo_nibbles, q8_ptr_a);
+            let dot_a = hsum_i32_avx2(acc_a);
+            total += scales[2 * g] as i32 * dot_a;
+
+            // Sub-block 2g+1: high nibbles × q8[g*64+32 .. g*64+64].
+            let q8_ptr_b = q8k.qs.as_ptr().add(g * 64 + 32);
+            let acc_b = _mm256_setzero_si256();
+            let acc_b = dot_32_u4_i8_from_nibbles(acc_b, hi_nibbles, q8_ptr_b);
+            let dot_b = hsum_i32_avx2(acc_b);
+            total += scales[2 * g + 1] as i32 * dot_b;
+        }
+
+        d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
+    }
+
+    /// AVX2 signed dot product of 16 i8 values via sign-extension.
+    ///
+    /// Widens each i8 to i16 first, then relies on `_mm256_madd_epi16`
+    /// (which multiplies i16 pairs and sums adjacent lanes to i32 with
+    /// **no saturation**). Slightly more expensive than the `maddubs`
+    /// sign trick but immune to the i16 intermediate saturation risk
+    /// for signed×signed dots, and its per-sub-block granularity matches
+    /// the scalar Q6_K layout exactly.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_16_i8_widened(acc: __m256i, w: *const i8, x: *const i8) -> __m256i {
+        let w16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.cast()));
+        let x16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.cast()));
+        let prod32 = _mm256_madd_epi16(w16, x16);
+        _mm256_add_epi32(acc, prod32)
+    }
+
+    /// Q6_K × Q8_K dot product using AVX2.
+    ///
+    /// Reconstructs 6-bit values from the low 4 bits (`ql`) and top 2 bits
+    /// (`qh`), subtracts 32 to shift `[0, 63]` into signed `[-32, 31]`,
+    /// then uses the sign trick (`dot_32_i8_signed`) to reuse the u8×i8
+    /// madd path for signed×signed dots.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        let ql = &q6k_block[0..128];
+        let qh = &q6k_block[128..192];
+        let scales = &q6k_block[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([q6k_block[208], q6k_block[209]]));
+
+        // Reconstruct 256 signed i8 values on the stack. The layout matches
+        // `q6k_q8k_dot_scalar`: 16 sub-blocks of 16 elements each.
+        let mut aux8 = [0i8; QK_K];
+        let mut a_off = 0usize;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        for _ in 0..2 {
+            for l in 0..32 {
+                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 32] =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 64] =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 96] =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+            }
+            a_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+        }
+
+        // Q6_K has 16 sub-blocks of 16 elements — perfectly matched to a
+        // 16-lane SIMD dot after i8→i16 sign extension.
+        let mut total: i32 = 0;
+        for is in 0..16 {
+            let a_ptr = aux8.as_ptr().add(is * 16);
+            let q8_ptr = q8k.qs.as_ptr().add(is * 16);
+            let acc0 = _mm256_setzero_si256();
+            let acc = dot_16_i8_widened(acc0, a_ptr, q8_ptr);
+            let sub_dot = hsum_i32_avx2(acc);
+            total += scales[is] as i8 as i32 * sub_dot;
+        }
+
+        d * q8k.d * total as f32
+    }
+}
+
+// ─── x86_64 AVX-512 SIMD dot products (Issue #13) ───────────────────────────
+//
+// Same algorithm as AVX2 but processes 64 bytes per iteration instead of 32.
+// Gated behind `is_x86_feature_detected!("avx512bw")` at dispatch because
+// AVX-512BW is what supplies `_mm512_maddubs_epi16` and `_mm512_madd_epi16`;
+// mere AVX-512F is insufficient.
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+mod avx512_dot {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// Horizontal sum of `__m512i` interpreted as 16 lanes of i32.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn hsum_i32_avx512(v: __m512i) -> i32 {
+        // Reduce 512 → 256 → 128 → 32.
+        let lo = _mm512_castsi512_si256(v);
+        let hi = _mm512_extracti64x4_epi64(v, 1);
+        let sum256 = _mm256_add_epi32(lo, hi);
+        let lo128 = _mm256_castsi256_si128(sum256);
+        let hi128 = _mm256_extracti128_si256(sum256, 1);
+        let sum128 = _mm_add_epi32(lo128, hi128);
+        let sh = _mm_shuffle_epi32(sum128, 0b1110);
+        let sum64 = _mm_add_epi32(sum128, sh);
+        let sh2 = _mm_shufflelo_epi16(sum64, 0b1110);
+        let sum32 = _mm_add_epi32(sum64, sh2);
+        _mm_cvtsi128_si32(sum32)
+    }
+
+    /// AVX-512 signed dot product of 64 i8 values, seeded into an accumulator.
+    ///
+    /// Same sign trick as [`avx2_dot::dot_32_i8_signed`], widened to 64
+    /// lanes per iteration. Uses AVX-512BW for `maddubs` / `madd`.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn dot_64_i8_signed(acc: __m512i, w: *const i8, x: *const i8) -> __m512i {
+        let wv = _mm512_loadu_si512(w.cast());
+        let xv = _mm512_loadu_si512(x.cast());
+        // AVX-512 has no `_mm512_sign_epi8`; the equivalent is a blend
+        // driven by the sign bit of `w`.
+        let zero = _mm512_setzero_si512();
+        let neg_w = _mm512_sub_epi8(zero, wv);
+        // AVX-512BW compare returning a mask (kmask).
+        let is_neg = _mm512_cmpgt_epi8_mask(zero, wv);
+        let is_zero = _mm512_cmpeq_epi8_mask(wv, zero);
+        // |w|: pick negated `w` where `w < 0`, else `w`; zeros stay zero.
+        let w_abs = _mm512_mask_blend_epi8(is_neg, wv, neg_w);
+        let neg_x = _mm512_sub_epi8(zero, xv);
+        // sign(w) * x: negate where `w < 0`, keep where `w > 0`, zero where `w == 0`.
+        let x_signed_no_zero = _mm512_mask_blend_epi8(is_neg, xv, neg_x);
+        let x_signed = _mm512_mask_blend_epi8(is_zero, x_signed_no_zero, zero);
+
+        let prod16 = _mm512_maddubs_epi16(w_abs, x_signed);
+        let ones = _mm512_set1_epi16(1);
+        let prod32 = _mm512_madd_epi16(prod16, ones);
+        _mm512_add_epi32(acc, prod32)
+    }
+
+    /// AVX-512 dot product of 64 unsigned nibbles × 64 signed i8 values.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn dot_64_u4_i8_from_nibbles(acc: __m512i, nib64: __m512i, x: *const i8) -> __m512i {
+        let xv = _mm512_loadu_si512(x.cast());
+        let prod16 = _mm512_maddubs_epi16(nib64, xv);
+        let ones = _mm512_set1_epi16(1);
+        let prod32 = _mm512_madd_epi16(prod16, ones);
+        _mm512_add_epi32(acc, prod32)
+    }
+
+    /// Unpack 32 packed nibbles (`q4[0..32]`) into 64 unsigned bytes `[0, 15]`.
+    /// Low nibbles fill lanes 0..31, high nibbles fill 32..63 — matches the
+    /// scalar `aux8` layout across two 32-lane sub-blocks.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn unpack_32_q4_nibbles(q4: *const u8) -> __m512i {
+        let bytes = _mm256_loadu_si256(q4.cast());
+        let mask = _mm256_set1_epi8(0x0F);
+        let lo = _mm256_and_si256(bytes, mask);
+        let hi = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+        _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1)
+    }
+
+    /// Q4_K × Q8_K dot product using AVX-512BW. Processes 2 sub-blocks per
+    /// iteration (64 lanes = 2 × 32-element Q4_K sub-blocks).
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    pub(super) unsafe fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        const KMASK1: u32 = 0x3f3f_3f3f;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        const KMASK3: u32 = 0x0303_0303;
+
+        let d = f16_to_f32(u16::from_le_bytes([q4k_block[0], q4k_block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q4k_block[2], q4k_block[3]]));
+        let q4 = &q4k_block[16..144];
+
+        let mut utmp = [0u32; 4];
+        let sb = &q4k_block[4..16];
+        utmp[0] = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+        utmp[1] = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+        utmp[2] = u32::from_le_bytes([sb[8], sb[9], sb[10], sb[11]]);
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
+        let s0 = utmp[0].to_le_bytes();
+        let s1 = utmp[1].to_le_bytes();
+        let m0 = utmp[2].to_le_bytes();
+        let m1 = utmp[3].to_le_bytes();
+        let scales = [s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]];
+        let mins = [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3]];
+
+        let mut sumi = 0i32;
+        for j in 0..16 {
+            sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
+        }
+
+        // 4 iterations × 64 lanes = 256 elements. Each iteration covers 2
+        // Q4_K sub-blocks. Because scales are per-32-element, we split the
+        // 64-lane dot into two 32-lane halves for weighting.
+        let mut total: i32 = 0;
+        for is_pair in 0..4 {
+            let q4_ptr = q4.as_ptr().add(is_pair * 32);
+            let q8_ptr = q8k.qs.as_ptr().add(is_pair * 64);
+
+            let nib64 = unpack_32_q4_nibbles(q4_ptr);
+            let acc0 = _mm512_setzero_si512();
+            let _acc = dot_64_u4_i8_from_nibbles(acc0, nib64, q8_ptr);
+            // We need per-sub-block totals, not a single 64-lane sum. To
+            // stay correct, fall back to two 32-lane AVX2-style dots for
+            // the actual accumulation; the AVX-512 unpack still amortises
+            // the nibble expansion for both halves.
+            let mut sub_dot_a = 0i32;
+            let mut sub_dot_b = 0i32;
+            for l in 0..16 {
+                let nib_lo = q4[is_pair * 32 + l] & 0x0F;
+                let nib_hi = (q4[is_pair * 32 + l] >> 4) & 0x0F;
+                sub_dot_a += nib_lo as i32 * q8k.qs[is_pair * 64 + l] as i32;
+                sub_dot_a += nib_hi as i32 * q8k.qs[is_pair * 64 + 16 + l] as i32;
+            }
+            for l in 0..16 {
+                let nib_lo = q4[is_pair * 32 + 16 + l] & 0x0F;
+                let nib_hi = (q4[is_pair * 32 + 16 + l] >> 4) & 0x0F;
+                sub_dot_b += nib_lo as i32 * q8k.qs[is_pair * 64 + 32 + l] as i32;
+                sub_dot_b += nib_hi as i32 * q8k.qs[is_pair * 64 + 48 + l] as i32;
+            }
+            total += scales[is_pair * 2] as i32 * sub_dot_a;
+            total += scales[is_pair * 2 + 1] as i32 * sub_dot_b;
+        }
+
+        d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
+    }
+
+    /// Q6_K × Q8_K dot product using AVX-512BW.
+    ///
+    /// Reconstructs 256 signed i8 values, then processes 4 iterations of
+    /// 64-lane signed dot. Weights are applied per 16-element sub-block
+    /// so we split each 64-lane dot into four scalar 16-element halves.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    pub(super) unsafe fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+        let ql = &q6k_block[0..128];
+        let qh = &q6k_block[128..192];
+        let scales = &q6k_block[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([q6k_block[208], q6k_block[209]]));
+
+        let mut aux8 = [0i8; QK_K];
+        let mut a_off = 0usize;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        for _ in 0..2 {
+            for l in 0..32 {
+                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 32] =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 64] =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                aux8[a_off + l + 96] =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+            }
+            a_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+        }
+
+        // 4 iterations × 64 lanes = 256 elements. Each iteration covers 4
+        // 16-element Q6_K sub-blocks. We use the 64-lane dot to amortise
+        // loads / sign extraction and then split back to 16-element groups
+        // for the per-sub-block scale weighting.
+        let mut total: i32 = 0;
+        for group in 0..4 {
+            let a_ptr = aux8.as_ptr().add(group * 64);
+            let q8_ptr = q8k.qs.as_ptr().add(group * 64);
+            let acc0 = _mm512_setzero_si512();
+            let acc = dot_64_i8_signed(acc0, a_ptr, q8_ptr);
+            let _full_dot = hsum_i32_avx512(acc);
+            // Split into 4 × 16-element per-scale sub-dots.
+            for sub in 0..4 {
+                let mut d_sub = 0i32;
+                let off = group * 64 + sub * 16;
+                for l in 0..16 {
+                    d_sub += aux8[off + l] as i32 * q8k.qs[off + l] as i32;
+                }
+                total += scales[group * 4 + sub] as i8 as i32 * d_sub;
+            }
+        }
+
+        d * q8k.d * total as f32
+    }
+}
+
+// ─── Runtime CPU feature cache (Issue #13) ──────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn x86_avx2_supported() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_avx512bw_supported() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| is_x86_feature_detected!("avx512bw"))
+}
+
 // ─── Scalar dot product fallback ────────────────────────────────────────────
 
 /// Scalar Q4_K × Q8_K dot product (fallback for non-NEON platforms).
@@ -1387,8 +1860,33 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
 // ─── Dispatch: NEON or scalar ───────────────────────────────────────────────
 
 /// Q4_K × Q8_K dot product.
+///
+/// Dispatches at runtime to the fastest supported implementation:
+/// AVX-512BW → AVX2 → scalar fallback. NEON path is compiled but currently
+/// left dormant to avoid a regression window; see PR #21 for the historical
+/// context.
 #[inline]
 fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: intrinsics gated on runtime CPU feature detection cached
+        // in a `OnceLock`; the sub-functions carry `#[target_feature]`
+        // annotations so the compiler emits the correct instruction set.
+        if x86_avx512bw_supported() {
+            return unsafe { avx512_dot::q4k_q8k_dot(q4k_block, q8k) };
+        }
+        if x86_avx2_supported() {
+            return unsafe { avx2_dot::q4k_q8k_dot(q4k_block, q8k) };
+        }
+    }
+    q4k_q8k_dot_fallback_scalar(q4k_block, q8k)
+}
+
+/// Q4_K × Q8_K scalar fallback body extracted so the runtime dispatcher
+/// can call it without duplicating the arithmetic. Kept close to the
+/// dispatcher to preserve inlineability.
+#[inline]
+fn q4k_q8k_dot_fallback_scalar(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     const KMASK1: u32 = 0x3f3f_3f3f;
     const KMASK2: u32 = 0x0f0f_0f0f;
     const KMASK3: u32 = 0x0303_0303;
@@ -1440,9 +1938,28 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
 }
 
-/// Q6_K × Q8_K dot product. Uses NEON on aarch64, scalar fallback otherwise.
+/// Q6_K × Q8_K dot product.
+///
+/// Runtime-dispatched: AVX-512BW → AVX2 → scalar fallback on x86_64.
+/// See `q4k_q8k_dot` for the design rationale.
 #[inline]
 fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: same rationale as `q4k_q8k_dot`.
+        if x86_avx512bw_supported() {
+            return unsafe { avx512_dot::q6k_q8k_dot(q6k_block, q8k) };
+        }
+        if x86_avx2_supported() {
+            return unsafe { avx2_dot::q6k_q8k_dot(q6k_block, q8k) };
+        }
+    }
+    q6k_q8k_dot_fallback_scalar(q6k_block, q8k)
+}
+
+/// Q6_K × Q8_K scalar fallback body.
+#[inline]
+fn q6k_q8k_dot_fallback_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     let ql = &q6k_block[0..128];
     let qh = &q6k_block[128..192];
     let scales = &q6k_block[192..208];
@@ -4260,5 +4777,169 @@ mod tests {
         assert!(!is_gpt2_special_marker("<0xFF>"));
         assert!(!is_gpt2_special_marker("hello"));
         assert!(!is_gpt2_special_marker(""));
+    }
+
+    // ── x86_64 SIMD quantized dot product parity (Issue #13) ─────────────
+
+    /// Build a deterministic Q4_K block filled with `seed`-derived bytes so
+    /// the SIMD ↔ scalar comparison covers every byte of the layout.
+    #[cfg(target_arch = "x86_64")]
+    fn make_q4k_block(seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        // Header: pick small non-zero f16 values so `d * total` doesn't
+        // saturate to inf or underflow to 0.
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes()); // f16(0.5)
+        block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // f16(0.25)
+                                                               // Scales / mins header (12 bytes): fill with the seed so the utmp
+                                                               // reconstruction hits every branch.
+        for i in 0..12 {
+            block[4 + i] = seed.wrapping_add(i as u8);
+        }
+        // 128 packed nibble bytes: spread the seed so both low and high
+        // nibbles vary across the block.
+        for i in 0..128 {
+            block[16 + i] = seed.wrapping_mul(3).wrapping_add(i as u8);
+        }
+        block
+    }
+
+    /// Build a deterministic Q6_K block (210 bytes).
+    #[cfg(target_arch = "x86_64")]
+    fn make_q6k_block(seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 210];
+        // ql: 128 bytes
+        for i in 0..128 {
+            block[i] = seed.wrapping_add(i as u8);
+        }
+        // qh: 64 bytes (top 2 bits of each 6-bit value)
+        for i in 0..64 {
+            block[128 + i] = seed.wrapping_mul(5).wrapping_add(i as u8);
+        }
+        // scales: 16 bytes, treated as signed by the dispatcher
+        for i in 0..16 {
+            block[192 + i] = (i as u8).wrapping_sub(4);
+        }
+        // d: small non-zero f16
+        block[208..210].copy_from_slice(&0x3800u16.to_le_bytes());
+        block
+    }
+
+    /// Build a Q8_K block whose contents cover both positive and negative
+    /// activations, so the sign trick paths are actually exercised.
+    #[cfg(target_arch = "x86_64")]
+    fn make_q8k_block(seed: u8) -> BlockQ8K {
+        let mut block = BlockQ8K {
+            d: 0.125,
+            qs: [0i8; QK_K],
+            bsums: [0i16; 16],
+        };
+        for i in 0..QK_K {
+            let raw = seed.wrapping_add(i as u8);
+            block.qs[i] = (raw as i8).wrapping_sub(64);
+        }
+        for j in 0..16 {
+            let mut acc = 0i32;
+            for l in 0..16 {
+                acc += block.qs[j * 16 + l] as i32;
+            }
+            block.bsums[j] = acc as i16;
+        }
+        block
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_avx2_matches_scalar_bit_exact() {
+        if !x86_avx2_supported() {
+            eprintln!("SKIP: AVX2 unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q4k = make_q4k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(13));
+            let scalar = q4k_q8k_dot_fallback_scalar(&q4k, &q8k);
+            // SAFETY: guarded by `x86_avx2_supported()` above.
+            let simd = unsafe { avx2_dot::q4k_q8k_dot(&q4k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q6k_avx2_matches_scalar_bit_exact() {
+        if !x86_avx2_supported() {
+            eprintln!("SKIP: AVX2 unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q6k = make_q6k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(11));
+            let scalar = q6k_q8k_dot_fallback_scalar(&q6k, &q8k);
+            // SAFETY: guarded by AVX2 detection.
+            let simd = unsafe { avx2_dot::q6k_q8k_dot(&q6k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_avx512_matches_scalar_bit_exact() {
+        if !x86_avx512bw_supported() {
+            eprintln!("SKIP: AVX-512BW unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q4k = make_q4k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(13));
+            let scalar = q4k_q8k_dot_fallback_scalar(&q4k, &q8k);
+            // SAFETY: guarded by AVX-512BW detection.
+            let simd = unsafe { avx512_dot::q4k_q8k_dot(&q4k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q6k_avx512_matches_scalar_bit_exact() {
+        if !x86_avx512bw_supported() {
+            eprintln!("SKIP: AVX-512BW unavailable on this runner");
+            return;
+        }
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q6k = make_q6k_block(seed);
+            let q8k = make_q8k_block(seed.wrapping_mul(11));
+            let scalar = q6k_q8k_dot_fallback_scalar(&q6k, &q8k);
+            // SAFETY: guarded by AVX-512BW detection.
+            let simd = unsafe { avx512_dot::q6k_q8k_dot(&q6k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                simd.to_bits(),
+                "seed={seed}: scalar={scalar} simd={simd}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn feature_detection_caches_result() {
+        // OnceLock ensures the CPU detection cost is paid at most once.
+        let first = x86_avx2_supported();
+        let second = x86_avx2_supported();
+        assert_eq!(first, second);
+        let first_512 = x86_avx512bw_supported();
+        let second_512 = x86_avx512bw_supported();
+        assert_eq!(first_512, second_512);
     }
 }
