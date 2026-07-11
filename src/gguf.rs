@@ -1769,37 +1769,24 @@ mod avx512_dot {
             sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
         }
 
-        // 4 iterations × 64 lanes = 256 elements. Each iteration covers 2
-        // Q4_K sub-blocks. Because scales are per-32-element, we split the
-        // 64-lane dot into two 32-lane halves for weighting.
+        // 4 iterations, each covering 32 packed bytes of q4 (= 64 nibbles
+        // → 2 sub-blocks). Match the scalar sub-block layout exactly:
+        //   sub-block 2g   = low  nibbles of q4[g*32 : g*32+32] · q8[g*64 : g*64+32]
+        //   sub-block 2g+1 = high nibbles of q4[g*32 : g*32+32] · q8[g*64+32 : g*64+64]
+        // Reused from the AVX2 fix; the earlier per-16-lane split
+        // interleaved q8 windows and produced silently wrong sums.
         let mut total: i32 = 0;
-        for is_pair in 0..4 {
-            let q4_ptr = q4.as_ptr().add(is_pair * 32);
-            let q8_ptr = q8k.qs.as_ptr().add(is_pair * 64);
-
-            let nib64 = unpack_32_q4_nibbles(q4_ptr);
-            let acc0 = _mm512_setzero_si512();
-            let _acc = dot_64_u4_i8_from_nibbles(acc0, nib64, q8_ptr);
-            // We need per-sub-block totals, not a single 64-lane sum. To
-            // stay correct, fall back to two 32-lane AVX2-style dots for
-            // the actual accumulation; the AVX-512 unpack still amortises
-            // the nibble expansion for both halves.
+        for g in 0..4 {
             let mut sub_dot_a = 0i32;
             let mut sub_dot_b = 0i32;
-            for l in 0..16 {
-                let nib_lo = q4[is_pair * 32 + l] & 0x0F;
-                let nib_hi = (q4[is_pair * 32 + l] >> 4) & 0x0F;
-                sub_dot_a += nib_lo as i32 * q8k.qs[is_pair * 64 + l] as i32;
-                sub_dot_a += nib_hi as i32 * q8k.qs[is_pair * 64 + 16 + l] as i32;
+            for l in 0..32 {
+                let lo = (q4[g * 32 + l] & 0x0F) as i32;
+                let hi = ((q4[g * 32 + l] >> 4) & 0x0F) as i32;
+                sub_dot_a += lo * q8k.qs[g * 64 + l] as i32;
+                sub_dot_b += hi * q8k.qs[g * 64 + 32 + l] as i32;
             }
-            for l in 0..16 {
-                let nib_lo = q4[is_pair * 32 + 16 + l] & 0x0F;
-                let nib_hi = (q4[is_pair * 32 + 16 + l] >> 4) & 0x0F;
-                sub_dot_b += nib_lo as i32 * q8k.qs[is_pair * 64 + 32 + l] as i32;
-                sub_dot_b += nib_hi as i32 * q8k.qs[is_pair * 64 + 48 + l] as i32;
-            }
-            total += scales[is_pair * 2] as i32 * sub_dot_a;
-            total += scales[is_pair * 2 + 1] as i32 * sub_dot_b;
+            total += scales[g * 2] as i32 * sub_dot_a;
+            total += scales[g * 2 + 1] as i32 * sub_dot_b;
         }
 
         d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
