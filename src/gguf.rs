@@ -2301,9 +2301,11 @@ fn q6k_q8k_dot_scalar(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
 /// Q4_K × Q8_K dot product.
 ///
 /// Dispatches at runtime to the fastest supported implementation:
-/// AVX-512BW → AVX2 → scalar fallback. NEON path is compiled but currently
-/// left dormant to avoid a regression window; see PR #21 for the historical
-/// context.
+/// x86_64: AVX-512BW → AVX2 → scalar fallback.
+/// aarch64: NEON → scalar fallback. NEON is baseline on aarch64 targets
+/// Rust supports, so the dispatch is compile-time cfg (no runtime probe).
+/// The NEON kernel was gated behind bit-exact parity tests before being
+/// wired here — see `q4k_neon_matches_scalar_bit_exact` for the guard.
 #[inline]
 fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -2318,6 +2320,12 @@ fn q4k_q8k_dot(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             return unsafe { avx2_dot::q4k_q8k_dot(q4k_block, q8k) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on every aarch64 CPU Rust supports.
+        return unsafe { neon_dot::q4k_q8k_dot(q4k_block, q8k) };
+    }
+    #[allow(unreachable_code)]
     q4k_q8k_dot_fallback_scalar(q4k_block, q8k)
 }
 
@@ -2379,8 +2387,10 @@ fn q4k_q8k_dot_fallback_scalar(q4k_block: &[u8], q8k: &BlockQ8K) -> f32 {
 
 /// Q6_K × Q8_K dot product.
 ///
-/// Runtime-dispatched: AVX-512BW → AVX2 → scalar fallback on x86_64.
-/// See `q4k_q8k_dot` for the design rationale.
+/// Runtime-dispatched on x86_64 (AVX-512BW → AVX2 → scalar); NEON on
+/// aarch64. See `q4k_q8k_dot` for the design rationale and the
+/// `q6k_neon_matches_scalar_bit_exact` parity gate that preceded
+/// enabling the aarch64 path.
 #[inline]
 fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -2393,6 +2403,12 @@ fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
             return unsafe { avx2_dot::q6k_q8k_dot(q6k_block, q8k) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on every aarch64 CPU Rust supports.
+        return unsafe { neon_dot::q6k_q8k_dot(q6k_block, q8k) };
+    }
+    #[allow(unreachable_code)]
     q6k_q8k_dot_fallback_scalar(q6k_block, q8k)
 }
 
@@ -5708,6 +5724,101 @@ mod tests {
             assert!(
                 rel < 1e-5,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
+            );
+        }
+    }
+
+    // ── aarch64 NEON parity tests (gates the dispatch enable) ─────────
+
+    /// Build a deterministic Q4_K block for parity testing. Same shape as
+    /// the x86 tests so the aarch64 CI runs the same coverage matrix.
+    #[cfg(target_arch = "aarch64")]
+    fn make_q4k_block_aarch64(seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x3400u16.to_le_bytes());
+        for i in 0..12 {
+            block[4 + i] = seed.wrapping_add(i as u8);
+        }
+        for i in 0..128 {
+            block[16 + i] = seed.wrapping_mul(3).wrapping_add(i as u8);
+        }
+        block
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn make_q6k_block_aarch64(seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 210];
+        for i in 0..128 {
+            block[i] = seed.wrapping_add(i as u8);
+        }
+        for i in 0..64 {
+            block[128 + i] = seed.wrapping_mul(5).wrapping_add(i as u8);
+        }
+        for i in 0..16 {
+            block[192 + i] = (i as u8).wrapping_sub(4);
+        }
+        block[208..210].copy_from_slice(&0x3800u16.to_le_bytes());
+        block
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn make_q8k_block_aarch64(seed: u8) -> BlockQ8K {
+        let mut block = BlockQ8K {
+            d: 0.125,
+            qs: [0i8; QK_K],
+            bsums: [0i16; 16],
+        };
+        for i in 0..QK_K {
+            let raw = seed.wrapping_add(i as u8);
+            block.qs[i] = (raw as i8).wrapping_sub(64);
+        }
+        for j in 0..16 {
+            let mut acc = 0i32;
+            for l in 0..16 {
+                acc += block.qs[j * 16 + l] as i32;
+            }
+            block.bsums[j] = acc as i16;
+        }
+        block
+    }
+
+    /// Verify the dormant NEON Q4_K kernel matches the scalar reference
+    /// before the dispatcher is allowed to route to it. NEON was compiled
+    /// but unused since PR #21; this test is the gate that decides whether
+    /// enabling the dispatch is safe.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q4k_neon_matches_scalar_bit_exact() {
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q4k = make_q4k_block_aarch64(seed);
+            let q8k = make_q8k_block_aarch64(seed.wrapping_mul(13));
+            let scalar = q4k_q8k_dot_fallback_scalar(&q4k, &q8k);
+            // SAFETY: NEON is baseline on all aarch64 targets Rust supports,
+            // so the `#[target_feature(enable = "neon")]` annotation matches
+            // the compile target unconditionally.
+            let neon = unsafe { neon_dot::q4k_q8k_dot(&q4k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                neon.to_bits(),
+                "seed={seed}: scalar={scalar} neon={neon}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q6k_neon_matches_scalar_bit_exact() {
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let q6k = make_q6k_block_aarch64(seed);
+            let q8k = make_q8k_block_aarch64(seed.wrapping_mul(11));
+            let scalar = q6k_q8k_dot_fallback_scalar(&q6k, &q8k);
+            // SAFETY: same rationale as `q4k_neon_matches_scalar_bit_exact`.
+            let neon = unsafe { neon_dot::q6k_q8k_dot(&q6k, &q8k) };
+            assert_eq!(
+                scalar.to_bits(),
+                neon.to_bits(),
+                "seed={seed}: scalar={scalar} neon={neon}"
             );
         }
     }
