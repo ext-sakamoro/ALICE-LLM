@@ -32,6 +32,22 @@ pub enum ModelArch {
     Qwen2,
     Qwen3,
     Qwen3_5,
+    /// DeepSeek-V3 / R1 (V2 / V2.5 も同じ family、llama.cpp では `deepseek2`
+    /// prefix)。特徴:
+    /// * **MLA** (Multi-head Latent Attention): Q と KV を LoRA 経由で
+    ///   低ランク射影して KV cache を圧縮
+    /// * **DeepSeek MoE**: 256 routed expert + shared expert、sigmoid gating
+    ///   with `noaux_tc` (no auxiliary loss trick)
+    /// * **Partial RoPE**: 全 head 次元でなく `qk_rope_head_dim` 部分のみ回転
+    /// * **First-K dense layers**: 最初 N layer は MoE の代わりに dense FFN
+    /// * **MTP head** (V3 のみ): multi-token prediction による native
+    ///   speculative decoding
+    ///
+    /// 現状 (2026-07-11 追加): arch 検出 + config 読み込み + weight loading
+    /// までの foundation のみ。MLA CPU forward / MoE routing / expert
+    /// streaming / MTP は Phase 2-5 の follow-up Issue で実装予定。
+    /// `forward()` は即 panic (fail-fast) で silent garbage を回避。
+    DeepSeekV3,
 }
 
 impl ModelArch {
@@ -56,6 +72,9 @@ impl ModelArch {
             // `qwen35.*` for both versions.
             Some("qwen35" | "qwen35moe") => Self::Qwen3_5,
             Some(s) if s.starts_with("qwen") => Self::Qwen2,
+            // DeepSeek-V2 / V2.5 / V3 / R1 all share the same architecture
+            // family in llama.cpp under the `deepseek2` prefix.
+            Some("deepseek2") => Self::DeepSeekV3,
             _ => Self::Llama,
         }
     }
@@ -70,6 +89,7 @@ impl ModelArch {
             Self::Gemma4 => "gemma4",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 | Self::Qwen3_5 => "qwen3",
+            Self::DeepSeekV3 => "deepseek2",
         }
     }
 
@@ -83,7 +103,13 @@ impl ModelArch {
     pub const fn use_neox_rope(&self) -> bool {
         matches!(
             self,
-            Self::Qwen2 | Self::Qwen3 | Self::Qwen3_5 | Self::Gemma2 | Self::Gemma3n | Self::Gemma4
+            Self::Qwen2
+                | Self::Qwen3
+                | Self::Qwen3_5
+                | Self::Gemma2
+                | Self::Gemma3n
+                | Self::Gemma4
+                | Self::DeepSeekV3
         )
     }
 
@@ -203,6 +229,52 @@ pub struct Gemma4Config {
     pub ffn_size_per_layer: Option<Vec<usize>>,
 }
 
+/// DeepSeek-V2 / V3 / R1 architecture-specific config.
+///
+/// Captures the MLA (Multi-head Latent Attention) LoRA ranks, the
+/// partial-RoPE head-dim split, and the DeepSeek MoE parameters that are
+/// not covered by the generic [`MoeConfig`]. All fields optional so the
+/// struct maps 1:1 to what the GGUF metadata provides — implementation
+/// phases can consume them as they come online.
+///
+/// GGUF metadata key prefix: `deepseek2.*`. Typical DeepSeek-V3 values are
+/// given in the field docs so future implementation phases can sanity-check
+/// their read values.
+#[derive(Debug, Clone)]
+pub struct DeepSeekV3Config {
+    /// LoRA rank for the Q projection down/up chain (V3: 1536).
+    pub q_lora_rank: Option<usize>,
+    /// LoRA rank for the KV projection down/up chain (V3: 512).
+    pub kv_lora_rank: Option<usize>,
+    /// Head dim for the non-rotated Q/K portion (V3: 128).
+    pub qk_nope_head_dim: Option<usize>,
+    /// Head dim for the rotated Q/K portion (V3: 64) — only this slice
+    /// participates in RoPE, the `nope` slice is passed through untouched.
+    pub qk_rope_head_dim: Option<usize>,
+    /// Head dim for V (V3: 128; equals `qk_nope_head_dim` in practice).
+    pub v_head_dim: Option<usize>,
+    /// Total number of routed experts (V3: 256).
+    pub n_routed_experts: Option<usize>,
+    /// Shared expert count (V3: 1) — always active in addition to top-k routed.
+    pub n_shared_experts: Option<usize>,
+    /// Top-k routed experts per token (V3: 8).
+    pub num_experts_per_tok: Option<usize>,
+    /// Per-expert FFN intermediate size (V3: 2048; distinct from the dense
+    /// FFN size used in `first_k_dense_replace` layers).
+    pub moe_intermediate_size: Option<usize>,
+    /// Number of leading layers that use a monolithic dense FFN instead of
+    /// MoE (V3: 3 — layers 0/1/2 dense, all others MoE + shared expert).
+    pub first_k_dense_replace: Option<usize>,
+    /// Routed expert output scale (V3: 2.5).
+    pub routed_scaling_factor: Option<f32>,
+    /// `true` when the router uses sigmoid gating with the "no auxiliary
+    /// loss" bias-correction trick introduced in DeepSeek-V3.
+    pub noaux_tc: Option<bool>,
+    /// MTP head layer index (V3: 61 = the extra MTP layer past 60 hidden
+    /// layers). `None` when no MTP head is present.
+    pub mtp_layer: Option<usize>,
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
@@ -235,6 +307,9 @@ pub struct Llama3Config {
     pub gemma3n: Option<Gemma3nConfig>,
     /// Gemma 4 augmentations (SWA half head_dim, per-layer FFN size).
     pub gemma4: Option<Gemma4Config>,
+    /// DeepSeek-V2 / V3 / R1 augmentations (MLA LoRA ranks + DeepSeek MoE
+    /// parameters + MTP head layer).
+    pub deepseek_v3: Option<DeepSeekV3Config>,
 }
 
 impl Llama3Config {
@@ -399,6 +474,81 @@ impl Llama3Config {
         self.gemma4
             .as_ref()
             .and_then(|g| g.ffn_size_per_layer.as_deref())
+    }
+
+    // DeepSeek-V3
+
+    #[inline]
+    pub fn deepseek_q_lora_rank(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.q_lora_rank)
+    }
+
+    #[inline]
+    pub fn deepseek_kv_lora_rank(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.kv_lora_rank)
+    }
+
+    #[inline]
+    pub fn deepseek_qk_nope_head_dim(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.qk_nope_head_dim)
+    }
+
+    #[inline]
+    pub fn deepseek_qk_rope_head_dim(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.qk_rope_head_dim)
+    }
+
+    #[inline]
+    pub fn deepseek_v_head_dim(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.v_head_dim)
+    }
+
+    #[inline]
+    pub fn deepseek_n_routed_experts(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.n_routed_experts)
+    }
+
+    #[inline]
+    pub fn deepseek_n_shared_experts(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.n_shared_experts)
+    }
+
+    #[inline]
+    pub fn deepseek_num_experts_per_tok(&self) -> Option<usize> {
+        self.deepseek_v3
+            .as_ref()
+            .and_then(|d| d.num_experts_per_tok)
+    }
+
+    #[inline]
+    pub fn deepseek_moe_intermediate_size(&self) -> Option<usize> {
+        self.deepseek_v3
+            .as_ref()
+            .and_then(|d| d.moe_intermediate_size)
+    }
+
+    #[inline]
+    pub fn deepseek_first_k_dense_replace(&self) -> Option<usize> {
+        self.deepseek_v3
+            .as_ref()
+            .and_then(|d| d.first_k_dense_replace)
+    }
+
+    #[inline]
+    pub fn deepseek_routed_scaling_factor(&self) -> Option<f32> {
+        self.deepseek_v3
+            .as_ref()
+            .and_then(|d| d.routed_scaling_factor)
+    }
+
+    #[inline]
+    pub fn deepseek_noaux_tc(&self) -> Option<bool> {
+        self.deepseek_v3.as_ref().and_then(|d| d.noaux_tc)
+    }
+
+    #[inline]
+    pub fn deepseek_mtp_layer(&self) -> Option<usize> {
+        self.deepseek_v3.as_ref().and_then(|d| d.mtp_layer)
     }
 
     /// Load config from GGUF metadata (auto-detects architecture).
@@ -683,6 +833,72 @@ impl Llama3Config {
             None
         };
 
+        // DeepSeek-V3 / R1: read the `deepseek2.*` sub-config. All fields
+        // optional — a missing key does not disqualify the model, we just
+        // leave the future forward path to raise a targeted `todo!()`.
+        let deepseek_v3 = if arch == ModelArch::DeepSeekV3 {
+            let q_lora_rank = gguf
+                .meta_u32(&format!("{prefix}.attention.q_lora_rank"))
+                .map(|v| v as usize);
+            let kv_lora_rank = gguf
+                .meta_u32(&format!("{prefix}.attention.kv_lora_rank"))
+                .map(|v| v as usize);
+            let qk_nope_head_dim = gguf
+                .meta_u32(&format!("{prefix}.attention.key_length"))
+                .map(|v| v as usize);
+            let qk_rope_head_dim = gguf
+                .meta_u32(&format!("{prefix}.rope.dimension_count"))
+                .map(|v| v as usize);
+            let v_head_dim = gguf
+                .meta_u32(&format!("{prefix}.attention.value_length"))
+                .map(|v| v as usize);
+            let n_routed_experts = gguf
+                .meta_u32(&format!("{prefix}.expert_count"))
+                .map(|v| v as usize);
+            let n_shared_experts = gguf
+                .meta_u32(&format!("{prefix}.expert_shared_count"))
+                .map(|v| v as usize);
+            let num_experts_per_tok = gguf
+                .meta_u32(&format!("{prefix}.expert_used_count"))
+                .map(|v| v as usize);
+            let moe_intermediate_size = gguf
+                .meta_u32(&format!("{prefix}.expert_feed_forward_length"))
+                .map(|v| v as usize);
+            let first_k_dense_replace = gguf
+                .meta_u32(&format!("{prefix}.leading_dense_block_count"))
+                .map(|v| v as usize);
+            let routed_scaling_factor = gguf.meta_f32(&format!("{prefix}.expert_weights_scale"));
+            let noaux_tc = gguf
+                .meta_u32(&format!("{prefix}.expert_gating_func"))
+                .map(|v| v == 2); // 2 = sigmoid (noaux_tc), 1 = softmax
+            let mtp_layer = gguf
+                .meta_u32(&format!("{prefix}.mtp_layer_count"))
+                .and_then(|c| {
+                    if c > 0 {
+                        Some(num_layers + c as usize - 1)
+                    } else {
+                        None
+                    }
+                });
+            Some(DeepSeekV3Config {
+                q_lora_rank,
+                kv_lora_rank,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                n_routed_experts,
+                n_shared_experts,
+                num_experts_per_tok,
+                moe_intermediate_size,
+                first_k_dense_replace,
+                routed_scaling_factor,
+                noaux_tc,
+                mtp_layer,
+            })
+        } else {
+            None
+        };
+
         Some(Self {
             arch,
             vocab_size,
@@ -700,6 +916,7 @@ impl Llama3Config {
             moe,
             gemma3n,
             gemma4,
+            deepseek_v3,
         })
     }
 
@@ -877,6 +1094,7 @@ impl Llama3Config {
             moe: None,
             gemma3n: None,
             gemma4: None,
+            deepseek_v3: None,
         }
     }
 
@@ -2927,6 +3145,16 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::Gemma4 {
             return self.forward_gemma4(token_id);
         }
+        // DeepSeek-V3 / R1: dedicated forward path (MLA + DeepSeek MoE with
+        // shared expert + partial RoPE + optional MTP head). Foundation
+        // (arch detection + config + weight loading) landed 2026-07-11;
+        // MLA CPU forward / MoE routing / expert streaming / MTP are
+        // Phase 2-5 follow-up work. Fail fast so users don't accidentally
+        // get silent garbage from a fallback that treats the model as
+        // standard attention.
+        if self.config.arch == ModelArch::DeepSeekV3 {
+            return self.forward_deepseek_v3(token_id);
+        }
         // Qwen 3.5 / Qwen 3.6 hybrid uses the standard forward path with a
         // per-layer branch (DeltaNet linear-attention vs. full attention).
         // See `layer_kind_map` for the layer-to-kind routing that was set up
@@ -3882,6 +4110,57 @@ impl<'a> Llama3Model<'a> {
     /// # Panics
     /// Panics if the model was not loaded with Gemma 4 architecture (missing
     /// required per-layer input embedding tensors, etc.).
+    /// DeepSeek-V2 / V3 / R1 forward pass — **foundation only** as of
+    /// 2026-07-11.
+    ///
+    /// The full implementation requires four separate landing efforts, each
+    /// tracked as a follow-up Issue:
+    /// 1. **MLA CPU forward** — Q/KV LoRA projections, partial RoPE on the
+    ///    `qk_rope_head_dim` slice, compressed KV cache sized to
+    ///    `kv_lora_rank`, weight-absorption trick for decode.
+    /// 2. **DeepSeek MoE routing** — 256 routed experts + shared expert,
+    ///    sigmoid gating with the `noaux_tc` bias-correction trick, top-k
+    ///    dispatch, `routed_scaling_factor`.
+    /// 3. **Expert streaming from disk** — colibri-style LRU + pinned
+    ///    hot-store + OS page cache so 671B weights fit in ~25 GB RAM.
+    /// 4. **MTP head + speculative decoding** — the extra decoder layer
+    ///    predicting future tokens for lossless rejection-sample spec.
+    ///
+    /// Until those land, the function fails fast with a clear message so a
+    /// silent-garbage fallback (treating the model as standard attention)
+    /// cannot slip through. The weight loading path is expected to succeed
+    /// so metadata / tensor names / shapes can still be inspected.
+    ///
+    /// `&mut self` is retained deliberately: the eventual forward pass will
+    /// mutate `kv_cache`, expert state, and MTP scratch, so the signature
+    /// stays uniform with the other `forward_*` variants even while the
+    /// body is only a `panic!` today.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn forward_deepseek_v3(&mut self, _token_id: u32) -> Vec<f32> {
+        let c = &self.config;
+        panic!(
+            "DeepSeek-V3 / R1 forward pass is not yet implemented (foundation only).\n\
+             Detected: n_routed_experts={:?}, n_shared_experts={:?}, num_experts_per_tok={:?}, \
+             q_lora_rank={:?}, kv_lora_rank={:?}, qk_nope_head_dim={:?}, qk_rope_head_dim={:?}, \
+             v_head_dim={:?}, first_k_dense_replace={:?}, routed_scaling_factor={:?}, \
+             noaux_tc={:?}, mtp_layer={:?}.\n\
+             Implementation is split across Phase 2-5 follow-up Issues \
+             (MLA / MoE routing / expert streaming / MTP).",
+            c.deepseek_n_routed_experts(),
+            c.deepseek_n_shared_experts(),
+            c.deepseek_num_experts_per_tok(),
+            c.deepseek_q_lora_rank(),
+            c.deepseek_kv_lora_rank(),
+            c.deepseek_qk_nope_head_dim(),
+            c.deepseek_qk_rope_head_dim(),
+            c.deepseek_v_head_dim(),
+            c.deepseek_first_k_dense_replace(),
+            c.deepseek_routed_scaling_factor(),
+            c.deepseek_noaux_tc(),
+            c.deepseek_mtp_layer(),
+        );
+    }
+
     fn forward_gemma4(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -8388,5 +8667,75 @@ mod tests {
         assert_eq!(kv_cache_fingerprint(&base), kv_cache_fingerprint(&base));
         // A single shape-critical field change must move the fingerprint.
         assert_ne!(kv_cache_fingerprint(&base), kv_cache_fingerprint(&variant));
+    }
+
+    // ── DeepSeek-V3 / R1 foundation (Phase 1) ────────────────────────
+
+    #[test]
+    fn deepseek_v3_config_accessors_return_none_when_absent() {
+        let c = Llama3Config::llama3_8b();
+        assert!(c.deepseek_v3.is_none());
+        assert!(c.deepseek_q_lora_rank().is_none());
+        assert!(c.deepseek_kv_lora_rank().is_none());
+        assert!(c.deepseek_qk_nope_head_dim().is_none());
+        assert!(c.deepseek_qk_rope_head_dim().is_none());
+        assert!(c.deepseek_v_head_dim().is_none());
+        assert!(c.deepseek_n_routed_experts().is_none());
+        assert!(c.deepseek_n_shared_experts().is_none());
+        assert!(c.deepseek_num_experts_per_tok().is_none());
+        assert!(c.deepseek_moe_intermediate_size().is_none());
+        assert!(c.deepseek_first_k_dense_replace().is_none());
+        assert!(c.deepseek_routed_scaling_factor().is_none());
+        assert!(c.deepseek_noaux_tc().is_none());
+        assert!(c.deepseek_mtp_layer().is_none());
+    }
+
+    #[test]
+    fn deepseek_v3_config_reads_typical_v3_values() {
+        let mut c = Llama3Config::llama3_8b();
+        c.arch = ModelArch::DeepSeekV3;
+        c.deepseek_v3 = Some(DeepSeekV3Config {
+            q_lora_rank: Some(1536),
+            kv_lora_rank: Some(512),
+            qk_nope_head_dim: Some(128),
+            qk_rope_head_dim: Some(64),
+            v_head_dim: Some(128),
+            n_routed_experts: Some(256),
+            n_shared_experts: Some(1),
+            num_experts_per_tok: Some(8),
+            moe_intermediate_size: Some(2048),
+            first_k_dense_replace: Some(3),
+            routed_scaling_factor: Some(2.5),
+            noaux_tc: Some(true),
+            mtp_layer: Some(60),
+        });
+        assert_eq!(c.deepseek_q_lora_rank(), Some(1536));
+        assert_eq!(c.deepseek_kv_lora_rank(), Some(512));
+        assert_eq!(c.deepseek_qk_nope_head_dim(), Some(128));
+        assert_eq!(c.deepseek_qk_rope_head_dim(), Some(64));
+        assert_eq!(c.deepseek_v_head_dim(), Some(128));
+        assert_eq!(c.deepseek_n_routed_experts(), Some(256));
+        assert_eq!(c.deepseek_n_shared_experts(), Some(1));
+        assert_eq!(c.deepseek_num_experts_per_tok(), Some(8));
+        assert_eq!(c.deepseek_moe_intermediate_size(), Some(2048));
+        assert_eq!(c.deepseek_first_k_dense_replace(), Some(3));
+        assert_eq!(c.deepseek_routed_scaling_factor(), Some(2.5));
+        assert_eq!(c.deepseek_noaux_tc(), Some(true));
+        assert_eq!(c.deepseek_mtp_layer(), Some(60));
+    }
+
+    #[test]
+    fn deepseek_v3_arch_uses_neox_rope() {
+        // DeepSeek-V3 uses NEOX RoPE half-rotation on the `qk_rope_head_dim`
+        // slice, consistent with Qwen and Gemma families.
+        assert!(ModelArch::DeepSeekV3.use_neox_rope());
+    }
+
+    #[test]
+    fn deepseek_v3_arch_meta_prefix_is_deepseek2() {
+        // llama.cpp names V2 / V3 / R1 all under the same `deepseek2` key
+        // prefix. Any drift here would silently mis-route GGUF metadata
+        // lookups in `Llama3Config::from_gguf`.
+        assert_eq!(ModelArch::DeepSeekV3.meta_prefix(), "deepseek2");
     }
 }
