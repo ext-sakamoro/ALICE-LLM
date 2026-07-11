@@ -1648,6 +1648,101 @@ mod avx2_dot {
         let s32 = _mm_add_ss(s64, sh2);
         _mm_cvtss_f32(s32)
     }
+
+    /// Ternary bitmask × f32 input dot product for one row (AVX2).
+    ///
+    /// Each byte of `pos_mask` / `neg_mask` encodes 8 lanes. The 32-bit
+    /// broadcast + per-lane AND with the `[0x01, 0x02, 0x04, 0x08, 0x10,
+    /// 0x20, 0x40, 0x80]` pattern extracts one bit per lane; comparing
+    /// against the same pattern yields an all-ones i32 (i.e. the f32
+    /// mask `-NaN`-like bit pattern used as an AND-mask) where the bit
+    /// was set. `_mm256_and_ps` with the input then produces `input[i]`
+    /// or `0.0` — no branchy blending needed.
+    ///
+    /// The scalar dot the SIMD path reproduces:
+    ///
+    /// ```text
+    /// sum = Σ_b Σ_{bit ∈ pos_mask[b]} input[b*8 + bit]
+    ///     - Σ_b Σ_{bit ∈ neg_mask[b]} input[b*8 + bit]
+    /// ```
+    ///
+    /// Returns the unscaled `pos_sum - neg_sum` — the caller applies the
+    /// row's f32 scale afterwards so both dispatch arms stay identical.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn ternary_dot_row_unscaled(
+        pos_mask: &[u8],
+        neg_mask: &[u8],
+        input: &[f32],
+        num_cols: usize,
+    ) -> f32 {
+        // 8-lane bit-mask constants: lane i tests bit `1 << i` of the byte.
+        let bit_lanes = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
+        let mut pos_acc = _mm256_setzero_ps();
+        let mut neg_acc = _mm256_setzero_ps();
+
+        // Cover the fully-populated bytes with 8 lanes each. Any tail that
+        // spans an incomplete final byte is finished by the scalar loop
+        // below (edge case: `num_cols % 8 != 0`).
+        let full_bytes = num_cols / 8;
+        for b in 0..full_bytes {
+            let pm = u32::from(pos_mask[b]);
+            let nm = u32::from(neg_mask[b]);
+            if (pm | nm) == 0 {
+                continue;
+            }
+            let input_v = _mm256_loadu_ps(input.as_ptr().add(b * 8));
+
+            // Positive contributions.
+            if pm != 0 {
+                let bcast = _mm256_set1_epi32(pm as i32);
+                let masked = _mm256_and_si256(bcast, bit_lanes);
+                let is_set = _mm256_cmpeq_epi32(masked, bit_lanes);
+                let contrib = _mm256_and_ps(_mm256_castsi256_ps(is_set), input_v);
+                pos_acc = _mm256_add_ps(pos_acc, contrib);
+            }
+            // Negative contributions.
+            if nm != 0 {
+                let bcast = _mm256_set1_epi32(nm as i32);
+                let masked = _mm256_and_si256(bcast, bit_lanes);
+                let is_set = _mm256_cmpeq_epi32(masked, bit_lanes);
+                let contrib = _mm256_and_ps(_mm256_castsi256_ps(is_set), input_v);
+                neg_acc = _mm256_add_ps(neg_acc, contrib);
+            }
+        }
+
+        // Horizontal sums for the SIMD accumulators.
+        let hsum = |v: __m256| -> f32 {
+            let lo = _mm256_castps256_ps128(v);
+            let hi = _mm256_extractf128_ps(v, 1);
+            let s = _mm_add_ps(lo, hi);
+            let sh = _mm_movehl_ps(s, s);
+            let s2 = _mm_add_ps(s, sh);
+            let sh2 = _mm_shuffle_ps(s2, s2, 0x55);
+            let s3 = _mm_add_ss(s2, sh2);
+            _mm_cvtss_f32(s3)
+        };
+        let mut pos_sum = hsum(pos_acc);
+        let mut neg_sum = hsum(neg_acc);
+
+        // Tail: elements in the final byte that fall past `num_cols`.
+        let tail_start = full_bytes * 8;
+        if tail_start < num_cols {
+            let last_b = full_bytes;
+            let pm = pos_mask[last_b];
+            let nm = neg_mask[last_b];
+            let remaining = num_cols - tail_start;
+            for bit in 0..remaining {
+                let idx = tail_start + bit;
+                let p = f32::from((pm >> bit) & 1);
+                let n = f32::from((nm >> bit) & 1);
+                pos_sum += p * input[idx];
+                neg_sum += n * input[idx];
+            }
+        }
+
+        pos_sum - neg_sum
+    }
 }
 
 // ─── x86_64 AVX-512 SIMD dot products (Issue #13) ───────────────────────────
@@ -1961,6 +2056,62 @@ mod avx512_dot {
             }
         }
         _mm512_reduce_add_ps(acc)
+    }
+
+    /// Ternary bitmask × f32 input dot product for one row (AVX-512F).
+    ///
+    /// Uses AVX-512's native 16-bit mask register (`__mmask16`) to gate the
+    /// per-lane contribution — no explicit compare + and dance. Two
+    /// consecutive bytes of `pos_mask` / `neg_mask` combine into a
+    /// `__mmask16` covering 16 lanes at once, so each iteration processes
+    /// twice the input width of the AVX2 path.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn ternary_dot_row_unscaled(
+        pos_mask: &[u8],
+        neg_mask: &[u8],
+        input: &[f32],
+        num_cols: usize,
+    ) -> f32 {
+        let mut pos_acc = _mm512_setzero_ps();
+        let mut neg_acc = _mm512_setzero_ps();
+
+        // 16-lane groups walk two mask bytes at a time.
+        let full_pairs = num_cols / 16;
+        for pair in 0..full_pairs {
+            let pm = u16::from(pos_mask[pair * 2]) | (u16::from(pos_mask[pair * 2 + 1]) << 8);
+            let nm = u16::from(neg_mask[pair * 2]) | (u16::from(neg_mask[pair * 2 + 1]) << 8);
+            if (pm | nm) == 0 {
+                continue;
+            }
+            let input_v = _mm512_loadu_ps(input.as_ptr().add(pair * 16));
+            if pm != 0 {
+                let k: __mmask16 = pm;
+                pos_acc = _mm512_mask_add_ps(pos_acc, k, pos_acc, input_v);
+            }
+            if nm != 0 {
+                let k: __mmask16 = nm;
+                neg_acc = _mm512_mask_add_ps(neg_acc, k, neg_acc, input_v);
+            }
+        }
+
+        let mut pos_sum = _mm512_reduce_add_ps(pos_acc);
+        let mut neg_sum = _mm512_reduce_add_ps(neg_acc);
+
+        // Tail: any elements past `full_pairs * 16`. We fall through to a
+        // scalar loop for the up-to-15 remaining lanes so the mask packing
+        // stays simple.
+        let tail_start = full_pairs * 16;
+        for idx in tail_start..num_cols {
+            let byte_idx = idx / 8;
+            let bit = idx % 8;
+            let p = f32::from((pos_mask[byte_idx] >> bit) & 1);
+            let n = f32::from((neg_mask[byte_idx] >> bit) & 1);
+            pos_sum += p * input[idx];
+            neg_sum += n * input[idx];
+        }
+
+        pos_sum - neg_sum
     }
 }
 
@@ -3766,6 +3917,44 @@ fn ternary_matvec_impl(rows: &[TernaryRow], input: &[f32], output: &mut [f32]) {
 
 #[inline]
 fn ternary_dot_row(row: &TernaryRow, input: &[f32]) -> f32 {
+    // Runtime-dispatched (Issue #24): AVX-512F → AVX2 → scalar.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_avx512bw_supported() {
+            // SAFETY: guarded by runtime CPU detection; input length is
+            // validated against `row.num_cols` on the ternary matvec entry.
+            let unscaled = unsafe {
+                avx512_dot::ternary_dot_row_unscaled(
+                    &row.pos_mask,
+                    &row.neg_mask,
+                    input,
+                    row.num_cols,
+                )
+            };
+            return row.scale * unscaled;
+        }
+        if x86_avx2_supported() {
+            // SAFETY: guarded by runtime CPU detection.
+            let unscaled = unsafe {
+                avx2_dot::ternary_dot_row_unscaled(
+                    &row.pos_mask,
+                    &row.neg_mask,
+                    input,
+                    row.num_cols,
+                )
+            };
+            return row.scale * unscaled;
+        }
+    }
+    ternary_dot_row_scalar(row, input)
+}
+
+/// Scalar fallback body for [`ternary_dot_row`]. Kept as a separate
+/// function so the SIMD dispatch on x86_64 can call it directly when no
+/// feature is available, and so the scalar tests exercise a stable
+/// reference implementation.
+#[inline]
+fn ternary_dot_row_scalar(row: &TernaryRow, input: &[f32]) -> f32 {
     let mut pos_sum = 0.0f32;
     let mut neg_sum = 0.0f32;
     let num_bytes = row.pos_mask.len();
@@ -3777,14 +3966,13 @@ fn ternary_dot_row(row: &TernaryRow, input: &[f32]) -> f32 {
             continue;
         }
         let base = b * 8;
-        // Unrolled 8-element loop for auto-vectorization
         for bit in 0..8 {
             let idx = base + bit;
             if idx >= row.num_cols {
                 break;
             }
-            let p = ((pm >> bit) & 1) as f32;
-            let n = ((nm >> bit) & 1) as f32;
+            let p = f32::from((pm >> bit) & 1);
+            let n = f32::from((nm >> bit) & 1);
             pos_sum += p * input[idx];
             neg_sum += n * input[idx];
         }
@@ -5413,6 +5601,113 @@ mod tests {
                 "seed={seed}: scalar={} simd={} rel={rel}",
                 scalar_out[0],
                 simd_out[0]
+            );
+        }
+    }
+
+    // ── Ternary bitmask SIMD parity (Issue #24) ────────────────────────
+
+    /// Build a deterministic TernaryRow for a given seed and column count.
+    /// Alternates between +1 / -1 / 0 driven by the seed so the SIMD path
+    /// exercises both `pos_mask` and `neg_mask` in every 8-lane group.
+    #[cfg(target_arch = "x86_64")]
+    fn make_ternary_row(seed: u8, num_cols: usize, scale: f32) -> TernaryRow {
+        let num_bytes = num_cols.div_ceil(8);
+        let mut pos_mask = vec![0u8; num_bytes];
+        let mut neg_mask = vec![0u8; num_bytes];
+        for i in 0..num_cols {
+            let raw = seed.wrapping_mul(3).wrapping_add(i as u8) as i8;
+            let byte_idx = i / 8;
+            let bit = 1u8 << (i % 8);
+            if raw > 20 {
+                pos_mask[byte_idx] |= bit;
+            } else if raw < -20 {
+                neg_mask[byte_idx] |= bit;
+            }
+        }
+        TernaryRow {
+            pos_mask,
+            neg_mask,
+            scale,
+            num_cols,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn make_ternary_input(seed: u8, num_cols: usize) -> Vec<f32> {
+        (0..num_cols)
+            .map(|i| f32::from(seed.wrapping_add(i as u8) as i8) * 0.01)
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ternary_avx2_matches_scalar_relative_tolerance() {
+        if !x86_avx2_supported() {
+            eprintln!("SKIP: AVX2 unavailable on this runner");
+            return;
+        }
+        // 128 covers 16 mask bytes = plenty of both empty and populated
+        // 8-lane groups; the divisible-by-8 count also matches typical
+        // hidden-dim shapes so the fast path (no tail) is dominant.
+        const COLS: usize = 128;
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let row = make_ternary_row(seed, COLS, 0.125);
+            let input = make_ternary_input(seed.wrapping_mul(7), COLS);
+            let scalar = ternary_dot_row_scalar(&row, &input);
+            // Force AVX2 arm via the runtime dispatch (test precondition
+            // covers AVX-512 skip via feature detection above).
+            let simd = ternary_dot_row(&row, &input);
+            let diff = (scalar - simd).abs();
+            let rel = diff / scalar.abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
+            );
+        }
+    }
+
+    /// Tail path (non-multiple-of-8 column count) must not be silently
+    /// dropped by the SIMD full-byte loop.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ternary_avx2_handles_non_multiple_of_8_cols() {
+        if !x86_avx2_supported() {
+            return;
+        }
+        // 100 = 12 full bytes + 4 tail bits → forces the scalar tail loop.
+        const COLS: usize = 100;
+        for seed in [1u8, 42, 200] {
+            let row = make_ternary_row(seed, COLS, 0.5);
+            let input = make_ternary_input(seed.wrapping_mul(11), COLS);
+            let scalar = ternary_dot_row_scalar(&row, &input);
+            let simd = ternary_dot_row(&row, &input);
+            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ternary_avx512_matches_scalar_relative_tolerance() {
+        if !x86_avx512bw_supported() {
+            eprintln!("SKIP: AVX-512BW unavailable on this runner");
+            return;
+        }
+        // 16-lane grouping: 128 cols = 8 full 16-lane groups.
+        const COLS: usize = 128;
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let row = make_ternary_row(seed, COLS, 0.125);
+            let input = make_ternary_input(seed.wrapping_mul(7), COLS);
+            let scalar = ternary_dot_row_scalar(&row, &input);
+            let simd = ternary_dot_row(&row, &input);
+            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
             );
         }
     }
