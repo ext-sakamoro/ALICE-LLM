@@ -27,6 +27,63 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Emit one JSONL line of top-5 logits to stderr for CPU/GPU divergence diagnostics
+/// (Issue #40). Format is intentionally identical between `qwen_gpu.rs` (GPU) and
+/// `elyza_gguf.rs` (CPU) so the two streams can be diffed line-by-line.
+fn dump_logits_jsonl(
+    backend: &str,
+    pos: i64,
+    logits: &[f32],
+    tokenizer: &GgufTokenizer,
+) {
+    // Argpartition-style top-5 without extra deps: track (idx, val).
+    let mut top: [(u32, f32); 5] = [(u32::MAX, f32::NEG_INFINITY); 5];
+    for (i, &v) in logits.iter().enumerate() {
+        // Find slot to displace (smallest current). Linear over 5 is fine.
+        let mut min_idx = 0usize;
+        for k in 1..5 {
+            if top[k].1 < top[min_idx].1 {
+                min_idx = k;
+            }
+        }
+        if v > top[min_idx].1 {
+            top[min_idx] = (i as u32, v);
+        }
+    }
+    // Sort descending by logit value.
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build JSONL manually (no serde dep for examples).
+    let mut line = String::with_capacity(256);
+    line.push_str(&format!(
+        "{{\"backend\":\"{backend}\",\"pos\":{pos},\"top5\":["
+    ));
+    for (k, (tid, logit)) in top.iter().enumerate() {
+        if k > 0 {
+            line.push(',');
+        }
+        let decoded = tokenizer.decode(&[*tid]);
+        // JSON-escape decoded token (only \, ", control chars matter for our vocabs).
+        let mut esc = String::with_capacity(decoded.len() + 2);
+        for ch in decoded.chars() {
+            match ch {
+                '"' => esc.push_str("\\\""),
+                '\\' => esc.push_str("\\\\"),
+                '\n' => esc.push_str("\\n"),
+                '\r' => esc.push_str("\\r"),
+                '\t' => esc.push_str("\\t"),
+                c if (c as u32) < 0x20 => esc.push_str(&format!("\\u{:04x}", c as u32)),
+                c => esc.push(c),
+            }
+        }
+        line.push_str(&format!(
+            "{{\"id\":{tid},\"logit\":{logit:.6},\"tok\":\"{esc}\"}}"
+        ));
+    }
+    line.push_str("]}");
+    eprintln!("{line}");
+}
+
 #[cfg(feature = "gpu")]
 fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
     GpuModelConfig {
@@ -58,6 +115,9 @@ fn main() {
     let max_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(256);
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let top_k: usize = parse_arg(&args, "--top-k").unwrap_or(40);
+    // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
+    // the first N decoded tokens plus the prompt-end position (pos=-1).
+    let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
 
     #[cfg(feature = "gpu")]
     {
@@ -121,6 +181,13 @@ fn main() {
         let mut logits = model.forward_and_read(last_prompt);
         let prefill_ms = t_prefill.elapsed().as_millis();
 
+        // Issue #40 diagnostic: dump prompt-end position logits (labelled pos=-1)
+        // before any decoded token is sampled. This is the layer input that
+        // determines the very first generated token.
+        if logits_dump > 0 {
+            dump_logits_jsonl("gpu", -1, &logits, &tokenizer);
+        }
+
         // --- Decode: autoregressive loop ---
         let t_decode = Instant::now();
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -138,7 +205,7 @@ fn main() {
             (rng_state as f32) / (u64::MAX as f32)
         };
 
-        for _ in 0..max_tokens {
+        for step in 0..max_tokens {
             let next_token = if temperature < 1e-6 {
                 sample_argmax(&logits) as u32
             } else {
@@ -159,6 +226,13 @@ fn main() {
             std::io::stdout().flush().ok();
 
             logits = model.forward_and_read(next_token);
+
+            // Issue #40 diagnostic: dump per-step logits AFTER forwarding the
+            // just-sampled token, so `pos` matches the "logits that would
+            // sample decode position pos+1" convention.
+            if logits_dump > 0 && step < logits_dump {
+                dump_logits_jsonl("gpu", step as i64, &logits, &tokenizer);
+            }
         }
 
         let decode_ms = t_decode.elapsed().as_millis();
