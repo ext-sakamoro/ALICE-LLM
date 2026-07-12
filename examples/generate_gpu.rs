@@ -64,6 +64,12 @@ fn main() {
             rope_theta: 500000.0,
             eps: 1e-5,
             max_seq_len: 2048,
+            full_attention_interval: None,
+            linear_num_kv_heads: None,
+            linear_qk_head_dim: None,
+            linear_kv_head_dim: None,
+            linear_num_v_heads: None,
+            linear_conv_kernel_dim: None,
         };
 
         // --- GPU init ---

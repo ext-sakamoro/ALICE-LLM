@@ -41,12 +41,12 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
         max_seq_len: cfg.max_seq_len,
         // Qwen3.5 DeltaNet-only fields — None for standard attention (Qwen 2 / 2.5 / 3).
         // GpuModel::load treats None `full_attention_interval` as pure-attention model.
-        full_attention_interval: cfg.full_attention_interval,
-        linear_num_kv_heads: cfg.linear_num_kv_heads.map(|v| v as u32),
-        linear_qk_head_dim: cfg.linear_qk_head_dim.map(|v| v as u32),
-        linear_kv_head_dim: cfg.linear_kv_head_dim.map(|v| v as u32),
-        linear_num_v_heads: cfg.linear_num_v_heads.map(|v| v as u32),
-        linear_conv_kernel_dim: cfg.linear_conv_kernel_dim.map(|v| v as u32),
+        full_attention_interval: cfg.full_attention_interval(),
+        linear_num_kv_heads: cfg.linear_num_kv_heads().map(|v| v as u32),
+        linear_qk_head_dim: cfg.linear_qk_head_dim().map(|v| v as u32),
+        linear_kv_head_dim: cfg.linear_kv_head_dim().map(|v| v as u32),
+        linear_num_v_heads: cfg.linear_num_v_heads().map(|v| v as u32),
+        linear_conv_kernel_dim: cfg.linear_conv_kernel_dim().map(|v| v as u32),
     }
 }
 
