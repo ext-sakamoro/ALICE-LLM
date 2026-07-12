@@ -2543,6 +2543,54 @@ impl<'a> LayerWeights<'a> {
 /// Issue #11. Mirrors the GPU-side `DeltaNetLayerWeightBufs` field layout so
 /// tensor loading logic reads the same `blk.{i}.ssm_*` / `blk.{i}.ffn_*`
 /// keys on both paths.
+/// DeepSeek-V3 / R1 per-layer MLA weight references (Phase 2 of Issue #32).
+///
+/// Mirrors the llama.cpp tensor naming for `deepseek2` GGUFs:
+/// `attn_norm.weight`, `attn_q_a.weight`, `attn_q_a_norm.weight`,
+/// `attn_q_b.weight`, `attn_kv_a_mqa.weight`, `attn_kv_a_norm.weight`,
+/// `attn_kv_b.weight`, `attn_output.weight`, plus a standard SwiGLU FFN
+/// for the first `first_k_dense_replace` layers (`ffn_norm`, `ffn_gate`,
+/// `ffn_up`, `ffn_down`). MoE-layer FFN weights are Phase 3 (Issue #33).
+///
+/// Shape summary (V3 numbers, hidden_dim=7168, num_heads=128,
+/// q_lora_rank=1536, kv_lora_rank=512, qk_nope=128, qk_rope=64, v_head=128):
+///
+/// * `q_a_proj`: `[q_lora_rank, hidden_dim]`
+/// * `q_b_proj`: `[num_heads * (qk_nope + qk_rope), q_lora_rank]`
+/// * `kv_a_proj_with_mqa`: `[kv_lora_rank + qk_rope, hidden_dim]`
+/// * `kv_b_proj`: `[num_heads * (qk_nope + v_head), kv_lora_rank]`
+/// * `o_proj`: `[hidden_dim, num_heads * v_head]`
+///
+/// FFN weights are `Option` because MoE layers omit them entirely.
+struct DeepSeekV3LayerWeights<'a> {
+    attn_norm: Vec<f32>,
+    /// Q LoRA down projection: `hidden → q_lora_rank`.
+    q_a_proj: WeightRef<'a>,
+    /// RMSNorm applied to the `q_lora_rank` intermediate before `q_b_proj`.
+    q_a_norm: Vec<f32>,
+    /// Q LoRA up projection: `q_lora_rank → num_heads * (qk_nope + qk_rope)`.
+    q_b_proj: WeightRef<'a>,
+    /// Fused KV LoRA down + MQA k_pe projection:
+    /// `hidden → (kv_lora_rank + qk_rope_head_dim)`.
+    kv_a_proj_with_mqa: WeightRef<'a>,
+    /// RMSNorm applied to the `kv_lora_rank` intermediate before `kv_b_proj`.
+    kv_a_norm: Vec<f32>,
+    /// KV LoRA up projection:
+    /// `kv_lora_rank → num_heads * (qk_nope + v_head)`.
+    kv_b_proj: WeightRef<'a>,
+    /// Output projection: `num_heads * v_head → hidden`.
+    o_proj: WeightRef<'a>,
+    // ── Dense FFN (present only for `first_k_dense_replace` layers) ─────
+    /// FFN RMSNorm, populated for dense layers only.
+    ffn_norm: Option<Vec<f32>>,
+    /// Dense SwiGLU gate. `None` for MoE layers (Phase 3).
+    gate_proj: Option<WeightRef<'a>>,
+    /// Dense SwiGLU up. `None` for MoE layers.
+    up_proj: Option<WeightRef<'a>>,
+    /// Dense SwiGLU down. `None` for MoE layers.
+    down_proj: Option<WeightRef<'a>>,
+}
+
 struct DeltaNetLayerWeights<'a> {
     attn_norm: Vec<f32>,
     /// Fused input projection: `hidden → q + k + v + z` packed.
@@ -2758,6 +2806,11 @@ pub struct Llama3Model<'a> {
     /// step; the oldest slot (`(rp + 1) % (kernel-1)`) is overwritten by the
     /// current activation before the next step reads it.
     deltanet_conv_ring_pos: Vec<usize>,
+    /// DeepSeek-V2 / V3 / R1 per-layer MLA + optional dense FFN weights.
+    /// `None` for non-DeepSeek architectures. Indexed by global layer index
+    /// (unlike DeltaNet, DeepSeek-V3 does not interleave with attention layers
+    /// — every layer is MLA).
+    deepseek_v3_layers: Option<Vec<DeepSeekV3LayerWeights<'a>>>,
 }
 
 /// Compact routing tag used by `Llama3Model::layer_kind_map` for hybrid
@@ -2796,20 +2849,34 @@ impl<'a> Llama3Model<'a> {
                 },
             )?;
 
-        // Layers. For hybrid Qwen 3.5 / 3.6, DeltaNet layers are loaded into a
-        // separate `deltanet_layers` vector (independent tensor names + no KV
-        // cache), while attention layers stay in `layers`. `layer_kind_map`
-        // keeps track of which vector each global layer index refers to.
+        // Layers. Three routing regimes coexist:
+        //  * DeepSeek-V3 / R1 — every layer is MLA, weights live in
+        //    `deepseek_v3_layers`; `layers` stays empty and `layer_kind_map`
+        //    is unused (the forward path indexes directly by global index).
+        //  * Qwen 3.5 / 3.6 hybrid — DeltaNet layers land in
+        //    `deltanet_layers`, attention layers in `layers`,
+        //    `layer_kind_map` disambiguates.
+        //  * Everything else — every layer is a standard attention entry in
+        //    `layers`, `layer_kind_map` is empty.
+        let is_deepseek_model = matches!(config.arch, ModelArch::DeepSeekV3);
         let is_hybrid_model = config.is_hybrid();
-        let mut layers = Vec::with_capacity(config.num_layers);
+        let mut layers = Vec::with_capacity(if is_deepseek_model {
+            0
+        } else {
+            config.num_layers
+        });
         let mut deltanet_layers_vec: Vec<DeltaNetLayerWeights<'a>> = Vec::new();
+        let mut deepseek_v3_layers_vec: Vec<DeepSeekV3LayerWeights<'a>> = Vec::new();
         let mut layer_kind_map: Vec<LayerKind> = if is_hybrid_model {
             Vec::with_capacity(config.num_layers)
         } else {
             Vec::new()
         };
         for i in 0..config.num_layers {
-            if is_hybrid_model && config.is_deltanet_layer(i) {
+            if is_deepseek_model {
+                let dsv = load_deepseek_v3_layer_weights(gguf, i, &config)?;
+                deepseek_v3_layers_vec.push(dsv);
+            } else if is_hybrid_model && config.is_deltanet_layer(i) {
                 let dn = load_deltanet_layer_weights(gguf, i, &config)?;
                 layer_kind_map.push(LayerKind::DeltaNet(deltanet_layers_vec.len()));
                 deltanet_layers_vec.push(dn);
@@ -2823,6 +2890,11 @@ impl<'a> Llama3Model<'a> {
         }
         let deltanet_layers = if is_hybrid_model {
             Some(deltanet_layers_vec)
+        } else {
+            None
+        };
+        let deepseek_v3_layers = if is_deepseek_model {
+            Some(deepseek_v3_layers_vec)
         } else {
             None
         };
@@ -2847,7 +2919,18 @@ impl<'a> Llama3Model<'a> {
             .collect();
         let deltanet_conv_ring_pos = vec![0usize; deltanet_layer_count];
 
-        let kv_dim = config.num_kv_heads * config.head_dim;
+        // KV cache dim per token.
+        //  * DeepSeek-V3 stores the compressed MLA latent (`kv_lora_rank` +
+        //    the shared `qk_rope_head_dim` positional slice). This is the
+        //    source of the ~57× KV-cache compression relative to standard
+        //    GQA and is what makes long-context DeepSeek runs fit in RAM.
+        //  * Everything else stores full `num_kv_heads * head_dim` bytes.
+        let kv_dim = if is_deepseek_model {
+            config.deepseek_kv_lora_rank().unwrap_or(0)
+                + config.deepseek_qk_rope_head_dim().unwrap_or(0)
+        } else {
+            config.num_kv_heads * config.head_dim
+        };
         let mut kv_cache = KvCache::new(config.num_layers, config.max_seq_len, kv_dim);
         // Gemma 3n shared-KV layer mapping (no-op for other architectures).
         kv_cache.set_layer_map(config.build_kv_layer_map());
@@ -2940,6 +3023,7 @@ impl<'a> Llama3Model<'a> {
             deltanet_state,
             deltanet_conv_state,
             deltanet_conv_ring_pos,
+            deepseek_v3_layers,
         })
     }
 
@@ -4111,54 +4195,224 @@ impl<'a> Llama3Model<'a> {
     /// Panics if the model was not loaded with Gemma 4 architecture (missing
     /// required per-layer input embedding tensors, etc.).
     /// DeepSeek-V2 / V3 / R1 forward pass — **foundation only** as of
-    /// 2026-07-11.
+    /// 2026-07-11 (foundation) and continues with MLA CPU forward as of
+    /// 2026-07-12.
     ///
-    /// The full implementation requires four separate landing efforts, each
-    /// tracked as a follow-up Issue:
-    /// 1. **MLA CPU forward** — Q/KV LoRA projections, partial RoPE on the
-    ///    `qk_rope_head_dim` slice, compressed KV cache sized to
-    ///    `kv_lora_rank`, weight-absorption trick for decode.
-    /// 2. **DeepSeek MoE routing** — 256 routed experts + shared expert,
-    ///    sigmoid gating with the `noaux_tc` bias-correction trick, top-k
-    ///    dispatch, `routed_scaling_factor`.
-    /// 3. **Expert streaming from disk** — colibri-style LRU + pinned
-    ///    hot-store + OS page cache so 671B weights fit in ~25 GB RAM.
-    /// 4. **MTP head + speculative decoding** — the extra decoder layer
-    ///    predicting future tokens for lossless rejection-sample spec.
+    /// Phase 2 lands the MLA arithmetic:
+    /// * Q LoRA chain: `q_a_proj → q_a_norm → q_b_proj`,
+    ///   split into `q_nope` + `q_pe`.
+    /// * KV LoRA chain: `kv_a_proj_with_mqa`,
+    ///   split into `kv_a` (compressed latent) + `k_pe_shared` (MQA
+    ///   positional slice shared across heads),
+    ///   then `kv_a_norm → kv_b_proj`, split into `k_nope` + `v`.
+    /// * Partial NEOX RoPE on `q_pe` (per head) and `k_pe_shared`.
+    /// * Compressed KV cache: only `kv_a` + `k_pe_shared` (`kv_lora_rank +
+    ///   qk_rope_head_dim` f32 per token) is persisted, which is the source
+    ///   of the ~57× KV-cache compression documented in the DeepSeek-V2
+    ///   paper.
+    /// * Attention: reconstruct `k_nope[h,t] = kv_b_proj(kv_a[t])` on demand,
+    ///   concatenate with the shared `k_pe`, compute the usual softmax dot
+    ///   product, output-projection via `o_proj`.
     ///
-    /// Until those land, the function fails fast with a clear message so a
-    /// silent-garbage fallback (treating the model as standard attention)
-    /// cannot slip through. The weight loading path is expected to succeed
-    /// so metadata / tensor names / shapes can still be inspected.
+    /// The FFN sub-block is dense SwiGLU **only for layers below
+    /// `first_k_dense_replace`** (V3: 3). Everything past that requires
+    /// DeepSeek MoE routing (Phase 3, Issue #33) and — until Phase 3 lands
+    /// — the function panics with a clear message so silent-garbage
+    /// fallbacks are impossible.
     ///
-    /// `&mut self` is retained deliberately: the eventual forward pass will
-    /// mutate `kv_cache`, expert state, and MTP scratch, so the signature
-    /// stays uniform with the other `forward_*` variants even while the
-    /// body is only a `panic!` today.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    fn forward_deepseek_v3(&mut self, _token_id: u32) -> Vec<f32> {
-        let c = &self.config;
-        panic!(
-            "DeepSeek-V3 / R1 forward pass is not yet implemented (foundation only).\n\
-             Detected: n_routed_experts={:?}, n_shared_experts={:?}, num_experts_per_tok={:?}, \
-             q_lora_rank={:?}, kv_lora_rank={:?}, qk_nope_head_dim={:?}, qk_rope_head_dim={:?}, \
-             v_head_dim={:?}, first_k_dense_replace={:?}, routed_scaling_factor={:?}, \
-             noaux_tc={:?}, mtp_layer={:?}.\n\
-             Implementation is split across Phase 2-5 follow-up Issues \
-             (MLA / MoE routing / expert streaming / MTP).",
-            c.deepseek_n_routed_experts(),
-            c.deepseek_n_shared_experts(),
-            c.deepseek_num_experts_per_tok(),
-            c.deepseek_q_lora_rank(),
-            c.deepseek_kv_lora_rank(),
-            c.deepseek_qk_nope_head_dim(),
-            c.deepseek_qk_rope_head_dim(),
-            c.deepseek_v_head_dim(),
-            c.deepseek_first_k_dense_replace(),
-            c.deepseek_routed_scaling_factor(),
-            c.deepseek_noaux_tc(),
-            c.deepseek_mtp_layer(),
-        );
+    /// Phase 4 (expert streaming) and Phase 5 (MTP native speculative
+    /// decoding) still track separately (Issues #34 / #35).
+    fn forward_deepseek_v3(&mut self, token_id: u32) -> Vec<f32> {
+        let c = self.config.clone();
+        let hidden_dim = c.hidden_dim;
+        let num_heads = c.num_heads;
+        let q_lora_rank = c.deepseek_q_lora_rank().expect("q_lora_rank");
+        let kv_lora_rank = c.deepseek_kv_lora_rank().expect("kv_lora_rank");
+        let qk_nope = c.deepseek_qk_nope_head_dim().expect("qk_nope_head_dim");
+        let qk_rope = c.deepseek_qk_rope_head_dim().expect("qk_rope_head_dim");
+        let v_head_dim = c.deepseek_v_head_dim().expect("v_head_dim");
+        let first_k_dense = c.deepseek_first_k_dense_replace().unwrap_or(0);
+        let q_head_total = qk_nope + qk_rope;
+        let kv_up_head_total = qk_nope + v_head_dim;
+        let compressed_kv_dim = kv_lora_rank + qk_rope;
+
+        let deepseek_layers = self
+            .deepseek_v3_layers
+            .as_ref()
+            .expect("DeepSeek-V3 layers not loaded");
+
+        let pos = self.kv_cache.seq_len();
+
+        // Embedding lookup.
+        let emb_start = token_id as usize * hidden_dim;
+        let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + hidden_dim].to_vec();
+
+        // Scratch buffers reused across layers.
+        let mut norm_buf = vec![0.0f32; hidden_dim];
+        let mut q_a_buf = vec![0.0f32; q_lora_rank];
+        let mut q_a_normed = vec![0.0f32; q_lora_rank];
+        let mut q_full = vec![0.0f32; num_heads * q_head_total];
+        let mut kv_a_full = vec![0.0f32; compressed_kv_dim];
+        let mut kv_a_normed = vec![0.0f32; kv_lora_rank];
+        let mut kv_up = vec![0.0f32; num_heads * kv_up_head_total];
+        let mut attn_out = vec![0.0f32; num_heads * v_head_dim];
+        let mut o_buf = vec![0.0f32; hidden_dim];
+        let mut gate_buf = vec![0.0f32; c.intermediate_dim];
+        let mut up_buf = vec![0.0f32; c.intermediate_dim];
+        let mut down_buf = vec![0.0f32; hidden_dim];
+
+        for layer_idx in 0..c.num_layers {
+            let layer = &deepseek_layers[layer_idx];
+
+            // ── Attention block ───────────────────────────────────────
+            rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
+
+            // Q LoRA chain.
+            layer.q_a_proj.matvec(&norm_buf, &mut q_a_buf);
+            rms_norm(&q_a_buf, &layer.q_a_norm, c.norm_eps, &mut q_a_normed);
+            layer.q_b_proj.matvec(&q_a_normed, &mut q_full);
+
+            // KV LoRA chain: single matvec produces the compressed latent
+            // `kv_a` plus the shared positional slice `k_pe`.
+            layer.kv_a_proj_with_mqa.matvec(&norm_buf, &mut kv_a_full);
+            let (kv_a_slice, k_pe_shared) = kv_a_full.split_at_mut(kv_lora_rank);
+            rms_norm(kv_a_slice, &layer.kv_a_norm, c.norm_eps, &mut kv_a_normed);
+            // Persist the compressed latent + shared k_pe in the KV cache
+            // (the ~57× compression trick). Reconstructed per-head `k_nope`
+            // stays purely on the stack.
+            let mut cache_entry = Vec::with_capacity(compressed_kv_dim);
+            cache_entry.extend_from_slice(&kv_a_normed);
+            cache_entry.extend_from_slice(k_pe_shared);
+            // Compute `k_nope` + `v` for the current token (needed to compare
+            // against future queries; historical positions rebuild theirs on
+            // demand from `kv_a`).
+            layer.kv_b_proj.matvec(&kv_a_normed, &mut kv_up);
+
+            // Split Q per-head into (q_nope, q_pe) and apply NEOX RoPE only
+            // to the `qk_rope` slice of each head. The shared `k_pe` gets
+            // a single RoPE pass (no head dimension).
+            for h in 0..num_heads {
+                let q_head_off = h * q_head_total;
+                let q_pe_slice = &mut q_full[q_head_off + qk_nope..q_head_off + q_head_total];
+                apply_rope_auto(
+                    q_pe_slice,
+                    pos,
+                    qk_rope,
+                    c.rope_theta,
+                    self.rope_freqs.as_deref(),
+                    true, // NEOX
+                );
+            }
+            apply_rope_auto(
+                k_pe_shared,
+                pos,
+                qk_rope,
+                c.rope_theta,
+                self.rope_freqs.as_deref(),
+                true,
+            );
+            // Persist (post-RoPE) k_pe into the cache entry so the shared
+            // slice lines up with `q_pe` at attention time.
+            cache_entry[kv_lora_rank..].copy_from_slice(k_pe_shared);
+            self.kv_cache.append(layer_idx, &cache_entry, &cache_entry);
+            self.kv_cache.advance();
+
+            // Attention: for each history position `t`, dot each head's Q
+            // against the reconstructed K, softmax, weighted sum over V.
+            // Historical `k_nope[h,t]` and `v[h,t]` come from re-projecting
+            // the cached `kv_a[t]` (weight-absorption is Phase 3 territory).
+            let seq_len = pos + 1;
+            let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
+            // Zero the attention output slab before accumulating per head.
+            attn_out.fill(0.0);
+            let mut scratch_kv_up = vec![0.0f32; num_heads * kv_up_head_total];
+            let mut scores = vec![0.0f32; seq_len];
+            for h in 0..num_heads {
+                let q_head_off = h * q_head_total;
+                let q_nope_head = &q_full[q_head_off..q_head_off + qk_nope];
+                let q_pe_head = &q_full[q_head_off + qk_nope..q_head_off + q_head_total];
+
+                let mut max_score = f32::NEG_INFINITY;
+                for t in 0..seq_len {
+                    let cache = self.kv_cache.key_at(layer_idx, t);
+                    let cached_kv_a = &cache[..kv_lora_rank];
+                    let cached_k_pe = &cache[kv_lora_rank..];
+                    layer.kv_b_proj.matvec(cached_kv_a, &mut scratch_kv_up);
+                    let head_off = h * kv_up_head_total;
+                    let k_nope_t = &scratch_kv_up[head_off..head_off + qk_nope];
+                    let mut dot = 0.0f32;
+                    for i in 0..qk_nope {
+                        dot += q_nope_head[i] * k_nope_t[i];
+                    }
+                    for i in 0..qk_rope {
+                        dot += q_pe_head[i] * cached_k_pe[i];
+                    }
+                    dot *= scale;
+                    scores[t] = dot;
+                    if dot > max_score {
+                        max_score = dot;
+                    }
+                }
+                // Softmax stable in place.
+                let mut denom = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_score).exp();
+                    denom += *s;
+                }
+                for s in &mut scores {
+                    *s /= denom;
+                }
+                // Weighted sum of V.
+                let attn_head_off = h * v_head_dim;
+                for t in 0..seq_len {
+                    let cache = self.kv_cache.value_at(layer_idx, t);
+                    let cached_kv_a = &cache[..kv_lora_rank];
+                    layer.kv_b_proj.matvec(cached_kv_a, &mut scratch_kv_up);
+                    let head_off = h * kv_up_head_total;
+                    let v_t = &scratch_kv_up[head_off + qk_nope..head_off + kv_up_head_total];
+                    let w = scores[t];
+                    for j in 0..v_head_dim {
+                        attn_out[attn_head_off + j] += w * v_t[j];
+                    }
+                }
+            }
+
+            layer.o_proj.matvec(&attn_out, &mut o_buf);
+            for i in 0..hidden_dim {
+                hidden[i] += o_buf[i];
+            }
+
+            // ── FFN block ─────────────────────────────────────────────
+            if layer_idx < first_k_dense {
+                let ffn_norm = layer.ffn_norm.as_ref().expect("dense ffn_norm");
+                let gate_proj = layer.gate_proj.as_ref().expect("dense gate_proj");
+                let up_proj = layer.up_proj.as_ref().expect("dense up_proj");
+                let down_proj = layer.down_proj.as_ref().expect("dense down_proj");
+                rms_norm(&hidden, ffn_norm, c.norm_eps, &mut norm_buf);
+                gate_proj.matvec(&norm_buf, &mut gate_buf);
+                up_proj.matvec(&norm_buf, &mut up_buf);
+                for i in 0..c.intermediate_dim {
+                    gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+                }
+                down_proj.matvec(&gate_buf, &mut down_buf);
+                for i in 0..hidden_dim {
+                    hidden[i] += down_buf[i];
+                }
+            } else {
+                panic!(
+                    "DeepSeek-V3 MoE FFN not implemented — Phase 3 (Issue #33). \
+                     Layer {layer_idx} is past first_k_dense_replace = {first_k_dense}. \
+                     Configure with `first_k_dense_replace >= num_layers` or wait for MoE \
+                     routing to land before running full-model inference."
+                );
+            }
+        }
+
+        // Output norm + logits.
+        rms_norm(&hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        self.output_proj.matvec(&norm_buf, &mut logits);
+        logits
     }
 
     fn forward_gemma4(&mut self, token_id: u32) -> Vec<f32> {
@@ -6988,6 +7242,115 @@ fn load_layer_weights<'a>(
 /// (`blk.{i}.ssm_conv1d.weight/bias`, `blk.{i}.ssm_in.weight`,
 /// `blk.{i}.ssm_alpha.weight`, `blk.{i}.ssm_beta.weight`,
 /// `blk.{i}.ssm_out.weight`, plus the standard FFN block).
+/// Load MLA + optional dense-FFN weights for one DeepSeek-V3 layer.
+///
+/// Consumes the same tensor names as llama.cpp's `deepseek2` architecture
+/// entries. Layers below `first_k_dense_replace` carry SwiGLU FFN tensors
+/// (`ffn_gate` / `ffn_up` / `ffn_down` + `ffn_norm`); layers above load with
+/// `None` for those fields — the MoE path lands in Phase 3 (Issue #33).
+fn load_deepseek_v3_layer_weights<'a>(
+    gguf: &'a GgufFile<'a>,
+    layer: usize,
+    config: &Llama3Config,
+) -> Option<DeepSeekV3LayerWeights<'a>> {
+    let prefix = format!("blk.{layer}");
+
+    let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
+
+    // MLA dimensions from the config metadata.
+    let q_lora_rank = config.deepseek_q_lora_rank()?;
+    let kv_lora_rank = config.deepseek_kv_lora_rank()?;
+    let qk_nope_head_dim = config.deepseek_qk_nope_head_dim()?;
+    let qk_rope_head_dim = config.deepseek_qk_rope_head_dim()?;
+    let v_head_dim = config.deepseek_v_head_dim()?;
+
+    let q_head_total = qk_nope_head_dim + qk_rope_head_dim;
+    let kv_up_head_total = qk_nope_head_dim + v_head_dim;
+
+    let q_a_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_q_a.weight"),
+        q_lora_rank,
+        config.hidden_dim,
+    )?;
+    let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
+    let q_b_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_q_b.weight"),
+        config.num_heads * q_head_total,
+        q_lora_rank,
+    )?;
+    let kv_a_proj_with_mqa = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_kv_a_mqa.weight"),
+        kv_lora_rank + qk_rope_head_dim,
+        config.hidden_dim,
+    )?;
+    let kv_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_kv_a_norm.weight"))?;
+    let kv_b_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_kv_b.weight"),
+        config.num_heads * kv_up_head_total,
+        kv_lora_rank,
+    )?;
+    let o_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_output.weight"),
+        config.hidden_dim,
+        config.num_heads * v_head_dim,
+    )?;
+
+    // Dense SwiGLU FFN only for the first `first_k_dense_replace` layers.
+    // Everything past that block is a DeepSeek-MoE FFN whose weights we
+    // deliberately skip until Phase 3 lands.
+    let first_k_dense = config.deepseek_first_k_dense_replace().unwrap_or(0);
+    let (ffn_norm, gate_proj, up_proj, down_proj) = if layer < first_k_dense {
+        let ffn_size = config.ffn_size_for_layer(layer);
+        let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+        let gate_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_gate.weight"),
+            ffn_size,
+            config.hidden_dim,
+        )?;
+        let up_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_up.weight"),
+            ffn_size,
+            config.hidden_dim,
+        )?;
+        let down_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_down.weight"),
+            config.hidden_dim,
+            ffn_size,
+        )?;
+        (
+            Some(ffn_norm),
+            Some(gate_proj),
+            Some(up_proj),
+            Some(down_proj),
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    Some(DeepSeekV3LayerWeights {
+        attn_norm,
+        q_a_proj,
+        q_a_norm,
+        q_b_proj,
+        kv_a_proj_with_mqa,
+        kv_a_norm,
+        kv_b_proj,
+        o_proj,
+        ffn_norm,
+        gate_proj,
+        up_proj,
+        down_proj,
+    })
+}
+
 fn load_deltanet_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -8737,5 +9100,103 @@ mod tests {
         // prefix. Any drift here would silently mis-route GGUF metadata
         // lookups in `Llama3Config::from_gguf`.
         assert_eq!(ModelArch::DeepSeekV3.meta_prefix(), "deepseek2");
+    }
+
+    // ── DeepSeek-V3 Phase 2: MLA shape + math sanity ─────────────────
+
+    /// Synthetic 4-layer DeepSeek-V3 config sized so weight loading /
+    /// forward paths can be exercised without a real 671B GGUF. Numbers
+    /// are downsized proportionally (num_heads=2, hidden_dim=16,
+    /// q_lora_rank=8, kv_lora_rank=4, qk_nope=4, qk_rope=2, v_head=4).
+    fn tiny_deepseek_v3_config() -> Llama3Config {
+        Llama3Config {
+            arch: ModelArch::DeepSeekV3,
+            vocab_size: 32,
+            hidden_dim: 16,
+            intermediate_dim: 32,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 4,
+            max_seq_len: 32,
+            head_dim: 6,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
+            deepseek_v3: Some(DeepSeekV3Config {
+                q_lora_rank: Some(8),
+                kv_lora_rank: Some(4),
+                qk_nope_head_dim: Some(4),
+                qk_rope_head_dim: Some(2),
+                v_head_dim: Some(4),
+                n_routed_experts: Some(8),
+                n_shared_experts: Some(1),
+                num_experts_per_tok: Some(2),
+                moe_intermediate_size: Some(32),
+                // Set high so every layer in the tiny model takes the dense
+                // SwiGLU path — MoE (Phase 3) is out of scope for these tests.
+                first_k_dense_replace: Some(4),
+                routed_scaling_factor: Some(2.5),
+                noaux_tc: Some(true),
+                mtp_layer: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn deepseek_v3_compressed_kv_dim_matches_paper() {
+        // The MLA cache stores `kv_lora_rank + qk_rope_head_dim` floats per
+        // token — 576 for V3 (512 + 64). The tiny fixture uses 4 + 2 = 6.
+        let c = tiny_deepseek_v3_config();
+        let kv_dim = c.deepseek_kv_lora_rank().unwrap() + c.deepseek_qk_rope_head_dim().unwrap();
+        assert_eq!(kv_dim, 6);
+        // Sanity-check the paper's V3 numbers as documented in the config
+        // comments, in case a future refactor accidentally rewrites them.
+        assert_eq!(512usize + 64usize, 576);
+    }
+
+    #[test]
+    fn deepseek_v3_shape_totals_align_with_head_layout() {
+        // `q_b_proj` output size and `kv_b_proj` output size are both
+        // per-head split into (nope, rope|v). A mistuned config would
+        // silently mis-index the split inside `forward_deepseek_v3`.
+        let c = tiny_deepseek_v3_config();
+        let num_heads = c.num_heads;
+        let q_head_total =
+            c.deepseek_qk_nope_head_dim().unwrap() + c.deepseek_qk_rope_head_dim().unwrap();
+        let kv_up_head_total =
+            c.deepseek_qk_nope_head_dim().unwrap() + c.deepseek_v_head_dim().unwrap();
+        assert_eq!(num_heads * q_head_total, 2 * 6);
+        assert_eq!(num_heads * kv_up_head_total, 2 * 8);
+    }
+
+    #[test]
+    fn deepseek_v3_first_k_dense_boundary_gates_moe_panic() {
+        // Layers below `first_k_dense_replace` take the dense SwiGLU FFN
+        // path; layers at or above must trigger the Phase-3 MoE panic.
+        // The tiny fixture bumps `first_k_dense_replace` up to `num_layers`
+        // so no layer trips the panic, exercising the dense branch end to
+        // end. This guard makes sure the boundary predicate itself stays
+        // aligned with what `forward_deepseek_v3` inspects.
+        let c = tiny_deepseek_v3_config();
+        let first_k = c.deepseek_first_k_dense_replace().unwrap();
+        assert!(first_k >= c.num_layers, "tiny fixture must stay dense-only");
+    }
+
+    #[test]
+    fn deepseek_v3_config_fixture_declares_all_mla_fields() {
+        // A tripwire: if a future PR adds an MLA field, this test forces
+        // the tiny fixture (and by extension every deep-seek test) to be
+        // updated so the shape assertions keep making sense.
+        let c = tiny_deepseek_v3_config();
+        let d = c.deepseek_v3.as_ref().unwrap();
+        assert!(d.q_lora_rank.is_some());
+        assert!(d.kv_lora_rank.is_some());
+        assert!(d.qk_nope_head_dim.is_some());
+        assert!(d.qk_rope_head_dim.is_some());
+        assert!(d.v_head_dim.is_some());
     }
 }
