@@ -118,6 +118,16 @@ fn main() {
     // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
     // the first N decoded tokens plus the prompt-end position (pos=-1).
     let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
+    // Issue #40 diagnostic: dump post-final-RMSNorm hidden state (pre-output-
+    // projection) for pos=-1 to stderr as JSONL. Same schema as CPU side so
+    // the two streams can be diffed for cos-sim / L2 to isolate whether the
+    // logit gap comes from the layer stack or from output_proj.
+    let dump_final_hidden = args.iter().any(|a| a == "--dump-final-hidden");
+    // Issue #40 layer bisection: run prefill and dump hidden state after
+    // layers 0, 6, 13, 20, 27 on the last prompt token, then exit. Requires
+    // one full prefill per checkpoint (5x prefill cost) because each stop
+    // point mutates KV cache differently and needs a clean reset.
+    let layer_bisect = args.iter().any(|a| a == "--layer-bisect");
 
     #[cfg(feature = "gpu")]
     {
@@ -171,14 +181,44 @@ fn main() {
         println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
         println!("---");
 
+        // --- Issue #40 layer bisection mode ---
+        if layer_bisect {
+            let checkpoints = [0usize, 6, 13, 20, 27];
+            eprintln!(
+                "[layer-bisect] Running 5 prefill passes to dump hidden state at layers {checkpoints:?}"
+            );
+            for &stop_at in &checkpoints {
+                model.reset();
+                // Prefill all prompt tokens except the last (full 28-layer path)
+                for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
+                    model.forward(tok);
+                }
+                // Last prompt token: stop after `stop_at` and read hidden
+                let last = *prompt_tokens.last().unwrap();
+                let hidden = model.forward_stop_after_layer_and_read_hidden(last, stop_at);
+                alice_llm::llama3::dump_hidden_jsonl_stderr(&format!("gpu_layer_{stop_at}"), &hidden);
+            }
+            eprintln!("[layer-bisect] Done");
+            return;
+        }
+
         // --- Prefill: process all prompt tokens except the last ---
         let t_prefill = Instant::now();
         for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
             model.forward(tok);
         }
-        // Last prompt token: read logits to get first generated token
+        // Last prompt token: read logits (and optionally the pre-output-
+        // projection hidden state) to get first generated token + Issue #40
+        // diagnostic sample.
         let last_prompt = *prompt_tokens.last().unwrap();
-        let mut logits = model.forward_and_read(last_prompt);
+        let mut logits = if dump_final_hidden {
+            let (hidden, logits) =
+                model.forward_and_read_hidden_and_logits(last_prompt);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu", &hidden);
+            logits
+        } else {
+            model.forward_and_read(last_prompt)
+        };
         let prefill_ms = t_prefill.elapsed().as_millis();
 
         // Issue #40 diagnostic: dump prompt-end position logits (labelled pos=-1)

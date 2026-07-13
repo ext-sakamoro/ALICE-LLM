@@ -11,6 +11,47 @@ use crate::gguf::{
 };
 use std::time::Instant;
 
+/// Issue #40 diagnostic. Emits one JSONL line to stderr summarising the
+/// post-final-RMSNorm hidden state (the buffer that feeds output_proj). The
+/// GPU path uses an identical schema so the two can be diffed offline.
+///
+/// Format:
+/// `{"backend":"cpu|gpu","kind":"pre_output_hidden","dim":N,"l2":X,"top8":[[idx,val],...]}`
+///
+/// The top-8 by absolute magnitude is chosen because logits are sensitive to
+/// the largest components of the hidden vector — small differences in those
+/// coordinates translate into large logit shifts through the output projection.
+pub fn dump_hidden_jsonl_stderr(backend: &str, hidden: &[f32]) {
+    let l2 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mut idxs: Vec<(usize, f32)> = hidden.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    idxs.sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let dim = hidden.len();
+    // Pre-size for full vector + header. ~10 chars per float on avg.
+    let mut line = String::with_capacity(dim * 10 + 256);
+    line.push_str(&format!(
+        "{{\"backend\":\"{backend}\",\"kind\":\"pre_output_hidden\",\"dim\":{dim},\"l2\":{l2:.6},\"top8\":["
+    ));
+    for (k, (i, v)) in idxs.iter().take(8).enumerate() {
+        if k > 0 {
+            line.push(',');
+        }
+        line.push_str(&format!("[{i},{v:.6}]"));
+    }
+    line.push_str("],\"full\":[");
+    for (k, v) in hidden.iter().enumerate() {
+        if k > 0 {
+            line.push(',');
+        }
+        line.push_str(&format!("{v:.6}"));
+    }
+    line.push_str("]}");
+    eprintln!("{line}");
+}
+
 // ─── Model architecture ─────────────────────────────────────────────────────
 
 /// Supported model architectures.
@@ -3552,6 +3593,17 @@ impl<'a> Llama3Model<'a> {
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
             }
+
+            // Issue #40 diagnostic: dump per-layer post-residual hidden state
+            // to identify the layer at which CPU/GPU divergence first emerges.
+            // Only emit at fixed checkpoints (layer 0, 6, 13, 20, 27) to bound
+            // stderr volume — that covers ~every 25% of the stack for a
+            // 28-layer model. Off-by-default (env var must be set).
+            if std::env::var_os("ALICE_LLM_DUMP_LAYERS").is_some()
+                && matches!(layer_idx, 0 | 6 | 13 | 20 | 27)
+            {
+                dump_hidden_jsonl_stderr(&format!("cpu_layer_{layer_idx}"), &hidden);
+            }
         }
 
         // Advance KV cache position (all layers have appended for this token)
@@ -3559,6 +3611,15 @@ impl<'a> Llama3Model<'a> {
 
         // Output norm
         rms_norm(&hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
+
+        // Issue #40 diagnostic: dump pre-output-projection hidden state when
+        // ALICE_LLM_DUMP_HIDDEN is set. Enables CPU vs GPU cos-sim comparison
+        // to isolate whether the divergence is in the layer stack or in the
+        // Q6_K output projection. Runs before the final matvec so the buffer
+        // captured is exactly what output_proj reads.
+        if std::env::var_os("ALICE_LLM_DUMP_HIDDEN").is_some() {
+            dump_hidden_jsonl_stderr("cpu", &norm_buf);
+        }
 
         // Output logits
         let mut logits = vec![0.0f32; c.vocab_size];

@@ -101,6 +101,16 @@ fn main() {
     // the prompt-end position and first N decoded tokens. When set, forces a
     // plain-argmax manual forward loop (no speculative, no ternary generation).
     let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
+    // Issue #40 diagnostic: dump post-final-RMSNorm hidden state (pre-output-
+    // projection) to stderr as JSONL. Combined with the same flag on
+    // `qwen_gpu`, allows offline cos-sim / L2 diff to isolate whether the
+    // logit gap comes from the layer stack or from output_proj. Sets the
+    // ALICE_LLM_DUMP_HIDDEN env var so the library's forward() path emits
+    // one JSONL line per forward call.
+    let dump_final_hidden = has_flag(&args, "--dump-final-hidden");
+    if dump_final_hidden {
+        std::env::set_var("ALICE_LLM_DUMP_HIDDEN", "1");
+    }
 
     println!("Loading GGUF model: {model_path}");
     let load_start = Instant::now();

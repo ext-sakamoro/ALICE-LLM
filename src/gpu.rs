@@ -1193,6 +1193,11 @@ pub struct GpuModel {
     _beta_buf: GpuBuffer,
     logits: GpuBuffer,
     staging: wgpu::Buffer,
+    /// Issue #40 diagnostic. Small staging buffer for reading `_norm_buf`
+    /// (post-final-RMSNorm hidden state) back to CPU. Sized `hidden_dim * 4`.
+    /// Lazily allocated the first time `forward_and_read_hidden_and_logits`
+    /// is called.
+    hidden_staging: std::cell::OnceCell<wgpu::Buffer>,
 
     // KV caches (attention layers only)
     k_caches: Vec<GpuBuffer>,
@@ -2480,6 +2485,7 @@ impl GpuModel {
             _beta_buf: beta_buf,
             logits,
             staging,
+            hidden_staging: std::cell::OnceCell::new(),
             k_caches,
             v_caches,
             deltanet_states,
@@ -2514,6 +2520,22 @@ impl GpuModel {
 
     /// Encode the full forward pass into a command encoder.
     fn encode_forward(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_forward_impl(encoder, None);
+    }
+
+    /// Encode the standard forward but stop after the given layer's FFN
+    /// residual add. Skips the final norm + output projection so the caller
+    /// can inspect the `hidden` buffer at a specific layer boundary. Used
+    /// exclusively by the Issue #40 layer bisection diagnostic.
+    fn encode_forward_stop_after(&self, encoder: &mut wgpu::CommandEncoder, stop_after: usize) {
+        self.encode_forward_impl(encoder, Some(stop_after));
+    }
+
+    fn encode_forward_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        stop_after: Option<usize>,
+    ) {
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         let mut dn_fwd_idx: usize = 0; // index into deltanet_layer_bgs
 
@@ -2680,6 +2702,13 @@ impl GpuModel {
             cp.set_pipeline(&self.engine.residual_add_pipeline);
             cp.set_bind_group(0, &self.residual_ffn_bg, &[]);
             cp.dispatch_workgroups(self.residual_dispatch_x, 1, 1);
+
+            // Issue #40 layer bisection: if the caller requested a stop after
+            // this layer, skip the output head. The `hidden` buffer now holds
+            // this layer's post-FFN-residual output.
+            if stop_after == Some(i) {
+                return;
+            }
         }
 
         // --- Output head ---
@@ -2789,6 +2818,116 @@ impl GpuModel {
         self.engine.queue.submit(Some(encoder.finish()));
         self.seq_len = seq_len;
         self.engine.map_staging(&self.staging, self.vocab_size)
+    }
+
+    /// Issue #40 layer bisection diagnostic. Executes forward but stops
+    /// after the given layer's FFN residual add, then returns that layer's
+    /// output hidden state. Skips the output head entirely so downstream
+    /// state is untouched.
+    ///
+    /// **KV cache side effect**: only layers `0..=stop_after` append K/V
+    /// at the current position. The caller MUST call `reset()` before any
+    /// subsequent forward — otherwise later attention layers will read
+    /// stale K/V at this position. This method advances `seq_len` regardless.
+    pub fn forward_stop_after_layer_and_read_hidden(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+    ) -> Vec<f32> {
+        assert!(
+            stop_after < self.config.num_layers,
+            "stop_after ({stop_after}) must be < num_layers ({})",
+            self.config.num_layers,
+        );
+
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let hidden_dim = self.config.hidden_dim;
+        let hidden_size = (hidden_dim * 4) as u64;
+        let hidden_staging = self.hidden_staging.get_or_init(|| {
+            self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hidden_staging"),
+                size: hidden_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_forward_stop_after(&mut encoder, stop_after);
+
+        encoder.copy_buffer_to_buffer(&self.hidden.buffer, 0, hidden_staging, 0, hidden_size);
+
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+
+        self.engine.map_staging(hidden_staging, hidden_dim)
+    }
+
+    /// Issue #40 diagnostic. Executes forward and returns both the
+    /// post-final-RMSNorm hidden state (the buffer that feeds output_proj)
+    /// AND the final logits. Used to isolate whether the CPU/GPU logit gap
+    /// originates in the layer stack (hidden state drift) or in the Q6_K
+    /// output projection.
+    ///
+    /// The hidden buffer is `hidden_dim` f32 values; logits are `vocab_size`.
+    /// Adds two `copy_buffer_to_buffer` steps to the encoder but is otherwise
+    /// the same as `forward_and_read`.
+    pub fn forward_and_read_hidden_and_logits(
+        &mut self,
+        token_id: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        // Lazy-allocate the hidden staging buffer on first call.
+        let hidden_dim = self.config.hidden_dim;
+        let hidden_size = (hidden_dim * 4) as u64;
+        let hidden_staging = self.hidden_staging.get_or_init(|| {
+            self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hidden_staging"),
+                size: hidden_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_forward(&mut encoder);
+
+        // Capture post-final-RMSNorm state BEFORE output projection reads
+        // it. Safe because output_proj only reads norm_buf (line 2687-2692 in
+        // encode_forward) — no subsequent writer clobbers it.
+        encoder.copy_buffer_to_buffer(
+            &self._norm_buf.buffer,
+            0,
+            hidden_staging,
+            0,
+            hidden_size,
+        );
+
+        let logits_size = (self.vocab_size * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.logits.buffer, 0, &self.staging, 0, logits_size);
+
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+
+        let hidden = self.engine.map_staging(hidden_staging, hidden_dim);
+        let logits = self.engine.map_staging(&self.staging, self.vocab_size);
+        (hidden, logits)
     }
 
     /// Reset KV caches and position counter.
