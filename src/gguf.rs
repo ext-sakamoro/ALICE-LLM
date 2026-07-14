@@ -1271,6 +1271,83 @@ mod neon_dot {
         vaddvq_f32(acc)
     }
 
+    /// Ternary bitmask × f32 input dot product for one row using NEON.
+    ///
+    /// Mirrors the AVX2 kernel `avx2_dot::ternary_dot_row_unscaled`. Per byte
+    /// of `pos_mask` / `neg_mask` we broadcast the byte into a `u32x4` lane,
+    /// AND it against the two 4-lane bit masks `[1, 2, 4, 8]` and
+    /// `[16, 32, 64, 128]`, and `vceqq_u32` against the same bit mask. That
+    /// yields all-ones per lane where the bit was set and 0 elsewhere; the
+    /// bitwise AND with the reinterpreted f32 input lane produces `input[i]`
+    /// or `0.0` — no branching, no per-lane multiplies.
+    ///
+    /// Returns the **unscaled** positive_sum − negative_sum; the caller
+    /// multiplies by `row.scale` (bit-exact with the AVX2 / scalar callers).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn ternary_dot_row_unscaled(
+        pos_mask: &[u8],
+        neg_mask: &[u8],
+        input: &[f32],
+        num_cols: usize,
+    ) -> f32 {
+        let bit_lanes_lo: uint32x4_t = vld1q_u32([0x01u32, 0x02, 0x04, 0x08].as_ptr());
+        let bit_lanes_hi: uint32x4_t = vld1q_u32([0x10u32, 0x20, 0x40, 0x80].as_ptr());
+        let mut pos_acc: float32x4_t = vdupq_n_f32(0.0);
+        let mut neg_acc: float32x4_t = vdupq_n_f32(0.0);
+
+        let full_bytes = num_cols / 8;
+        for b in 0..full_bytes {
+            let pm = u32::from(pos_mask[b]);
+            let nm = u32::from(neg_mask[b]);
+            if (pm | nm) == 0 {
+                continue;
+            }
+            let in_ptr = input.as_ptr().add(b * 8);
+            let in_lo = vld1q_f32(in_ptr);
+            let in_hi = vld1q_f32(in_ptr.add(4));
+
+            if pm != 0 {
+                let bcast = vdupq_n_u32(pm);
+                let is_set_lo = vceqq_u32(vandq_u32(bcast, bit_lanes_lo), bit_lanes_lo);
+                let is_set_hi = vceqq_u32(vandq_u32(bcast, bit_lanes_hi), bit_lanes_hi);
+                let contrib_lo = vandq_u32(is_set_lo, vreinterpretq_u32_f32(in_lo));
+                let contrib_hi = vandq_u32(is_set_hi, vreinterpretq_u32_f32(in_hi));
+                pos_acc = vaddq_f32(pos_acc, vreinterpretq_f32_u32(contrib_lo));
+                pos_acc = vaddq_f32(pos_acc, vreinterpretq_f32_u32(contrib_hi));
+            }
+            if nm != 0 {
+                let bcast = vdupq_n_u32(nm);
+                let is_set_lo = vceqq_u32(vandq_u32(bcast, bit_lanes_lo), bit_lanes_lo);
+                let is_set_hi = vceqq_u32(vandq_u32(bcast, bit_lanes_hi), bit_lanes_hi);
+                let contrib_lo = vandq_u32(is_set_lo, vreinterpretq_u32_f32(in_lo));
+                let contrib_hi = vandq_u32(is_set_hi, vreinterpretq_u32_f32(in_hi));
+                neg_acc = vaddq_f32(neg_acc, vreinterpretq_f32_u32(contrib_lo));
+                neg_acc = vaddq_f32(neg_acc, vreinterpretq_f32_u32(contrib_hi));
+            }
+        }
+
+        let mut pos_sum = vaddvq_f32(pos_acc);
+        let mut neg_sum = vaddvq_f32(neg_acc);
+
+        // Tail: elements in the final byte that fall past `num_cols`.
+        let tail_start = full_bytes * 8;
+        if tail_start < num_cols {
+            let last_b = full_bytes;
+            let pm = pos_mask[last_b];
+            let nm = neg_mask[last_b];
+            let remaining = num_cols - tail_start;
+            for bit in 0..remaining {
+                let idx = tail_start + bit;
+                let p = f32::from((pm >> bit) & 1);
+                let n = f32::from((nm >> bit) & 1);
+                pos_sum += p * input[idx];
+                neg_sum += n * input[idx];
+            }
+        }
+
+        pos_sum - neg_sum
+    }
+
     #[inline]
     fn unpack_scales_mins_q4k(scale_bytes: &[u8]) -> ([u8; 8], [u8; 8]) {
         const KMASK1: u32 = 0x3f3f_3f3f;
@@ -4034,6 +4111,18 @@ fn ternary_dot_row(row: &TernaryRow, input: &[f32]) -> f32 {
             return row.scale * unscaled;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on every aarch64 target Rust supports.
+        // Parity with scalar is relative-tolerance (1e-5), not bit-exact,
+        // due to differing summation order — same rationale as the AVX2
+        // path documented in `ternary_avx2_matches_scalar_relative_tolerance`.
+        let unscaled = unsafe {
+            neon_dot::ternary_dot_row_unscaled(&row.pos_mask, &row.neg_mask, input, row.num_cols)
+        };
+        return row.scale * unscaled;
+    }
+    #[allow(unreachable_code)]
     ternary_dot_row_scalar(row, input)
 }
 
@@ -5698,7 +5787,7 @@ mod tests {
     /// Build a deterministic TernaryRow for a given seed and column count.
     /// Alternates between +1 / -1 / 0 driven by the seed so the SIMD path
     /// exercises both `pos_mask` and `neg_mask` in every 8-lane group.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn make_ternary_row(seed: u8, num_cols: usize, scale: f32) -> TernaryRow {
         let num_bytes = num_cols.div_ceil(8);
         let mut pos_mask = vec![0u8; num_bytes];
@@ -5721,7 +5810,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn make_ternary_input(seed: u8, num_cols: usize) -> Vec<f32> {
         (0..num_cols)
             .map(|i| f32::from(seed.wrapping_add(i as u8) as i8) * 0.01)
@@ -5891,6 +5980,45 @@ mod tests {
                 scalar.to_bits(),
                 neon.to_bits(),
                 "seed={seed}: scalar={scalar} neon={neon}"
+            );
+        }
+    }
+
+    /// Ternary NEON is verified within a relative tolerance (1e-5) rather
+    /// than bit-exact because the parallel adds re-order summation vs the
+    /// scalar sequential path — same rationale as the AVX2 kernel.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ternary_neon_matches_scalar_relative_tolerance() {
+        const COLS: usize = 128;
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let row = make_ternary_row(seed, COLS, 0.125);
+            let input = make_ternary_input(seed.wrapping_mul(7), COLS);
+            let scalar = ternary_dot_row_scalar(&row, &input);
+            let simd = ternary_dot_row(&row, &input);
+            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
+            );
+        }
+    }
+
+    /// Tail path (non-multiple-of-8 column count) must not be silently
+    /// dropped by the SIMD full-byte loop.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ternary_neon_handles_non_multiple_of_8_cols() {
+        const COLS: usize = 100;
+        for seed in [1u8, 42, 200] {
+            let row = make_ternary_row(seed, COLS, 0.5);
+            let input = make_ternary_input(seed.wrapping_mul(11), COLS);
+            let scalar = ternary_dot_row_scalar(&row, &input);
+            let simd = ternary_dot_row(&row, &input);
+            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
             );
         }
     }
