@@ -70,6 +70,8 @@ fn main() {
             linear_kv_head_dim: None,
             linear_num_v_heads: None,
             linear_conv_kernel_dim: None,
+            // Llama-3 uses LLAMA-style RoPE (pair (i, i+1)).
+            neox_rope: false,
         };
 
         // --- GPU init ---

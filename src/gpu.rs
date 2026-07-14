@@ -56,7 +56,9 @@ struct RopeParams {
     head_dim: u32,
     theta: f32,
     batch_size: u32,
-    _pad1: u32,
+    /// RoPE rotation convention. `0` = LLAMA-style pair `(i, i+1)`,
+    /// `1` = NEOX-style pair `(i, i + head_dim/2)`. See Issue #40.
+    neox: u32,
     _pad2: u32,
     _pad3: u32,
 }
@@ -785,7 +787,11 @@ impl<'a> GpuPass<'a> {
             head_dim,
             theta,
             batch_size: 1,
-            _pad1: 0,
+            // Default LLAMA-style — this path is only used by the legacy
+            // one-shot `rope` benchmark method and does not carry Qwen
+            // routing. NEOX callers should set this via the persistent
+            // RopeParams buffer created in `GpuModel::load`.
+            neox: 0,
             _pad2: 0,
             _pad3: 0,
         });
@@ -1052,6 +1058,11 @@ pub struct GpuModelConfig {
     pub linear_num_v_heads: Option<u32>,
     /// Qwen3.5 DeltaNet: causal conv1d kernel size (typically 4).
     pub linear_conv_kernel_dim: Option<u32>,
+    /// RoPE rotation convention. `false` = LLAMA-style (pair `(i, i+1)`),
+    /// `true` = NEOX-style (pair `(i, i + head_dim/2)`). Qwen 2/3, Gemma 2
+    /// require NEOX; Llama/Mistral/Gemma 4 use LLAMA-style. Mirrors
+    /// `Llama3Config::is_neox_rope()` on the CPU side.
+    pub neox_rope: bool,
 }
 
 /// Pre-cached matvec bind group with dispatch dimensions.
@@ -1907,13 +1918,14 @@ impl GpuModel {
                 })
         };
 
+        let neox_flag: u32 = u32::from(config.neox_rope);
         let rope_q_params_buf = make_persistent(bytemuck::bytes_of(&RopeParams {
             position: 0,
             num_heads: config.num_heads,
             head_dim: config.head_dim,
             theta: config.rope_theta,
             batch_size: 1,
-            _pad1: 0,
+            neox: neox_flag,
             _pad2: 0,
             _pad3: 0,
         }));
@@ -1923,7 +1935,7 @@ impl GpuModel {
             head_dim: config.head_dim,
             theta: config.rope_theta,
             batch_size: 1,
-            _pad1: 0,
+            neox: neox_flag,
             _pad2: 0,
             _pad3: 0,
         }));
@@ -2531,11 +2543,7 @@ impl GpuModel {
         self.encode_forward_impl(encoder, Some(stop_after));
     }
 
-    fn encode_forward_impl(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        stop_after: Option<usize>,
-    ) {
+    fn encode_forward_impl(&self, encoder: &mut wgpu::CommandEncoder, stop_after: Option<usize>) {
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         let mut dn_fwd_idx: usize = 0; // index into deltanet_layer_bgs
 
@@ -2880,10 +2888,7 @@ impl GpuModel {
     /// The hidden buffer is `hidden_dim` f32 values; logits are `vocab_size`.
     /// Adds two `copy_buffer_to_buffer` steps to the encoder but is otherwise
     /// the same as `forward_and_read`.
-    pub fn forward_and_read_hidden_and_logits(
-        &mut self,
-        token_id: u32,
-    ) -> (Vec<f32>, Vec<f32>) {
+    pub fn forward_and_read_hidden_and_logits(&mut self, token_id: u32) -> (Vec<f32>, Vec<f32>) {
         let pos = self.seq_len;
         let seq_len = pos + 1;
 
@@ -2911,13 +2916,7 @@ impl GpuModel {
         // Capture post-final-RMSNorm state BEFORE output projection reads
         // it. Safe because output_proj only reads norm_buf (line 2687-2692 in
         // encode_forward) — no subsequent writer clobbers it.
-        encoder.copy_buffer_to_buffer(
-            &self._norm_buf.buffer,
-            0,
-            hidden_staging,
-            0,
-            hidden_size,
-        );
+        encoder.copy_buffer_to_buffer(&self._norm_buf.buffer, 0, hidden_staging, 0, hidden_size);
 
         let logits_size = (self.vocab_size * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.logits.buffer, 0, &self.staging, 0, logits_size);

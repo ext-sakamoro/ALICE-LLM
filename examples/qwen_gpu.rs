@@ -30,12 +30,7 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
 /// Emit one JSONL line of top-5 logits to stderr for CPU/GPU divergence diagnostics
 /// (Issue #40). Format is intentionally identical between `qwen_gpu.rs` (GPU) and
 /// `elyza_gguf.rs` (CPU) so the two streams can be diffed line-by-line.
-fn dump_logits_jsonl(
-    backend: &str,
-    pos: i64,
-    logits: &[f32],
-    tokenizer: &GgufTokenizer,
-) {
+fn dump_logits_jsonl(backend: &str, pos: i64, logits: &[f32], tokenizer: &GgufTokenizer) {
     // Argpartition-style top-5 without extra deps: track (idx, val).
     let mut top: [(u32, f32); 5] = [(u32::MAX, f32::NEG_INFINITY); 5];
     for (i, &v) in logits.iter().enumerate() {
@@ -104,6 +99,9 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
         linear_kv_head_dim: cfg.linear_kv_head_dim().map(|v| v as u32),
         linear_num_v_heads: cfg.linear_num_v_heads().map(|v| v as u32),
         linear_conv_kernel_dim: cfg.linear_conv_kernel_dim().map(|v| v as u32),
+        // Qwen 2/2.5/3 require NEOX-style RoPE. Route from Llama3Config
+        // (Issue #40 root-cause fix).
+        neox_rope: cfg.arch.use_neox_rope(),
     }
 }
 
@@ -196,7 +194,10 @@ fn main() {
                 // Last prompt token: stop after `stop_at` and read hidden
                 let last = *prompt_tokens.last().unwrap();
                 let hidden = model.forward_stop_after_layer_and_read_hidden(last, stop_at);
-                alice_llm::llama3::dump_hidden_jsonl_stderr(&format!("gpu_layer_{stop_at}"), &hidden);
+                alice_llm::llama3::dump_hidden_jsonl_stderr(
+                    &format!("gpu_layer_{stop_at}"),
+                    &hidden,
+                );
             }
             eprintln!("[layer-bisect] Done");
             return;
@@ -212,8 +213,7 @@ fn main() {
         // diagnostic sample.
         let last_prompt = *prompt_tokens.last().unwrap();
         let mut logits = if dump_final_hidden {
-            let (hidden, logits) =
-                model.forward_and_read_hidden_and_logits(last_prompt);
+            let (hidden, logits) = model.forward_and_read_hidden_and_logits(last_prompt);
             alice_llm::llama3::dump_hidden_jsonl_stderr("gpu", &hidden);
             logits
         } else {

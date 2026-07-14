@@ -225,9 +225,7 @@ fn main() {
         };
         println!();
         println!("---");
-        println!(
-            "Tokens: {n_gen} generated, {n_prompt} prompt (logits-dump manual argmax)"
-        );
+        println!("Tokens: {n_gen} generated, {n_prompt} prompt (logits-dump manual argmax)");
         println!(
             "Speed: {tok_per_sec:.1} tok/s ({prefill_ms} prefill + {decode_ms} decode = {} total ms)",
             prefill_ms + decode_ms
