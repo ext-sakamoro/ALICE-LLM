@@ -1215,6 +1215,62 @@ mod neon_dot {
         d * q8k.d * total as f32
     }
 
+    /// Fused Q8_0 dequantize + f32 matvec for one row using NEON.
+    ///
+    /// Q8_0 stores 32 signed i8 weights per block plus a single f16 scale, and
+    /// — unlike the K-series — the ALICE-LLM dispatch feeds it raw f32 inputs
+    /// rather than a pre-quantised Q8_K block. That makes the SIMD path an f32
+    /// FMA loop rather than an integer madd chain, mirroring the AVX2
+    /// `avx2_dot::q8_0_matvec_row`.
+    ///
+    /// Per block of 32 elements we perform two 16-lane halves. Each half
+    /// widens 16 i8 → i32 (two `vmovl` chains) → f32, multiplies by the block
+    /// scale, and does four 4-lane FMAs against the input. The accumulator is
+    /// horizontally summed at the end with `vaddvq_f32` (aarch64 baseline).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn q8_0_matvec_row(input: &[f32], row_data: &[u8], cols: usize) -> f32 {
+        let blocks_per_row = cols / QK8_0;
+        let block_bytes = 34usize;
+        let mut acc: float32x4_t = vdupq_n_f32(0.0);
+
+        for bi in 0..blocks_per_row {
+            let off = bi * block_bytes;
+            let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+            let d_bcast = vdupq_n_f32(d);
+            let qs_ptr = row_data.as_ptr().add(off + 2).cast::<i8>();
+            let col_base = bi * QK8_0;
+            let in_ptr = input.as_ptr().add(col_base);
+
+            // First half: bytes 0..15, inputs 0..15.
+            let a0 = vld1q_s8(qs_ptr);
+            let a0_lo = vmovl_s8(vget_low_s8(a0));
+            let a0_hi = vmovl_s8(vget_high_s8(a0));
+            let f0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a0_lo))), d_bcast);
+            let f1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(a0_lo))), d_bcast);
+            let f2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a0_hi))), d_bcast);
+            let f3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(a0_hi))), d_bcast);
+            acc = vfmaq_f32(acc, f0, vld1q_f32(in_ptr));
+            acc = vfmaq_f32(acc, f1, vld1q_f32(in_ptr.add(4)));
+            acc = vfmaq_f32(acc, f2, vld1q_f32(in_ptr.add(8)));
+            acc = vfmaq_f32(acc, f3, vld1q_f32(in_ptr.add(12)));
+
+            // Second half: bytes 16..31, inputs 16..31.
+            let a1 = vld1q_s8(qs_ptr.add(16));
+            let a1_lo = vmovl_s8(vget_low_s8(a1));
+            let a1_hi = vmovl_s8(vget_high_s8(a1));
+            let g0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a1_lo))), d_bcast);
+            let g1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(a1_lo))), d_bcast);
+            let g2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a1_hi))), d_bcast);
+            let g3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(a1_hi))), d_bcast);
+            acc = vfmaq_f32(acc, g0, vld1q_f32(in_ptr.add(16)));
+            acc = vfmaq_f32(acc, g1, vld1q_f32(in_ptr.add(20)));
+            acc = vfmaq_f32(acc, g2, vld1q_f32(in_ptr.add(24)));
+            acc = vfmaq_f32(acc, g3, vld1q_f32(in_ptr.add(28)));
+        }
+
+        vaddvq_f32(acc)
+    }
+
     #[inline]
     fn unpack_scales_mins_q4k(scale_bytes: &[u8]) -> ([u8; 8], [u8; 8]) {
         const KMASK1: u32 = 0x3f3f_3f3f;
@@ -2815,6 +2871,22 @@ pub fn q8_0_matvec(input: &[f32], data: &[u8], rows: usize, cols: usize, output:
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on every aarch64 target Rust supports, so
+        // no runtime feature probe is needed — the `#[target_feature]` on the
+        // kernel matches unconditionally. Parity vs scalar is FMA-rounding
+        // approximate (see `q8_0_neon_matches_scalar_within_tol`), not
+        // bit-exact, because scalar uses separate mul + add whereas the NEON
+        // path uses `vfmaq_f32` (fused mul-add, single rounding).
+        for row in 0..rows {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            output[row] = unsafe { neon_dot::q8_0_matvec_row(input, row_data, cols) };
+        }
+        return;
+    }
+
+    #[allow(unreachable_code)]
     for row in 0..rows {
         let mut acc = 0.0f32;
         let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
@@ -5819,6 +5891,65 @@ mod tests {
                 scalar.to_bits(),
                 neon.to_bits(),
                 "seed={seed}: scalar={scalar} neon={neon}"
+            );
+        }
+    }
+
+    /// Q8_0 NEON is verified against scalar within a tight relative tolerance
+    /// rather than bit-exact because the paths use different accumulation:
+    /// scalar does `w * input + acc` (two roundings) whereas NEON uses
+    /// `vfmaq_f32(acc, f, x)` (single fused rounding). The tolerance below is
+    /// chosen empirically: for a 4096-column matvec, cumulative float error
+    /// stays under 1e-4 relative on `f32::EPSILON * cols`-order inputs.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q8_0_neon_matches_scalar_within_tol() {
+        const COLS: usize = 4096;
+        const BLOCK_BYTES: usize = 34;
+        const BLOCKS: usize = COLS / QK8_0;
+        for seed in [0u8, 1, 7, 128, 200, 255] {
+            let mut row_data = vec![0u8; BLOCKS * BLOCK_BYTES];
+            for bi in 0..BLOCKS {
+                let off = bi * BLOCK_BYTES;
+                // f16 scale from a safe range (no denormals, no Inf/NaN).
+                // 0x3400 = 0.25, 0x3800 = 0.5, 0x3c00 = 1.0. Vary within
+                // 0x3400..0x3c00 so scales stay in [0.25, 1.0).
+                let d_bits = 0x3400u16.wrapping_add((seed as u16 ^ bi as u16) & 0x07FF);
+                row_data[off..off + 2].copy_from_slice(&d_bits.to_le_bytes());
+                for l in 0..QK8_0 {
+                    row_data[off + 2 + l] = seed
+                        .wrapping_add((bi as u8).wrapping_mul(3))
+                        .wrapping_add(l as u8);
+                }
+            }
+            let input: Vec<f32> = (0..COLS)
+                .map(|i| ((i as f32 * 0.017 + seed as f32).sin() * 0.5))
+                .collect();
+
+            // Scalar reference.
+            let mut scalar_out = [0.0f32];
+            {
+                let mut acc = 0.0f32;
+                for bi in 0..BLOCKS {
+                    let off = bi * BLOCK_BYTES;
+                    let d = f16_to_f32(u16::from_le_bytes([row_data[off], row_data[off + 1]]));
+                    let col_base = bi * QK8_0;
+                    for l in 0..QK8_0 {
+                        let w = d * f32::from(row_data[off + 2 + l] as i8);
+                        acc += w * input[col_base + l];
+                    }
+                }
+                scalar_out[0] = acc;
+            }
+            // SAFETY: NEON is baseline on all aarch64 targets.
+            let neon = unsafe { neon_dot::q8_0_matvec_row(&input, &row_data, COLS) };
+
+            let diff = (scalar_out[0] - neon).abs();
+            let rel = diff / scalar_out[0].abs().max(f32::EPSILON);
+            assert!(
+                rel < 1e-4,
+                "seed={seed}: scalar={} neon={neon} diff={diff} rel={rel}",
+                scalar_out[0]
             );
         }
     }
