@@ -2652,16 +2652,53 @@ struct DeepSeekMoeWeights<'a> {
     /// weights use the un-biased scores. `None` when the checkpoint does
     /// not ship a bias tensor (older DeepSeek-V2 / rare V3 variants).
     exp_probs_b: Option<Vec<f32>>,
-    /// Routed expert gate/up/down weights, 3D `[n_expert, out, in]` layout
-    /// identical to Qwen 3 MoE / Mixtral (see `MoeExpertWeights`).
-    ffn_gate_exps: WeightRef<'a>,
-    ffn_up_exps: WeightRef<'a>,
-    ffn_down_exps: WeightRef<'a>,
+    /// Routed experts — either in-memory (default) or streamed on demand
+    /// through the Phase 4a LRU pool. See [`RoutedExpertStorage`].
+    routed: RoutedExpertStorage<'a>,
     /// Shared expert (always active, no gating). Uses `n_shared_experts *
     /// moe_intermediate_size` as its FFN size — V3: 1 * 2048 = 2048.
+    /// Shared expert is never streamed: it fires on every token so LRU
+    /// caching offers no locality benefit.
     ffn_gate_shexp: WeightRef<'a>,
     ffn_up_shexp: WeightRef<'a>,
     ffn_down_shexp: WeightRef<'a>,
+}
+
+/// Backing store for the routed-expert weights of a DeepSeek-V3 MoE layer.
+///
+/// Two variants:
+///
+/// - **`InMemory`** — the pre-Phase-4 default. Full expert 3D tensors are
+///   held as `WeightRef<'a>` and per-expert slabs are extracted by slicing
+///   into the mmap'd bytes. Zero allocations per matvec.
+///
+/// - **`Streaming`** — Phase 4a (Issue #34). The routed-expert bytes live
+///   inside a shared `StreamingExpertPool` with an LRU cache; slabs are
+///   loaded on demand for the top-k experts selected by the router. This
+///   makes running the full 671 B DeepSeek-V3 possible on machines that
+///   cannot fit all 15,616 routed experts in RAM simultaneously.
+///
+/// The loader currently only builds `InMemory` — real-GGUF streaming
+/// wiring is deliberately deferred to a follow-up (see [`Phase 4a scope`
+/// in `deepseek_streaming.rs`](crate::deepseek_streaming)). The enum shape
+/// is in place so `forward_deepseek_moe_layer` supports either backend
+/// today and the loader can be swapped without further code changes.
+enum RoutedExpertStorage<'a> {
+    InMemory {
+        gate: WeightRef<'a>,
+        up: WeightRef<'a>,
+        down: WeightRef<'a>,
+    },
+    /// Phase 4a scaffolding — enum variant + forward-path dispatch are in
+    /// place so a subsequent PR can wire the loader to construct this
+    /// variant (real-GGUF mmap threading + pool budget knob) without
+    /// further changes to the forward code. Pool semantics are covered
+    /// by [`crate::deepseek_streaming`]'s unit tests.
+    #[allow(dead_code)]
+    Streaming {
+        pool: std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>,
+        layer_idx: usize,
+    },
 }
 
 struct DeltaNetLayerWeights<'a> {
@@ -6585,12 +6622,21 @@ fn forward_deepseek_moe_layer(
     );
 
     // ── Step 8: Dispatch to top-k routed experts, accumulate. ──────────
-    let gate_exps = &moe.ffn_gate_exps;
-    let up_exps = &moe.ffn_up_exps;
-    let down_exps = &moe.ffn_down_exps;
-    let gate_slab = expert_slab_bytes(gate_exps, moe_ffn, hidden_dim);
-    let up_slab = expert_slab_bytes(up_exps, moe_ffn, hidden_dim);
-    let down_slab = expert_slab_bytes(down_exps, hidden_dim, moe_ffn);
+    // The `routed` enum lets us serve slabs from either an in-memory
+    // WeightRef (Phase 3 default) or a streaming pool (Phase 4a). Both
+    // paths hand the same `&[u8]` + qtype to `quantized_matvec` — the
+    // streaming path holds an `Arc<Vec<u8>>` in a temporary for the
+    // scope of one expert's three matvecs, then drops it (the LRU cache
+    // still owns the shared copy internally).
+    use crate::deepseek_streaming::ExpertKind;
+    let (gate_qtype, up_qtype, down_qtype) = match &moe.routed {
+        RoutedExpertStorage::InMemory { gate, up, down } => (gate.qtype, up.qtype, down.qtype),
+        RoutedExpertStorage::Streaming { pool, layer_idx } => (
+            pool.qtype(*layer_idx, ExpertKind::Gate),
+            pool.qtype(*layer_idx, ExpertKind::Up),
+            pool.qtype(*layer_idx, ExpertKind::Down),
+        ),
+    };
 
     for v in output.iter_mut() {
         *v = 0.0;
@@ -6599,33 +6645,46 @@ fn forward_deepseek_moe_layer(
     let mut up_buf = vec![0.0f32; moe_ffn];
     let mut expert_out = vec![0.0f32; hidden_dim];
     for &(e, weight) in &selected {
-        let g_data = &gate_exps.data[e * gate_slab..(e + 1) * gate_slab];
-        let u_data = &up_exps.data[e * up_slab..(e + 1) * up_slab];
-        let d_data = &down_exps.data[e * down_slab..(e + 1) * down_slab];
+        // Fetch this expert's three slabs. The `Arc<Vec<u8>>` variants
+        // for the streaming path outlive each matvec call, so borrowing
+        // `.as_slice()` for the argument is safe until the loop iteration
+        // ends.
+        let (g_arc, u_arc, d_arc);
+        let (g_data, u_data, d_data): (&[u8], &[u8], &[u8]) = match &moe.routed {
+            RoutedExpertStorage::InMemory { gate, up, down } => {
+                let gate_slab = expert_slab_bytes(gate, moe_ffn, hidden_dim);
+                let up_slab = expert_slab_bytes(up, moe_ffn, hidden_dim);
+                let down_slab = expert_slab_bytes(down, hidden_dim, moe_ffn);
+                (
+                    &gate.data[e * gate_slab..(e + 1) * gate_slab],
+                    &up.data[e * up_slab..(e + 1) * up_slab],
+                    &down.data[e * down_slab..(e + 1) * down_slab],
+                )
+            }
+            RoutedExpertStorage::Streaming { pool, layer_idx } => {
+                g_arc = pool.get_or_load(*layer_idx, ExpertKind::Gate, e);
+                u_arc = pool.get_or_load(*layer_idx, ExpertKind::Up, e);
+                d_arc = pool.get_or_load(*layer_idx, ExpertKind::Down, e);
+                (g_arc.as_slice(), u_arc.as_slice(), d_arc.as_slice())
+            }
+        };
 
         crate::gguf::quantized_matvec(
             norm_buf,
             g_data,
-            gate_exps.qtype,
+            gate_qtype,
             moe_ffn,
             hidden_dim,
             &mut gate_buf,
         );
-        crate::gguf::quantized_matvec(
-            norm_buf,
-            u_data,
-            up_exps.qtype,
-            moe_ffn,
-            hidden_dim,
-            &mut up_buf,
-        );
+        crate::gguf::quantized_matvec(norm_buf, u_data, up_qtype, moe_ffn, hidden_dim, &mut up_buf);
         for i in 0..moe_ffn {
             gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
         }
         crate::gguf::quantized_matvec(
             &gate_buf,
             d_data,
-            down_exps.qtype,
+            down_qtype,
             hidden_dim,
             moe_ffn,
             &mut expert_out,
@@ -7682,13 +7741,30 @@ fn load_deepseek_v3_layer_weights<'a>(
             config.hidden_dim,
             shared_ffn,
         )?;
+        // Default routed-expert storage is InMemory (pre-Phase-4). Streaming
+        // pool wiring for real GGUFs is a follow-up (see RoutedExpertStorage
+        // doc comment). The env var check is here so the plumbing is visible
+        // to future changes, but currently always falls through to InMemory
+        // — flipping the flag today logs a note and falls back rather than
+        // silently mis-loading the model.
+        if std::env::var_os("ALICE_LLM_MOE_STREAMING").is_some() {
+            eprintln!(
+                "[alice-llm] ALICE_LLM_MOE_STREAMING set for layer {layer}, but Phase 4a \
+                 does not yet wire real-GGUF streaming through the loader; falling back to \
+                 InMemory routed experts. Streaming API + LRU cache are exercised via \
+                 `deepseek_streaming::StreamingExpertPool` unit tests only."
+            );
+        }
+        let routed = RoutedExpertStorage::InMemory {
+            gate: ffn_gate_exps,
+            up: ffn_up_exps,
+            down: ffn_down_exps,
+        };
         let moe = DeepSeekMoeWeights {
             ffn_norm,
             ffn_gate_inp,
             exp_probs_b,
-            ffn_gate_exps,
-            ffn_up_exps,
-            ffn_down_exps,
+            routed,
             ffn_gate_shexp,
             ffn_up_shexp,
             ffn_down_shexp,
