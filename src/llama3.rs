@@ -3245,38 +3245,171 @@ impl<'a> Llama3Model<'a> {
         self.deepseek_v3_mtp.is_some()
     }
 
-    /// DeepSeek-V3 Multi-Token Prediction draft (Phase 5a, Issue #35).
+    /// DeepSeek-V3 Multi-Token Prediction draft (Phase 5a.3, Issue #35).
     ///
     /// Runs the loaded MTP module on `(prev_hidden, next_token)` to draft
     /// the *second-next* token's logits — the one that would follow the
     /// token the main model just decoded. The caller then verifies with a
     /// regular main-model forward and applies rejection sampling.
     ///
+    /// # Algorithm (paper §3.5.2, D=1)
+    ///
+    /// 1. Look up embedding for `next_token`.
+    /// 2. `hnorm` on `prev_hidden`, `enorm` on the embedding.
+    /// 3. Concat `(hnorm_out, enorm_out)` into a `2 * hidden_dim` vector.
+    /// 4. `eh_proj` (a `[hidden, 2*hidden]` matvec) collapses back to
+    ///    `hidden_dim`.
+    /// 5. Run the MTP block's single V3 layer (attention + MoE FFN) at
+    ///    position 0. Because the block only ever sees this one draft
+    ///    position, `seq_len = 1` and the attention softmax reduces to
+    ///    `[1.0]` — no KV cache needed, no history to iterate over. The
+    ///    per-head attention output is exactly the value vector `V[h]`.
+    /// 6. Final RMSNorm, then the *main model's* `output_proj` (MTP
+    ///    shares the output head, no separate `mtp.output.weight`).
+    ///
+    /// # Assumptions
+    ///
+    /// - `prev_hidden.len() == config.hidden_dim`.
+    /// - The loaded MTP block uses the MoE FFN branch (all V3 MTP variants
+    ///   at authorship time do; a dense fallback would need to be added
+    ///   alongside `forward_deepseek_moe_layer`).
+    ///
     /// # Panics
     ///
-    /// Panics with `todo!()` because the full MLA + MoE FFN forward for
-    /// the inner transformer block is Phase 5a.2 — factoring the per-
-    /// layer forward primitives out of `forward_deepseek_v3` so the MTP
-    /// module can reuse them requires touching that function's outer
-    /// loop. The struct, loader, and env-var plumbing (Phase 5a) land
-    /// today so the forward can drop in without further storage churn.
+    /// - If [`has_deepseek_mtp`] is `false`.
+    /// - If `prev_hidden.len() != config.hidden_dim` (debug-only assert).
     ///
-    /// # When to call
+    /// # Validation status
     ///
-    /// Only when [`has_deepseek_mtp`] returns `true`. Guarded panic
-    /// otherwise.
+    /// The forward is fully implemented. Bit-exact correctness against a
+    /// reference DeepSeek-V3 implementation still needs a real V3 GGUF
+    /// (blocked on ~370 GB local disk). Unit tests verify tensor-shape
+    /// invariants and non-NaN outputs on synthetic weights.
     ///
     /// [`has_deepseek_mtp`]: Self::has_deepseek_mtp
-    pub fn mtp_draft(&mut self, _prev_hidden: &[f32], _next_token: u32) -> Vec<f32> {
-        assert!(
-            self.deepseek_v3_mtp.is_some(),
-            "mtp_draft called without a loaded MTP head — check has_deepseek_mtp() first"
+    pub fn mtp_draft(&mut self, prev_hidden: &[f32], next_token: u32) -> Vec<f32> {
+        let mtp = self
+            .deepseek_v3_mtp
+            .as_ref()
+            .expect("mtp_draft called without a loaded MTP head — check has_deepseek_mtp() first");
+        let c = self.config.clone();
+        let hidden_dim = c.hidden_dim;
+        debug_assert_eq!(
+            prev_hidden.len(),
+            hidden_dim,
+            "prev_hidden length must match config.hidden_dim"
         );
-        todo!(
-            "Phase 5a.2: MTP forward requires refactoring forward_deepseek_v3's per-layer \
-             logic into a reusable helper. Struct + loader + gating are in place; wiring \
-             happens in the next PR. Issue #35."
-        )
+        let num_heads = c.num_heads;
+        let q_lora_rank = c.deepseek_q_lora_rank().expect("q_lora_rank");
+        let kv_lora_rank = c.deepseek_kv_lora_rank().expect("kv_lora_rank");
+        let qk_nope = c.deepseek_qk_nope_head_dim().expect("qk_nope_head_dim");
+        let qk_rope = c.deepseek_qk_rope_head_dim().expect("qk_rope_head_dim");
+        let v_head_dim = c.deepseek_v_head_dim().expect("v_head_dim");
+        let q_head_total = qk_nope + qk_rope;
+        let kv_up_head_total = qk_nope + v_head_dim;
+
+        // ── Step 1-2: Look up next_token embedding + apply enorm / hnorm.
+        let emb_start = next_token as usize * hidden_dim;
+        let embed = &self.embedding[emb_start..emb_start + hidden_dim];
+        let mut hnorm_out = vec![0.0f32; hidden_dim];
+        let mut enorm_out = vec![0.0f32; hidden_dim];
+        rms_norm(prev_hidden, &mtp.hnorm, c.norm_eps, &mut hnorm_out);
+        rms_norm(embed, &mtp.enorm, c.norm_eps, &mut enorm_out);
+
+        // ── Step 3-4: Concat (hnorm, enorm) → eh_proj → hidden.
+        let mut concat = Vec::with_capacity(2 * hidden_dim);
+        concat.extend_from_slice(&hnorm_out);
+        concat.extend_from_slice(&enorm_out);
+        let mut hidden = vec![0.0f32; hidden_dim];
+        mtp.eh_proj.matvec(&concat, &mut hidden);
+
+        // ── Step 5: Inner V3 transformer block at pos=0 (seq_len=1).
+        // Layout mirrors forward_deepseek_v3's per-layer body — extracted
+        // here so MTP does not require the full multi-position attention
+        // loop or a shared KV cache. Every softmax reduces to [1.0]
+        // because there is exactly one attention slot.
+        let block = &mtp.block;
+        let mut norm_buf = vec![0.0f32; hidden_dim];
+        rms_norm(&hidden, &block.attn_norm, c.norm_eps, &mut norm_buf);
+
+        // Q LoRA chain.
+        let mut q_a_buf = vec![0.0f32; q_lora_rank];
+        let mut q_a_normed = vec![0.0f32; q_lora_rank];
+        let mut q_full = vec![0.0f32; num_heads * q_head_total];
+        block.q_a_proj.matvec(&norm_buf, &mut q_a_buf);
+        rms_norm(&q_a_buf, &block.q_a_norm, c.norm_eps, &mut q_a_normed);
+        block.q_b_proj.matvec(&q_a_normed, &mut q_full);
+
+        // KV LoRA chain: kv_a plus shared k_pe.
+        let mut kv_a_full = vec![0.0f32; kv_lora_rank + qk_rope];
+        let mut kv_a_normed = vec![0.0f32; kv_lora_rank];
+        let mut kv_up = vec![0.0f32; num_heads * kv_up_head_total];
+        block.kv_a_proj_with_mqa.matvec(&norm_buf, &mut kv_a_full);
+        let (kv_a_slice, k_pe_shared) = kv_a_full.split_at_mut(kv_lora_rank);
+        rms_norm(kv_a_slice, &block.kv_a_norm, c.norm_eps, &mut kv_a_normed);
+        block.kv_b_proj.matvec(&kv_a_normed, &mut kv_up);
+
+        // RoPE at position 0 for both Q's rope portion (each head) and
+        // the shared k_pe. Position 0 rotates by angle 0 for every dim,
+        // so this is technically a no-op — but calling it keeps the code
+        // structurally identical to the main forward and future-proofs
+        // against multi-position MTP variants.
+        for h in 0..num_heads {
+            let q_head_off = h * q_head_total;
+            let q_pe_slice = &mut q_full[q_head_off + qk_nope..q_head_off + q_head_total];
+            apply_rope_auto(
+                q_pe_slice,
+                0,
+                qk_rope,
+                c.rope_theta,
+                self.rope_freqs.as_deref(),
+                true, // NEOX
+            );
+        }
+        apply_rope_auto(
+            k_pe_shared,
+            0,
+            qk_rope,
+            c.rope_theta,
+            self.rope_freqs.as_deref(),
+            true,
+        );
+
+        // Single-position attention: softmax([single_score]) = [1.0], so
+        // the head output is exactly the value vector v[h] for each head.
+        // No score computation, no softmax, no accumulation loop needed.
+        let mut attn_out = vec![0.0f32; num_heads * v_head_dim];
+        for h in 0..num_heads {
+            let head_off_up = h * kv_up_head_total;
+            let head_off_out = h * v_head_dim;
+            let v_h = &kv_up[head_off_up + qk_nope..head_off_up + kv_up_head_total];
+            attn_out[head_off_out..head_off_out + v_head_dim].copy_from_slice(v_h);
+        }
+
+        // O projection + residual.
+        let mut o_buf = vec![0.0f32; hidden_dim];
+        block.o_proj.matvec(&attn_out, &mut o_buf);
+        for i in 0..hidden_dim {
+            hidden[i] += o_buf[i];
+        }
+
+        // FFN branch. MTP always uses MoE (see load_deepseek_v3_mtp_weights
+        // caveat) — no dense fallback here.
+        let moe = block
+            .moe
+            .as_ref()
+            .expect("MTP block requires MoE FFN weights (Phase 5a.2 loader guarantee)");
+        let mut down_buf = vec![0.0f32; hidden_dim];
+        forward_deepseek_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
+        for i in 0..hidden_dim {
+            hidden[i] += down_buf[i];
+        }
+
+        // ── Step 6: Final norm + shared output_proj.
+        rms_norm(&hidden, &mtp.final_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        self.output_proj.matvec(&norm_buf, &mut logits);
+        logits
     }
 
     /// Serialise the current KV cache to `path` (colibri-style warm restart).
