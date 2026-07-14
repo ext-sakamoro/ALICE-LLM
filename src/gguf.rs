@@ -472,6 +472,26 @@ impl<'a> GgufFile<'a> {
         self.meta(key)?.as_bool()
     }
 
+    /// Byte offset of a tensor's data section within the underlying file.
+    ///
+    /// Absolute offset = `tensor_data_start + info.offset`, matching what
+    /// `tensor_data` would slice into. Exposed so the DeepSeek-V3 Phase 4
+    /// streaming pool can locate expert slabs inside its own independent
+    /// `Mmap` of the same file without re-borrowing this instance's slice.
+    #[must_use]
+    pub fn tensor_absolute_offset(&self, name: &str) -> Option<u64> {
+        let info = self.tensors.get(name)?;
+        Some(self.tensor_data_start as u64 + info.offset)
+    }
+
+    /// Byte length of a tensor's raw data (post-quant), matching what
+    /// `tensor_data` would return. Convenient for streaming callers that
+    /// need the size without also materialising a slice reference.
+    #[must_use]
+    pub fn tensor_byte_size(&self, name: &str) -> Option<usize> {
+        Some(self.tensors.get(name)?.data_size())
+    }
+
     /// Get raw quantized data for a tensor.
     #[must_use]
     pub fn tensor_data(&self, name: &str) -> Option<&'a [u8]> {
