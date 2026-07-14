@@ -7642,7 +7642,22 @@ fn load_layer_weights<'a>(
 /// (default: 4 GiB). Set to `0` to force every fetch to miss — useful for
 /// bench harnesses that measure cold-cache decode time.
 ///
+/// The `memmap2` crate is a `gguf`-feature-gated dependency; without the
+/// feature the fallback stub always returns `None`, so callers stay on the
+/// InMemory routed-expert path.
+///
 /// [`StreamingExpertPool`]: crate::deepseek_streaming::StreamingExpertPool
+#[cfg(not(feature = "gguf"))]
+fn build_deepseek_streaming_pool(
+    _gguf: &GgufFile<'_>,
+    _config: &Llama3Config,
+) -> Option<std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>> {
+    None
+}
+
+/// `gguf`-feature-gated real implementation. See the doc-comment on the
+/// `not(feature = "gguf")` stub above for full env-var documentation.
+#[cfg(feature = "gguf")]
 #[allow(clippy::too_many_lines)]
 fn build_deepseek_streaming_pool(
     gguf: &GgufFile<'_>,
