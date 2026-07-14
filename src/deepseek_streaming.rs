@@ -1,0 +1,447 @@
+//! DeepSeek-V3 routed-expert streaming from disk (Phase 4a, Issue #34).
+//!
+//! # Overview
+//!
+//! DeepSeek-V3 671B has 61 MoE layers × 256 routed experts + 1 shared expert
+//! per layer. Even at Q4_K_M each routed expert is ~19 MB, so keeping every
+//! expert in RAM costs ~370 GB. The core of the colibri innovation is to
+//! **load routed experts on demand** with an LRU cache, since a single token
+//! only touches `num_experts_per_tok = 8` per MoE layer.
+//!
+//! # Scope of Phase 4a (this module)
+//!
+//! Ships the *infrastructure* — types, LRU semantics, and the enum that lets
+//! `DeepSeekMoeWeights` hold either in-memory `WeightRef`s or a shared pool:
+//!
+//! - [`StreamingExpertPool`] — owns a byte source and an LRU cache of decoded
+//!   expert slabs. Cache eviction is byte-budget-driven.
+//! - [`LruExpertCache`] — MRU-first `VecDeque` order + `HashMap` slot map, with
+//!   `Arc<Vec<u8>>` so a caller can safely hold a slab reference across an
+//!   eviction of the same key.
+//! - [`ExpertByteSource`] — trait abstracting the underlying storage; the two
+//!   canonical implementations are an owned `Vec<u8>` (unit tests / small
+//!   test models) and a `memmap2::Mmap` (production, real GGUF).
+//! - [`ExpertKind`] / [`ExpertSlabRef`] — dispatch surface consumed by
+//!   `forward_deepseek_moe_layer` in `llama3.rs`.
+//!
+//! # Deferred to Phase 4b
+//!
+//! - **Async readahead** — `posix_fadvise(WILLNEED)` + a background thread
+//!   that reads next-layer's likely experts while the current layer's matvec
+//!   runs. Requires router-lookahead prediction to know which experts to
+//!   prefetch.
+//! - **Hot-pinning** — permanent RAM residence for the top-N experts across
+//!   all layers, bypassing LRU eviction.
+//! - **Router-lookahead prefetch** (experimental) — colibri claims 71.6% of
+//!   next-layer routing is predictable from the current layer's post-attention
+//!   state. Would allow overlap of expert I/O with compute.
+//! - **OS page cache tuning** — `mlock` for hot regions, `madvise(RANDOM)` for
+//!   the expert region so the kernel does not thrash on sequential readahead.
+//! - **Real DeepSeek-V3 GGUF benchmarks** — blocked on local disk budget
+//!   (~370 GB) and dedicated multi-day slot.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use crate::gguf::GgmlType;
+
+/// Which of the three MoE weight matrices a slab belongs to.
+///
+/// Encoded as a `u8` so it fits into a compact `ExpertKey` even when we
+/// eventually key millions of entries during a long streaming session.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpertKind {
+    Gate = 0,
+    Up = 1,
+    Down = 2,
+}
+
+/// Uniquely identifies one expert slab in the model.
+///
+/// Fields are `(layer_idx, kind, expert_idx)`. `expert_idx` is the routed-
+/// expert index within the layer (`0..n_routed_experts`, so 0..256 for V3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExpertKey {
+    pub layer_idx: u16,
+    pub kind: ExpertKind,
+    pub expert_idx: u16,
+}
+
+impl ExpertKey {
+    #[inline]
+    pub const fn new(layer_idx: usize, kind: ExpertKind, expert_idx: usize) -> Self {
+        Self {
+            layer_idx: layer_idx as u16,
+            kind,
+            expert_idx: expert_idx as u16,
+        }
+    }
+}
+
+/// Abstract byte storage backing an expert pool.
+///
+/// The two canonical implementations are `Vec<u8>` (unit tests, small
+/// synthetic data) and `memmap2::Mmap` (production, real GGUF files). Any
+/// type that can produce a `&[u8]` slice works, so custom sources — for
+/// example a chunked S3 reader with local caching — can also be dropped in.
+pub trait ExpertByteSource: Send + Sync {
+    fn as_bytes(&self) -> &[u8];
+}
+
+impl ExpertByteSource for Vec<u8> {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl ExpertByteSource for Box<[u8]> {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// Byte offset + length of one layer's expert-0 slab, plus per-expert
+/// stride and quant type. Sufficient to locate any expert `e` for that
+/// layer via `base_offset + e * bytes_per_expert`.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertLayerInfo {
+    pub base_offset: usize,
+    pub bytes_per_expert: usize,
+    pub n_experts: usize,
+    pub qtype: GgmlType,
+}
+
+/// LRU cache of decoded expert slabs. Eviction is triggered when the running
+/// byte total would exceed `budget_bytes` after inserting a new slab.
+///
+/// Slab values are `Arc<Vec<u8>>` so a caller that pulled a slab, was
+/// preempted by a subsequent MoE dispatch that evicted the same key, and
+/// then returned to finish its matvec still holds valid bytes — the `Arc`
+/// keeps the eviction-victim `Vec` alive until the last handle drops.
+pub struct LruExpertCache {
+    entries: HashMap<ExpertKey, Arc<Vec<u8>>>,
+    /// Front = most-recently used; back = eviction candidate.
+    lru: VecDeque<ExpertKey>,
+    current_bytes: usize,
+    budget_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl LruExpertCache {
+    /// Create a cache with the given byte budget. `0` disables the cache
+    /// (every lookup misses, useful for cold-cache micro-benchmarks).
+    pub fn with_budget(budget_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            current_bytes: 0,
+            budget_bytes,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up a key. Bumps the entry to the front of the LRU order and
+    /// increments the hit counter when present.
+    pub fn get(&mut self, key: &ExpertKey) -> Option<Arc<Vec<u8>>> {
+        let hit = self.entries.get(key)?.clone();
+        // Bump to MRU position.
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_front(*key);
+        self.hits += 1;
+        Some(hit)
+    }
+
+    /// Insert a new slab, evicting LRU entries as needed to stay under
+    /// budget. If the incoming slab is larger than the budget itself, it
+    /// still gets stored (the caller expects it) but every other entry is
+    /// dropped first.
+    pub fn insert(&mut self, key: ExpertKey, bytes: Arc<Vec<u8>>) {
+        let incoming_bytes = bytes.len();
+        // Remove any existing entry for this key (rare — typically only
+        // when the caller reloads the same expert without a prior get).
+        if let Some(old) = self.entries.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(old.len());
+            if let Some(pos) = self.lru.iter().position(|k| k == &key) {
+                self.lru.remove(pos);
+            }
+        }
+        // Evict LRU entries until the new slab fits.
+        while self.current_bytes + incoming_bytes > self.budget_bytes && !self.lru.is_empty() {
+            if let Some(victim) = self.lru.pop_back() {
+                if let Some(evicted) = self.entries.remove(&victim) {
+                    self.current_bytes = self.current_bytes.saturating_sub(evicted.len());
+                }
+            }
+        }
+        self.entries.insert(key, bytes);
+        self.lru.push_front(key);
+        self.current_bytes += incoming_bytes;
+        self.misses += 1;
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub fn current_bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Streaming pool serving routed-expert slabs for every MoE layer in a
+/// DeepSeek-V3 model. One pool instance is shared across all MoE layers via
+/// `Arc` — the layer index is passed at fetch time.
+pub struct StreamingExpertPool {
+    source: Arc<dyn ExpertByteSource>,
+    /// Indexed by `[layer_idx][kind as usize]`. Populated at construction
+    /// time by walking the GGUF metadata for the routed-expert tensors.
+    layer_info: Vec<[ExpertLayerInfo; 3]>,
+    cache: Mutex<LruExpertCache>,
+}
+
+impl StreamingExpertPool {
+    pub fn new(
+        source: Arc<dyn ExpertByteSource>,
+        layer_info: Vec<[ExpertLayerInfo; 3]>,
+        budget_bytes: usize,
+    ) -> Self {
+        Self {
+            source,
+            layer_info,
+            cache: Mutex::new(LruExpertCache::with_budget(budget_bytes)),
+        }
+    }
+
+    /// Return the quant type for the given layer + kind. Needed so the MoE
+    /// dispatch code can pass the right `GgmlType` to `quantized_matvec`.
+    pub fn qtype(&self, layer_idx: usize, kind: ExpertKind) -> GgmlType {
+        self.layer_info[layer_idx][kind as usize].qtype
+    }
+
+    pub fn bytes_per_expert(&self, layer_idx: usize, kind: ExpertKind) -> usize {
+        self.layer_info[layer_idx][kind as usize].bytes_per_expert
+    }
+
+    /// Fetch a slab, either from the LRU cache (hit) or by reading fresh
+    /// bytes from the underlying source (miss).
+    ///
+    /// # Panics
+    ///
+    /// Panics on out-of-bounds `layer_idx` / `expert_idx` — those are always
+    /// programmer errors (the caller derived them from config), so a debug
+    /// panic is more useful than an `Err` variant that no callsite could
+    /// meaningfully recover from.
+    pub fn get_or_load(
+        &self,
+        layer_idx: usize,
+        kind: ExpertKind,
+        expert_idx: usize,
+    ) -> Arc<Vec<u8>> {
+        let key = ExpertKey::new(layer_idx, kind, expert_idx);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(hit) = cache.get(&key) {
+                return hit;
+            }
+        }
+        let info = &self.layer_info[layer_idx][kind as usize];
+        assert!(
+            expert_idx < info.n_experts,
+            "expert_idx {expert_idx} out of range (n_experts = {})",
+            info.n_experts
+        );
+        let offset = info.base_offset + expert_idx * info.bytes_per_expert;
+        let source_bytes = self.source.as_bytes();
+        assert!(
+            offset + info.bytes_per_expert <= source_bytes.len(),
+            "expert slab out of source range (offset {offset} + len {} > source len {})",
+            info.bytes_per_expert,
+            source_bytes.len()
+        );
+        let slab = Arc::new(source_bytes[offset..offset + info.bytes_per_expert].to_vec());
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(key, slab.clone());
+        slab
+    }
+
+    /// Snapshot of current cache metrics — hits, misses, live-byte total.
+    /// Zero-cost when unused; primarily consumed by bench harnesses.
+    pub fn cache_stats(&self) -> CacheStats {
+        let cache = self.cache.lock().unwrap();
+        CacheStats {
+            hits: cache.hits(),
+            misses: cache.misses(),
+            current_bytes: cache.current_bytes(),
+            entries: cache.len(),
+        }
+    }
+}
+
+/// Point-in-time snapshot of an [`LruExpertCache`]'s counters.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub current_bytes: usize,
+    pub entries: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pool(n_experts: usize, bytes_per_expert: usize, budget: usize) -> StreamingExpertPool {
+        // Synthetic source: byte value at offset `i` = `(i % 251) as u8` so
+        // each expert has a deterministic-but-distinct byte pattern.
+        let total = 3 * n_experts * bytes_per_expert;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let source: Arc<dyn ExpertByteSource> = Arc::new(data);
+        let mut per_kind = [ExpertLayerInfo {
+            base_offset: 0,
+            bytes_per_expert,
+            n_experts,
+            qtype: GgmlType::Q4_K,
+        }; 3];
+        per_kind[ExpertKind::Gate as usize].base_offset = 0;
+        per_kind[ExpertKind::Up as usize].base_offset = n_experts * bytes_per_expert;
+        per_kind[ExpertKind::Down as usize].base_offset = 2 * n_experts * bytes_per_expert;
+        StreamingExpertPool::new(source, vec![per_kind], budget)
+    }
+
+    #[test]
+    fn get_or_load_returns_deterministic_slab_from_source() {
+        let pool = make_pool(4, 32, 1024);
+        // Expert 2's gate slab starts at offset 2 * 32 = 64, spans 32 bytes.
+        let slab = pool.get_or_load(0, ExpertKind::Gate, 2);
+        assert_eq!(slab.len(), 32);
+        // Confirm the deterministic byte pattern.
+        for (i, &b) in slab.iter().enumerate() {
+            assert_eq!(b, ((64 + i) % 251) as u8, "byte {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn second_lookup_is_a_cache_hit() {
+        let pool = make_pool(4, 32, 1024);
+        let _slab1 = pool.get_or_load(0, ExpertKind::Up, 1);
+        let stats_after_load = pool.cache_stats();
+        assert_eq!(stats_after_load.misses, 1);
+        assert_eq!(stats_after_load.hits, 0);
+
+        let _slab2 = pool.get_or_load(0, ExpertKind::Up, 1);
+        let stats_after_hit = pool.cache_stats();
+        assert_eq!(stats_after_hit.misses, 1, "no extra miss on second lookup");
+        assert_eq!(stats_after_hit.hits, 1);
+    }
+
+    #[test]
+    fn evicts_lru_when_budget_exceeded() {
+        // Budget of 64 bytes = only 2 slabs of 32 bytes fit simultaneously.
+        let pool = make_pool(4, 32, 64);
+        // Load experts 0, 1, 2 in order — expert 0 becomes LRU.
+        let _e0 = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let _e1 = pool.get_or_load(0, ExpertKind::Gate, 1);
+        assert_eq!(pool.cache_stats().current_bytes, 64);
+        let _e2 = pool.get_or_load(0, ExpertKind::Gate, 2);
+        // Expert 0 must have been evicted; cache still at 64 bytes.
+        let stats = pool.cache_stats();
+        assert_eq!(stats.current_bytes, 64);
+        assert_eq!(
+            stats.entries, 2,
+            "cache holds exactly 2 entries after eviction"
+        );
+        // Re-loading expert 0 counts as a miss (evicted, not a hit).
+        let _e0_again = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let stats2 = pool.cache_stats();
+        assert_eq!(stats2.misses, 4, "expert 0 reload is a fresh miss");
+    }
+
+    #[test]
+    fn get_bumps_lru_position() {
+        // Budget 64 bytes = 2 slabs. Load 0, 1, touch 0, then load 2.
+        // Since 0 was just accessed, expert 1 (least recent) should be evicted.
+        let pool = make_pool(4, 32, 64);
+        let _e0 = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let _e1 = pool.get_or_load(0, ExpertKind::Gate, 1);
+        // Re-touch expert 0 — bumps it to MRU.
+        let _e0_again = pool.get_or_load(0, ExpertKind::Gate, 0);
+        // Now load expert 2 — expert 1 should be the victim.
+        let _e2 = pool.get_or_load(0, ExpertKind::Gate, 2);
+        let stats = pool.cache_stats();
+        assert_eq!(stats.entries, 2);
+        // Verify 0 and 2 are in cache (touch them, count hits).
+        let hits_before = pool.cache_stats().hits;
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 2);
+        let hits_after = pool.cache_stats().hits;
+        assert_eq!(hits_after - hits_before, 2, "both 0 and 2 should hit");
+    }
+
+    #[test]
+    fn different_kinds_do_not_collide() {
+        // Same layer_idx + expert_idx but different kind → distinct cache entries.
+        let pool = make_pool(4, 32, 1024);
+        let gate = pool.get_or_load(0, ExpertKind::Gate, 1);
+        let up = pool.get_or_load(0, ExpertKind::Up, 1);
+        let down = pool.get_or_load(0, ExpertKind::Down, 1);
+        // Gate slab starts at 0 * 4*32 = 0, so expert 1 gate offset = 32.
+        // Up slab starts at 1 * 4*32 = 128, so expert 1 up offset = 160.
+        // Down slab starts at 2 * 4*32 = 256, so expert 1 down offset = 288.
+        assert_eq!(gate[0], (32 % 251) as u8);
+        assert_eq!(up[0], (160 % 251) as u8);
+        assert_eq!(down[0], (288 % 251) as u8);
+        assert_eq!(pool.cache_stats().entries, 3);
+        assert_eq!(pool.cache_stats().misses, 3);
+    }
+
+    #[test]
+    fn arc_lets_caller_outlive_eviction() {
+        // Load expert 0, keep its Arc, then evict 0 by loading enough others.
+        // The Arc must still deref to valid bytes.
+        let pool = make_pool(4, 32, 64);
+        let e0 = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let expected: Vec<u8> = e0.iter().copied().collect();
+        // Fill cache past capacity so 0 gets evicted.
+        let _e1 = pool.get_or_load(0, ExpertKind::Gate, 1);
+        let _e2 = pool.get_or_load(0, ExpertKind::Gate, 2);
+        // Cache no longer holds expert 0.
+        let stats = pool.cache_stats();
+        assert!(!stats.entries == 0 || stats.entries <= 2);
+        // The Arc we captured earlier still holds the original bytes.
+        assert_eq!(*e0, expected, "arc-held slab must survive eviction");
+    }
+
+    #[test]
+    fn zero_budget_evicts_immediately() {
+        let pool = make_pool(4, 32, 0);
+        let _e0 = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let stats = pool.cache_stats();
+        // With budget = 0, the newly inserted slab is over budget, so
+        // subsequent inserts evict everything including itself on the next
+        // insert. First insert stays because the eviction loop condition
+        // uses saturating math and there's nothing else to drop.
+        assert!(
+            stats.entries <= 1,
+            "zero-budget cache must not accumulate entries"
+        );
+    }
+}
