@@ -1182,21 +1182,93 @@ mod neon_dot {
         let scales = &q6k_block[192..208];
         let d = f16_to_f32(u16::from_le_bytes([q6k_block[208], q6k_block[209]]));
 
-        // Reconstruct 6-bit signed quants (scalar — complex bit packing)
+        // Reconstruct 6-bit signed quants using NEON.
+        //
+        // Q6_K packs 256 6-bit values into 128 ql bytes (4 low bits each,
+        // two elements per byte) plus 64 qh bytes (2 high bits per element,
+        // four elements per byte). Per iteration we unpack 128 elements from
+        // 64 ql bytes + 32 qh bytes at a time, distributing into four output
+        // quadrants of 32 elements each:
+        //   Q0: aux8[  0.. 32] = (ql[ 0.. 32] & 0xF)   | ((qh << 4) & 0x30)
+        //   Q1: aux8[ 32.. 64] = (ql[32.. 64] & 0xF)   | ((qh << 2) & 0x30)
+        //   Q2: aux8[ 64.. 96] = (ql[ 0.. 32] >> 4)    | ( qh       & 0x30)
+        //   Q3: aux8[ 96..128] = (ql[32.. 64] >> 4)    | ((qh >> 2) & 0x30)
+        // Then subtract 32 to move the 6-bit unsigned value into the signed
+        // range [-32, 31]. The shift-mask trick lets the same qh vector feed
+        // all four quadrants with only add / and / or / shl / shr — no per-
+        // element scalar packing. This replaces the previous scalar bit
+        // packing loop (~14 µs of the old 89 µs NEON path on Mac M3).
         let mut aux8 = [0i8; QK_K];
+        let mask_nib = vdupq_n_u8(0x0F);
+        let mask_hi = vdupq_n_u8(0x30);
+        let bias = vdupq_n_s8(-32);
         let mut a_off = 0usize;
         let mut ql_off = 0usize;
         let mut qh_off = 0usize;
         for _ in 0..2 {
-            for l in 0..32 {
-                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 32] =
-                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 64] =
-                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 96] =
-                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
-            }
+            let ql_a = vld1q_u8(ql.as_ptr().add(ql_off));
+            let ql_b = vld1q_u8(ql.as_ptr().add(ql_off + 16));
+            let ql_c = vld1q_u8(ql.as_ptr().add(ql_off + 32));
+            let ql_d = vld1q_u8(ql.as_ptr().add(ql_off + 48));
+            let qh_a = vld1q_u8(qh.as_ptr().add(qh_off));
+            let qh_b = vld1q_u8(qh.as_ptr().add(qh_off + 16));
+
+            // Quadrant 0: (ql[0..32] & 0xF) | ((qh << 4) & 0x30) - 32
+            let hi_a_q0 = vandq_u8(vshlq_n_u8::<4>(qh_a), mask_hi);
+            let hi_b_q0 = vandq_u8(vshlq_n_u8::<4>(qh_b), mask_hi);
+            let out_0a = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_a, mask_nib), hi_a_q0)),
+                bias,
+            );
+            let out_0b = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_b, mask_nib), hi_b_q0)),
+                bias,
+            );
+            vst1q_s8(aux8.as_mut_ptr().add(a_off), out_0a);
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 16), out_0b);
+
+            // Quadrant 1: (ql[32..64] & 0xF) | ((qh << 2) & 0x30) - 32
+            let hi_a_q1 = vandq_u8(vshlq_n_u8::<2>(qh_a), mask_hi);
+            let hi_b_q1 = vandq_u8(vshlq_n_u8::<2>(qh_b), mask_hi);
+            let out_1a = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_c, mask_nib), hi_a_q1)),
+                bias,
+            );
+            let out_1b = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_d, mask_nib), hi_b_q1)),
+                bias,
+            );
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 32), out_1a);
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 48), out_1b);
+
+            // Quadrant 2: (ql[0..32] >> 4) | (qh & 0x30) - 32
+            let hi_a_q2 = vandq_u8(qh_a, mask_hi);
+            let hi_b_q2 = vandq_u8(qh_b, mask_hi);
+            let out_2a = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql_a), hi_a_q2)),
+                bias,
+            );
+            let out_2b = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql_b), hi_b_q2)),
+                bias,
+            );
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 64), out_2a);
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 80), out_2b);
+
+            // Quadrant 3: (ql[32..64] >> 4) | ((qh >> 2) & 0x30) - 32
+            let hi_a_q3 = vandq_u8(vshrq_n_u8::<2>(qh_a), mask_hi);
+            let hi_b_q3 = vandq_u8(vshrq_n_u8::<2>(qh_b), mask_hi);
+            let out_3a = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql_c), hi_a_q3)),
+                bias,
+            );
+            let out_3b = vaddq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql_d), hi_b_q3)),
+                bias,
+            );
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 96), out_3a);
+            vst1q_s8(aux8.as_mut_ptr().add(a_off + 112), out_3b);
+
             a_off += 128;
             ql_off += 64;
             qh_off += 32;
