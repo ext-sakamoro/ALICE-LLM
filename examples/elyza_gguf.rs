@@ -11,8 +11,10 @@
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
 use alice_llm::llama3::Llama3Model;
+use alice_llm::sample_argmax;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::time::Instant;
 
 fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
@@ -24,6 +26,53 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
+}
+
+/// Emit one JSONL line of top-5 logits to stderr for CPU/GPU divergence diagnostics
+/// (Issue #40). Format is intentionally identical between `qwen_gpu.rs` (GPU) and
+/// `elyza_gguf.rs` (CPU) so the two streams can be diffed line-by-line.
+fn dump_logits_jsonl(backend: &str, pos: i64, logits: &[f32], tokenizer: &GgufTokenizer) {
+    let mut top: [(u32, f32); 5] = [(u32::MAX, f32::NEG_INFINITY); 5];
+    for (i, &v) in logits.iter().enumerate() {
+        let mut min_idx = 0usize;
+        for k in 1..5 {
+            if top[k].1 < top[min_idx].1 {
+                min_idx = k;
+            }
+        }
+        if v > top[min_idx].1 {
+            top[min_idx] = (i as u32, v);
+        }
+    }
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut line = String::with_capacity(256);
+    line.push_str(&format!(
+        "{{\"backend\":\"{backend}\",\"pos\":{pos},\"top5\":["
+    ));
+    for (k, (tid, logit)) in top.iter().enumerate() {
+        if k > 0 {
+            line.push(',');
+        }
+        let decoded = tokenizer.decode(&[*tid]);
+        let mut esc = String::with_capacity(decoded.len() + 2);
+        for ch in decoded.chars() {
+            match ch {
+                '"' => esc.push_str("\\\""),
+                '\\' => esc.push_str("\\\\"),
+                '\n' => esc.push_str("\\n"),
+                '\r' => esc.push_str("\\r"),
+                '\t' => esc.push_str("\\t"),
+                c if (c as u32) < 0x20 => esc.push_str(&format!("\\u{:04x}", c as u32)),
+                c => esc.push(c),
+            }
+        }
+        line.push_str(&format!(
+            "{{\"id\":{tid},\"logit\":{logit:.6},\"tok\":\"{esc}\"}}"
+        ));
+    }
+    line.push_str("]}");
+    eprintln!("{line}");
 }
 
 fn main() {
@@ -48,6 +97,20 @@ fn main() {
     let draft_layers: usize = parse_arg(&args, "--draft-layers").unwrap_or(8);
     let ternary = has_flag(&args, "--ternary");
     let ternary_threshold: f32 = parse_arg(&args, "--ternary-threshold").unwrap_or(0.7);
+    // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
+    // the prompt-end position and first N decoded tokens. When set, forces a
+    // plain-argmax manual forward loop (no speculative, no ternary generation).
+    let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
+    // Issue #40 diagnostic: dump post-final-RMSNorm hidden state (pre-output-
+    // projection) to stderr as JSONL. Combined with the same flag on
+    // `qwen_gpu`, allows offline cos-sim / L2 diff to isolate whether the
+    // logit gap comes from the layer stack or from output_proj. Sets the
+    // ALICE_LLM_DUMP_HIDDEN env var so the library's forward() path emits
+    // one JSONL line per forward call.
+    let dump_final_hidden = has_flag(&args, "--dump-final-hidden");
+    if dump_final_hidden {
+        std::env::set_var("ALICE_LLM_DUMP_HIDDEN", "1");
+    }
 
     println!("Loading GGUF model: {model_path}");
     let load_start = Instant::now();
@@ -114,6 +177,61 @@ fn main() {
         println!("Generating (max {max_tokens} tokens, temp={temperature})...");
     }
     println!("---");
+
+    // Issue #40 diagnostic path: manual argmax loop with per-position top-5 logits
+    // dump to stderr. Bypasses speculative / ternary generate() paths to keep the
+    // CPU vs GPU comparison apples-to-apples (temperature=0 argmax on both sides).
+    if logits_dump > 0 {
+        let prompt_tokens = tokenizer.encode(&formatted);
+        let n_prompt = prompt_tokens.len();
+        println!("  Prompt tokens: {n_prompt}");
+        println!("  logits-dump: N={logits_dump} (stderr JSONL, backend=\"cpu\")");
+
+        let t_prefill = Instant::now();
+        // Prefill all prompt tokens except the last.
+        for &tok in &prompt_tokens[..n_prompt - 1] {
+            let _ = model.forward(tok);
+        }
+        // Last prompt token: capture logits for pos=-1 (prompt end).
+        let last_prompt = *prompt_tokens.last().unwrap();
+        let mut logits = model.forward(last_prompt);
+        let prefill_ms = t_prefill.elapsed().as_millis();
+        dump_logits_jsonl("cpu", -1, &logits, &tokenizer);
+
+        let t_decode = Instant::now();
+        let mut generated: Vec<u32> = Vec::new();
+        let eos_id = tokenizer.eos_id;
+        for step in 0..max_tokens {
+            let next_token = sample_argmax(&logits) as u32;
+            if next_token == eos_id {
+                break;
+            }
+            generated.push(next_token);
+            let text = tokenizer.decode(&[next_token]);
+            print!("{text}");
+            std::io::stdout().flush().ok();
+
+            logits = model.forward(next_token);
+            if step < logits_dump {
+                dump_logits_jsonl("cpu", step as i64, &logits, &tokenizer);
+            }
+        }
+        let decode_ms = t_decode.elapsed().as_millis();
+        let n_gen = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            n_gen as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        println!();
+        println!("---");
+        println!("Tokens: {n_gen} generated, {n_prompt} prompt (logits-dump manual argmax)");
+        println!(
+            "Speed: {tok_per_sec:.1} tok/s ({prefill_ms} prefill + {decode_ms} decode = {} total ms)",
+            prefill_ms + decode_ms
+        );
+        return;
+    }
 
     let result = if ternary {
         model.generate_ternary(&tokenizer, &formatted, max_tokens, temperature, 40)

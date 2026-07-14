@@ -27,6 +27,58 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Emit one JSONL line of top-5 logits to stderr for CPU/GPU divergence diagnostics
+/// (Issue #40). Format is intentionally identical between `qwen_gpu.rs` (GPU) and
+/// `elyza_gguf.rs` (CPU) so the two streams can be diffed line-by-line.
+fn dump_logits_jsonl(backend: &str, pos: i64, logits: &[f32], tokenizer: &GgufTokenizer) {
+    // Argpartition-style top-5 without extra deps: track (idx, val).
+    let mut top: [(u32, f32); 5] = [(u32::MAX, f32::NEG_INFINITY); 5];
+    for (i, &v) in logits.iter().enumerate() {
+        // Find slot to displace (smallest current). Linear over 5 is fine.
+        let mut min_idx = 0usize;
+        for k in 1..5 {
+            if top[k].1 < top[min_idx].1 {
+                min_idx = k;
+            }
+        }
+        if v > top[min_idx].1 {
+            top[min_idx] = (i as u32, v);
+        }
+    }
+    // Sort descending by logit value.
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build JSONL manually (no serde dep for examples).
+    let mut line = String::with_capacity(256);
+    line.push_str(&format!(
+        "{{\"backend\":\"{backend}\",\"pos\":{pos},\"top5\":["
+    ));
+    for (k, (tid, logit)) in top.iter().enumerate() {
+        if k > 0 {
+            line.push(',');
+        }
+        let decoded = tokenizer.decode(&[*tid]);
+        // JSON-escape decoded token (only \, ", control chars matter for our vocabs).
+        let mut esc = String::with_capacity(decoded.len() + 2);
+        for ch in decoded.chars() {
+            match ch {
+                '"' => esc.push_str("\\\""),
+                '\\' => esc.push_str("\\\\"),
+                '\n' => esc.push_str("\\n"),
+                '\r' => esc.push_str("\\r"),
+                '\t' => esc.push_str("\\t"),
+                c if (c as u32) < 0x20 => esc.push_str(&format!("\\u{:04x}", c as u32)),
+                c => esc.push(c),
+            }
+        }
+        line.push_str(&format!(
+            "{{\"id\":{tid},\"logit\":{logit:.6},\"tok\":\"{esc}\"}}"
+        ));
+    }
+    line.push_str("]}");
+    eprintln!("{line}");
+}
+
 #[cfg(feature = "gpu")]
 fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
     GpuModelConfig {
@@ -41,12 +93,15 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
         max_seq_len: cfg.max_seq_len,
         // Qwen3.5 DeltaNet-only fields — None for standard attention (Qwen 2 / 2.5 / 3).
         // GpuModel::load treats None `full_attention_interval` as pure-attention model.
-        full_attention_interval: cfg.full_attention_interval,
-        linear_num_kv_heads: cfg.linear_num_kv_heads.map(|v| v as u32),
-        linear_qk_head_dim: cfg.linear_qk_head_dim.map(|v| v as u32),
-        linear_kv_head_dim: cfg.linear_kv_head_dim.map(|v| v as u32),
-        linear_num_v_heads: cfg.linear_num_v_heads.map(|v| v as u32),
-        linear_conv_kernel_dim: cfg.linear_conv_kernel_dim.map(|v| v as u32),
+        full_attention_interval: cfg.full_attention_interval(),
+        linear_num_kv_heads: cfg.linear_num_kv_heads().map(|v| v as u32),
+        linear_qk_head_dim: cfg.linear_qk_head_dim().map(|v| v as u32),
+        linear_kv_head_dim: cfg.linear_kv_head_dim().map(|v| v as u32),
+        linear_num_v_heads: cfg.linear_num_v_heads().map(|v| v as u32),
+        linear_conv_kernel_dim: cfg.linear_conv_kernel_dim().map(|v| v as u32),
+        // Qwen 2/2.5/3 require NEOX-style RoPE. Route from Llama3Config
+        // (Issue #40 root-cause fix).
+        neox_rope: cfg.arch.use_neox_rope(),
     }
 }
 
@@ -58,6 +113,19 @@ fn main() {
     let max_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(256);
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let top_k: usize = parse_arg(&args, "--top-k").unwrap_or(40);
+    // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
+    // the first N decoded tokens plus the prompt-end position (pos=-1).
+    let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
+    // Issue #40 diagnostic: dump post-final-RMSNorm hidden state (pre-output-
+    // projection) for pos=-1 to stderr as JSONL. Same schema as CPU side so
+    // the two streams can be diffed for cos-sim / L2 to isolate whether the
+    // logit gap comes from the layer stack or from output_proj.
+    let dump_final_hidden = args.iter().any(|a| a == "--dump-final-hidden");
+    // Issue #40 layer bisection: run prefill and dump hidden state after
+    // layers 0, 6, 13, 20, 27 on the last prompt token, then exit. Requires
+    // one full prefill per checkpoint (5x prefill cost) because each stop
+    // point mutates KV cache differently and needs a clean reset.
+    let layer_bisect = args.iter().any(|a| a == "--layer-bisect");
 
     #[cfg(feature = "gpu")]
     {
@@ -111,15 +179,54 @@ fn main() {
         println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
         println!("---");
 
+        // --- Issue #40 layer bisection mode ---
+        if layer_bisect {
+            let checkpoints = [0usize, 6, 13, 20, 27];
+            eprintln!(
+                "[layer-bisect] Running 5 prefill passes to dump hidden state at layers {checkpoints:?}"
+            );
+            for &stop_at in &checkpoints {
+                model.reset();
+                // Prefill all prompt tokens except the last (full 28-layer path)
+                for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
+                    model.forward(tok);
+                }
+                // Last prompt token: stop after `stop_at` and read hidden
+                let last = *prompt_tokens.last().unwrap();
+                let hidden = model.forward_stop_after_layer_and_read_hidden(last, stop_at);
+                alice_llm::llama3::dump_hidden_jsonl_stderr(
+                    &format!("gpu_layer_{stop_at}"),
+                    &hidden,
+                );
+            }
+            eprintln!("[layer-bisect] Done");
+            return;
+        }
+
         // --- Prefill: process all prompt tokens except the last ---
         let t_prefill = Instant::now();
         for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
             model.forward(tok);
         }
-        // Last prompt token: read logits to get first generated token
+        // Last prompt token: read logits (and optionally the pre-output-
+        // projection hidden state) to get first generated token + Issue #40
+        // diagnostic sample.
         let last_prompt = *prompt_tokens.last().unwrap();
-        let mut logits = model.forward_and_read(last_prompt);
+        let mut logits = if dump_final_hidden {
+            let (hidden, logits) = model.forward_and_read_hidden_and_logits(last_prompt);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu", &hidden);
+            logits
+        } else {
+            model.forward_and_read(last_prompt)
+        };
         let prefill_ms = t_prefill.elapsed().as_millis();
+
+        // Issue #40 diagnostic: dump prompt-end position logits (labelled pos=-1)
+        // before any decoded token is sampled. This is the layer input that
+        // determines the very first generated token.
+        if logits_dump > 0 {
+            dump_logits_jsonl("gpu", -1, &logits, &tokenizer);
+        }
 
         // --- Decode: autoregressive loop ---
         let t_decode = Instant::now();
@@ -138,7 +245,7 @@ fn main() {
             (rng_state as f32) / (u64::MAX as f32)
         };
 
-        for _ in 0..max_tokens {
+        for step in 0..max_tokens {
             let next_token = if temperature < 1e-6 {
                 sample_argmax(&logits) as u32
             } else {
@@ -159,6 +266,13 @@ fn main() {
             std::io::stdout().flush().ok();
 
             logits = model.forward_and_read(next_token);
+
+            // Issue #40 diagnostic: dump per-step logits AFTER forwarding the
+            // just-sampled token, so `pos` matches the "logits that would
+            // sample decode position pos+1" convention.
+            if logits_dump > 0 && step < logits_dump {
+                dump_logits_jsonl("gpu", step as i64, &logits, &tokenizer);
+            }
         }
 
         let decode_ms = t_decode.elapsed().as_millis();
