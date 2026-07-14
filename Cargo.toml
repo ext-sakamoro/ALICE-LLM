@@ -87,6 +87,10 @@ required-features = ["gguf", "gpu"]
 name = "bench_simd_matvec"
 required-features = ["gguf"]
 
+[[example]]
+name = "bench_deepseek_streaming"
+required-features = ["gguf"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
