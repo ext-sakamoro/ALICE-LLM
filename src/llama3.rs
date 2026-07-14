@@ -7231,6 +7231,180 @@ impl Default for SpeculativeConfig {
     }
 }
 
+/// DeepSeek-V3 MTP speculative-decoding adaptive-guard policy (Phase 5a.2,
+/// Issue #35). Colibri reports that MTP accept rate is bimodal on real V3
+/// traffic — around 40-60% during coherent generation, dropping to 0-5%
+/// when the model transitions into a different distribution (e.g. hitting
+/// a code block, structured output). Running MTP unconditionally in the
+/// low-accept regime is a net loss because the draft + verify overhead
+/// exceeds the compute saved by skipping a main-model forward.
+///
+/// This policy tracks accept rate over a sliding window and toggles MTP
+/// on/off with hysteresis:
+///
+/// - Start with MTP **enabled**.
+/// - After every accept/reject decision, push into a fixed-capacity
+///   [`std::collections::VecDeque`] of recent outcomes.
+/// - If MTP is enabled and the recent accept rate falls **below**
+///   `disable_threshold`, transition to **cooldown** for `cooldown_tokens`
+///   subsequent verify steps — during cooldown, MTP is skipped
+///   entirely (draft-then-verify degrades to plain greedy).
+/// - When cooldown expires, re-enable MTP and continue tracking.
+///
+/// The hysteresis prevents flap-flopping around the threshold: without a
+/// cooldown, a single accepted draft would immediately re-enable MTP
+/// after one bad stretch, only to see the same accept rate collapse
+/// again on the next few tokens.
+#[derive(Debug, Clone)]
+pub struct MtpDraftPolicy {
+    /// Rolling window of recent decisions. `true` = accepted, `false` = rejected.
+    /// Bounded to [`window_size`]; oldest entries evict when the window fills.
+    window: std::collections::VecDeque<bool>,
+    /// Size of the sliding window (number of most-recent decisions the
+    /// accept-rate check looks at). Larger = more stable decisions, less
+    /// responsive to distribution shifts.
+    window_size: usize,
+    /// If MTP is enabled and the window's accept rate falls strictly
+    /// below this, transition to cooldown. `0.30` (30%) is the colibri
+    /// default — accepts break even with plain greedy around this ratio
+    /// on their hardware profile.
+    disable_threshold: f32,
+    /// Number of verify steps the policy stays in cooldown after
+    /// disabling. Longer cooldown = less flap; shorter = quicker recovery
+    /// when the distribution shifts back to MTP-favourable territory.
+    cooldown_tokens: usize,
+    /// Cooldown countdown. `> 0` → MTP is disabled and we tick down; `0`
+    /// → MTP is enabled and we track normally.
+    cooldown_remaining: usize,
+    /// Total accepted + rejected across the lifetime of this policy —
+    /// exposed for bench harness telemetry.
+    total_accepted: u64,
+    total_rejected: u64,
+    /// Total cooldowns entered. High counts on a stable prompt suggests
+    /// the threshold is too aggressive.
+    total_cooldowns: u64,
+}
+
+impl MtpDraftPolicy {
+    /// Construct a policy with the colibri-reported defaults: 32-token
+    /// window, 30% disable threshold, 16-token cooldown.
+    #[must_use]
+    pub fn new_default() -> Self {
+        Self::with_params(32, 0.30, 16)
+    }
+
+    /// Construct with explicit tuning parameters. Panics if `window_size`
+    /// is zero or `disable_threshold` is outside `[0.0, 1.0]`.
+    #[must_use]
+    pub fn with_params(window_size: usize, disable_threshold: f32, cooldown_tokens: usize) -> Self {
+        assert!(window_size > 0, "MTP policy window_size must be > 0");
+        assert!(
+            (0.0..=1.0).contains(&disable_threshold),
+            "MTP policy disable_threshold must be in [0.0, 1.0]"
+        );
+        Self {
+            window: std::collections::VecDeque::with_capacity(window_size),
+            window_size,
+            disable_threshold,
+            cooldown_tokens,
+            cooldown_remaining: 0,
+            total_accepted: 0,
+            total_rejected: 0,
+            total_cooldowns: 0,
+        }
+    }
+
+    /// Whether MTP drafting is currently enabled. When `false`, the caller
+    /// should skip the MTP forward and fall back to plain greedy verify.
+    ///
+    /// Every call to `should_draft` also ticks the cooldown counter down
+    /// by one — so this method must be called exactly once per verify
+    /// step to keep the countdown aligned with token cadence.
+    pub fn should_draft(&mut self) -> bool {
+        if self.cooldown_remaining > 0 {
+            self.cooldown_remaining -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Record the outcome of an MTP-verify decision and re-evaluate
+    /// whether to enter cooldown. `accepted = true` means the draft
+    /// matched the main-model verify at the current position.
+    ///
+    /// Only call this when the previous `should_draft` returned `true` —
+    /// during cooldown there is no draft to record.
+    pub fn record(&mut self, accepted: bool) {
+        if accepted {
+            self.total_accepted += 1;
+        } else {
+            self.total_rejected += 1;
+        }
+        // Slide the window.
+        if self.window.len() == self.window_size {
+            self.window.pop_front();
+        }
+        self.window.push_back(accepted);
+
+        // Only start a cooldown if the window is full — accept-rate on a
+        // half-populated window is too noisy to trigger a policy shift.
+        if self.window.len() >= self.window_size {
+            let accepts: usize = self.window.iter().filter(|&&v| v).count();
+            let rate = accepts as f32 / self.window.len() as f32;
+            if rate < self.disable_threshold {
+                self.cooldown_remaining = self.cooldown_tokens;
+                self.total_cooldowns += 1;
+                // Clear the window so the post-cooldown re-evaluation
+                // does not immediately re-trigger on the same evidence.
+                self.window.clear();
+            }
+        }
+    }
+
+    /// Snapshot of policy state. Consumers (bench harness / telemetry
+    /// logger) inspect this to understand what fraction of tokens the
+    /// policy skipped, the current cooldown state, and cumulative counters.
+    #[must_use]
+    pub fn stats(&self) -> MtpDraftStats {
+        let total_decisions = self.total_accepted + self.total_rejected;
+        let accept_rate = if total_decisions > 0 {
+            self.total_accepted as f32 / total_decisions as f32
+        } else {
+            0.0
+        };
+        MtpDraftStats {
+            in_cooldown: self.cooldown_remaining > 0,
+            cooldown_remaining: self.cooldown_remaining,
+            window_len: self.window.len(),
+            total_accepted: self.total_accepted,
+            total_rejected: self.total_rejected,
+            total_cooldowns: self.total_cooldowns,
+            overall_accept_rate: accept_rate,
+        }
+    }
+}
+
+impl Default for MtpDraftPolicy {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+/// Point-in-time snapshot of [`MtpDraftPolicy`] counters.
+#[derive(Debug, Clone, Copy)]
+pub struct MtpDraftStats {
+    pub in_cooldown: bool,
+    pub cooldown_remaining: usize,
+    pub window_len: usize,
+    pub total_accepted: u64,
+    pub total_rejected: u64,
+    pub total_cooldowns: u64,
+    /// Ratio of `total_accepted / (total_accepted + total_rejected)`, or
+    /// `0.0` when no decisions have been recorded yet.
+    pub overall_accept_rate: f32,
+}
+
 /// Deterministic 64-bit PRNG (splitmix64). Adequate for token sampling and
 /// gives bit-exact reproducibility across platforms without pulling in an
 /// external RNG dependency.
@@ -10473,6 +10647,105 @@ mod tests {
         assert_eq!(selected.len(), 2, "must select all experts when top-k > n");
         let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    // ── DeepSeek-V3 Phase 5a.2: MTP adaptive draft policy ────────────
+
+    /// A fresh policy starts enabled — every `should_draft` returns `true`
+    /// until enough rejections force a cooldown transition.
+    #[test]
+    fn mtp_policy_starts_enabled() {
+        let mut p = MtpDraftPolicy::new_default();
+        for _ in 0..5 {
+            assert!(p.should_draft(), "fresh policy must draft immediately");
+        }
+    }
+
+    /// Filling the window with all-rejections must trip the cooldown and
+    /// then `should_draft` must return `false` for exactly
+    /// `cooldown_tokens` subsequent calls.
+    #[test]
+    fn mtp_policy_enters_cooldown_after_all_rejections() {
+        let window = 4;
+        let cooldown = 3;
+        let mut p = MtpDraftPolicy::with_params(window, 0.30, cooldown);
+        for _ in 0..window {
+            assert!(p.should_draft());
+            p.record(false); // reject
+        }
+        // Now the window has 4/4 rejects → rate 0 < 0.30, cooldown started.
+        assert!(
+            p.stats().in_cooldown,
+            "must be in cooldown after all-reject window"
+        );
+        for _ in 0..cooldown {
+            assert!(!p.should_draft(), "cooldown must skip drafts");
+        }
+        // Cooldown just expired → drafts resume.
+        assert!(p.should_draft(), "post-cooldown must resume drafting");
+    }
+
+    /// Accept rate above threshold must NOT trigger cooldown, even after
+    /// the window fills.
+    #[test]
+    fn mtp_policy_stays_enabled_above_threshold() {
+        let window = 4;
+        let mut p = MtpDraftPolicy::with_params(window, 0.30, 8);
+        // 3 accepts + 1 reject = 75% > 30%, no cooldown.
+        for &accept in &[true, true, true, false] {
+            assert!(p.should_draft());
+            p.record(accept);
+        }
+        assert!(
+            !p.stats().in_cooldown,
+            "75% accept rate must not trigger cooldown"
+        );
+    }
+
+    /// The window resets on cooldown entry so a single accept post-cooldown
+    /// does NOT prematurely re-trigger evaluation.
+    #[test]
+    fn mtp_policy_clears_window_on_cooldown() {
+        let mut p = MtpDraftPolicy::with_params(4, 0.30, 2);
+        for _ in 0..4 {
+            assert!(p.should_draft());
+            p.record(false);
+        }
+        assert!(p.stats().in_cooldown);
+        // Tick through cooldown.
+        for _ in 0..2 {
+            let _ = p.should_draft();
+        }
+        // Single accept post-cooldown — window is empty so evaluation
+        // needs 4 more decisions before it can re-trigger.
+        assert!(p.should_draft());
+        p.record(true);
+        assert!(
+            !p.stats().in_cooldown,
+            "single post-cooldown accept must not re-trigger"
+        );
+    }
+
+    /// Stats counter must accumulate accepts + rejects across cooldowns
+    /// (cooldowns clear the window but not the lifetime totals).
+    #[test]
+    fn mtp_policy_stats_track_lifetime_totals() {
+        let mut p = MtpDraftPolicy::with_params(4, 0.30, 1);
+        for _ in 0..4 {
+            assert!(p.should_draft());
+            p.record(false);
+        }
+        assert_eq!(p.stats().total_rejected, 4);
+        // Cool down for one, then accept some.
+        let _ = p.should_draft();
+        for _ in 0..3 {
+            assert!(p.should_draft());
+            p.record(true);
+        }
+        let stats = p.stats();
+        assert_eq!(stats.total_accepted, 3);
+        assert_eq!(stats.total_rejected, 4);
+        assert!((stats.overall_accept_rate - 3.0 / 7.0).abs() < 1e-5);
     }
 
     // ── DeepSeek-V3 Phase 5a: MTP loader gating ──────────────────────
