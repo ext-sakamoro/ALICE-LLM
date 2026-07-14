@@ -103,6 +103,18 @@ impl ExpertByteSource for Box<[u8]> {
     }
 }
 
+// The gguf feature also gates the memmap2 dependency (Cargo.toml), so we
+// only compile the Mmap impl when gguf is enabled. This is the production
+// byte source: the pool `mmap`s the GGUF file separately from the parser's
+// mmap so its lifetime is independent and it can be shared across threads.
+#[cfg(feature = "gguf")]
+impl ExpertByteSource for memmap2::Mmap {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
 /// Byte offset + length of one layer's expert-0 slab, plus per-expert
 /// stride and quant type. Sufficient to locate any expert `e` for that
 /// layer via `base_offset + e * bytes_per_expert`.

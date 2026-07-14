@@ -2977,6 +2977,16 @@ impl<'a> Llama3Model<'a> {
         });
         let mut deltanet_layers_vec: Vec<DeltaNetLayerWeights<'a>> = Vec::new();
         let mut deepseek_v3_layers_vec: Vec<DeepSeekV3LayerWeights<'a>> = Vec::new();
+        // Phase 4b.1: build one shared streaming pool for the whole model
+        // when `ALICE_LLM_MOE_STREAMING=1` + `ALICE_LLM_MOE_STREAMING_FILE=<path>`
+        // are both set. Failure (env unset, file open error, missing tensor)
+        // silently falls back to InMemory so callers who don't opt in are
+        // unaffected.
+        let deepseek_streaming_pool = if is_deepseek_model {
+            build_deepseek_streaming_pool(gguf, &config)
+        } else {
+            None
+        };
         let mut layer_kind_map: Vec<LayerKind> = if is_hybrid_model {
             Vec::with_capacity(config.num_layers)
         } else {
@@ -2984,7 +2994,12 @@ impl<'a> Llama3Model<'a> {
         };
         for i in 0..config.num_layers {
             if is_deepseek_model {
-                let dsv = load_deepseek_v3_layer_weights(gguf, i, &config)?;
+                let dsv = load_deepseek_v3_layer_weights(
+                    gguf,
+                    i,
+                    &config,
+                    deepseek_streaming_pool.as_ref(),
+                )?;
                 deepseek_v3_layers_vec.push(dsv);
             } else if is_hybrid_model && config.is_deltanet_layer(i) {
                 let dn = load_deltanet_layer_weights(gguf, i, &config)?;
@@ -7612,10 +7627,141 @@ fn load_layer_weights<'a>(
 /// entries. Layers below `first_k_dense_replace` carry SwiGLU FFN tensors
 /// (`ffn_gate` / `ffn_up` / `ffn_down` + `ffn_norm`); layers above load with
 /// `None` for those fields — the MoE path lands in Phase 3 (Issue #33).
+/// Build a shared [`StreamingExpertPool`] for the routed-expert weights of a
+/// DeepSeek-V3 model. Returns `None` unless both environment variables are
+/// set, so callers that don't opt in are unaffected:
+///
+/// - `ALICE_LLM_MOE_STREAMING=1` — enables the streaming path (any other
+///   value or missing → in-memory routed experts as before).
+/// - `ALICE_LLM_MOE_STREAMING_FILE=<path>` — filesystem path to the same
+///   GGUF the caller is already parsing. The pool opens the file a second
+///   time so its `Mmap` has its own lifetime, independent of the parser's
+///   borrowed slice.
+///
+/// Cache byte budget is configurable via `ALICE_LLM_MOE_CACHE_BYTES`
+/// (default: 4 GiB). Set to `0` to force every fetch to miss — useful for
+/// bench harnesses that measure cold-cache decode time.
+///
+/// [`StreamingExpertPool`]: crate::deepseek_streaming::StreamingExpertPool
+#[allow(clippy::too_many_lines)]
+fn build_deepseek_streaming_pool(
+    gguf: &GgufFile<'_>,
+    config: &Llama3Config,
+) -> Option<std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>> {
+    use crate::deepseek_streaming::{ExpertLayerInfo, StreamingExpertPool};
+    if std::env::var("ALICE_LLM_MOE_STREAMING").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let path = match std::env::var("ALICE_LLM_MOE_STREAMING_FILE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "[alice-llm] ALICE_LLM_MOE_STREAMING=1 but ALICE_LLM_MOE_STREAMING_FILE not set; \
+                 falling back to InMemory routed experts."
+            );
+            return None;
+        }
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[alice-llm] streaming pool disabled: cannot open '{path}': {e}");
+            return None;
+        }
+    };
+    // SAFETY: mmap of a read-only file we opened above. The Mmap owns its
+    // mapping and lives for the pool's lifetime (Arc-shared into every MoE
+    // layer's Streaming variant); it is not observed by any other process
+    // in a mutating way.
+    let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[alice-llm] streaming pool disabled: mmap failed: {e}");
+            return None;
+        }
+    };
+
+    let first_k_dense = config.deepseek_first_k_dense_replace().unwrap_or(0);
+    let n_experts = config.deepseek_n_routed_experts()?;
+
+    // For dense layers (below first_k_dense) we still emit a placeholder
+    // ExpertLayerInfo entry so `Vec::len() == num_layers` and callers can
+    // index by layer_idx uniformly. The forward path never touches these
+    // placeholders because it only takes the Streaming branch when the
+    // layer's `DeepSeekMoeWeights.routed` is Streaming (which only happens
+    // for MoE layers, past first_k_dense).
+    let placeholder = ExpertLayerInfo {
+        base_offset: 0,
+        bytes_per_expert: 0,
+        n_experts: 0,
+        qtype: crate::gguf::GgmlType::F32,
+    };
+    let mut layer_info: Vec<[ExpertLayerInfo; 3]> = Vec::with_capacity(config.num_layers);
+    for layer_idx in 0..config.num_layers {
+        if layer_idx < first_k_dense {
+            layer_info.push([placeholder; 3]);
+            continue;
+        }
+        let prefix = format!("blk.{layer_idx}");
+        let gate_name = format!("{prefix}.ffn_gate_exps.weight");
+        let up_name = format!("{prefix}.ffn_up_exps.weight");
+        let down_name = format!("{prefix}.ffn_down_exps.weight");
+        let gate_info = gguf.tensors.get(&gate_name)?;
+        let up_info = gguf.tensors.get(&up_name)?;
+        let down_info = gguf.tensors.get(&down_name)?;
+        // Per-expert byte stride = tensor size / n_experts. The 3D layout
+        // is expert-major (`[n_expert, out, in]` row-major), so dividing
+        // by n_experts yields the byte width of one expert's 2D slab.
+        let gate_bytes_per_expert = gate_info.data_size().checked_div(n_experts)?;
+        let up_bytes_per_expert = up_info.data_size().checked_div(n_experts)?;
+        let down_bytes_per_expert = down_info.data_size().checked_div(n_experts)?;
+        let gate_off = gguf.tensor_absolute_offset(&gate_name)? as usize;
+        let up_off = gguf.tensor_absolute_offset(&up_name)? as usize;
+        let down_off = gguf.tensor_absolute_offset(&down_name)? as usize;
+        layer_info.push([
+            ExpertLayerInfo {
+                base_offset: gate_off,
+                bytes_per_expert: gate_bytes_per_expert,
+                n_experts,
+                qtype: gate_info.qtype,
+            },
+            ExpertLayerInfo {
+                base_offset: up_off,
+                bytes_per_expert: up_bytes_per_expert,
+                n_experts,
+                qtype: up_info.qtype,
+            },
+            ExpertLayerInfo {
+                base_offset: down_off,
+                bytes_per_expert: down_bytes_per_expert,
+                n_experts,
+                qtype: down_info.qtype,
+            },
+        ]);
+    }
+
+    let budget: usize = std::env::var("ALICE_LLM_MOE_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize * 1024 * 1024 * 1024);
+
+    eprintln!(
+        "[alice-llm] DeepSeek streaming pool: mmap '{path}' ({} bytes), budget {} MiB",
+        mmap.len(),
+        budget / (1024 * 1024)
+    );
+    let source: std::sync::Arc<dyn crate::deepseek_streaming::ExpertByteSource> =
+        std::sync::Arc::new(mmap);
+    Some(std::sync::Arc::new(StreamingExpertPool::new(
+        source, layer_info, budget,
+    )))
+}
+
 fn load_deepseek_v3_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
     config: &Llama3Config,
+    streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
 ) -> Option<DeepSeekV3LayerWeights<'a>> {
     let prefix = format!("blk.{layer}");
 
@@ -7705,24 +7851,6 @@ fn load_deepseek_v3_layer_weights<'a>(
         let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"))?;
         // noaux_tc bias — optional (older DeepSeek-V2 doesn't ship this).
         let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
-        let ffn_gate_exps = load_weight_ref(
-            gguf,
-            &format!("{prefix}.ffn_gate_exps.weight"),
-            moe_ffn * n_experts,
-            config.hidden_dim,
-        )?;
-        let ffn_up_exps = load_weight_ref(
-            gguf,
-            &format!("{prefix}.ffn_up_exps.weight"),
-            moe_ffn * n_experts,
-            config.hidden_dim,
-        )?;
-        let ffn_down_exps = load_weight_ref(
-            gguf,
-            &format!("{prefix}.ffn_down_exps.weight"),
-            config.hidden_dim * n_experts,
-            moe_ffn,
-        )?;
         let ffn_gate_shexp = load_weight_ref(
             gguf,
             &format!("{prefix}.ffn_gate_shexp.weight"),
@@ -7741,24 +7869,40 @@ fn load_deepseek_v3_layer_weights<'a>(
             config.hidden_dim,
             shared_ffn,
         )?;
-        // Default routed-expert storage is InMemory (pre-Phase-4). Streaming
-        // pool wiring for real GGUFs is a follow-up (see RoutedExpertStorage
-        // doc comment). The env var check is here so the plumbing is visible
-        // to future changes, but currently always falls through to InMemory
-        // — flipping the flag today logs a note and falls back rather than
-        // silently mis-loading the model.
-        if std::env::var_os("ALICE_LLM_MOE_STREAMING").is_some() {
-            eprintln!(
-                "[alice-llm] ALICE_LLM_MOE_STREAMING set for layer {layer}, but Phase 4a \
-                 does not yet wire real-GGUF streaming through the loader; falling back to \
-                 InMemory routed experts. Streaming API + LRU cache are exercised via \
-                 `deepseek_streaming::StreamingExpertPool` unit tests only."
-            );
-        }
-        let routed = RoutedExpertStorage::InMemory {
-            gate: ffn_gate_exps,
-            up: ffn_up_exps,
-            down: ffn_down_exps,
+        let routed = if let Some(pool) = streaming_pool {
+            // Phase 4b.1 streaming path: skip WeightRef loading for the
+            // three routed 3D tensors — the pool's own mmap of the same
+            // file will page them in lazily via `get_or_load`. Only the
+            // shared expert stays as an eagerly-loaded WeightRef because
+            // it fires on every token (LRU offers no benefit).
+            RoutedExpertStorage::Streaming {
+                pool: pool.clone(),
+                layer_idx: layer,
+            }
+        } else {
+            let ffn_gate_exps = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_gate_exps.weight"),
+                moe_ffn * n_experts,
+                config.hidden_dim,
+            )?;
+            let ffn_up_exps = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_up_exps.weight"),
+                moe_ffn * n_experts,
+                config.hidden_dim,
+            )?;
+            let ffn_down_exps = load_weight_ref(
+                gguf,
+                &format!("{prefix}.ffn_down_exps.weight"),
+                config.hidden_dim * n_experts,
+                moe_ffn,
+            )?;
+            RoutedExpertStorage::InMemory {
+                gate: ffn_gate_exps,
+                up: ffn_up_exps,
+                down: ffn_down_exps,
+            }
         };
         let moe = DeepSeekMoeWeights {
             ffn_norm,
@@ -9609,6 +9753,268 @@ mod tests {
             c.deepseek_qk_nope_head_dim().unwrap() + c.deepseek_v_head_dim().unwrap();
         assert_eq!(num_heads * q_head_total, 2 * 6);
         assert_eq!(num_heads * kv_up_head_total, 2 * 8);
+    }
+
+    // ── DeepSeek-V3 Phase 4a: MoE streaming parity ────────────────────
+
+    /// Constructs both `RoutedExpertStorage::InMemory` and
+    /// `RoutedExpertStorage::Streaming` variants over the same underlying
+    /// byte buffer, calls `forward_deepseek_moe_layer` on each, and
+    /// asserts the output is bit-identical.
+    ///
+    /// This is the end-to-end proof that swapping storage backends never
+    /// changes numerical output — the whole point of putting streaming
+    /// behind an enum instead of a separate forward path.
+    #[test]
+    fn deepseek_moe_forward_streaming_matches_in_memory() {
+        use crate::deepseek_streaming::{ExpertKind, ExpertLayerInfo, StreamingExpertPool};
+        use crate::gguf::GgmlType;
+        use std::sync::Arc;
+
+        // Tiny MoE config: hidden=4, moe_ffn=8, n_experts=4, top_k=2,
+        // n_shared=1, routed_scale=1.5. F32 quant keeps byte math trivial.
+        const HIDDEN: usize = 4;
+        const MOE_FFN: usize = 8;
+        const N_EXPERTS: usize = 4;
+        const TOP_K: usize = 2;
+        const N_SHARED: usize = 1;
+        const ROUTED_SCALE: f32 = 1.5;
+        const SHARED_FFN: usize = N_SHARED * MOE_FFN;
+
+        // Deterministic byte pattern for gate/up/down expert tensors.
+        // Each expert slab is `moe_ffn * hidden * 4` = 128 bytes.
+        const SLAB_BYTES: usize = MOE_FFN * HIDDEN * 4;
+        const DOWN_SLAB_BYTES: usize = HIDDEN * MOE_FFN * 4;
+        assert_eq!(SLAB_BYTES, DOWN_SLAB_BYTES);
+        let make_slab = |seed: u8| -> Vec<u8> {
+            (0..SLAB_BYTES)
+                .flat_map(|i| {
+                    let v = ((seed as f32 + i as f32 * 0.017).sin() * 0.5).to_le_bytes();
+                    v.into_iter()
+                })
+                .take(SLAB_BYTES)
+                .collect()
+        };
+        // Layout in the streaming source: [gate_e0..3 | up_e0..3 | down_e0..3].
+        let mut source_bytes = Vec::with_capacity(3 * N_EXPERTS * SLAB_BYTES);
+        for e in 0..N_EXPERTS {
+            source_bytes.extend(make_slab(e as u8));
+        }
+        for e in 0..N_EXPERTS {
+            source_bytes.extend(make_slab((e + 10) as u8));
+        }
+        for e in 0..N_EXPERTS {
+            source_bytes.extend(make_slab((e + 20) as u8));
+        }
+
+        // In-memory WeightRefs slice the same buffer directly.
+        let gate_bytes = &source_bytes[0..N_EXPERTS * SLAB_BYTES];
+        let up_bytes = &source_bytes[N_EXPERTS * SLAB_BYTES..2 * N_EXPERTS * SLAB_BYTES];
+        let down_bytes = &source_bytes[2 * N_EXPERTS * SLAB_BYTES..3 * N_EXPERTS * SLAB_BYTES];
+
+        // Shared expert weights (also F32, small).
+        let shared_gate: Vec<u8> = (0..SHARED_FFN * HIDDEN * 4)
+            .flat_map(|i| ((i as f32 * 0.03 - 0.1).cos() * 0.2).to_le_bytes())
+            .collect();
+        let shared_up: Vec<u8> = (0..SHARED_FFN * HIDDEN * 4)
+            .flat_map(|i| ((i as f32 * 0.05 + 0.05).sin() * 0.15).to_le_bytes())
+            .collect();
+        let shared_down: Vec<u8> = (0..HIDDEN * SHARED_FFN * 4)
+            .flat_map(|i| ((i as f32 * 0.07 - 0.2).cos() * 0.18).to_le_bytes())
+            .collect();
+
+        // Router + norm + noaux_tc bias.
+        let ffn_norm: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + i as f32 * 0.05).collect();
+        let ffn_gate_inp: Vec<f32> = (0..N_EXPERTS * HIDDEN)
+            .map(|i| (i as f32 * 0.1).sin() * 0.3)
+            .collect();
+        let exp_probs_b: Vec<f32> = vec![0.0, 0.1, -0.05, 0.02];
+
+        // Build a minimal config with the DeepSeek MoE sub-config populated.
+        let config = Llama3Config {
+            arch: ModelArch::DeepSeekV3,
+            vocab_size: 128,
+            hidden_dim: HIDDEN,
+            intermediate_dim: MOE_FFN,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 1,
+            max_seq_len: 32,
+            head_dim: 4,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-6,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
+            deepseek_v3: Some(DeepSeekV3Config {
+                q_lora_rank: Some(8),
+                kv_lora_rank: Some(4),
+                qk_nope_head_dim: Some(4),
+                qk_rope_head_dim: Some(2),
+                v_head_dim: Some(4),
+                n_routed_experts: Some(N_EXPERTS),
+                n_shared_experts: Some(N_SHARED),
+                num_experts_per_tok: Some(TOP_K),
+                moe_intermediate_size: Some(MOE_FFN),
+                first_k_dense_replace: Some(0),
+                routed_scaling_factor: Some(ROUTED_SCALE),
+                noaux_tc: Some(true),
+                mtp_layer: None,
+            }),
+        };
+
+        // Build the two `DeepSeekMoeWeights` variants sharing everything
+        // except the routed-expert storage backend. Written as explicit
+        // struct literals rather than a closure so both variants borrow
+        // from the same set of `Vec<u8>` bindings — a closure would
+        // trigger `lifetime may not live long enough`.
+        let in_memory = DeepSeekMoeWeights {
+            ffn_norm: ffn_norm.clone(),
+            ffn_gate_inp: ffn_gate_inp.clone(),
+            exp_probs_b: Some(exp_probs_b.clone()),
+            routed: RoutedExpertStorage::InMemory {
+                gate: WeightRef {
+                    data: gate_bytes,
+                    qtype: GgmlType::F32,
+                    rows: N_EXPERTS * MOE_FFN,
+                    cols: HIDDEN,
+                },
+                up: WeightRef {
+                    data: up_bytes,
+                    qtype: GgmlType::F32,
+                    rows: N_EXPERTS * MOE_FFN,
+                    cols: HIDDEN,
+                },
+                down: WeightRef {
+                    data: down_bytes,
+                    qtype: GgmlType::F32,
+                    rows: N_EXPERTS * HIDDEN,
+                    cols: MOE_FFN,
+                },
+            },
+            ffn_gate_shexp: WeightRef {
+                data: &shared_gate,
+                qtype: GgmlType::F32,
+                rows: SHARED_FFN,
+                cols: HIDDEN,
+            },
+            ffn_up_shexp: WeightRef {
+                data: &shared_up,
+                qtype: GgmlType::F32,
+                rows: SHARED_FFN,
+                cols: HIDDEN,
+            },
+            ffn_down_shexp: WeightRef {
+                data: &shared_down,
+                qtype: GgmlType::F32,
+                rows: HIDDEN,
+                cols: SHARED_FFN,
+            },
+        };
+
+        // Streaming variant: pool over an owned copy of `source_bytes`.
+        let source_owned: Arc<dyn crate::deepseek_streaming::ExpertByteSource> =
+            Arc::new(source_bytes.clone());
+        let layer_info = vec![[
+            ExpertLayerInfo {
+                base_offset: 0,
+                bytes_per_expert: SLAB_BYTES,
+                n_experts: N_EXPERTS,
+                qtype: GgmlType::F32,
+            },
+            ExpertLayerInfo {
+                base_offset: N_EXPERTS * SLAB_BYTES,
+                bytes_per_expert: SLAB_BYTES,
+                n_experts: N_EXPERTS,
+                qtype: GgmlType::F32,
+            },
+            ExpertLayerInfo {
+                base_offset: 2 * N_EXPERTS * SLAB_BYTES,
+                bytes_per_expert: SLAB_BYTES,
+                n_experts: N_EXPERTS,
+                qtype: GgmlType::F32,
+            },
+        ]];
+        let pool = Arc::new(StreamingExpertPool::new(
+            source_owned,
+            layer_info,
+            1024 * 1024, // 1 MiB budget, plenty for 3 * 128 = 384 bytes/expert
+        ));
+        let streaming = DeepSeekMoeWeights {
+            ffn_norm: ffn_norm.clone(),
+            ffn_gate_inp: ffn_gate_inp.clone(),
+            exp_probs_b: Some(exp_probs_b.clone()),
+            routed: RoutedExpertStorage::Streaming {
+                pool: pool.clone(),
+                layer_idx: 0,
+            },
+            ffn_gate_shexp: WeightRef {
+                data: &shared_gate,
+                qtype: GgmlType::F32,
+                rows: SHARED_FFN,
+                cols: HIDDEN,
+            },
+            ffn_up_shexp: WeightRef {
+                data: &shared_up,
+                qtype: GgmlType::F32,
+                rows: SHARED_FFN,
+                cols: HIDDEN,
+            },
+            ffn_down_shexp: WeightRef {
+                data: &shared_down,
+                qtype: GgmlType::F32,
+                rows: HIDDEN,
+                cols: SHARED_FFN,
+            },
+        };
+
+        // Same input for both paths.
+        let hidden_state: Vec<f32> = (0..HIDDEN).map(|i| 0.5 - i as f32 * 0.1).collect();
+        let mut norm_buf_a = vec![0.0f32; HIDDEN];
+        let mut norm_buf_b = vec![0.0f32; HIDDEN];
+        let mut out_in_memory = vec![0.0f32; HIDDEN];
+        let mut out_streaming = vec![0.0f32; HIDDEN];
+
+        forward_deepseek_moe_layer(
+            &config,
+            &in_memory,
+            &hidden_state,
+            &mut norm_buf_a,
+            &mut out_in_memory,
+        );
+        forward_deepseek_moe_layer(
+            &config,
+            &streaming,
+            &hidden_state,
+            &mut norm_buf_b,
+            &mut out_streaming,
+        );
+
+        // Bit-exact parity: the two paths dispatch to the same
+        // `quantized_matvec` on identical bytes, in the same order.
+        assert_eq!(
+            out_in_memory
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            out_streaming
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "InMemory vs Streaming forward diverged: {out_in_memory:?} vs {out_streaming:?}"
+        );
+
+        // Sanity: pool must have hit each expert's 3 kinds exactly once
+        // per selected top-k (2 experts × 3 kinds = 6 misses, no hits
+        // because each key is fetched at most once per single forward).
+        let stats = pool.cache_stats();
+        assert_eq!(
+            stats.misses, 6,
+            "expected 6 pool misses (2 experts × 3 kinds)"
+        );
+        assert_eq!(stats.hits, 0, "no hits on a single-forward run");
     }
 
     // ── DeepSeek-V3 Phase 3: MoE routing math ────────────────────────
