@@ -2624,12 +2624,44 @@ struct DeepSeekV3LayerWeights<'a> {
     // ── Dense FFN (present only for `first_k_dense_replace` layers) ─────
     /// FFN RMSNorm, populated for dense layers only.
     ffn_norm: Option<Vec<f32>>,
-    /// Dense SwiGLU gate. `None` for MoE layers (Phase 3).
+    /// Dense SwiGLU gate. `None` for MoE layers.
     gate_proj: Option<WeightRef<'a>>,
     /// Dense SwiGLU up. `None` for MoE layers.
     up_proj: Option<WeightRef<'a>>,
     /// Dense SwiGLU down. `None` for MoE layers.
     down_proj: Option<WeightRef<'a>>,
+    // ── MoE (present only for layers ≥ `first_k_dense_replace`) ─────────
+    /// DeepSeek-V3 MoE weights (Phase 3). `None` for dense layers.
+    moe: Option<DeepSeekMoeWeights<'a>>,
+}
+
+/// DeepSeek-V3 MoE weight bundle for one non-dense layer.
+///
+/// V3 uses **sigmoid gating** with the noaux_tc bias-correction trick +
+/// one **always-active shared expert** + **routed_scaling_factor** applied
+/// to the routed sum. All three components are loaded together so the
+/// forward path can dispatch without checking Option-ness inside the
+/// hot loop.
+struct DeepSeekMoeWeights<'a> {
+    /// FFN RMSNorm applied to `hidden` before the router / shared expert.
+    ffn_norm: Vec<f32>,
+    /// Router logits projection: `hidden → n_routed_experts` (dense f32).
+    ffn_gate_inp: Vec<f32>,
+    /// noaux_tc expert-bias vector `[n_routed_experts]`. Added to the
+    /// sigmoid scores for **top-k selection** only — the final routing
+    /// weights use the un-biased scores. `None` when the checkpoint does
+    /// not ship a bias tensor (older DeepSeek-V2 / rare V3 variants).
+    exp_probs_b: Option<Vec<f32>>,
+    /// Routed expert gate/up/down weights, 3D `[n_expert, out, in]` layout
+    /// identical to Qwen 3 MoE / Mixtral (see `MoeExpertWeights`).
+    ffn_gate_exps: WeightRef<'a>,
+    ffn_up_exps: WeightRef<'a>,
+    ffn_down_exps: WeightRef<'a>,
+    /// Shared expert (always active, no gating). Uses `n_shared_experts *
+    /// moe_intermediate_size` as its FFN size — V3: 1 * 2048 = 2048.
+    ffn_gate_shexp: WeightRef<'a>,
+    ffn_up_shexp: WeightRef<'a>,
+    ffn_down_shexp: WeightRef<'a>,
 }
 
 struct DeltaNetLayerWeights<'a> {
@@ -4460,12 +4492,14 @@ impl<'a> Llama3Model<'a> {
                     hidden[i] += down_buf[i];
                 }
             } else {
-                panic!(
-                    "DeepSeek-V3 MoE FFN not implemented — Phase 3 (Issue #33). \
-                     Layer {layer_idx} is past first_k_dense_replace = {first_k_dense}. \
-                     Configure with `first_k_dense_replace >= num_layers` or wait for MoE \
-                     routing to land before running full-model inference."
-                );
+                let moe = layer
+                    .moe
+                    .as_ref()
+                    .expect("DeepSeek-V3 MoE weights required past first_k_dense_replace");
+                forward_deepseek_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
+                for i in 0..hidden_dim {
+                    hidden[i] += down_buf[i];
+                }
             }
         }
 
@@ -6406,6 +6440,216 @@ fn load_weight_ref<'a>(
 ///    - `up   = ffn_up_exps[e]   @ norm_buf`
 ///    - `expert_out = ffn_down_exps[e] @ (SiLU(gate) * up)`
 /// 6. Sum weighted `expert_out` into `output`.
+/// DeepSeek-V3 MoE routing (pure math, Phase 3).
+///
+/// Splits out steps 3-7 of `forward_deepseek_moe_layer` so the routing
+/// arithmetic can be unit-tested in isolation without loading real weights:
+///
+/// 1. `scores = sigmoid(router_logits)` (un-biased routing weights).
+/// 2. `biased = scores + exp_probs_b` if noaux_tc bias is present.
+/// 3. Pick top-k experts by `biased` score (or by `scores` if no bias).
+/// 4. Recover the un-biased `scores` at the selected indices.
+/// 5. Renormalise the selected weights to sum-to-1, then multiply by
+///    `routed_scale` (V3 uses 2.5).
+///
+/// Returns `Vec<(expert_index, routing_weight)>` of length `top_k`.
+///
+/// Numerically-stable sigmoid: uses the branch `1/(1+exp(-x))` for x ≥ 0
+/// and `exp(x)/(1+exp(x))` for x < 0 to keep the exp argument non-positive.
+fn deepseek_moe_route(
+    router_logits: &[f32],
+    exp_probs_b: Option<&[f32]>,
+    top_k: usize,
+    routed_scale: f32,
+) -> Vec<(usize, f32)> {
+    let n_experts = router_logits.len();
+    let scores: Vec<f32> = router_logits
+        .iter()
+        .map(|&x| {
+            if x >= 0.0 {
+                1.0 / (1.0 + (-x).exp())
+            } else {
+                let e = x.exp();
+                e / (1.0 + e)
+            }
+        })
+        .collect();
+
+    let mut idx_biased: Vec<(usize, f32)> = if let Some(bias) = exp_probs_b {
+        assert_eq!(bias.len(), n_experts, "exp_probs_b shape mismatch");
+        scores
+            .iter()
+            .zip(bias.iter())
+            .enumerate()
+            .map(|(i, (&s, &b))| (i, s + b))
+            .collect()
+    } else {
+        scores.iter().enumerate().map(|(i, &s)| (i, s)).collect()
+    };
+    idx_biased.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx_biased.truncate(top_k);
+
+    let mut selected: Vec<(usize, f32)> =
+        idx_biased.iter().map(|(i, _)| (*i, scores[*i])).collect();
+    let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for (_, w) in &mut selected {
+            *w *= inv;
+        }
+    }
+    for (_, w) in &mut selected {
+        *w *= routed_scale;
+    }
+    selected
+}
+
+/// DeepSeek-V3 MoE FFN forward pass (Phase 3, Issue #33).
+///
+/// Distinct from `forward_moe_layer` (Qwen 3 MoE / Mixtral style, softmax
+/// gating, no shared expert) because V3 uses **sigmoid gating with the
+/// noaux_tc bias-correction trick**, an **always-active shared expert**,
+/// and a **routed_scaling_factor** applied to the routed sum before it is
+/// added to the shared expert's output.
+///
+/// Algorithm (matches DeepSeek-V3 paper Section 4 + colibri implementation):
+/// 1. `hidden → ffn_norm → norm_buf`
+/// 2. `router_logits = ffn_gate_inp @ norm_buf` (`[n_routed_experts]`)
+/// 3. `scores = sigmoid(router_logits)` — the un-biased routing weights.
+/// 4. `biased = scores + exp_probs_b` when noaux_tc bias is present
+///    (used **only** for selecting top-k, not for the final weights).
+/// 5. Pick top-k experts by `biased` score.
+/// 6. Renormalise the top-k `scores` (not `biased`) to sum to 1 —
+///    those become the routing weights.
+/// 7. Multiply the renormalised weights by `routed_scaling_factor`
+///    (V3: 2.5) so the routed contribution is amplified relative to the
+///    shared expert.
+/// 8. For each of the top-k experts: run SwiGLU FFN on `norm_buf`,
+///    accumulate into `output` weighted by the routing weight.
+/// 9. Run the shared expert unconditionally (SwiGLU FFN on `norm_buf`) and
+///    add its full contribution to `output`.
+///
+/// Output is the FFN branch's contribution — the caller adds it to the
+/// residual `hidden` outside this function.
+fn forward_deepseek_moe_layer(
+    c: &Llama3Config,
+    moe: &DeepSeekMoeWeights<'_>,
+    hidden: &[f32],
+    norm_buf: &mut [f32],
+    output: &mut [f32],
+) {
+    let hidden_dim = c.hidden_dim;
+    let n_experts = c
+        .deepseek_n_routed_experts()
+        .expect("DeepSeek MoE requires n_routed_experts");
+    let n_shared = c
+        .deepseek_n_shared_experts()
+        .expect("DeepSeek MoE requires n_shared_experts");
+    let top_k = c
+        .deepseek_num_experts_per_tok()
+        .expect("DeepSeek MoE requires num_experts_per_tok");
+    let moe_ffn = c
+        .deepseek_moe_intermediate_size()
+        .expect("DeepSeek MoE requires moe_intermediate_size");
+    let shared_ffn = n_shared * moe_ffn;
+    let routed_scale = c.deepseek_routed_scaling_factor().unwrap_or(1.0);
+
+    // ── Step 1: FFN RMSNorm on the input residual. ─────────────────────
+    rms_norm(hidden, &moe.ffn_norm, c.norm_eps, norm_buf);
+
+    // ── Step 2: Router logits `router[e] = W[e, :] · norm_buf`. ────────
+    // `ffn_gate_inp` is dense f32, laid out `[n_experts, hidden_dim]`
+    // row-major with hidden_dim the fast axis (matches Qwen 3 MoE).
+    let router_w = &moe.ffn_gate_inp;
+    assert_eq!(
+        router_w.len(),
+        n_experts * hidden_dim,
+        "ffn_gate_inp shape mismatch"
+    );
+    let mut router_logits = vec![0.0f32; n_experts];
+    for (e, logit) in router_logits.iter_mut().enumerate() {
+        let base = e * hidden_dim;
+        let mut acc = 0.0f32;
+        for (h, &x) in norm_buf.iter().enumerate() {
+            acc += router_w[base + h] * x;
+        }
+        *logit = acc;
+    }
+
+    // ── Steps 3-7: pure routing math (testable in isolation). ──────────
+    let selected = deepseek_moe_route(
+        &router_logits,
+        moe.exp_probs_b.as_deref(),
+        top_k,
+        routed_scale,
+    );
+
+    // ── Step 8: Dispatch to top-k routed experts, accumulate. ──────────
+    let gate_exps = &moe.ffn_gate_exps;
+    let up_exps = &moe.ffn_up_exps;
+    let down_exps = &moe.ffn_down_exps;
+    let gate_slab = expert_slab_bytes(gate_exps, moe_ffn, hidden_dim);
+    let up_slab = expert_slab_bytes(up_exps, moe_ffn, hidden_dim);
+    let down_slab = expert_slab_bytes(down_exps, hidden_dim, moe_ffn);
+
+    for v in output.iter_mut() {
+        *v = 0.0;
+    }
+    let mut gate_buf = vec![0.0f32; moe_ffn];
+    let mut up_buf = vec![0.0f32; moe_ffn];
+    let mut expert_out = vec![0.0f32; hidden_dim];
+    for &(e, weight) in &selected {
+        let g_data = &gate_exps.data[e * gate_slab..(e + 1) * gate_slab];
+        let u_data = &up_exps.data[e * up_slab..(e + 1) * up_slab];
+        let d_data = &down_exps.data[e * down_slab..(e + 1) * down_slab];
+
+        crate::gguf::quantized_matvec(
+            norm_buf,
+            g_data,
+            gate_exps.qtype,
+            moe_ffn,
+            hidden_dim,
+            &mut gate_buf,
+        );
+        crate::gguf::quantized_matvec(
+            norm_buf,
+            u_data,
+            up_exps.qtype,
+            moe_ffn,
+            hidden_dim,
+            &mut up_buf,
+        );
+        for i in 0..moe_ffn {
+            gate_buf[i] = silu(gate_buf[i]) * up_buf[i];
+        }
+        crate::gguf::quantized_matvec(
+            &gate_buf,
+            d_data,
+            down_exps.qtype,
+            hidden_dim,
+            moe_ffn,
+            &mut expert_out,
+        );
+        for i in 0..hidden_dim {
+            output[i] += weight * expert_out[i];
+        }
+    }
+
+    // ── Step 9: Always-active shared expert (SwiGLU FFN, no gating). ───
+    let mut shared_gate = vec![0.0f32; shared_ffn];
+    let mut shared_up = vec![0.0f32; shared_ffn];
+    let mut shared_out = vec![0.0f32; hidden_dim];
+    moe.ffn_gate_shexp.matvec(norm_buf, &mut shared_gate);
+    moe.ffn_up_shexp.matvec(norm_buf, &mut shared_up);
+    for i in 0..shared_ffn {
+        shared_gate[i] = silu(shared_gate[i]) * shared_up[i];
+    }
+    moe.ffn_down_shexp.matvec(&shared_gate, &mut shared_out);
+    for i in 0..hidden_dim {
+        output[i] += shared_out[i];
+    }
+}
+
 fn forward_moe_layer(
     c: &Llama3Config,
     layer: &LayerWeights<'_>,
@@ -7362,10 +7606,10 @@ fn load_deepseek_v3_layer_weights<'a>(
     )?;
 
     // Dense SwiGLU FFN only for the first `first_k_dense_replace` layers.
-    // Everything past that block is a DeepSeek-MoE FFN whose weights we
-    // deliberately skip until Phase 3 lands.
+    // Layers ≥ first_k_dense use the DeepSeek-V3 MoE branch (Phase 3):
+    // router + noaux_tc bias + top-k routed experts + always-active shared.
     let first_k_dense = config.deepseek_first_k_dense_replace().unwrap_or(0);
-    let (ffn_norm, gate_proj, up_proj, down_proj) = if layer < first_k_dense {
+    let (ffn_norm, gate_proj, up_proj, down_proj, moe) = if layer < first_k_dense {
         let ffn_size = config.ffn_size_for_layer(layer);
         let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
         let gate_proj = load_weight_ref(
@@ -7391,9 +7635,65 @@ fn load_deepseek_v3_layer_weights<'a>(
             Some(gate_proj),
             Some(up_proj),
             Some(down_proj),
+            None,
         )
     } else {
-        (None, None, None, None)
+        let n_experts = config.deepseek_n_routed_experts()?;
+        let n_shared = config.deepseek_n_shared_experts()?;
+        let moe_ffn = config.deepseek_moe_intermediate_size()?;
+        let shared_ffn = n_shared * moe_ffn;
+        let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+        let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        // noaux_tc bias — optional (older DeepSeek-V2 doesn't ship this).
+        let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
+        let ffn_gate_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_gate_exps.weight"),
+            moe_ffn * n_experts,
+            config.hidden_dim,
+        )?;
+        let ffn_up_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_up_exps.weight"),
+            moe_ffn * n_experts,
+            config.hidden_dim,
+        )?;
+        let ffn_down_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_down_exps.weight"),
+            config.hidden_dim * n_experts,
+            moe_ffn,
+        )?;
+        let ffn_gate_shexp = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_gate_shexp.weight"),
+            shared_ffn,
+            config.hidden_dim,
+        )?;
+        let ffn_up_shexp = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_up_shexp.weight"),
+            shared_ffn,
+            config.hidden_dim,
+        )?;
+        let ffn_down_shexp = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_down_shexp.weight"),
+            config.hidden_dim,
+            shared_ffn,
+        )?;
+        let moe = DeepSeekMoeWeights {
+            ffn_norm,
+            ffn_gate_inp,
+            exp_probs_b,
+            ffn_gate_exps,
+            ffn_up_exps,
+            ffn_down_exps,
+            ffn_gate_shexp,
+            ffn_up_shexp,
+            ffn_down_shexp,
+        };
+        (None, None, None, None, Some(moe))
     };
 
     Some(DeepSeekV3LayerWeights {
@@ -7409,6 +7709,7 @@ fn load_deepseek_v3_layer_weights<'a>(
         gate_proj,
         up_proj,
         down_proj,
+        moe,
     })
 }
 
@@ -9234,13 +9535,85 @@ mod tests {
         assert_eq!(num_heads * kv_up_head_total, 2 * 8);
     }
 
+    // ── DeepSeek-V3 Phase 3: MoE routing math ────────────────────────
+
     #[test]
-    fn deepseek_v3_first_k_dense_boundary_gates_moe_panic() {
+    fn deepseek_moe_route_sigmoid_topk_no_bias() {
+        // Logits chosen so sigmoid(x) is roughly [0.27, 0.5, 0.73, 0.88, 0.95]
+        // for [-1, 0, 1, 2, 3]. Top-2 by score = experts 4 and 3.
+        let logits = vec![-1.0, 0.0, 1.0, 2.0, 3.0];
+        let selected = deepseek_moe_route(&logits, None, 2, 1.0);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, 4);
+        assert_eq!(selected[1].0, 3);
+        // Weights should sum to ~routed_scale (=1.0 here) after renormalize.
+        let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "weights sum = {sum}");
+    }
+
+    #[test]
+    fn deepseek_moe_route_noaux_tc_bias_affects_selection_not_weights() {
+        // Logits: expert 0 has highest un-biased score (sigmoid(3) ≈ 0.95).
+        // Bias vector boosts expert 3 by +10 so it becomes top-1 despite a
+        // much lower un-biased score. But the returned weight for expert 3
+        // must be its un-biased sigmoid score (renormalized), NOT the biased
+        // one — that's the whole point of noaux_tc.
+        let logits = vec![3.0, -5.0, -5.0, -1.0, -5.0];
+        let bias = vec![0.0, 0.0, 0.0, 10.0, 0.0];
+        let selected = deepseek_moe_route(&logits, Some(&bias), 2, 1.0);
+        // Selection: biased top-2 = expert 3 (score+10) and expert 0.
+        let picked: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
+        assert!(picked.contains(&3), "expert 3 must be top-k via bias");
+        assert!(
+            picked.contains(&0),
+            "expert 0 must be top-k via un-biased score"
+        );
+        // The final weight of expert 3 must be based on its un-biased score
+        // (sigmoid(-1) ≈ 0.269), NOT sigmoid(-1) + 10.
+        let w3 = selected.iter().find(|(i, _)| *i == 3).unwrap().1;
+        let w0 = selected.iter().find(|(i, _)| *i == 0).unwrap().1;
+        // Un-biased renormalize: w0 / w3 ≈ sigmoid(3) / sigmoid(-1) ≈ 3.53.
+        // If bias leaked into weights we'd see w3 dominant instead.
+        assert!(
+            w0 > w3,
+            "un-biased weight of expert 0 must exceed expert 3 (w0={w0} w3={w3})"
+        );
+    }
+
+    #[test]
+    fn deepseek_moe_route_routed_scaling_factor() {
+        // With routed_scale = 2.5, the returned weights must sum to
+        // routed_scale (not 1.0) — DeepSeek-V3 uses this to amplify the
+        // routed sum relative to the always-active shared expert.
+        let logits = vec![0.0, 1.0, 2.0, 3.0];
+        let selected = deepseek_moe_route(&logits, None, 2, 2.5);
+        let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+        assert!(
+            (sum - 2.5).abs() < 1e-5,
+            "weights sum = {sum}, expected 2.5"
+        );
+    }
+
+    #[test]
+    fn deepseek_moe_route_top_k_larger_than_experts() {
+        // Edge case: top-k > n_experts. Must not panic; selects all.
+        let logits = vec![1.0, 2.0];
+        let selected = deepseek_moe_route(&logits, None, 8, 1.0);
+        assert_eq!(selected.len(), 2, "must select all experts when top-k > n");
+        let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn deepseek_v3_first_k_dense_boundary_gates_moe_branch() {
         // Layers below `first_k_dense_replace` take the dense SwiGLU FFN
-        // path; layers at or above must trigger the Phase-3 MoE panic.
-        // The tiny fixture bumps `first_k_dense_replace` up to `num_layers`
-        // so no layer trips the panic, exercising the dense branch end to
-        // end. This guard makes sure the boundary predicate itself stays
+        // path; layers at or above take the DeepSeek-V3 MoE branch
+        // (Phase 3 landed — no more panic). The tiny fixture keeps
+        // `first_k_dense_replace >= num_layers` so every layer stays on
+        // the dense path — the MoE branch is exercised end-to-end only
+        // when a real GGUF (or a fixture that actually loads MoE weights)
+        // is loaded, since the MoE weights are not synthesised here.
+        // This guard makes sure the boundary predicate itself stays
         // aligned with what `forward_deepseek_v3` inspects.
         let c = tiny_deepseek_v3_config();
         let first_k = c.deepseek_first_k_dense_replace().unwrap();
