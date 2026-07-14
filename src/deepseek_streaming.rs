@@ -295,6 +295,53 @@ impl StreamingExpertPool {
         slab
     }
 
+    /// Warm the cache with a batch of expert keys. Every key that already
+    /// hits stays in place (only its LRU position bumps); every miss reads
+    /// from the source and inserts. Intended usage: `forward_deepseek_moe_layer`
+    /// calls this on the top-k × 3-kind key list *immediately after* the
+    /// router picks its winners and *before* the per-expert matvec loop.
+    /// The subsequent `get_or_load` calls inside the loop then become
+    /// guaranteed hits, decoupling the I/O phase from the compute phase.
+    ///
+    /// This is the Phase 4b.2 replacement for async readahead. It is
+    /// sequential; the [`prefetch_parallel`] variant below fans out over
+    /// rayon when the `parallel` feature is enabled — the winning move on
+    /// real disk-backed mmap since page-in latency dominates.
+    ///
+    /// [`prefetch_parallel`]: Self::prefetch_parallel
+    pub fn prefetch(&self, keys: &[ExpertKey]) {
+        for &k in keys {
+            let _ = self.get_or_load(k.layer_idx as usize, k.kind, k.expert_idx as usize);
+        }
+    }
+
+    /// Parallel prefetch via rayon (feature-gated). Same semantics as
+    /// [`prefetch`] but the misses fan out across the rayon global thread
+    /// pool. Only useful when the source is genuinely I/O-bound (real
+    /// disk-backed `Mmap` with cold pages) — for the in-memory `Vec<u8>`
+    /// unit-test source the sequential variant is faster because the extra
+    /// work-stealing overhead outweighs the copy cost.
+    ///
+    /// When the `parallel` feature is not enabled this delegates to
+    /// [`prefetch`] so the caller sees a consistent API regardless of
+    /// which build variant they compile.
+    ///
+    /// [`prefetch`]: Self::prefetch
+    #[cfg(feature = "parallel")]
+    pub fn prefetch_parallel(&self, keys: &[ExpertKey]) {
+        use rayon::prelude::*;
+        keys.par_iter().for_each(|&k| {
+            let _ = self.get_or_load(k.layer_idx as usize, k.kind, k.expert_idx as usize);
+        });
+    }
+
+    /// Fallback when `parallel` is disabled — sequential prefetch. See
+    /// the `#[cfg(feature = "parallel")]` variant for the real doc.
+    #[cfg(not(feature = "parallel"))]
+    pub fn prefetch_parallel(&self, keys: &[ExpertKey]) {
+        self.prefetch(keys);
+    }
+
     /// Snapshot of current cache metrics — hits, misses, live-byte total.
     /// Zero-cost when unused; primarily consumed by bench harnesses.
     pub fn cache_stats(&self) -> CacheStats {
@@ -440,6 +487,80 @@ mod tests {
         assert!(!stats.entries == 0 || stats.entries <= 2);
         // The Arc we captured earlier still holds the original bytes.
         assert_eq!(*e0, expected, "arc-held slab must survive eviction");
+    }
+
+    #[test]
+    fn prefetch_batch_warms_all_keys() {
+        let pool = make_pool(4, 32, 1024);
+        let keys = vec![
+            ExpertKey::new(0, ExpertKind::Gate, 0),
+            ExpertKey::new(0, ExpertKind::Gate, 1),
+            ExpertKey::new(0, ExpertKind::Up, 2),
+            ExpertKey::new(0, ExpertKind::Down, 3),
+        ];
+        pool.prefetch(&keys);
+        let after_prefetch = pool.cache_stats();
+        assert_eq!(after_prefetch.misses, 4, "prefetch loads every key");
+        assert_eq!(after_prefetch.entries, 4);
+
+        // Every subsequent get_or_load must be a hit.
+        for key in &keys {
+            let _ = pool.get_or_load(key.layer_idx as usize, key.kind, key.expert_idx as usize);
+        }
+        let after_get = pool.cache_stats();
+        assert_eq!(after_get.misses, 4, "no fresh misses after prefetch");
+        assert_eq!(after_get.hits, 4);
+    }
+
+    #[test]
+    fn prefetch_is_noop_for_already_cached_keys() {
+        let pool = make_pool(4, 32, 1024);
+        // Load expert 0 once.
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0);
+        assert_eq!(pool.cache_stats().misses, 1);
+        // Prefetch the same key + one new key.
+        let keys = vec![
+            ExpertKey::new(0, ExpertKind::Gate, 0), // already cached (hit, LRU bump)
+            ExpertKey::new(0, ExpertKind::Gate, 1), // fresh (miss)
+        ];
+        pool.prefetch(&keys);
+        let stats = pool.cache_stats();
+        assert_eq!(
+            stats.misses, 2,
+            "only the fresh key increments miss counter"
+        );
+        assert_eq!(
+            stats.hits, 1,
+            "cached key increments hit counter via LRU bump"
+        );
+    }
+
+    #[test]
+    fn prefetch_parallel_matches_sequential_semantics() {
+        // Under both feature configurations `prefetch_parallel` must
+        // produce the same final cache contents as `prefetch`. This
+        // catches the mistake of e.g. dropping keys under parallelism.
+        let pool_seq = make_pool(8, 32, 4096);
+        let pool_par = make_pool(8, 32, 4096);
+        let keys: Vec<ExpertKey> = (0..8)
+            .flat_map(|e| {
+                [ExpertKind::Gate, ExpertKind::Up, ExpertKind::Down]
+                    .into_iter()
+                    .map(move |k| ExpertKey::new(0, k, e))
+            })
+            .collect();
+        pool_seq.prefetch(&keys);
+        pool_par.prefetch_parallel(&keys);
+        let s_seq = pool_seq.cache_stats();
+        let s_par = pool_par.cache_stats();
+        assert_eq!(
+            s_seq.entries, s_par.entries,
+            "prefetch_parallel entry count must match sequential"
+        );
+        assert_eq!(
+            s_seq.current_bytes, s_par.current_bytes,
+            "prefetch_parallel byte total must match sequential"
+        );
     }
 
     #[test]

@@ -6643,14 +6643,30 @@ fn forward_deepseek_moe_layer(
     // streaming path holds an `Arc<Vec<u8>>` in a temporary for the
     // scope of one expert's three matvecs, then drops it (the LRU cache
     // still owns the shared copy internally).
-    use crate::deepseek_streaming::ExpertKind;
+    //
+    // Phase 4b.2: on the streaming path we prefetch every selected
+    // expert's 3 kinds (gate + up + down) into the cache BEFORE the
+    // matvec loop starts. Cache misses happen upfront (potentially in
+    // parallel via rayon when `parallel` is enabled) so the subsequent
+    // per-expert `get_or_load` calls inside the loop become guaranteed
+    // hits — decoupling I/O from compute.
+    use crate::deepseek_streaming::{ExpertKey, ExpertKind};
     let (gate_qtype, up_qtype, down_qtype) = match &moe.routed {
         RoutedExpertStorage::InMemory { gate, up, down } => (gate.qtype, up.qtype, down.qtype),
-        RoutedExpertStorage::Streaming { pool, layer_idx } => (
-            pool.qtype(*layer_idx, ExpertKind::Gate),
-            pool.qtype(*layer_idx, ExpertKind::Up),
-            pool.qtype(*layer_idx, ExpertKind::Down),
-        ),
+        RoutedExpertStorage::Streaming { pool, layer_idx } => {
+            let mut prefetch_keys = Vec::with_capacity(selected.len() * 3);
+            for &(e, _) in &selected {
+                prefetch_keys.push(ExpertKey::new(*layer_idx, ExpertKind::Gate, e));
+                prefetch_keys.push(ExpertKey::new(*layer_idx, ExpertKind::Up, e));
+                prefetch_keys.push(ExpertKey::new(*layer_idx, ExpertKind::Down, e));
+            }
+            pool.prefetch_parallel(&prefetch_keys);
+            (
+                pool.qtype(*layer_idx, ExpertKind::Gate),
+                pool.qtype(*layer_idx, ExpertKind::Up),
+                pool.qtype(*layer_idx, ExpertKind::Down),
+            )
+        }
     };
 
     for v in output.iter_mut() {
@@ -10021,15 +10037,19 @@ mod tests {
             "InMemory vs Streaming forward diverged: {out_in_memory:?} vs {out_streaming:?}"
         );
 
-        // Sanity: pool must have hit each expert's 3 kinds exactly once
-        // per selected top-k (2 experts × 3 kinds = 6 misses, no hits
-        // because each key is fetched at most once per single forward).
+        // Sanity: with Phase 4b.2 prefetch, top-k × 3 kinds first fill the
+        // cache upfront (2 × 3 = 6 misses), and the per-expert matvec loop
+        // then re-fetches the same 6 keys — all hits. Prefetch decouples
+        // I/O from compute even on the synthetic in-memory source.
         let stats = pool.cache_stats();
         assert_eq!(
             stats.misses, 6,
             "expected 6 pool misses (2 experts × 3 kinds)"
         );
-        assert_eq!(stats.hits, 0, "no hits on a single-forward run");
+        assert_eq!(
+            stats.hits, 6,
+            "matvec loop re-fetches prefetched keys as hits"
+        );
     }
 
     // ── DeepSeek-V3 Phase 3: MoE routing math ────────────────────────
