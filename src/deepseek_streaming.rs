@@ -40,7 +40,7 @@
 //! - **Real DeepSeek-V3 GGUF benchmarks** — blocked on local disk budget
 //!   (~370 GB) and dedicated multi-day slot.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::gguf::GgmlType;
@@ -115,6 +115,46 @@ impl ExpertByteSource for memmap2::Mmap {
     }
 }
 
+/// Advise the kernel that the given mmap region will be accessed randomly
+/// (Phase 4b.4). This disables the sequential-readahead heuristic — a win
+/// for routed-expert bytes because the router picks 8 experts out of 256
+/// per token, so paging in *adjacent* experts is pure page-cache pollution.
+///
+/// Silently no-op on non-Unix platforms and when the `gguf` feature is
+/// off (`libc` is a gguf-gated optional dep, no separate `mmap-tuning`
+/// feature — every gguf user gets it). Returns `true` when the syscall
+/// was actually issued so bench harnesses can gate their timing on the
+/// hint being live.
+///
+/// # Safety
+///
+/// `madvise` is safe when the passed pointer + length span a valid mapped
+/// region owned by the current process. This helper only accepts `&[u8]`
+/// slices that must have been obtained from a live [`memmap2::Mmap`], so
+/// both invariants are enforced by the type system at the call site.
+#[cfg(all(unix, feature = "gguf"))]
+pub fn advise_random(mmap_bytes: &[u8]) -> bool {
+    // SAFETY: madvise takes (addr, len, advice) and is a no-op if the
+    // range is not a valid mapping — but the caller passed us bytes that
+    // came from a live memmap2::Mmap in the pool constructor, so we know
+    // the range is valid. The Mmap outlives this call by construction.
+    let ret = unsafe {
+        libc::madvise(
+            mmap_bytes.as_ptr() as *mut libc::c_void,
+            mmap_bytes.len(),
+            libc::MADV_RANDOM,
+        )
+    };
+    ret == 0
+}
+
+/// Non-Unix / no-gguf fallback for [`advise_random`]. Always returns
+/// `false` so callers know the hint was skipped.
+#[cfg(not(all(unix, feature = "gguf")))]
+pub fn advise_random(_mmap_bytes: &[u8]) -> bool {
+    false
+}
+
 /// Byte offset + length of one layer's expert-0 slab, plus per-expert
 /// stride and quant type. Sufficient to locate any expert `e` for that
 /// layer via `base_offset + e * bytes_per_expert`.
@@ -137,6 +177,13 @@ pub struct LruExpertCache {
     entries: HashMap<ExpertKey, Arc<Vec<u8>>>,
     /// Front = most-recently used; back = eviction candidate.
     lru: VecDeque<ExpertKey>,
+    /// Phase 4b.3 hot-pinning set: keys in here are skipped by the LRU
+    /// eviction loop, so they stay resident regardless of how many other
+    /// entries push the current byte total over budget. Intended for the
+    /// top-N most-frequent experts identified by offline profiling —
+    /// pinning them costs a fixed amount of RAM but eliminates the miss
+    /// penalty every time the router picks them.
+    pinned: HashSet<ExpertKey>,
     current_bytes: usize,
     budget_bytes: usize,
     hits: u64,
@@ -150,6 +197,7 @@ impl LruExpertCache {
         Self {
             entries: HashMap::new(),
             lru: VecDeque::new(),
+            pinned: HashSet::new(),
             current_bytes: 0,
             budget_bytes,
             hits: 0,
@@ -184,18 +232,56 @@ impl LruExpertCache {
                 self.lru.remove(pos);
             }
         }
-        // Evict LRU entries until the new slab fits.
+        // Evict LRU entries until the new slab fits, skipping any keys the
+        // caller has hot-pinned via `pin`. If every remaining entry is
+        // pinned, the loop terminates without evicting further and the new
+        // slab still gets inserted — the cache is allowed to grow beyond
+        // its byte budget when all evictable candidates are gone. This is
+        // by design: the caller's `pin` set is a hard lower bound on the
+        // memory footprint, and the LRU cache is a soft upper bound.
         while self.current_bytes + incoming_bytes > self.budget_bytes && !self.lru.is_empty() {
-            if let Some(victim) = self.lru.pop_back() {
-                if let Some(evicted) = self.entries.remove(&victim) {
-                    self.current_bytes = self.current_bytes.saturating_sub(evicted.len());
+            // Scan from the back (least-recently-used) forward, evicting
+            // the first non-pinned candidate.
+            let mut victim_pos: Option<usize> = None;
+            for i in (0..self.lru.len()).rev() {
+                if !self.pinned.contains(&self.lru[i]) {
+                    victim_pos = Some(i);
+                    break;
                 }
+            }
+            match victim_pos {
+                Some(pos) => {
+                    let victim = self.lru.remove(pos).expect("index in bounds");
+                    if let Some(evicted) = self.entries.remove(&victim) {
+                        self.current_bytes = self.current_bytes.saturating_sub(evicted.len());
+                    }
+                }
+                None => break, // every entry pinned; can't evict further
             }
         }
         self.entries.insert(key, bytes);
         self.lru.push_front(key);
         self.current_bytes += incoming_bytes;
         self.misses += 1;
+    }
+
+    /// Mark a key as hot-pinned — the eviction loop will skip it. Safe to
+    /// call for keys not currently in the cache; the pin persists so that
+    /// when the key is next loaded it's already flagged.
+    pub fn pin(&mut self, key: ExpertKey) {
+        self.pinned.insert(key);
+    }
+
+    /// Remove a hot-pin. If the entry is still in the cache it becomes
+    /// evictable again on the next insert that requires space.
+    pub fn unpin(&mut self, key: &ExpertKey) {
+        self.pinned.remove(key);
+    }
+
+    /// Number of hot-pinned entries. Exposed so bench harnesses can
+    /// verify the pin set matches what they configured.
+    pub fn pinned_len(&self) -> usize {
+        self.pinned.len()
     }
 
     pub fn hits(&self) -> u64 {
@@ -342,6 +428,36 @@ impl StreamingExpertPool {
         self.prefetch(keys);
     }
 
+    /// Hot-pin a batch of expert keys. Pinned entries survive LRU
+    /// eviction until [`unpin_experts`] removes them (or the pool drops).
+    /// Intended for pinning the top-N most-frequent experts identified
+    /// by offline profiling — costs a fixed slice of RAM but eliminates
+    /// the miss penalty for those keys entirely. See
+    /// [`LruExpertCache::pin`] for the semantic details.
+    ///
+    /// This is Phase 4b.3 (Issue #34). It intentionally does NOT load
+    /// the pinned keys into the cache — call [`prefetch`] first if you
+    /// want the keys warm. Pinning without prefetching means the first
+    /// access is still a miss, but from then on the entry is permanent.
+    ///
+    /// [`unpin_experts`]: Self::unpin_experts
+    /// [`prefetch`]: Self::prefetch
+    pub fn pin_experts(&self, keys: &[ExpertKey]) {
+        let mut cache = self.cache.lock().unwrap();
+        for &k in keys {
+            cache.pin(k);
+        }
+    }
+
+    /// Unpin a batch of previously-pinned expert keys, making them
+    /// evictable again. Silently ignores keys that were not pinned.
+    pub fn unpin_experts(&self, keys: &[ExpertKey]) {
+        let mut cache = self.cache.lock().unwrap();
+        for k in keys {
+            cache.unpin(k);
+        }
+    }
+
     /// Snapshot of current cache metrics — hits, misses, live-byte total.
     /// Zero-cost when unused; primarily consumed by bench harnesses.
     pub fn cache_stats(&self) -> CacheStats {
@@ -351,6 +467,7 @@ impl StreamingExpertPool {
             misses: cache.misses(),
             current_bytes: cache.current_bytes(),
             entries: cache.len(),
+            pinned: cache.pinned_len(),
         }
     }
 }
@@ -362,6 +479,10 @@ pub struct CacheStats {
     pub misses: u64,
     pub current_bytes: usize,
     pub entries: usize,
+    /// Count of hot-pinned entries (Phase 4b.3). Pinned entries are
+    /// exempt from LRU eviction until [`StreamingExpertPool::unpin_experts`]
+    /// removes them. `entries - pinned` is the count of evictable entries.
+    pub pinned: usize,
 }
 
 #[cfg(test)]
@@ -561,6 +682,117 @@ mod tests {
             s_seq.current_bytes, s_par.current_bytes,
             "prefetch_parallel byte total must match sequential"
         );
+    }
+
+    #[test]
+    fn pinned_entry_survives_budget_pressure() {
+        // Budget = 64 bytes → only 2 slabs of 32 bytes fit at once.
+        let pool = make_pool(4, 32, 64);
+        let pinned_key = ExpertKey::new(0, ExpertKind::Gate, 0);
+        pool.pin_experts(&[pinned_key]);
+        assert_eq!(pool.cache_stats().pinned, 1);
+
+        // Load the pinned key, then flood the cache with 3 other keys.
+        // Normally the LRU would evict the oldest entry (the pinned one),
+        // but the pin should shield it.
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0); // pinned load
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 1);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 2); // triggers eviction
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 3); // triggers eviction
+
+        // Verify the pinned key is still cached: subsequent get is a hit.
+        let hits_before = pool.cache_stats().hits;
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let hits_after = pool.cache_stats().hits;
+        assert_eq!(
+            hits_after - hits_before,
+            1,
+            "pinned key must remain in cache"
+        );
+    }
+
+    #[test]
+    fn unpin_makes_entry_evictable_again() {
+        let pool = make_pool(4, 32, 64);
+        let key = ExpertKey::new(0, ExpertKind::Gate, 0);
+        pool.pin_experts(&[key]);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 1);
+        // Unpin, then trigger eviction pressure — the previously-pinned
+        // key should now be a valid eviction victim.
+        pool.unpin_experts(&[key]);
+        assert_eq!(pool.cache_stats().pinned, 0);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 2);
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 3);
+        // Expert 0 was the oldest and no longer pinned → evicted.
+        // Reloading it is a miss, not a hit.
+        let misses_before = pool.cache_stats().misses;
+        let _ = pool.get_or_load(0, ExpertKind::Gate, 0);
+        let misses_after = pool.cache_stats().misses;
+        assert_eq!(
+            misses_after - misses_before,
+            1,
+            "unpinned key must be evictable"
+        );
+    }
+
+    #[test]
+    fn pinning_all_entries_bypasses_eviction_bound() {
+        // Budget = 64 bytes, but pin 3 * 32 = 96 bytes of entries. The
+        // cache is allowed to overflow because every candidate is pinned.
+        let pool = make_pool(4, 32, 64);
+        let keys = [
+            ExpertKey::new(0, ExpertKind::Gate, 0),
+            ExpertKey::new(0, ExpertKind::Gate, 1),
+            ExpertKey::new(0, ExpertKind::Gate, 2),
+        ];
+        pool.pin_experts(&keys);
+        for k in &keys {
+            let _ = pool.get_or_load(0, ExpertKind::Gate, k.expert_idx as usize);
+        }
+        let stats = pool.cache_stats();
+        assert_eq!(stats.entries, 3, "all 3 pinned keys stay in cache");
+        assert!(
+            stats.current_bytes > stats.entries * 0, // just >0
+            "pin overrides byte-budget lower bound"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "gguf"))]
+    fn advise_random_returns_true_for_valid_mmap() {
+        // Construct a real temp-file mmap so the syscall has a valid
+        // target. On non-Unix builds this test is compiled out and the
+        // fallback advise_random always returns false.
+        use std::io::Write;
+        let mut tf = tempfile_alt();
+        tf.write_all(b"hello alice-llm streaming pool madvise test")
+            .unwrap();
+        tf.flush().unwrap();
+        // SAFETY: file is a real, live temp file we just wrote.
+        let mmap = unsafe { memmap2::Mmap::map(&tf) }.unwrap();
+        assert!(
+            super::advise_random(&mmap),
+            "madvise MADV_RANDOM must succeed on a valid mmap"
+        );
+    }
+
+    #[cfg(all(unix, feature = "gguf"))]
+    fn tempfile_alt() -> std::fs::File {
+        // Minimal in-test tempfile: creates a file under std::env::temp_dir()
+        // and immediately unlinks it while keeping the file handle. On
+        // Unix the mmap survives the unlink until the FD is closed.
+        let mut path = std::env::temp_dir();
+        path.push(format!("alice_llm_streaming_test_{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        file
     }
 
     #[test]

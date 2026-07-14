@@ -7712,6 +7712,15 @@ fn build_deepseek_streaming_pool(
         }
     };
 
+    // Phase 4b.4: Tell the kernel this region will be accessed randomly
+    // so its sequential-readahead heuristic does NOT thrash — the router
+    // picks 8 of 256 experts per token, so paging in adjacent experts is
+    // pure page-cache pollution. No-op on non-Unix builds.
+    let advised = crate::deepseek_streaming::advise_random(&mmap);
+    if advised {
+        eprintln!("[alice-llm] MADV_RANDOM applied to streaming pool mmap");
+    }
+
     let first_k_dense = config.deepseek_first_k_dense_replace().unwrap_or(0);
     let n_experts = config.deepseek_n_routed_experts()?;
 

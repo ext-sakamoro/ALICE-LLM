@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 [features]
 default = ["std"]
 std = []
-gguf = ["dep:memmap2"]
+gguf = ["dep:memmap2", "dep:libc"]
 parallel = ["dep:rayon"]
 simd = ["dep:wide"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
@@ -20,6 +20,7 @@ server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "gpu", "gguf"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
+libc = { version = "0.2", optional = true }
 rayon = { version = "1.10", optional = true }
 wide = { version = "0.7", optional = true }
 wgpu = { version = "24", optional = true }
