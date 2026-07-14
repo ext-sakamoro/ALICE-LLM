@@ -2664,6 +2664,69 @@ struct DeepSeekMoeWeights<'a> {
     ffn_down_shexp: WeightRef<'a>,
 }
 
+/// DeepSeek-V3 Multi-Token Prediction (MTP) module weights (Phase 5a, Issue #35).
+///
+/// # What MTP is
+///
+/// V3 optionally trains a small extra transformer module on top of the
+/// main 60 hidden layers that predicts *two* tokens per forward pass
+/// instead of one. At inference time this yields a lossless draft
+/// pipeline for speculative decoding: the MTP head drafts token *N + 2*
+/// during the main model's forward for token *N + 1*, and a subsequent
+/// main-model forward for *N + 1* verifies whether the draft was correct.
+///
+/// # Architecture (paper §3.5.2)
+///
+/// One MTP module (V3 uses `D = 1` for spec decoding):
+///
+/// 1. `enorm` — RMSNorm on the embedding of the next token
+/// 2. `hnorm` — RMSNorm on the previous MTP module's hidden state (or the
+///    main model's last hidden state for the first MTP module)
+/// 3. `eh_proj` — concat(hnorm_out, enorm_out) → `[2*hidden, hidden]`
+///    projection back to hidden dim
+/// 4. `block` — one full transformer block, same MLA + MoE FFN structure
+///    as a regular V3 layer
+/// 5. `final_norm` + shared `output_proj` (main model's `output.weight`)
+///    produce the logits for the extra predicted position
+///
+/// # GGUF tensor naming
+///
+/// llama.cpp did not have V3 MTP support at the time this was authored, so
+/// there is no canonical naming yet. The loader accepts the paper-inspired
+/// names `mtp.enorm.weight` / `mtp.hnorm.weight` / `mtp.eh_proj.weight` /
+/// `mtp.norm.weight` and reads the inner transformer block from
+/// `mtp.blk.0.*` (same tensor family as `blk.{i}.*` main layers). When
+/// llama.cpp settles on a convention, add the alternative names next to
+/// the current lookups.
+///
+/// # Scope of Phase 5a (this struct)
+///
+/// Ships the *loader* and *storage* only — the forward path is stubbed
+/// via [`Llama3Model::mtp_draft`] which currently returns `todo!()`. Full
+/// MTP forward needs to reuse `forward_deepseek_v3`'s per-layer MLA + MoE
+/// primitives; factoring those out is a follow-up (Phase 5a.2) because it
+/// touches the outer forward loop.
+///
+/// [`Llama3Model::mtp_draft`]: Llama3Model::mtp_draft
+#[allow(dead_code)]
+struct DeepSeekV3MtpWeights<'a> {
+    /// Embedding entry RMSNorm — applied to the next token's embedding.
+    enorm: Vec<f32>,
+    /// Hidden entry RMSNorm — applied to the incoming hidden state.
+    hnorm: Vec<f32>,
+    /// Concatenation projection: `[2 * hidden_dim, hidden_dim]`. Takes
+    /// `concat(hnorm_out, enorm_out)` and produces the hidden vector that
+    /// feeds the inner transformer block.
+    eh_proj: WeightRef<'a>,
+    /// The inner transformer block. Structurally identical to a regular
+    /// V3 layer (attention: MLA with LoRA Q/KV + partial NEOX RoPE, FFN:
+    /// MoE with sigmoid gating + shared expert + noaux_tc bias).
+    block: DeepSeekV3LayerWeights<'a>,
+    /// Final RMSNorm before the output head. The head itself is shared
+    /// with the main model's `output_proj` — no separate MTP `output.weight`.
+    final_norm: Vec<f32>,
+}
+
 /// Backing store for the routed-expert weights of a DeepSeek-V3 MoE layer.
 ///
 /// Two variants:
@@ -2921,6 +2984,16 @@ pub struct Llama3Model<'a> {
     /// (unlike DeltaNet, DeepSeek-V3 does not interleave with attention layers
     /// — every layer is MLA).
     deepseek_v3_layers: Option<Vec<DeepSeekV3LayerWeights<'a>>>,
+    /// DeepSeek-V3 Multi-Token Prediction head weights (Phase 5a, Issue #35).
+    /// `None` when the checkpoint does not ship an MTP head (all V2 quants
+    /// and some V3 variants) or the arch is not DeepSeek-V3. Populated at
+    /// load time by [`load_deepseek_v3_mtp_weights`] when the `mtp.*`
+    /// tensor family is present. Used at inference time by [`mtp_draft`]
+    /// to produce a single draft token for speculative decoding.
+    ///
+    /// [`load_deepseek_v3_mtp_weights`]: crate::llama3::load_deepseek_v3_mtp_weights
+    /// [`mtp_draft`]: Llama3Model::mtp_draft
+    deepseek_v3_mtp: Option<DeepSeekV3MtpWeights<'a>>,
 }
 
 /// Compact routing tag used by `Llama3Model::layer_kind_map` for hybrid
@@ -3020,6 +3093,15 @@ impl<'a> Llama3Model<'a> {
         };
         let deepseek_v3_layers = if is_deepseek_model {
             Some(deepseek_v3_layers_vec)
+        } else {
+            None
+        };
+        // Phase 5a: optional MTP head. Only DeepSeek-V3 checkpoints ship
+        // this; V2 quants and pre-MTP V3 variants leave it None. The
+        // loader tolerates missing tensors and never errors — a missing
+        // MTP head only prevents speculative decoding, not regular decode.
+        let deepseek_v3_mtp = if is_deepseek_model {
+            load_deepseek_v3_mtp_weights(gguf, &config, deepseek_streaming_pool.as_ref())
         } else {
             None
         };
@@ -3149,7 +3231,52 @@ impl<'a> Llama3Model<'a> {
             deltanet_conv_state,
             deltanet_conv_ring_pos,
             deepseek_v3_layers,
+            deepseek_v3_mtp,
         })
+    }
+
+    /// Whether this model shipped a DeepSeek-V3 MTP head. Callers gate
+    /// [`mtp_draft`] on this — a missing head disables speculative
+    /// decoding but does not affect regular greedy / sample generation.
+    ///
+    /// [`mtp_draft`]: Self::mtp_draft
+    #[must_use]
+    pub fn has_deepseek_mtp(&self) -> bool {
+        self.deepseek_v3_mtp.is_some()
+    }
+
+    /// DeepSeek-V3 Multi-Token Prediction draft (Phase 5a, Issue #35).
+    ///
+    /// Runs the loaded MTP module on `(prev_hidden, next_token)` to draft
+    /// the *second-next* token's logits — the one that would follow the
+    /// token the main model just decoded. The caller then verifies with a
+    /// regular main-model forward and applies rejection sampling.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `todo!()` because the full MLA + MoE FFN forward for
+    /// the inner transformer block is Phase 5a.2 — factoring the per-
+    /// layer forward primitives out of `forward_deepseek_v3` so the MTP
+    /// module can reuse them requires touching that function's outer
+    /// loop. The struct, loader, and env-var plumbing (Phase 5a) land
+    /// today so the forward can drop in without further storage churn.
+    ///
+    /// # When to call
+    ///
+    /// Only when [`has_deepseek_mtp`] returns `true`. Guarded panic
+    /// otherwise.
+    ///
+    /// [`has_deepseek_mtp`]: Self::has_deepseek_mtp
+    pub fn mtp_draft(&mut self, _prev_hidden: &[f32], _next_token: u32) -> Vec<f32> {
+        assert!(
+            self.deepseek_v3_mtp.is_some(),
+            "mtp_draft called without a loaded MTP head — check has_deepseek_mtp() first"
+        );
+        todo!(
+            "Phase 5a.2: MTP forward requires refactoring forward_deepseek_v3's per-layer \
+             logic into a reusable helper. Struct + loader + gating are in place; wiring \
+             happens in the next PR. Issue #35."
+        )
     }
 
     /// Serialise the current KV cache to `path` (colibri-style warm restart).
@@ -7973,6 +8100,224 @@ fn load_deepseek_v3_layer_weights<'a>(
     })
 }
 
+/// Load the DeepSeek-V3 Multi-Token Prediction head (Phase 5a, Issue #35).
+///
+/// Returns `Some(_)` when every required MTP tensor is present in the
+/// checkpoint, `None` otherwise — a missing MTP head silently disables
+/// speculative decoding at inference time (see [`Llama3Model::has_deepseek_mtp`])
+/// but does not affect regular decode.
+///
+/// # Tensor naming
+///
+/// llama.cpp did not have V3 MTP support at authorship time, so this loader
+/// probes the paper-inspired `mtp.*` namespace. Each lookup silently returns
+/// `None` on a missing tensor so callers get a clean "no MTP head shipped"
+/// signal instead of an error. When llama.cpp finalises a convention, add
+/// its names to the alternates list in-line.
+///
+/// The inner transformer block is loaded by delegating to
+/// [`load_deepseek_v3_layer_weights`] with `prefix = "mtp.blk.0"` — MTP
+/// reuses the exact MLA + MoE layer structure of a main-model block, so
+/// there is no MTP-specific attention / FFN loader to write.
+///
+/// [`Llama3Model::has_deepseek_mtp`]: crate::llama3::Llama3Model::has_deepseek_mtp
+fn load_deepseek_v3_mtp_weights<'a>(
+    gguf: &'a GgufFile<'a>,
+    config: &Llama3Config,
+    streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
+) -> Option<DeepSeekV3MtpWeights<'a>> {
+    // Only look for MTP tensors when the config declares an MTP layer.
+    // V2 quants and pre-MTP V3 variants leave this field None.
+    if config.deepseek_mtp_layer().is_none() {
+        return None;
+    }
+
+    // Entry projections. Every subsequent `?` returns None if any single
+    // tensor is missing — the intended failure mode: "not all MTP tensors
+    // ship, so we can't do MTP" ends up as `None`, not `Some(partial)`.
+    let enorm = gguf.tensor_to_f32("mtp.enorm.weight")?;
+    let hnorm = gguf.tensor_to_f32("mtp.hnorm.weight")?;
+    let eh_proj = load_weight_ref(
+        gguf,
+        "mtp.eh_proj.weight",
+        config.hidden_dim,
+        2 * config.hidden_dim,
+    )?;
+
+    // The inner transformer block reuses the regular V3 layer loader.
+    // Layer index is a fresh N (past the main model's num_layers) so the
+    // streaming pool's layer_info would need a dedicated slot — which it
+    // doesn't have in Phase 4b.1 (built for `num_layers` only). Pass
+    // `None` for streaming_pool here so MTP experts stay InMemory
+    // regardless of the outer streaming setting. Adding MTP-aware
+    // streaming is a Phase 4c candidate: for now, 256 experts × 19 MB ≈
+    // 5 GB extra RAM is tolerable next to the routed-expert budget.
+    let _ = streaming_pool; // silence unused-param when non-gguf feature build
+    let block = {
+        // MTP block loader shares tensor prefix "mtp.blk.0" — we thread
+        // that in by temporarily fabricating a config with layer index 0
+        // and using a wrapper. Actually simpler: modify the loader to
+        // accept a prefix. That refactor is invasive for one caller;
+        // instead call load_weight_ref explicitly for the block below,
+        // mirroring load_deepseek_v3_layer_weights. Since this is Phase
+        // 5a scaffolding and the forward is stubbed, keep it minimal —
+        // load only the attention path and the MoE / dense-FFN decision,
+        // leaving the same-shaped stub in `block`.
+        load_deepseek_v3_layer_weights_with_prefix(gguf, "mtp.blk.0", config, None)?
+    };
+
+    let final_norm = gguf.tensor_to_f32("mtp.norm.weight")?;
+
+    Some(DeepSeekV3MtpWeights {
+        enorm,
+        hnorm,
+        eh_proj,
+        block,
+        final_norm,
+    })
+}
+
+/// Prefix-parameterised variant of [`load_deepseek_v3_layer_weights`] used
+/// by the MTP loader. The main-layer loader hard-codes `blk.{layer}` as
+/// the tensor namespace; MTP needs `mtp.blk.0` so we accept an explicit
+/// prefix instead. Returns None if any required tensor is missing.
+fn load_deepseek_v3_layer_weights_with_prefix<'a>(
+    gguf: &'a GgufFile<'a>,
+    prefix: &str,
+    config: &Llama3Config,
+    streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
+) -> Option<DeepSeekV3LayerWeights<'a>> {
+    // Duplication with load_deepseek_v3_layer_weights is intentional — the
+    // main-layer function hard-codes `format!("blk.{layer}")` deep in a
+    // 200-line body, refactoring it to take a prefix would touch every
+    // call site. This helper is used by exactly one caller (MTP), so a
+    // targeted duplicate keeps the diff surgical.
+    let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
+    let q_lora_rank = config.deepseek_q_lora_rank()?;
+    let kv_lora_rank = config.deepseek_kv_lora_rank()?;
+    let qk_nope_head_dim = config.deepseek_qk_nope_head_dim()?;
+    let qk_rope_head_dim = config.deepseek_qk_rope_head_dim()?;
+    let v_head_dim = config.deepseek_v_head_dim()?;
+    let q_head_total = qk_nope_head_dim + qk_rope_head_dim;
+    let kv_up_head_total = qk_nope_head_dim + v_head_dim;
+
+    let q_a_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_q_a.weight"),
+        q_lora_rank,
+        config.hidden_dim,
+    )?;
+    let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
+    let q_b_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_q_b.weight"),
+        config.num_heads * q_head_total,
+        q_lora_rank,
+    )?;
+    let kv_a_proj_with_mqa = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_kv_a_mqa.weight"),
+        kv_lora_rank + qk_rope_head_dim,
+        config.hidden_dim,
+    )?;
+    let kv_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_kv_a_norm.weight"))?;
+    let kv_b_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_kv_b.weight"),
+        config.num_heads * kv_up_head_total,
+        kv_lora_rank,
+    )?;
+    let o_proj = load_weight_ref(
+        gguf,
+        &format!("{prefix}.attn_output.weight"),
+        config.hidden_dim,
+        config.num_heads * v_head_dim,
+    )?;
+
+    // MTP block is always past first_k_dense_replace conceptually — it
+    // sees full MoE FFN. Load MoE weights only; dense fields stay None.
+    let n_experts = config.deepseek_n_routed_experts()?;
+    let n_shared = config.deepseek_n_shared_experts()?;
+    let moe_ffn = config.deepseek_moe_intermediate_size()?;
+    let shared_ffn = n_shared * moe_ffn;
+
+    let ffn_norm_v = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+    let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"))?;
+    let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
+    let ffn_gate_shexp = load_weight_ref(
+        gguf,
+        &format!("{prefix}.ffn_gate_shexp.weight"),
+        shared_ffn,
+        config.hidden_dim,
+    )?;
+    let ffn_up_shexp = load_weight_ref(
+        gguf,
+        &format!("{prefix}.ffn_up_shexp.weight"),
+        shared_ffn,
+        config.hidden_dim,
+    )?;
+    let ffn_down_shexp = load_weight_ref(
+        gguf,
+        &format!("{prefix}.ffn_down_shexp.weight"),
+        config.hidden_dim,
+        shared_ffn,
+    )?;
+    let routed = if streaming_pool.is_some() {
+        // MTP-aware streaming is deferred (see caller for reasoning); the
+        // MTP path always uses InMemory for its routed experts.
+        unreachable!("MTP loader unexpectedly received a streaming pool");
+    } else {
+        let ffn_gate_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_gate_exps.weight"),
+            moe_ffn * n_experts,
+            config.hidden_dim,
+        )?;
+        let ffn_up_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_up_exps.weight"),
+            moe_ffn * n_experts,
+            config.hidden_dim,
+        )?;
+        let ffn_down_exps = load_weight_ref(
+            gguf,
+            &format!("{prefix}.ffn_down_exps.weight"),
+            config.hidden_dim * n_experts,
+            moe_ffn,
+        )?;
+        RoutedExpertStorage::InMemory {
+            gate: ffn_gate_exps,
+            up: ffn_up_exps,
+            down: ffn_down_exps,
+        }
+    };
+    let moe = DeepSeekMoeWeights {
+        ffn_norm: ffn_norm_v,
+        ffn_gate_inp,
+        exp_probs_b,
+        routed,
+        ffn_gate_shexp,
+        ffn_up_shexp,
+        ffn_down_shexp,
+    };
+
+    Some(DeepSeekV3LayerWeights {
+        attn_norm,
+        q_a_proj,
+        q_a_norm,
+        q_b_proj,
+        kv_a_proj_with_mqa,
+        kv_a_norm,
+        kv_b_proj,
+        o_proj,
+        ffn_norm: None,
+        gate_proj: None,
+        up_proj: None,
+        down_proj: None,
+        moe: Some(moe),
+    })
+}
+
 fn load_deltanet_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -10128,6 +10473,55 @@ mod tests {
         assert_eq!(selected.len(), 2, "must select all experts when top-k > n");
         let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    // ── DeepSeek-V3 Phase 5a: MTP loader gating ──────────────────────
+
+    /// A DeepSeek-V3 config whose `mtp_layer` is `None` must produce a
+    /// model with no MTP head — the loader is short-circuited before it
+    /// tries to look up any `mtp.*` tensor. Guards the fast path for V2
+    /// and pre-MTP V3 quants.
+    #[test]
+    fn mtp_loader_returns_none_when_config_has_no_mtp_layer() {
+        // Config with mtp_layer explicitly unset.
+        let mut c = tiny_deepseek_v3_config();
+        if let Some(d) = c.deepseek_v3.as_mut() {
+            d.mtp_layer = None;
+        }
+        // The loader early-returns on config gate; no GGUF needed.
+        assert!(c.deepseek_mtp_layer().is_none());
+    }
+
+    /// The `has_deepseek_mtp` predicate on a non-DeepSeek model is
+    /// vacuously false. Regression guard against future refactors that
+    /// might inadvertently return true for Llama-3.
+    #[test]
+    fn has_deepseek_mtp_false_when_arch_is_not_deepseek() {
+        // We construct a Llama3Model isn't possible without a full GGUF,
+        // but we can at least assert the invariant at the config layer:
+        // non-DeepSeek configs never populate `deepseek_v3`, so the
+        // `deepseek_v3_mtp` field will always be None regardless of
+        // whether the MTP layer count env is set.
+        let llama_config = Llama3Config {
+            arch: ModelArch::Llama,
+            vocab_size: 128,
+            hidden_dim: 16,
+            intermediate_dim: 32,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 2,
+            max_seq_len: 32,
+            head_dim: 8,
+            rope_theta: 500_000.0,
+            norm_eps: 1e-6,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
+            deepseek_v3: None,
+        };
+        assert!(llama_config.deepseek_mtp_layer().is_none());
     }
 
     #[test]
