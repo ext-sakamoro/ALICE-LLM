@@ -428,6 +428,51 @@ impl StreamingExpertPool {
         self.prefetch(keys);
     }
 
+    /// Predict the routed-expert set the *next* MoE layer will pick and
+    /// prefetch it into the cache. Overlaps well with the outer forward
+    /// loop's between-layer work (residual add + next attention RMSNorm +
+    /// Q/K/V projection) when called right after the current layer's
+    /// routing is decided.
+    ///
+    /// This is the synchronous variant — the prefetch blocks until every
+    /// predicted key is either resident or freshly loaded. Async overlap
+    /// (predict + prefetch on a background thread while the current
+    /// layer's matvec runs) is deferred to Phase 4c; async support would
+    /// require a bounded work queue and thread pool, adds synchronisation
+    /// complexity, and cannot be validated without a real DeepSeek-V3
+    /// GGUF to bench against.
+    ///
+    /// # Predictor
+    ///
+    /// The [`NextLayerPredictor`] parameter decouples the prefetch
+    /// mechanism from the actual prediction algorithm. The simplest
+    /// implementation, [`PersistenceHeuristic`], assumes the next layer
+    /// picks the same top-k as the current one. The colibri paper reports
+    /// ~71.6% overlap between consecutive layers' top-k on real
+    /// DeepSeek-V3 traffic, so persistence is a strong default even
+    /// though a proper next-layer predictor would do better.
+    ///
+    /// Returns the number of predicted keys that were prefetched (i.e.
+    /// `top_k * 3` unless the predictor produced fewer).
+    pub fn prefetch_predicted_next_layer(
+        &self,
+        current_router_logits: &[f32],
+        next_layer_idx: usize,
+        top_k: usize,
+        predictor: &dyn NextLayerPredictor,
+    ) -> usize {
+        let predicted = predictor.predict(current_router_logits, top_k);
+        let mut keys = Vec::with_capacity(predicted.len() * 3);
+        for e in predicted {
+            keys.push(ExpertKey::new(next_layer_idx, ExpertKind::Gate, e));
+            keys.push(ExpertKey::new(next_layer_idx, ExpertKind::Up, e));
+            keys.push(ExpertKey::new(next_layer_idx, ExpertKind::Down, e));
+        }
+        let n = keys.len();
+        self.prefetch_parallel(&keys);
+        n
+    }
+
     /// Hot-pin a batch of expert keys. Pinned entries survive LRU
     /// eviction until [`unpin_experts`] removes them (or the pool drops).
     /// Intended for pinning the top-N most-frequent experts identified
@@ -469,6 +514,48 @@ impl StreamingExpertPool {
             entries: cache.len(),
             pinned: cache.pinned_len(),
         }
+    }
+}
+
+/// Predict which routed-expert indices the next MoE layer will pick, given
+/// the current layer's raw router logits. Implementations may consume the
+/// logits as-is or apply arbitrary post-processing (sigmoid, softmax,
+/// noaux_tc bias, learned lookahead model, etc.).
+///
+/// The returned indices are in `0..n_routed_experts`; duplicates and
+/// out-of-range entries are silently dropped by the caller's prefetch
+/// dispatch, so implementations may keep the algorithm simple without
+/// guarding against them here.
+///
+/// Phase 4b infrastructure — real DeepSeek-V3 validation of prediction
+/// accuracy is deferred to a follow-up (blocked on ~370 GB local disk to
+/// hold the model checkpoint). See [`PersistenceHeuristic`] for the
+/// simplest baseline.
+pub trait NextLayerPredictor: Send + Sync {
+    fn predict(&self, current_router_logits: &[f32], top_k: usize) -> Vec<usize>;
+}
+
+/// The zero-training baseline predictor: **assume the next layer picks the
+/// same top-k routed experts as the current layer**. This is what colibri
+/// calls "persistence"; empirically it correctly predicts ~71.6% of the
+/// next layer's top-k routing on real DeepSeek-V3 traffic (Issue #34 body,
+/// PILOT=1 experiment). A one-line implementation that turns out to be
+/// surprisingly hard to beat without a learned predictor.
+///
+/// Selection is by raw logit magnitude — sigmoid vs raw scoring does not
+/// change the top-k order for a fixed layer, so we skip the sigmoid pass
+/// and sort on the logits directly.
+pub struct PersistenceHeuristic;
+
+impl NextLayerPredictor for PersistenceHeuristic {
+    fn predict(&self, current_router_logits: &[f32], top_k: usize) -> Vec<usize> {
+        let mut indexed: Vec<(usize, f32)> = current_router_logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.into_iter().take(top_k).map(|(i, _)| i).collect()
     }
 }
 
@@ -755,6 +842,78 @@ mod tests {
         assert!(
             stats.current_bytes > stats.entries * 0, // just >0
             "pin overrides byte-budget lower bound"
+        );
+    }
+
+    #[test]
+    fn persistence_heuristic_picks_top_k_by_logit() {
+        // Logits [0.1, 0.9, 0.3, 0.7, 0.5] → top-3 = experts 1, 3, 4.
+        let logits = vec![0.1, 0.9, 0.3, 0.7, 0.5];
+        let predicted = PersistenceHeuristic.predict(&logits, 3);
+        assert_eq!(predicted, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn persistence_heuristic_handles_top_k_bigger_than_n_experts() {
+        let logits = vec![0.1, 0.5];
+        let predicted = PersistenceHeuristic.predict(&logits, 8);
+        assert_eq!(predicted, vec![1, 0]);
+    }
+
+    #[test]
+    fn prefetch_predicted_next_layer_warms_next_layer() {
+        // Two-layer synthetic pool: verify that calling
+        // prefetch_predicted_next_layer on layer 0's logits warms layer 1's
+        // top-k experts, and that layer 1's subsequent get_or_load
+        // sequence hits every predicted key.
+        let n_experts = 4;
+        let bytes_per_expert = 32;
+        let n_layers = 2;
+        let total = n_layers * 3 * n_experts * bytes_per_expert;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let source: Arc<dyn ExpertByteSource> = Arc::new(data);
+        let mut layer_info = Vec::with_capacity(n_layers);
+        for layer_idx in 0..n_layers {
+            let base = layer_idx * 3 * n_experts * bytes_per_expert;
+            let mut per_kind = [ExpertLayerInfo {
+                base_offset: 0,
+                bytes_per_expert,
+                n_experts,
+                qtype: GgmlType::Q4_K,
+            }; 3];
+            per_kind[ExpertKind::Gate as usize].base_offset = base;
+            per_kind[ExpertKind::Up as usize].base_offset = base + n_experts * bytes_per_expert;
+            per_kind[ExpertKind::Down as usize].base_offset =
+                base + 2 * n_experts * bytes_per_expert;
+            layer_info.push(per_kind);
+        }
+        let pool = StreamingExpertPool::new(source, layer_info, 4096);
+
+        // Simulate layer 0's routing: experts 1 and 3 have highest logits.
+        let logits = vec![0.1, 0.9, 0.3, 0.7];
+        let top_k = 2;
+        let n_prefetched = pool.prefetch_predicted_next_layer(
+            &logits,
+            /* next_layer_idx */ 1,
+            top_k,
+            &PersistenceHeuristic,
+        );
+        assert_eq!(n_prefetched, top_k * 3, "3 kinds per predicted expert");
+
+        // Pool now has layer 1's experts 1 and 3 cached (across all 3
+        // kinds). Simulate layer 1's forward hitting the SAME experts —
+        // every get should be a hit.
+        let hits_before = pool.cache_stats().hits;
+        for &e in &[1usize, 3] {
+            let _ = pool.get_or_load(1, ExpertKind::Gate, e);
+            let _ = pool.get_or_load(1, ExpertKind::Up, e);
+            let _ = pool.get_or_load(1, ExpertKind::Down, e);
+        }
+        let hits_after = pool.cache_stats().hits;
+        assert_eq!(
+            hits_after - hits_before,
+            6,
+            "persistence heuristic correctly pre-warmed next-layer routing"
         );
     }
 
