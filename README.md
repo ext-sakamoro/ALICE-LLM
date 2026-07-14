@@ -341,6 +341,34 @@ The M1 Pro SoC bandwidth of 200 GB/s is shared with GPU/NPU/Media Engine. The ba
 
 ---
 
+## aarch64 NEON Quantized Matvec Bench (Issue #30)
+
+Per-quantization NEON matvec kernels on Apple M3 (Mac) and NVIDIA Tegra Orin Nano (Jetson). 128 × 4096 f32-output matvec, 200-iter median (µs/matvec):
+
+| Quant | Mac M3 scalar | Mac M3 NEON | Speedup | Jetson scalar | Jetson NEON | Speedup |
+|:---|---:|---:|---:|---:|---:|---:|
+| Q4_K | (already NEON) | **32.3** | — | (already NEON) | **172.7** | — |
+| Q5_K | (scalar + SDOT auto-vec) | **42.9** | — | (scalar + SDOT auto-vec) | **282.7** | — |
+| Q6_K | 89.6 (old NEON) | **35.3** | 2.54× | 344.9 (old NEON) | **165.2** | 2.09× |
+| Q8_0 | 398.5 | **130.1** | 3.06× | 951.2 | **250.8** | 3.79× |
+| Ternary | 344.7 | **68.9** | 5.00× | 967.2 | **190.4** | 5.08× |
+
+**Design notes** (all kernels bit-exact or `rel_err < 1e-5` vs scalar reference — see `q*_neon_matches_scalar_*` unit tests):
+
+- **Q4_K / Q6_K**: `vmull_s8` widening dot with `vpaddlq_s16` reduction. Q6_K also unpacks its 6-bit ql + qh layout in parallel using the `((qh << 4) & 0x30)` / `((qh << 2) & 0x30)` / `(qh & 0x30)` / `((qh >> 2) & 0x30)` shift-mask trick that feeds all four quadrants without per-element scalar packing.
+- **Q8_0**: i8 → i16 → i32 → f32 widening chain (`vmovl` × 2, `vcvtq_f32_s32`) followed by `vfmaq_f32` FMA against the row's f32 input. Memory-bandwidth bound at 1.06 bytes/element.
+- **Ternary**: bitmask expansion via `vdupq_n_u32(byte)` broadcast → `vandq_u32` against `[1,2,4,8]` / `[16,32,64,128]` → `vceqq_u32` → `vandq_u32` with reinterpreted f32 input. Zero per-lane multiplies — pure branchless select.
+
+**Observations**:
+
+- On Jetson, **Q6_K NEON (165.2 µs) is now faster than Q4_K NEON (172.7 µs)** since the qh packing overhead is gone. The two K-quant kernels are essentially at the memory-bandwidth floor.
+- Q8_0 sits ~4× above Q4_K on both platforms because Q8_0 packs only 1 byte per element vs Q4_K's 0.56 bytes/element — nearly 2× more bytes read per output.
+- Mac M3 speedups over Jetson (2.4–6.6×) correlate with LPDDR5X vs LPDDR5 bandwidth (~5.8× ratio); compute-heavy quants get closer to that ceiling.
+
+Bench harness: `cargo run --release --example bench_simd_matvec --features gguf`
+
+---
+
 ## Speculative Decoding
 
 Layer-skip self-speculative decoding + probabilistic sampling:
