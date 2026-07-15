@@ -11,6 +11,7 @@ const MATVEC_Q4K_SHADER: &str = include_str!("shaders/dequant_matvec_q4k.wgsl");
 const MATVEC_Q6K_SHADER: &str = include_str!("shaders/dequant_matvec_q6k.wgsl");
 const MATVEC_Q1_0_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0.wgsl");
 const MATVEC_Q1_0_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0_batch4.wgsl");
+const MATVEC_Q1_0_ROW4_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0_row4.wgsl");
 const MATVEC_Q1_0_ROW4_BATCH4_SHADER: &str =
     include_str!("shaders/dequant_matvec_q1_0_row4_batch4.wgsl");
 const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
@@ -147,6 +148,11 @@ pub struct GpuEngine {
     /// 4 batch input vectors. Halves per-token dispatch cost when combined
     /// with 4-token speculative decoding.
     matvec_q1_0_batch4_pipeline: wgpu::ComputePipeline,
+    /// Q1_0 row4 matvec (single batch) — 1 workgroup produces 4 rows × 1
+    /// batch = 4 outputs. Used by the standard batch=1 decode path where
+    /// speculative decoding is not in use. Same 4× workgroup-count
+    /// amortization as row4×batch4 without the batch dimension.
+    matvec_q1_0_row4_pipeline: wgpu::ComputePipeline,
     /// Q1_0 row4×batch4 matvec — 1 workgroup produces 4 rows × 4 batches =
     /// 16 outputs. Compounds Step 2's batch4 win with 4× fewer workgroups
     /// and 4× less total input-read traffic. Register / smem cost: 16 f32
@@ -272,6 +278,11 @@ impl GpuEngine {
             "matvec_q1_0_batch4",
             "matvec_q1_0_batch4",
         );
+        let matvec_q1_0_row4_pipeline = make_pipeline(
+            MATVEC_Q1_0_ROW4_SHADER,
+            "matvec_q1_0_row4",
+            "matvec_q1_0_row4",
+        );
         let matvec_q1_0_row4_batch4_pipeline = make_pipeline(
             MATVEC_Q1_0_ROW4_BATCH4_SHADER,
             "matvec_q1_0_row4_batch4",
@@ -340,6 +351,7 @@ impl GpuEngine {
             matvec_q6k_pipeline,
             matvec_q1_0_pipeline,
             matvec_q1_0_batch4_pipeline,
+            matvec_q1_0_row4_pipeline,
             matvec_q1_0_row4_batch4_pipeline,
             matvec_q1_0_row8_batch4_pipeline,
             rmsnorm_pipeline: make_pipeline(RMSNORM_SHADER, "rmsnorm", "rmsnorm"),
@@ -802,6 +814,76 @@ impl<'a> GpuPass<'a> {
     /// The shader itself clamps to `params.rows` internally, so callers that
     /// pass a row count that isn't a multiple of 4 still produce correct
     /// output (the trailing 1..3 rows of the last row-group are guarded).
+    /// Q1_0 row4 GPU matvec (single batch) — 1 workgroup produces 4 rows × 1
+    /// batch = 4 outputs. The natural companion to `matvec_q1_0_row4_batch4`
+    /// for the standard batch=1 decode path (where speculative decoding is
+    /// not in use).
+    ///
+    /// Same workgroup-count amortization as row4×batch4 (4× fewer workgroups
+    /// than the base `matvec_q1_0` single-row kernel), same 4× reduction in
+    /// total input-read traffic (input is shared across 4 output rows within
+    /// a workgroup), but without the batch dimension.
+    ///
+    /// Input / output layout matches `matvec_q1_0`:
+    ///   input[col]                 for col ∈ [0..cols)
+    ///   output[row]                for row ∈ [0..rows)
+    pub fn matvec_q1_0_row4(
+        &mut self,
+        weights: &GpuWeightBuffer,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+    ) {
+        let row_groups = weights.rows.div_ceil(4);
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(row_groups);
+        let params = self.engine.make_uniform(&MatvecParams {
+            rows: weights.rows,
+            cols: weights.cols,
+            blocks_per_row: weights.blocks_per_row,
+            grid_x,
+            batch_size: 1,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        });
+        let layout = self
+            .engine
+            .matvec_q1_0_row4_pipeline
+            .get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.matvec_q1_0_row4_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
     /// Q1_0 row8×batch4 GPU matvec — 1 workgroup produces 8 rows × 4 batches
     /// = 32 outputs. Compounds `matvec_q1_0_row4_batch4` by doubling the row
     /// batching factor, dropping workgroup count another 2× and total
