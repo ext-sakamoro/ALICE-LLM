@@ -2078,6 +2078,17 @@ fn softplus(x: f32) -> f32 {
     }
 }
 
+/// Sigmoid activation `sigmoid(x) = 1 / (1 + exp(-x))`. Used by Bonsai /
+/// Qwen 3.6 DeltaNet (Phase X.3.e.3.2 §Gap B extra) to constrain the raw
+/// beta projection to `(0, 1)` before it enters the delta-rule integration
+/// as the update-rate coefficient. Standard `silu(x) = x * sigmoid(x)`
+/// already lives above; this helper exposes the bare sigmoid so the
+/// beta path can multiply by 1, not `x`.
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// Causal depthwise conv1d single-token step for Qwen 3.5 DeltaNet.
 ///
 /// Direct CPU port of `src/shaders/conv1d_causal.wgsl`. Depthwise means the
@@ -3954,6 +3965,21 @@ impl<'a> Llama3Model<'a> {
                             let alpha_biased = dn_alpha[h] + ssm_dt_bias[h];
                             let gate = softplus(alpha_biased) * ssm_a[h];
                             dn_alpha[h] = gate.exp();
+                        }
+
+                        // 2d. Beta sigmoid (Phase X.3.e.3.2 Gap B extra).
+                        // Reference qwen35.cpp:440-441 applies `ggml_sigmoid`
+                        // to the raw beta projection so it enters the
+                        // recurrence as an update-rate coefficient in `(0, 1)`
+                        // rather than an unbounded real. Gated to the same
+                        // Bonsai / Qwen 3.6 branch as the alpha SSM discretis-
+                        // ation above — standard Qwen 3.5 GGUFs stay on the
+                        // raw-beta path, preserving pre-refactor numerics
+                        // until an end-to-end reference comparison can
+                        // decide whether Qwen 3.5 should also switch. See
+                        // docs/PHASE_X_3_E_3_DESIGN.md §5 for the follow-up.
+                        for h in 0..dn_num_v_heads {
+                            dn_beta[h] = sigmoid(dn_beta[h]);
                         }
                     }
 
@@ -10512,6 +10538,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Phase X.3.e.3.2 (Gap B extra): sigmoid helper is the numerical
+    /// foundation for the Bonsai / Qwen 3.6 beta constraint. Verify
+    /// hand-computed exact values at zero / symmetric anchors and confirm
+    /// the output stays in `(0, 1)` across extreme inputs.
+    #[test]
+    fn sigmoid_matches_reference() {
+        // sigmoid(0) = 1 / 2
+        assert!((sigmoid(0.0) - 0.5_f32).abs() < 1e-6);
+        // sigmoid(x) + sigmoid(-x) = 1 (symmetry)
+        for &x in &[-5.0_f32, -1.0, 0.5, 2.0, 8.0] {
+            let s = sigmoid(x) + sigmoid(-x);
+            assert!(
+                (s - 1.0_f32).abs() < 1e-6,
+                "sigmoid({x}) + sigmoid({}) = {s}, expected 1",
+                -x,
+            );
+        }
+        // Asymptotic: sigmoid(x) → 1 for large x, → 0 for large -x
+        assert!((sigmoid(30.0) - 1.0_f32).abs() < 1e-6);
+        assert!(sigmoid(-30.0).abs() < 1e-6);
+        // Range: sigmoid(x) ∈ (0, 1) for all finite x
+        for &x in &[-100.0_f32, -20.0, -1.0, 0.0, 1.0, 20.0, 100.0] {
+            let y = sigmoid(x);
+            assert!(
+                y.is_finite() && (0.0..=1.0).contains(&y),
+                "sigmoid({x}) = {y}"
+            );
+        }
+        // Consistency: silu(x) = x * sigmoid(x)
+        for &x in &[-2.0_f32, -0.5, 0.0, 0.5, 2.0] {
+            let silu_ref = x * sigmoid(x);
+            let silu_direct = silu(x);
+            assert!(
+                (silu_ref - silu_direct).abs() < 1e-6,
+                "silu({x}) inconsistent with x * sigmoid(x)",
+            );
+        }
+    }
+
+    /// Phase X.3.e.3.2 (Gap B extra): Bonsai / Qwen 3.6 beta transformation
+    /// applies `sigmoid` to constrain the raw beta projection to `(0, 1)`
+    /// before it enters the delta-rule integration. Verify per-V-head
+    /// broadcast + range invariant.
+    #[test]
+    fn ssm_beta_sigmoid_applied_per_v_head() {
+        let num_v_heads = 5;
+        // Raw beta values covering large negative → large positive.
+        let mut dn_beta = vec![-8.0_f32, -1.0, 0.0, 2.5, 10.0];
+
+        // Apply the transformation (mirrors forward-path Step 2d).
+        for h in 0..num_v_heads {
+            dn_beta[h] = sigmoid(dn_beta[h]);
+        }
+
+        // Every head is now in (0, 1).
+        for (h, &val) in dn_beta.iter().enumerate() {
+            assert!(
+                val.is_finite() && val > 0.0 && val < 1.0,
+                "head {h}: sigmoid output {val} outside (0, 1)",
+            );
+        }
+
+        // Ordering preserved (sigmoid is monotonic).
+        for pair in dn_beta.windows(2) {
+            assert!(pair[0] < pair[1], "sigmoid not monotonic: {pair:?}");
+        }
+
+        // Anchor: middle head (raw=0) must land at exactly 0.5.
+        assert!((dn_beta[2] - 0.5_f32).abs() < 1e-6);
     }
 
     // ── LayerWeights sub-struct accessors (Issue #11) ────────────────────
