@@ -22,7 +22,10 @@ Phase X.3.e.3 は当初 4 Gap と設計、実装過程で reference (`PrismML ll
 
 **Backwards compat**: 全 refinement は Bonsai conditional (`is_bonsai_path = ssm_a.is_some() && ssm_dt_bias.is_some()`) で発火、Qwen 3.5 (両方 None) は完全 unchanged
 
-**残る作業** (別 session、要 external resource): End-to-end numerical validation vs llama.cpp Bonsai 27B tensor dumps (~1-2h の GGUF DL + build) と Qwen 3.5 backwards compat 意思決定 (現状は Bonsai only、reference 一致させるなら Qwen 3.5 側も同 refinement 適用が正解)
+**残る作業**:
+
+- **X.3.e.3.3 End-to-end numerical validation** (別 session、要 disk cleanup + llama.cpp fork build) → 実行手順を `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented、disk 空けた後に ~3-5h で完遂可能
+- **X.3.e.3.4 Qwen 3.5 backwards compat 意思決定** → **✅ 2026-07-16 解決済**: HuggingFace API で Qwen3.5-4B safetensors を確認、`linear_attn.A_log` / `dt_bias` / `norm.weight` / `in_proj_qkv` / `in_proj_z` / `conv1d.weight` 全て存在。ALICE-LLM loader が unconditional で `tensor_to_f32(...)` で Option を読む設計なので、Qwen 3.5 GGUF (正しく converted) なら SSM tensors も Some で load される。よって `is_bonsai_path = ssm_a.is_some() && ssm_dt_bias.is_some()` は自動的に Qwen 3.5 でも true → SSM refinement 適用 → reference formula と一致 = **意思決定不要、現行 code が正解**。命名の misleading (`bonsai_semantics` / `is_bonsai_path` は実質「GGUF に SSM refinement tensor 含む」) は将来 followup で `use_ssm_refinement` へ rename 推奨だが機能は unchanged
 
 ---
 
@@ -407,7 +410,8 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
 - [x] beta sigmoid transformation → commit `2d55f2b` (Gap B extra、reference qwen35.cpp:440-441)
 - [x] Post-conv1d silu + z-gate after ssm-norm → commit `c342f10` (§Q/K L2Norm + §silu(z) order、reference qwen35.cpp:502 + :562)
 - [x] Qwen 3.5 (num_v_heads == num_kv_heads) regression なし → **304 tests pass** (前 296 + 新規 8)
-- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3) → **別 session** (要 GGUF DL + llama.cpp build)
+- [x] **Qwen 3.5 backwards compat 意思決定** (旧 X.3.e.3.4) → **✅ 解決** (HuggingFace API 確認、Qwen 3.5 も同 SSM tensors を持つため現行 conditional が Qwen 3.5 でも auto-trigger、意思決定不要)
+- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3) → **別 session** (要 GGUF DL + llama.cpp build、手順 doc `PHASE_X_3_E_3_3_VALIDATION.md` 参照)
 - [ ] End-to-end first 3 tokens 一致 (prompt fixed, seed fixed) → **別 session** (同上)
 - [ ] Bonsai 27B Jetson load time が X.5 baseline から±10% 以内 → **別 session** (要実機測定)
 
@@ -431,7 +435,8 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
   - Issue #60 (Phase X.3 diff analysis, Comment `4978572709`)
   - Qwen 3.6 HF config: https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/config.json
 - Successor:
-  - Phase X.3.e.3.3 (別 session、要 external resource): llama.cpp end-to-end numerical validation + Qwen 3.5 backwards compat 意思決定
+  - Phase X.3.e.3.3 (別 session、要 external resource): llama.cpp end-to-end numerical validation — 実行手順 `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented
+  - ~~Phase X.3.e.3.4~~ Qwen 3.5 backwards compat 意思決定 — **✅ 2026-07-16 解決済** (HuggingFace API で SSM tensor 存在確認、意思決定不要)
   - Phase X.4 (4-bit KV cache) — X.3.e.3 完了、着手可
   - Phase X.8 (Guided Generation) — Bonsai output quality 確定後着手
 - ALICE-* memory:
