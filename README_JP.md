@@ -137,12 +137,33 @@ K=4 (バッチ):   101 ms/4トークン (25.3 ms/トークン, 39.5 tok/s)
 
 両モデルは単一の `GpuEngine`（`Rc<GpuEngine>`）を共有 — 同一のwgpu Device/Queue、独立したKVキャッシュ。
 
+### Bonsai 27B Q1_0 を Jetson Orin Nano 8GB で動かす (Vulkan iGPU)
+
+PrismML の Bonsai 27B は 3.6 GB の Q1_0 GGUF (post-training binary g128 ternary quantization) で出荷される。ALICE-LLM の Q1_0 wgpu path は最大レイヤーの matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) を CPU NEON 20 ms から GPU Vulkan sub-ms まで持っていく:
+
+| Step | カーネル | µs/matvec | vs CPU | 前 step 比 | 帯域利用 |
+|:---:|:---|---:|---:|---:|---:|
+| — | CPU NEON pos-only ベースライン | 20,120 | 1.0× | — | — |
+| 1 | wgpu single-matvec | 4,369 | 4.61× | — | 1.61 GB/s (2.4%) |
+| **6** | **wgpu row4 (batch=1)** | **2,407** | **8.36×** | **1.82×** | **3.06 GB/s (4.5%)** |
+| 2 | wgpu batch4 (投機的デコード用) | 1,014 | 19.84× | — | 6.94 GB/s (10.2%) |
+| 4 | wgpu row4×batch4 (投機的デコード用) | 764 | 26.35× | 1.33× | 9.67 GB/s (14.2%) |
+| 5 | wgpu row8×batch4 (投機的デコード用) | 741 | 27.15× | 1.03× | 9.95 GB/s (14.6%) |
+
+理論限界: 103 µs / matvec (68 GB/s LPDDR5 ピーク時)。CPU との parity は全 6 カーネルで bit-exact (L2_rel = 6e-7)。
+
+Row-batching の考え方: 1 workgroup で N 個の出力行を生成し、入力読み出しを共有する。これで workgroup 数と入力読み出しの総量が N× 削減される。row8 では 1.03× と diminishing returns が確認されたので、Ampere iGPU の Q1_0 は **4 行 / workgroup がスイートスポット**。
+
 ### WGSLシェーダーアーキテクチャ
 
 | シェーダー | K=1 (スカラー) | K=4 (バッチ) | バインディング |
 |---|---|---|---|
 | `dequant_matvec_q4k` | acc 1個, subgroupAdd 1回 | acc 4個, subgroupAdd 4回 | weights, input, output, params |
 | `dequant_matvec_q6k` | acc 1個, subgroupAdd 1回 | acc 4個, subgroupAdd 4回 | weights, input, output, params |
+| `dequant_matvec_q1_0` | acc 1個 (batch=1) | acc 4個 (batch4) | weights, input, output, params |
+| `dequant_matvec_q1_0_row4` | acc 4個 (4行 / workgroup, batch=1) | — | weights, input, output, params |
+| `dequant_matvec_q1_0_row4_batch4` | — | acc 16個 (4行×4バッチ) | weights, input, output, params |
+| `dequant_matvec_q1_0_row8_batch4` | — | acc 32個 (8行×4バッチ) | weights, input, output, params |
 | `swiglu_fused_q4k` | acc 2個 (gate+up) | acc 8個 (gate×4+up×4) | gate_w, up_w, input, output, params |
 | `rmsnorm` | `wid.x` でバッチ | — | input, weights, output, params |
 | `rope` | `wid.y` でバッチ | — | data, params |

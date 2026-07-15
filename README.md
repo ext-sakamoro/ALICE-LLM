@@ -142,12 +142,33 @@ Accept rate:           90% (19/21)
 
 Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Queue, independent KV caches.
 
+### Bonsai 27B Q1_0 on Jetson Orin Nano 8GB (Vulkan iGPU)
+
+PrismML's Bonsai 27B ships as a 3.6 GB Q1_0 GGUF (post-training binary g128 ternary quantization). ALICE-LLM's Q1_0 wgpu path takes the largest layer matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) from CPU NEON 20 ms down to GPU Vulkan sub-ms:
+
+| Step | Kernel | µs/matvec | vs CPU | vs prev | Bandwidth util |
+|:---:|:---|---:|---:|---:|---:|
+| — | CPU NEON pos-only baseline | 20,120 | 1.0× | — | — |
+| 1 | wgpu single-matvec | 4,369 | 4.61× | — | 1.61 GB/s (2.4%) |
+| **6** | **wgpu row4 (batch=1)** | **2,407** | **8.36×** | **1.82×** | **3.06 GB/s (4.5%)** |
+| 2 | wgpu batch4 (speculative) | 1,014 | 19.84× | — | 6.94 GB/s (10.2%) |
+| 4 | wgpu row4×batch4 (speculative) | 764 | 26.35× | 1.33× | 9.67 GB/s (14.2%) |
+| 5 | wgpu row8×batch4 (speculative) | 741 | 27.15× | 1.03× | 9.95 GB/s (14.6%) |
+
+Theoretical ceiling: 103 µs / matvec at 68 GB/s LPDDR5 peak. Parity vs CPU is bit-exact (L2_rel = 6e-7) across all six kernels.
+
+The row-batching approach: 1 workgroup produces N output rows sharing one input read, cutting workgroup count and input-read traffic by N×. Diminishing returns confirmed at row8 (1.03× over row4), so 4 rows / workgroup is the sweet spot for Q1_0 on Ampere iGPU.
+
 ### WGSL Shader Architecture
 
 | Shader | K=1 (scalar) | K=4 (batch) | Bindings |
 |---|---|---|---|
 | `dequant_matvec_q4k` | 1 acc, 1 subgroupAdd | 4 acc, 4 subgroupAdd | weights, input, output, params |
 | `dequant_matvec_q6k` | 1 acc, 1 subgroupAdd | 4 acc, 4 subgroupAdd | weights, input, output, params |
+| `dequant_matvec_q1_0` | 1 acc (batch=1) | 4 acc (batch4) | weights, input, output, params |
+| `dequant_matvec_q1_0_row4` | 4 acc (4 rows / workgroup, batch=1) | — | weights, input, output, params |
+| `dequant_matvec_q1_0_row4_batch4` | — | 16 acc (4 rows × 4 batches) | weights, input, output, params |
+| `dequant_matvec_q1_0_row8_batch4` | — | 32 acc (8 rows × 4 batches) | weights, input, output, params |
 | `swiglu_fused_q4k` | 2 acc (gate+up) | 8 acc (gate×4+up×4) | gate_w, up_w, input, output, params |
 | `rmsnorm` | batch via `wid.x` | — | input, weights, output, params |
 | `rope` | batch via `wid.y` | — | data, params |
