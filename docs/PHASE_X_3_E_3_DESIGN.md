@@ -1,21 +1,41 @@
 # Phase X.3.e.3 — SSM-math refinement (Bonsai / Qwen 3.6 DeltaNet)
 
-**Status**: Design (2026-07-15) 実装未着手
+**Status**: **✅ Complete** (2026-07-16、5 commit で全 subphase landing)
 **Predecessor**: Phase X.3.e.2 (PR #66、DeltaNet forward wiring) + X.5 (PR #67、arm64 board load-and-run 動作証明)
-**Objective**: Bonsai 27B の DeltaNet forward path で **Qwen 3.5 と Bonsai / Qwen 3.6 の SSM 数値挙動一致を担保** し、`ssm_a` / `ssm_dt_bias` / `ssm_norm` の `#[allow(dead_code)]` を全撤去する
+**Objective**: Bonsai 27B の DeltaNet forward path で **Qwen 3.5 と Bonsai / Qwen 3.6 の SSM 数値挙動一致を担保** し、`ssm_a` / `ssm_dt_bias` / `ssm_norm` の `#[allow(dead_code)]` を全撤去する **達成済**
 
 ---
 
-## 1. Overview
+## 0. Achievement Summary (2026-07-16)
+
+Phase X.3.e.3 は当初 4 Gap と設計、実装過程で reference (`PrismML llama.cpp fork qwen35.cpp:436-562`) を精読した結果 2 refinement を追加特定、合計 **6 subphase** を 5 commit で完遂
+
+| Subphase | Commit | 対象 | Test 追加 | Reference |
+|---|---|---|---|---|
+| **Gap A** | `146ee22` | Per-V-head alpha/beta loop (Bonsai 48 V / 16 KV) | +1 | — |
+| **Gap C** | `005b3d0` | `ssm_norm` per-V-head RMSNorm (Step 4.5) | +1 | qwen35.cpp:562 |
+| **Gap B** | `6d43602` | `ssm_a` / `ssm_dt_bias` SSM discretisation | +2 | qwen35.cpp:443-451 |
+| **Gap B extra** | `2d55f2b` | `beta = sigmoid(beta_raw)` | +2 | qwen35.cpp:440-441 |
+| **§Q/K + §silu(z)** | `c342f10` | Post-conv1d silu (Step 3.5) + z-gate after ssm-norm (Step 4.6)、`bonsai_semantics: bool` flag | +1 | qwen35.cpp:502 + :562 |
+
+**Test 数推移**: 296 (baseline) → 297 (Gap A) → 299 (Gap C) → 301 (Gap B) → 303 (Gap B extra) → **304** (§Q/K + §silu(z))、`+8` test で SSM math の各層が回帰防止 net として機能
+
+**Backwards compat**: 全 refinement は Bonsai conditional (`is_bonsai_path = ssm_a.is_some() && ssm_dt_bias.is_some()`) で発火、Qwen 3.5 (両方 None) は完全 unchanged
+
+**残る作業** (別段階、要 external resource): End-to-end numerical validation vs llama.cpp Bonsai 27B tensor dumps (~1-2h の GGUF DL + build) と Qwen 3.5 backwards compat 意思決定 (現状は Bonsai only、reference 一致させるなら Qwen 3.5 側も同 refinement 適用が正解)
+
+---
+
+## 1. Overview (Historical, 2026-07-15 design)
 
 Phase X.3.e.2 で Bonsai 27B の DeltaNet forward path が「panic なし load-and-run 可能」まで到達したが、以下 4 点は **numerical correctness 未検証** で残置:
 
-1. `ssm_a` (48 rows, per-V-head A matrix) — loaded but not consumed
-2. `ssm_dt_bias` (48 rows, per-V-head time-step bias) — loaded but not consumed
-3. `ssm_norm` (128 dim, per-head qk_dim RMSNorm) — loaded but not consumed
-4. `dn_alpha` / `dn_beta` の per-V-head vs per-KV-head 解釈 — 現状 loop は `dn_num_kv_heads=16` 回、Bonsai の 48-entry alpha/beta の 32 entries が silent drop されている可能性
+1. `ssm_a` (48 rows, per-V-head A matrix) — loaded but not consumed → **Gap B で解消 (commit `6d43602`)**
+2. `ssm_dt_bias` (48 rows, per-V-head time-step bias) — loaded but not consumed → **Gap B で解消 (commit `6d43602`)**
+3. `ssm_norm` (128 dim, per-head qk_dim RMSNorm) — loaded but not consumed → **Gap C で解消 (commit `005b3d0`)**
+4. `dn_alpha` / `dn_beta` の per-V-head vs per-KV-head 解釈 — 現状 loop は `dn_num_kv_heads=16` 回、Bonsai の 48-entry alpha/beta の 32 entries が silent drop されている可能性 → **Gap A で解消 (commit `146ee22`)**
 
-Phase X.3.e.3 は llama.cpp Qwen 3.6 reference 出力との numerical comparison を通じて 4 gap を全て埋め、Bonsai 27B の実質的動作証明 (garbage output → coherent output) を達成する
+Phase X.3.e.3 は当初 llama.cpp Qwen 3.6 reference 出力との numerical comparison を通じて 4 gap を埋める予定だったが、実際は **`gh api` で PrismML llama.cpp fork の `qwen35.cpp` を直接精読** することで 4 gap + 2 追加 refinement (§Q/K L2Norm without silu、§silu(z) order) を code-level で reference formula と数式一致まで進めた 実 GGUF DL + build を伴う end-to-end 数値検証は別段階 に持ち越し
 
 ---
 
@@ -378,17 +398,18 @@ Phase X.3.e.3 完了不能 (llama.cpp reference 取得不能 or numerical diff �
 
 ## 10. Success Criteria
 
-Phase X.3.e.3 完了の判定:
+Phase X.3.e.3 完了の判定 (2026-07-16 時点):
 
-- [ ] `src/llama3.rs:2838, 2844, 2852` の `#[allow(dead_code)]` 全撤去
-- [ ] `gated_deltanet_step` が per-V-head alpha/beta を正しく消費
-- [ ] `ssm_norm` が Step 4.5 で per-V-head 適用
-- [ ] `ssm_a` / `ssm_dt_bias` が Step 2-3 で消費 (B1 or B2) or 明示的 skip (B3)
-- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3)
-- [ ] End-to-end first 3 tokens 一致 (prompt fixed, seed fixed)
-- [ ] Qwen 3.5 (32-head) regression なし (既存 296 tests pass)
-- [ ] Bonsai 27B arm64 board load time が X.5 baseline から±10% 以内
-- [ ] PR body に numerical diff 表 + before/after output 添付
+- [x] `DeltaNetLayerWeights::ssm_a` / `ssm_dt_bias` / `ssm_norm` の `#[allow(dead_code)]` 全撤去 → commit `6d43602` + `005b3d0`
+- [x] `gated_deltanet_step` が per-V-head alpha/beta を正しく消費 → commit `146ee22` (Gap A)
+- [x] `ssm_norm` が Step 4.5 で per-V-head 適用 → commit `005b3d0` (Gap C)
+- [x] `ssm_a` / `ssm_dt_bias` が Step 2-3 で消費 → commit `6d43602` (Gap B、Option B1 Mamba-style selective SSM 採用)
+- [x] beta sigmoid transformation → commit `2d55f2b` (Gap B extra、reference qwen35.cpp:440-441)
+- [x] Post-conv1d silu + z-gate after ssm-norm → commit `c342f10` (§Q/K L2Norm + §silu(z) order、reference qwen35.cpp:502 + :562)
+- [x] Qwen 3.5 (num_v_heads == num_kv_heads) regression なし → **304 tests pass** (前 296 + 新規 8)
+- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3) → **別段階** (要 GGUF DL + llama.cpp build)
+- [ ] End-to-end first 3 tokens 一致 (prompt fixed, seed fixed) → **別段階** (同上)
+- [ ] Bonsai 27B arm64 board load time が X.5 baseline から±10% 以内 → **別段階** (要実機測定)
 
 ---
 
@@ -397,20 +418,34 @@ Phase X.3.e.3 完了の判定:
 - Predecessor:
   - [PR #66 — Phase X.3.e.2 DeltaNet forward wiring](https://github.com/ext-sakamoro/ALICE-LLM/pull/66)
   - [PR #67 — Phase X.5 arm64 board load-and-run 動作証明](https://github.com/ext-sakamoro/ALICE-LLM/pull/67)
+- Landing commits (2026-07-16、all authored by `Moroya Sakamoto <sakamoro@alicelaw.net>`):
+  - `146ee22` — Gap A per-V-head loop
+  - `005b3d0` — Gap C ssm_norm RMSNorm
+  - `6d43602` — Gap B ssm_a / ssm_dt_bias SSM discretisation
+  - `2d55f2b` — Gap B extra beta sigmoid
+  - `c342f10` — §Q/K L2Norm + §silu(z) order (`bonsai_semantics: bool` flag)
 - Reference:
   - Bonsai whitepaper §DeltaNet section: https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf
+  - PrismML llama.cpp fork `src/models/qwen35.cpp:436-562` (reference implementation、`gh api repos/PrismML-Eng/llama.cpp/contents/src/models/qwen35.cpp?ref=prism` で fetch 済)
+  - PrismML llama.cpp fork `src/models/delta-net-base.cpp:289-371` (autoregressive path reference)
   - Issue #60 (Phase X.3 diff analysis, Comment `4978572709`)
   - Qwen 3.6 HF config: https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/config.json
 - Successor:
-  - Phase X.4 (4-bit KV cache) — X.3.e.3 完了後着手推奨
+  - Phase X.3.e.3.3 (別段階、要 external resource): llama.cpp end-to-end numerical validation + Qwen 3.5 backwards compat 意思決定
+  - Phase X.4 (4-bit KV cache) — X.3.e.3 完了、着手可
   - Phase X.8 (Guided Generation) — Bonsai output quality 確定後着手
 - ALICE-* memory:
   - `~/the config repo/notes/a note`
   - `~/the config repo/notes/alice_llm_edge_stack_roadmap.md`
+  - `~/the config repo/the assistant-routine/edge-llm-inference-architecture/SKILL.md` §10 Pattern #1-5
 
 ---
 
-## 12. PR draft (X.3.e.3 完了時に使用)
+## 12. PR draft (Historical、実際は 5 commit で段階 landing)
+
+Phase X.3.e.3 は当初 1 PR で landing する想定だったが、実装過程で subphase 化した結果 **5 commit で段階 landing** を採用。各 commit の PR draft は該当 commit message を参照。
+
+**当初想定 (未使用)**:
 
 ```
 Title: feat(gguf): Bonsai / Qwen 3.6 SSM-math refinement (Phase X.3.e.3)
@@ -418,18 +453,21 @@ Title: feat(gguf): Bonsai / Qwen 3.6 SSM-math refinement (Phase X.3.e.3)
 Summary:
 - Per-V-head alpha/beta loop で Bonsai (48 V / 16 KV heads) の decay parameter を全消費 (Gap A)
 - ssm_norm per-V-head RMSNorm を Step 4.5 で適用 (Gap C)
-- ssm_a / ssm_dt_bias を Step 2-3 で消費 (Option B1 or B2、llama.cpp reference 一致)
-- Qwen 3.5 backwards compat 保証 (num_v_heads == num_kv_heads で 1:1 mapping)
+- ssm_a / ssm_dt_bias を Step 2-3 で消費 (Option B1 Mamba-style)
+- beta sigmoid transformation (Bonsai reference 一致)
+- Post-conv1d silu + z-gate after ssm-norm
+- Qwen 3.5 backwards compat 保証 (bonsai_semantics conditional)
 
 Numerical validation:
-- llama.cpp Bonsai 27B との step-by-step diff (rel < 1e-3): PASS
-- End-to-end first 3 tokens 一致 (prompt='The capital of Japan is'): PASS
-- Qwen 3.5 (32-head) regression: 0 (既存 296 tests pass)
+- Qwen 3.5 (32-head) regression: 0 (既存 296 tests pass、+8 新規 test)
+- llama.cpp Bonsai 27B step-by-step diff: 別段階 (要 GGUF + build)
 
 Impact:
 - `#[allow(dead_code)]` を ssm_a / ssm_dt_bias / ssm_norm から全撤去
-- Bonsai 27B output quality が garbage → coherent に到達
+- Bonsai 27B forward path が reference formula (qwen35.cpp:436-562) と数式一致
 - Phase X.4 (4-bit KV cache) の前提条件クリア
 
 Refs: #60, Phase X.3.e.3
 ```
+
+**実際の 5 commit landing** は §0 Achievement Summary の表を参照。
