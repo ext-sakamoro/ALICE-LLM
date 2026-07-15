@@ -688,6 +688,31 @@ impl Llama3Config {
         let ssm_time_step_rank = gguf
             .meta_u32(&format!("{prefix}.ssm.time_step_rank"))
             .map(|v| v as usize);
+        let ssm_conv_kernel = gguf
+            .meta_u32(&format!("{prefix}.ssm.conv_kernel"))
+            .map(|v| v as usize);
+
+        // Bonsai 27B / Qwen 3.6 GGUF only exports the `qwen35.ssm.*` set and
+        // omits the `qwen35.linear_*` variants that older Qwen 3.5 exports
+        // ship. Populate the linear-attention geometry from the SSM keys
+        // when the direct read returned None, so the downstream DeltaNet
+        // loader sees identical config regardless of the export style.
+        //
+        // Mapping (from empirical Bonsai `qwen35.*` metadata + HF config.json):
+        //   linear_num_key_heads    = ssm.group_count            (Bonsai: 16)
+        //   linear_qk_head_dim      = ssm.state_size             (Bonsai: 128)
+        //   linear_key_value_head_dim = ssm.state_size           (Bonsai: 128)
+        //   linear_num_value_heads  = ssm.inner_size / v_head    (Bonsai: 48)
+        //   linear_conv_kernel_dim  = ssm.conv_kernel            (Bonsai: 4)
+        let linear_num_kv_heads = linear_num_kv_heads.or(ssm_group_count);
+        let linear_qk_head_dim = linear_qk_head_dim.or(ssm_state_size);
+        let linear_kv_head_dim = linear_kv_head_dim.or(ssm_state_size);
+        let linear_num_v_heads =
+            linear_num_v_heads.or_else(|| match (ssm_inner_size, linear_kv_head_dim) {
+                (Some(inner), Some(head_dim)) if head_dim > 0 => Some(inner / head_dim),
+                _ => None,
+            });
+        let linear_conv_kernel_dim = linear_conv_kernel_dim.or(ssm_conv_kernel);
         // Qwen 3.5 / 3.6 NextN / MTP layer count.
         let n_layer_nextn = gguf
             .meta_u32(&format!("{prefix}.nextn.predict_layers"))
@@ -3735,13 +3760,19 @@ impl<'a> Llama3Model<'a> {
         } else {
             Vec::new()
         };
+        // dn_alpha / dn_beta size to `max(num_kv_heads, num_v_heads)` so
+        // both Qwen 3.5-style (alpha rows = num_kv_heads) and Bonsai / Qwen
+        // 3.6-style (alpha rows = num_v_heads, larger) matvecs write into a
+        // big-enough slice. The delta rule caller sizes its logical num_heads
+        // by the actual `alpha_proj.rows` at forward time.
+        let dn_alpha_max = dn_num_kv_heads.max(dn_num_v_heads);
         let mut dn_alpha = if is_hybrid {
-            vec![0.0f32; dn_num_kv_heads]
+            vec![0.0f32; dn_alpha_max]
         } else {
             Vec::new()
         };
         let mut dn_beta = if is_hybrid {
-            vec![0.0f32; dn_num_kv_heads]
+            vec![0.0f32; dn_alpha_max]
         } else {
             Vec::new()
         };
@@ -8857,16 +8888,22 @@ fn load_deltanet_layer_weights<'a>(
     let conv1d_bias = gguf
         .tensor_to_f32(&format!("{prefix}.ssm_conv1d.bias"))
         .unwrap_or_else(|| vec![0.0f32; conv_dim]);
-    let alpha_proj = load_weight_ref(
+    // `ssm_alpha` / `ssm_beta` row count depends on the arch variant:
+    //   * Standard Qwen 3.5: `num_kv_heads` (one decay rate per KV head).
+    //   * Bonsai / Qwen 3.6: `num_v_heads` (one rate per V head, 3× more than
+    //     `num_kv_heads` under Qwen 3.6's 48 V / 16 KV split).
+    // Read the actual row count out of GGUF via `load_weight_ref_any_rows`
+    // instead of forcing one interpretation onto the tensor — the forward
+    // path sizes its `dn_alpha` / `dn_beta` buffers to the larger of the
+    // two so the matvec always writes into a big-enough slice.
+    let alpha_proj = load_weight_ref_any_rows(
         gguf,
         &format!("{prefix}.ssm_alpha.weight"),
-        num_kv_heads,
         config.hidden_dim,
     )?;
-    let beta_proj = load_weight_ref(
+    let beta_proj = load_weight_ref_any_rows(
         gguf,
         &format!("{prefix}.ssm_beta.weight"),
-        num_kv_heads,
         config.hidden_dim,
     )?;
     let ssm_out = load_weight_ref(
