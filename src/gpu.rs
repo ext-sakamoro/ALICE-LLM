@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 const MATVEC_Q4K_SHADER: &str = include_str!("shaders/dequant_matvec_q4k.wgsl");
 const MATVEC_Q6K_SHADER: &str = include_str!("shaders/dequant_matvec_q6k.wgsl");
+const MATVEC_Q1_0_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0.wgsl");
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
@@ -99,6 +100,9 @@ pub struct GpuBuffer {
 pub enum GpuQuantType {
     Q4K,
     Q6K,
+    /// PrismML Q1_0 (Bonsai 27B binary g128) — 128 elements per block,
+    /// 18 bytes per block (2 FP16 scale + 16 × 1-bit packed values).
+    Q1_0,
 }
 
 /// Quantized weight tensor on GPU (Q4_K or Q6_K).
@@ -131,6 +135,9 @@ pub struct GpuEngine {
     pub device_type: wgpu::DeviceType,
     matvec_q4k_pipeline: wgpu::ComputePipeline,
     matvec_q6k_pipeline: wgpu::ComputePipeline,
+    /// PrismML Q1_0 (Bonsai 27B binary g128) matvec, 128 elements/block,
+    /// 18 bytes/block, byte-level indexed (blocks straddle `u32` word boundaries).
+    matvec_q1_0_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
     silu_mul_pipeline: wgpu::ComputePipeline,
     residual_add_pipeline: wgpu::ComputePipeline,
@@ -238,6 +245,7 @@ impl GpuEngine {
         // Create original pipelines first
         let matvec_q4k_pipeline = make_pipeline(MATVEC_Q4K_SHADER, "matvec_q4k", "matvec_q4k");
         let matvec_q6k_pipeline = make_pipeline(MATVEC_Q6K_SHADER, "matvec_q6k", "matvec_q6k");
+        let matvec_q1_0_pipeline = make_pipeline(MATVEC_Q1_0_SHADER, "matvec_q1_0", "matvec_q1_0");
         let swiglu_fused_q4k_pipeline = make_pipeline(
             SWIGLU_FUSED_Q4K_SHADER,
             "swiglu_fused_q4k",
@@ -294,6 +302,7 @@ impl GpuEngine {
         Self {
             matvec_q4k_pipeline,
             matvec_q6k_pipeline,
+            matvec_q1_0_pipeline,
             rmsnorm_pipeline: make_pipeline(RMSNORM_SHADER, "rmsnorm", "rmsnorm"),
             silu_mul_pipeline: make_pipeline(SILU_MUL_SHADER, "silu_mul", "silu_mul"),
             residual_add_pipeline: make_pipeline(
@@ -374,6 +383,11 @@ impl GpuEngine {
         self.upload_weights_typed(data, rows, cols, GpuQuantType::Q6K)
     }
 
+    /// Upload Q1_0 (PrismML Bonsai binary g128) weight tensor to GPU.
+    pub fn upload_weights_q1_0(&self, data: &[u8], rows: usize, cols: usize) -> GpuWeightBuffer {
+        self.upload_weights_typed(data, rows, cols, GpuQuantType::Q1_0)
+    }
+
     fn upload_weights_typed(
         &self,
         data: &[u8],
@@ -381,9 +395,10 @@ impl GpuEngine {
         cols: usize,
         quant: GpuQuantType,
     ) -> GpuWeightBuffer {
-        let label = match quant {
-            GpuQuantType::Q4K => "q4k_weights",
-            GpuQuantType::Q6K => "q6k_weights",
+        let (label, elements_per_block) = match quant {
+            GpuQuantType::Q4K => ("q4k_weights", 256usize),
+            GpuQuantType::Q6K => ("q6k_weights", 256),
+            GpuQuantType::Q1_0 => ("q1_0_weights", 128),
         };
         GpuWeightBuffer {
             buffer: self
@@ -395,7 +410,7 @@ impl GpuEngine {
                 }),
             rows: rows as u32,
             cols: cols as u32,
-            blocks_per_row: (cols / 256) as u32,
+            blocks_per_row: (cols / elements_per_block) as u32,
             quant,
         }
     }
@@ -618,6 +633,63 @@ fn matvec_dispatch(rows: u32) -> (u32, u32, u32) {
 
 impl<'a> GpuPass<'a> {
     /// Q4_K matvec: output = weights × input (GPU buffers, no readback).
+    /// PrismML `Q1_0` (Bonsai 27B binary g128) GPU matvec — one workgroup per
+    /// output row, workgroup_size 128 = one thread per element in a Q1_0 block.
+    /// Uses byte-level indexing inside the shader because 18 bytes/block does
+    /// not align to `u32` word boundaries.
+    pub fn matvec_q1_0(
+        &mut self,
+        weights: &GpuWeightBuffer,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+    ) {
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
+        let params = self.engine.make_uniform(&MatvecParams {
+            rows: weights.rows,
+            cols: weights.cols,
+            blocks_per_row: weights.blocks_per_row,
+            grid_x,
+            batch_size: 1,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        });
+        let layout = self.engine.matvec_q1_0_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.matvec_q1_0_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
     pub fn matvec_q4k(&mut self, weights: &GpuWeightBuffer, input: &GpuBuffer, output: &GpuBuffer) {
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
         let params = self.engine.make_uniform(&MatvecParams {
@@ -884,6 +956,7 @@ impl<'a> GpuPass<'a> {
         match weights.quant {
             GpuQuantType::Q4K => self.matvec_q4k(weights, input, output),
             GpuQuantType::Q6K => self.matvec_q6k(weights, input, output),
+            GpuQuantType::Q1_0 => self.matvec_q1_0(weights, input, output),
         }
     }
 
@@ -1308,6 +1381,7 @@ fn timed_mv(engine: &GpuEngine, mv: &MatvecBG) -> (f64, GpuQuantType) {
     let pipeline = match mv.quant {
         GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
         GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+        GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
     };
     let us = timed_dispatch(engine, pipeline, &mv.bg, mv.dispatch_x, mv.dispatch_y, 1);
     (us, mv.quant)
@@ -1421,6 +1495,7 @@ impl GpuModel {
         let pipeline = match w.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+            GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
         };
         let layout = pipeline.get_bind_group_layout(0);
         let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2734,6 +2809,7 @@ impl GpuModel {
         let pipeline = match mv.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+            GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
         };
         cp.set_pipeline(pipeline);
         cp.set_bind_group(0, &mv.bg, &[]);
@@ -2746,6 +2822,9 @@ impl GpuModel {
         let pipeline = match mv.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_batch4_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_batch4_pipeline,
+            // No dedicated Q1_0 batch4 kernel yet — fall back to the single-
+            // row matvec, batch loop unrolls in the caller.
+            GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
         };
         cp.set_pipeline(pipeline);
         cp.set_bind_group(0, &mv.bg, &[]);
@@ -3010,6 +3089,13 @@ impl GpuModel {
                         r.matvec_q6k_us += us;
                         r.matvec_q6k_n += 1;
                     }
+                    GpuQuantType::Q1_0 => {
+                        // Bin Q1_0 timings into the Q6K accumulator until a
+                        // dedicated counter is added — keeps the profile
+                        // summary total accurate for mixed-quant models.
+                        r.matvec_q6k_us += us;
+                        r.matvec_q6k_n += 1;
+                    }
                 }
             }
 
@@ -3092,6 +3178,10 @@ impl GpuModel {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
+                GpuQuantType::Q1_0 => {
+                    r.matvec_q6k_us += us;
+                    r.matvec_q6k_n += 1;
+                }
             }
 
             r.residual_us += timed_dispatch(
@@ -3128,6 +3218,10 @@ impl GpuModel {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
+                GpuQuantType::Q1_0 => {
+                    r.matvec_q6k_us += us;
+                    r.matvec_q6k_n += 1;
+                }
             }
 
             r.residual_us += timed_dispatch(
@@ -3152,6 +3246,10 @@ impl GpuModel {
                 r.matvec_q4k_n += 1;
             }
             GpuQuantType::Q6K => {
+                r.matvec_q6k_us += us;
+                r.matvec_q6k_n += 1;
+            }
+            GpuQuantType::Q1_0 => {
                 r.matvec_q6k_us += us;
                 r.matvec_q6k_n += 1;
             }
@@ -3459,10 +3557,12 @@ impl GpuModel {
                 let pipeline = match $mv.quant {
                     GpuQuantType::Q4K => &self.engine.matvec_q4k_pipeline,
                     GpuQuantType::Q6K => &self.engine.matvec_q6k_pipeline,
+                    GpuQuantType::Q1_0 => &self.engine.matvec_q1_0_pipeline,
                 };
                 let tag = match $mv.quant {
                     GpuQuantType::Q4K => 1u8,
                     GpuQuantType::Q6K => 2u8,
+                    GpuQuantType::Q1_0 => 3u8,
                 };
                 ts_dispatch!(pipeline, &$mv.bg, $mv.dispatch_x, $mv.dispatch_y, 1, tag);
             }};
