@@ -219,5 +219,65 @@ fn main() {
             "Parity (batch4[0] vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
             l2_rel_b4, max_abs_err_b4
         );
+
+        // ---- Step 3: dispatch batching (single-tensor microbench) ----
+        //
+        // Hypothesis: at 1013 µs / matvec (batch4) vs the 103 µs
+        // memory-bandwidth ceiling, the residual 10× gap is dominated by
+        // wgpu / Vulkan submit + fence-wait overhead, not shader execute
+        // time. If that holds, submitting N matvec dispatches inside a
+        // single ComputePass + single execute() should collapse that
+        // overhead across N iterations.
+        //
+        // We reuse the batch4 pipeline (same bind group / buffers) and
+        // record 20 dispatches into one command buffer, then execute + sync
+        // once. Per-matvec time = total / (N * 4) since each dispatch still
+        // produces 4 batch outputs.
+        println!("\n--- Step 3: dispatch batching (1 command buffer, {n_iter} dispatches) ---");
+
+        // Warmup
+        {
+            let mut pass = engine.begin_pass();
+            for _ in 0..5 {
+                pass.matvec_q1_0_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            }
+            pass.execute();
+            engine.sync();
+        }
+
+        let t0 = Instant::now();
+        {
+            let mut pass = engine.begin_pass();
+            for _ in 0..n_iter {
+                pass.matvec_q1_0_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            }
+            pass.execute();
+            engine.sync();
+        }
+        let total_us = t0.elapsed().as_micros() as f64;
+        let batched_per_dispatch = total_us / n_iter as f64;
+        let batched_per_matvec = batched_per_dispatch / 4.0;
+
+        println!(
+            "GPU batch4×{n_iter} in 1 cmd buffer:  {:>10.1} µs total = {:.1} µs/dispatch = {:.1} µs/matvec",
+            total_us, batched_per_dispatch, batched_per_matvec
+        );
+        println!(
+            "Speedup vs Step 2 (per matvec): {:.2}× (submit overhead 分散)",
+            gpu_b4_per_matvec / batched_per_matvec
+        );
+        println!(
+            "Speedup CPU / GPU-batched: {:.2}× per matvec",
+            cpu_us / batched_per_matvec
+        );
+
+        // Bandwidth headroom check
+        let bytes_per_matvec = tensor_data.len() as f64;
+        let bandwidth_gb_s = bytes_per_matvec / (batched_per_matvec * 1000.0);
+        // ~68 GB/s LPDDR5 on Jetson Orin Nano, ~200 GB/s LPDDR5X on M3 Max
+        println!(
+            "Effective per-matvec bandwidth: {:.2} GB/s (weight bytes / matvec time)",
+            bandwidth_gb_s
+        );
     }
 }
