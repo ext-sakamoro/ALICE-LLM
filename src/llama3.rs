@@ -2139,6 +2139,18 @@ fn causal_conv1d_step(
 /// Executes per-head loops using `rayon` when `num_heads >= 8` so 32-head
 /// Qwen 3.5 configs get parallel speedup without paying scheduler
 /// overhead on toy configs (used only by the unit tests).
+///
+/// Buffer layout (Phase X.3.e.3.1, Bonsai / Qwen 3.6 per-V-head expansion):
+///   * `q`, `k`             — `num_kv_heads * qk_dim` (V heads inside the same
+///     KV group share Q/K, mirroring standard GQA).
+///   * `v`, `z`, `out`      — `num_v_heads * v_dim`   (independent per V head).
+///   * `alpha`, `beta`      — `num_v_heads`            (per-V-head decay / rate).
+///   * `state`              — `num_v_heads * qk_dim * v_dim`.
+///
+/// For standard Qwen 3.5 (`num_v_heads == num_kv_heads`) the mapping collapses
+/// to the previous 1:1 arrangement; for Bonsai (48 V / 16 KV heads) each KV
+/// group covers `num_v_heads / num_kv_heads = 3` V heads with independent
+/// state and per-V-head alpha / beta.
 #[allow(clippy::too_many_arguments)]
 fn gated_deltanet_step(
     q: &[f32],
@@ -2149,42 +2161,81 @@ fn gated_deltanet_step(
     z: &[f32],
     state: &mut [f32],
     out: &mut [f32],
-    num_heads: usize,
+    num_kv_heads: usize,
+    num_v_heads: usize,
     qk_dim: usize,
     v_dim: usize,
 ) {
-    debug_assert_eq!(q.len(), num_heads * qk_dim);
-    debug_assert_eq!(k.len(), num_heads * qk_dim);
-    debug_assert_eq!(v.len(), num_heads * v_dim);
-    debug_assert_eq!(alpha.len(), num_heads);
-    debug_assert_eq!(beta.len(), num_heads);
-    debug_assert_eq!(z.len(), num_heads * v_dim);
-    debug_assert_eq!(state.len(), num_heads * qk_dim * v_dim);
-    debug_assert_eq!(out.len(), num_heads * v_dim);
+    debug_assert!(num_kv_heads > 0);
+    debug_assert!(num_v_heads > 0);
+    debug_assert_eq!(
+        num_v_heads % num_kv_heads,
+        0,
+        "num_v_heads ({num_v_heads}) must be a multiple of num_kv_heads ({num_kv_heads})",
+    );
+    debug_assert_eq!(q.len(), num_kv_heads * qk_dim);
+    debug_assert_eq!(k.len(), num_kv_heads * qk_dim);
+    debug_assert_eq!(v.len(), num_v_heads * v_dim);
+    debug_assert_eq!(alpha.len(), num_v_heads);
+    debug_assert_eq!(beta.len(), num_v_heads);
+    debug_assert_eq!(z.len(), num_v_heads * v_dim);
+    debug_assert_eq!(state.len(), num_v_heads * qk_dim * v_dim);
+    debug_assert_eq!(out.len(), num_v_heads * v_dim);
 
     // Small configs (unit tests, toy models) skip rayon to avoid the
     // scheduler cost dominating a handful of arithmetic ops. Production
-    // Qwen 3.5 uses 32 heads which clears the threshold comfortably.
+    // Qwen 3.5 uses 32 heads which clears the threshold comfortably;
+    // Bonsai 27B has 48 V heads per DeltaNet layer.
     #[cfg(feature = "parallel")]
     {
-        if num_heads >= 8 {
+        if num_v_heads >= 8 {
             gated_deltanet_step_parallel(
-                q, k, v, alpha, beta, z, state, out, num_heads, qk_dim, v_dim,
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                z,
+                state,
+                out,
+                num_kv_heads,
+                num_v_heads,
+                qk_dim,
+                v_dim,
             );
             return;
         }
     }
-    for head in 0..num_heads {
-        gated_deltanet_head(q, k, v, alpha, beta, z, state, out, head, qk_dim, v_dim);
+    let v_per_kv = num_v_heads / num_kv_heads;
+    for v_head in 0..num_v_heads {
+        let kv_head = v_head / v_per_kv;
+        let q_off = kv_head * qk_dim;
+        let k_off = kv_head * qk_dim;
+        let v_off = v_head * v_dim;
+        let z_off = v_head * v_dim;
+        let s_off = v_head * qk_dim * v_dim;
+        gated_deltanet_head_disjoint(
+            &q[q_off..q_off + qk_dim],
+            &k[k_off..k_off + qk_dim],
+            &v[v_off..v_off + v_dim],
+            alpha[v_head],
+            beta[v_head],
+            &z[z_off..z_off + v_dim],
+            &mut state[s_off..s_off + qk_dim * v_dim],
+            &mut out[v_off..v_off + v_dim],
+            qk_dim,
+            v_dim,
+        );
     }
 }
 
-/// Rayon-parallel driver for [`gated_deltanet_step`] (`num_heads >= 8`).
+/// Rayon-parallel driver for [`gated_deltanet_step`] (`num_v_heads >= 8`).
 ///
-/// Chunks the per-head slices of the mutable buffers so each worker owns a
+/// Chunks the per-V-head slices of the mutable buffers so each worker owns a
 /// disjoint `[qk_dim * v_dim]` state slab and a disjoint `[v_dim]` output
-/// slab — the recurrence is intrinsically embarrassingly parallel across
-/// heads because there is no cross-head coupling.
+/// slab — the recurrence is intrinsically embarrassingly parallel across V
+/// heads because there is no cross-head coupling. Q / K live at `kv_head`
+/// granularity (shared across the V heads inside the same KV group).
 #[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 fn gated_deltanet_step_parallel(
@@ -2196,26 +2247,32 @@ fn gated_deltanet_step_parallel(
     z: &[f32],
     state: &mut [f32],
     out: &mut [f32],
-    _num_heads: usize,
+    num_kv_heads: usize,
+    _num_v_heads: usize,
     qk_dim: usize,
     v_dim: usize,
 ) {
     use rayon::iter::{IndexedParallelIterator, ParallelIterator};
     use rayon::slice::ParallelSliceMut;
 
+    // Derive V-per-KV grouping from the caller-provided head counts. The
+    // `par_chunks_mut(state_stride)` split below iterates once per V head,
+    // so we recover `kv_head = v_head / v_per_kv` inside the closure.
+    let v_per_kv = _num_v_heads / num_kv_heads;
     let state_stride = qk_dim * v_dim;
     state
         .par_chunks_mut(state_stride)
         .zip(out.par_chunks_mut(v_dim))
         .enumerate()
-        .for_each(|(head, (state_slab, out_slab))| {
+        .for_each(|(v_head, (state_slab, out_slab))| {
+            let kv_head = v_head / v_per_kv;
             gated_deltanet_head_disjoint(
-                &q[head * qk_dim..(head + 1) * qk_dim],
-                &k[head * qk_dim..(head + 1) * qk_dim],
-                &v[head * v_dim..(head + 1) * v_dim],
-                alpha[head],
-                beta[head],
-                &z[head * v_dim..(head + 1) * v_dim],
+                &q[kv_head * qk_dim..(kv_head + 1) * qk_dim],
+                &k[kv_head * qk_dim..(kv_head + 1) * qk_dim],
+                &v[v_head * v_dim..(v_head + 1) * v_dim],
+                alpha[v_head],
+                beta[v_head],
+                &z[v_head * v_dim..(v_head + 1) * v_dim],
                 state_slab,
                 out_slab,
                 qk_dim,
@@ -2224,7 +2281,14 @@ fn gated_deltanet_step_parallel(
         });
 }
 
-/// Per-head kernel using absolute head index into flat buffers. Serial path.
+/// Per-head kernel using a single absolute head index into flat buffers.
+/// Serial reference path retained for unit tests; assumes the 1:1 mapping
+/// where V heads and KV heads coincide (standard Qwen 3.5). Hybrid
+/// architectures (Bonsai / Qwen 3.6, num_v_heads > num_kv_heads) are
+/// exercised by the loops inside [`gated_deltanet_step`] and
+/// [`gated_deltanet_step_parallel`] instead — production forward path no
+/// longer calls this helper directly.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn gated_deltanet_head(
     q: &[f32],
@@ -3198,7 +3262,10 @@ impl<'a> Llama3Model<'a> {
         let dn_conv_kernel = config.linear_conv_kernel_dim().unwrap_or(4);
         let dn_conv_dim_state =
             dn_qk_dim_state * dn_num_kv_heads_state * 2 + dn_v_dim_state * dn_num_v_heads_state;
-        let dn_state_elems = dn_num_kv_heads_state * dn_qk_dim_state * dn_v_dim_state;
+        // Phase X.3.e.3.1: state is per-V-head. Bonsai (48 V / 16 KV) inflates
+        // the buffer 3× vs the pre-refactor per-KV allocation; Qwen 3.5
+        // (num_v_heads == num_kv_heads) sees no change.
+        let dn_state_elems = dn_num_v_heads_state * dn_qk_dim_state * dn_v_dim_state;
         let dn_conv_ring_slots = dn_conv_kernel.saturating_sub(1);
         let deltanet_state = (0..deltanet_layer_count)
             .map(|_| vec![0.0f32; dn_state_elems])
@@ -3884,12 +3951,13 @@ impl<'a> Llama3Model<'a> {
                         q_slice,
                         k_slice,
                         v_slice,
-                        &dn_alpha,
-                        &dn_beta,
+                        &dn_alpha[..dn_num_v_heads],
+                        &dn_beta[..dn_num_v_heads],
                         z_slice,
                         &mut self.deltanet_state[dn_idx],
                         &mut dn_delta_out,
                         dn_num_kv_heads,
+                        dn_num_v_heads,
                         dn_qk_dim,
                         dn_v_dim,
                     );
@@ -10053,7 +10121,8 @@ mod tests {
         let mut out = vec![0.0f32; num_heads * v_dim];
 
         gated_deltanet_step(
-            &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, qk_dim, v_dim,
+            &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, num_heads, qk_dim,
+            v_dim,
         );
 
         // Sanity: state should be non-zero and finite (recurrence absorbed
@@ -10086,7 +10155,8 @@ mod tests {
         let mut out = vec![0.0f32; num_heads * v_dim];
 
         gated_deltanet_step(
-            &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, qk_dim, v_dim,
+            &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, num_heads, qk_dim,
+            v_dim,
         );
 
         assert!(state.iter().all(|v| v.is_finite()));
@@ -10155,6 +10225,7 @@ mod tests {
             &mut state_actual,
             &mut out_actual,
             num_heads,
+            num_heads,
             qk_dim,
             v_dim,
         );
@@ -10164,6 +10235,99 @@ mod tests {
         }
         for (i, (a, s)) in state_actual.iter().zip(state_serial.iter()).enumerate() {
             assert!((a - s).abs() < 1e-6, "state[{i}]: parallel {a} serial {s}");
+        }
+    }
+
+    /// Phase X.3.e.3.1: Bonsai / Qwen 3.6 hybrid arch has `num_v_heads >
+    /// num_kv_heads`. The pre-refactor loop iterated `num_kv_heads` times,
+    /// silent-dropping the tail V heads' alpha / beta / state / output.
+    /// Verified by exercising a `num_v_heads = 3 * num_kv_heads` config and
+    /// asserting every V head's state slab is written (impossible under
+    /// the old code — the tail slabs stayed all-zero) and that V heads
+    /// inside the same KV group produce distinct states (per-V-head alpha
+    /// / beta actually flowing into the recurrence, not shared).
+    #[test]
+    fn gated_deltanet_step_bonsai_per_v_head_consumption() {
+        let num_kv_heads = 4;
+        // 3 V heads per KV group — mirrors Bonsai's 48 V / 16 KV ratio.
+        let num_v_heads = 12;
+        let qk_dim = 3;
+        let v_dim = 3;
+        let v_per_kv = num_v_heads / num_kv_heads;
+        let state_stride = qk_dim * v_dim;
+
+        // Q / K live at KV-head granularity (V heads within a group share).
+        let mut q = Vec::with_capacity(num_kv_heads * qk_dim);
+        let mut k = Vec::with_capacity(num_kv_heads * qk_dim);
+        for h in 0..num_kv_heads {
+            for i in 0..qk_dim {
+                let seed = (h * qk_dim + i) as f32 * 0.3;
+                q.push(seed.sin());
+                k.push(seed.cos());
+            }
+        }
+        // V / Z per-V-head.
+        let mut v = Vec::with_capacity(num_v_heads * v_dim);
+        let mut z = Vec::with_capacity(num_v_heads * v_dim);
+        for h in 0..num_v_heads {
+            for j in 0..v_dim {
+                let seed = (h * v_dim + j) as f32 * 0.5;
+                v.push(seed.sin() + 0.1);
+                z.push(seed.cos());
+            }
+        }
+        // Distinct per-V-head alpha / beta — under the old loop, entries
+        // beyond `num_kv_heads` would be silently ignored.
+        let alpha: Vec<f32> = (0..num_v_heads).map(|h| 0.9 - 0.02 * h as f32).collect();
+        let beta: Vec<f32> = (0..num_v_heads).map(|h| 0.1 + 0.02 * h as f32).collect();
+
+        let mut state = vec![0.0f32; num_v_heads * state_stride];
+        let mut out = vec![0.0f32; num_v_heads * v_dim];
+
+        gated_deltanet_step(
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &z,
+            &mut state,
+            &mut out,
+            num_kv_heads,
+            num_v_heads,
+            qk_dim,
+            v_dim,
+        );
+
+        assert!(state.iter().all(|val| val.is_finite()));
+        assert!(out.iter().all(|val| val.is_finite()));
+
+        // Every V head's state slab must be written (any non-zero entry).
+        // Pre-fix, V heads with index >= num_kv_heads stayed all-zero.
+        for v_head in 0..num_v_heads {
+            let slab = &state[v_head * state_stride..(v_head + 1) * state_stride];
+            assert!(
+                slab.iter().any(|&val| val.abs() > 0.0),
+                "V head {v_head} state slab all zero — per-V-head loop did not cover it",
+            );
+        }
+
+        // V heads inside the same KV group must produce distinct state
+        // (they share Q / K but have independent V / Z / alpha / beta).
+        for kv in 0..num_kv_heads {
+            let head_a = kv * v_per_kv;
+            let head_b = kv * v_per_kv + 1;
+            let slab_a = &state[head_a * state_stride..(head_a + 1) * state_stride];
+            let slab_b = &state[head_b * state_stride..(head_b + 1) * state_stride];
+            let max_diff = slab_a
+                .iter()
+                .zip(slab_b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff > 1e-6,
+                "KV group {kv}: V head {head_a} state ≈ V head {head_b} state (max_diff={max_diff}), per-V-head alpha/beta collapsed",
+            );
         }
     }
 
