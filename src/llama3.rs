@@ -2061,6 +2061,23 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Softplus activation `softplus(x) = ln(1 + exp(x))`. Used by Bonsai /
+/// Qwen 3.6 DeltaNet (Phase X.3.e.3.2 Gap B) to derive the SSM decay
+/// parameter from the raw alpha projection output. Numerically stable
+/// form: for `x > 20` returns `x` (asymptotic limit, exp overflow
+/// avoided); for `x < -20` returns `exp(x)` (avoids `ln(1 + 0)` losing
+/// precision); otherwise evaluates the closed form directly.
+#[inline]
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
 /// Causal depthwise conv1d single-token step for Qwen 3.5 DeltaNet.
 ///
 /// Direct CPU port of `src/shaders/conv1d_causal.wgsl`. Depthwise means the
@@ -2893,19 +2910,19 @@ struct DeltaNetLayerWeights<'a> {
     /// `gated_deltanet_step`.
     attn_gate: Option<WeightRef<'a>>,
     /// Qwen 3.6 learnable SSM state-transition parameter (`num_v_heads`
-    /// entries, f32). Corresponds to the `A` matrix in the discretised
-    /// state-space update `h_next = A * h_prev + B * x`. Currently loaded
-    /// but not applied to the delta-rule integration — the reference
-    /// `gated_deltanet_head_disjoint` uses only `alpha_h` for the state
-    /// decay. Phase X.3.e.3 (post-load numerical comparison against
-    /// llama.cpp Qwen 3.6) will decide where to fold this in.
-    #[allow(dead_code)]
+    /// entries, f32), stored ≈ `-exp(A_log)` (negative, per Mamba
+    /// convention). Multiplied by `softplus(alpha_raw + ssm_dt_bias)`
+    /// in the forward path (Phase X.3.e.3.2 Gap B) to derive the
+    /// per-V-head log-decay `gate`; the actual decay factor used inside
+    /// the delta-rule recurrence is `exp(gate) ∈ (0, 1]`. Standard
+    /// Qwen 3.5 GGUFs ship no `ssm_a`; the transformation is skipped
+    /// and the raw alpha projection output is used directly.
     ssm_a: Option<Vec<f32>>,
-    /// Qwen 3.6 SSM discretisation-step bias (`num_v_heads` entries, f32).
-    /// Loaded but not applied yet; see [`ssm_a`] for the follow-up plan.
+    /// Qwen 3.6 SSM discretisation-step bias (`num_v_heads` entries, f32),
+    /// added to the raw alpha projection output before the softplus in
+    /// the discretisation formula; see [`ssm_a`] for the full math.
     ///
     /// [`ssm_a`]: DeltaNetLayerWeights::ssm_a
-    #[allow(dead_code)]
     ssm_dt_bias: Option<Vec<f32>>,
     /// Qwen 3.6 SSM state RMSNorm weight (`state_size` = per-head qk_dim
     /// entries = `v_dim`, f32). Broadcast across V heads and applied to
@@ -3914,6 +3931,31 @@ impl<'a> Llama3Model<'a> {
                     // 2a/2b. alpha / beta decay-rate + update-rate projections.
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
                     dn_layer.beta_proj.matvec(&norm_buf, &mut dn_beta);
+
+                    // 2c. Bonsai / Qwen 3.6 SSM discretisation (Phase X.3.e.3.2
+                    // Gap B). Reference: PrismML llama.cpp fork qwen35.cpp:443
+                    // -451, where the raw alpha projection is transformed into
+                    // an actual per-V-head decay factor via
+                    //   alpha_biased = alpha + ssm_dt_bias
+                    //   alpha_softplus = softplus(alpha_biased)     // > 0
+                    //   gate = alpha_softplus * ssm_a               // < 0 (ssm_a stored ≈ -exp(A_log))
+                    //   decay = exp(gate)                           // ∈ (0, 1]
+                    // The transformed `decay` replaces `alpha_h` inside the
+                    // recurrence, matching the Mamba-style selective SSM math.
+                    // Standard Qwen 3.5 GGUFs ship neither `ssm_a` nor
+                    // `ssm_dt.bias`; the branch below is a no-op for those
+                    // and preserves the pre-Phase-X.3.e.3.2 numerics.
+                    if let (Some(ssm_a), Some(ssm_dt_bias)) =
+                        (dn_layer.ssm_a.as_ref(), dn_layer.ssm_dt_bias.as_ref())
+                    {
+                        debug_assert_eq!(ssm_a.len(), dn_num_v_heads);
+                        debug_assert_eq!(ssm_dt_bias.len(), dn_num_v_heads);
+                        for h in 0..dn_num_v_heads {
+                            let alpha_biased = dn_alpha[h] + ssm_dt_bias[h];
+                            let gate = softplus(alpha_biased) * ssm_a[h];
+                            dn_alpha[h] = gate.exp();
+                        }
+                    }
 
                     // Split fused output. Layout (matches GPU-side loader):
                     //   [ q | k | v | z ]
@@ -10383,6 +10425,92 @@ mod tests {
                 (actual - expected).abs() < 1e-6,
                 "head {head} lane {lane}: got {actual}, expected {expected}",
             );
+        }
+    }
+
+    /// Phase X.3.e.3.2 (Gap B): softplus helper is the numerical foundation
+    /// for the Bonsai / Qwen 3.6 SSM discretisation. Verify hand-computed
+    /// exact values at zero, positive, negative anchors and confirm the
+    /// numerically-stable path (`|x| > 20`) still produces finite outputs.
+    #[test]
+    fn softplus_matches_reference() {
+        // softplus(0) = ln(1 + 1) = ln(2) ≈ 0.6931472
+        assert!(
+            (softplus(0.0) - 0.6931472_f32).abs() < 1e-6,
+            "softplus(0) = {}",
+            softplus(0.0)
+        );
+        // softplus(1) = ln(1 + e) ≈ 1.3132617
+        assert!(
+            (softplus(1.0) - 1.3132617_f32).abs() < 1e-5,
+            "softplus(1) = {}",
+            softplus(1.0)
+        );
+        // softplus(-1) = ln(1 + 1/e) ≈ 0.3132617
+        assert!(
+            (softplus(-1.0) - 0.3132617_f32).abs() < 1e-5,
+            "softplus(-1) = {}",
+            softplus(-1.0)
+        );
+        // Asymptotic: softplus(x) → x for large x
+        assert!((softplus(30.0) - 30.0_f32).abs() < 1e-6);
+        // Asymptotic: softplus(x) → 0 for large negative x
+        assert!(softplus(-30.0).abs() < 1e-10);
+        // Numerical stability across extreme range
+        for &x in &[-100.0_f32, -50.0, -20.0, -1.0, 0.0, 1.0, 20.0, 50.0, 100.0] {
+            let y = softplus(x);
+            assert!(y.is_finite(), "softplus({x}) = {y} not finite");
+            assert!(y >= 0.0, "softplus({x}) = {y} negative");
+        }
+    }
+
+    /// Phase X.3.e.3.2 (Gap B): The Bonsai / Qwen 3.6 SSM discretisation
+    /// transforms the raw alpha projection into an actual decay factor via
+    /// `decay = exp(softplus(alpha + dt_bias) * ssm_a)`. Verify concrete
+    /// anchor cases so a future refactor of `softplus` cannot silently
+    /// break the transformation.
+    #[test]
+    fn ssm_alpha_transformation_matches_reference() {
+        // Anchor 1: alpha=0, dt_bias=0, ssm_a=-1
+        //   biased = 0, softplus(0) = ln(2), gate = -ln(2), decay = exp(-ln(2)) = 1/2
+        let decay = (softplus(0.0 + 0.0) * -1.0_f32).exp();
+        assert!(
+            (decay - 0.5_f32).abs() < 1e-6,
+            "anchor 1: decay = {decay}, expected 0.5",
+        );
+
+        // Anchor 2: alpha=large positive → softplus ≈ alpha, ssm_a=-2 → gate ≈ -2*alpha
+        //   decay ≈ exp(-2 * alpha) → very small
+        let decay2 = (softplus(10.0) * -2.0_f32).exp();
+        assert!(
+            decay2 < 0.01 && decay2 > 0.0,
+            "anchor 2: decay = {decay2}, expected tiny positive",
+        );
+
+        // Anchor 3: alpha=large negative → softplus ≈ 0, gate ≈ 0, decay ≈ 1
+        let decay3 = (softplus(-30.0) * -1.0_f32).exp();
+        assert!(
+            (decay3 - 1.0_f32).abs() < 1e-6,
+            "anchor 3: decay = {decay3}, expected 1",
+        );
+
+        // Domain sweep: decay must stay in (0, 1] for all reasonable inputs
+        // (assuming ssm_a is stored as negative, per Mamba convention).
+        for &alpha in &[-100.0_f32, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0] {
+            for &dt_bias in &[-5.0_f32, 0.0, 5.0] {
+                for &ssm_a_val in &[-5.0_f32, -1.0, -0.1] {
+                    let gate = softplus(alpha + dt_bias) * ssm_a_val;
+                    let decay = gate.exp();
+                    assert!(
+                        decay.is_finite(),
+                        "α={alpha}, dt_b={dt_bias}, a={ssm_a_val}: decay={decay} not finite",
+                    );
+                    assert!(
+                        (0.0..=1.0 + 1e-6).contains(&decay),
+                        "α={alpha}, dt_b={dt_bias}, a={ssm_a_val}: decay={decay} outside [0, 1]",
+                    );
+                }
+            }
         }
     }
 
