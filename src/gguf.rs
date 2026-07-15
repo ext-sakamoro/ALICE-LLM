@@ -47,6 +47,11 @@ const fn f16_to_f32(h: u16) -> f32 {
 // ─── Quantization types ────────────────────────────────────────────────────
 
 /// GGML tensor quantization type.
+///
+/// `Q1_0`/`Q2_0` are the group-128 low-bit formats used by PrismML's
+/// llama.cpp fork for Bonsai 27B (binary/ternary post-training conversion of
+/// Qwen 3.6-27B). Type IDs 41/42 come from that fork; upstream llama.cpp
+/// leaves those slots free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum GgmlType {
@@ -63,6 +68,12 @@ pub enum GgmlType {
     Q5_K,
     Q6_K,
     IQ4_XS,
+    /// PrismML fork: 128-element binary ternary block, {−1, +1} × FP16 scale.
+    /// 18 bytes/block (2 FP16 + 16 packed bits).
+    Q1_0,
+    /// PrismML fork: 128-element ternary block, {−1, 0, +1} × FP16 scale.
+    /// 34 bytes/block (2 FP16 + 32 packed 2-bit slots).
+    Q2_0,
     Other(u32),
 }
 
@@ -82,6 +93,8 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             23 => Self::IQ4_XS,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
             other => Self::Other(other),
         }
     }
@@ -108,6 +121,10 @@ impl GgmlType {
             Self::Q6_K => 210,
             // IQ4_XS: d (2) + scales_h (2) + scales_l (QK_K/64=4) + qs (QK_K/2=128) = 136
             Self::IQ4_XS => 136,
+            // Q1_0 (PrismML g128): d (2) + qs (QK1_0/8 = 16) = 18
+            Self::Q1_0 => 18,
+            // Q2_0 (PrismML g128): d (2) + qs (QK2_0/4 = 32) = 34
+            Self::Q2_0 => 34,
             Self::Other(_) => 0,
         }
     }
@@ -119,10 +136,14 @@ impl GgmlType {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => QK8_0,
             Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => QK_K,
+            Self::Q1_0 | Self::Q2_0 => QK_G128,
             Self::Other(_) => 1,
         }
     }
 }
+
+/// PrismML fork block size for `Q1_0` / `Q2_0` (Bonsai 27B group-128 layout).
+pub const QK_G128: usize = 128;
 
 // ─── GGUF metadata values ──────────────────────────────────────────────────
 
@@ -546,6 +567,8 @@ impl<'a> GgufFile<'a> {
             GgmlType::Q4_K => dequantize_q4_k(data, &mut out),
             GgmlType::Q5_K => dequantize_q5_k(data, &mut out),
             GgmlType::Q6_K => dequantize_q6_k(data, &mut out),
+            GgmlType::Q1_0 => dequantize_q1_0(data, &mut out),
+            GgmlType::Q2_0 => dequantize_q2_0(data, &mut out),
             GgmlType::Other(_) => return None,
         }
 
@@ -1006,6 +1029,60 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
             ql_off += 64;
             qh_off += 32;
             sc_off += 8;
+        }
+    }
+}
+
+// ─── Q1_0 / Q2_0 dequantization (PrismML Bonsai 27B, group-128) ─────────────
+//
+// Q1_0: 18 bytes/block, 128 elements. Layout:
+//   [0..2]   FP16 scale `d`
+//   [2..18]  16 bytes of packed 1-bit ternary values (binary {−1, +1})
+//            Bit `k` in byte `b` corresponds to element `b * 8 + k`
+//            (LSB-first within each byte, matching llama.cpp's block_q1_0).
+//   Value = ((bit == 1) ? +1 : −1) * d
+//
+// Q2_0: 34 bytes/block, 128 elements. Layout:
+//   [0..2]   FP16 scale `d`
+//   [2..34]  32 bytes of packed 2-bit ternary values ({−1, 0, +1})
+//            Slot `k` in byte `b` (k=0..3) corresponds to element `b * 4 + k`
+//            Standard ternary encoding: `((slot & 3) - 1) * d` yields
+//            {−1, 0, +1, +2}, with the +2 code reserved / unused by the encoder.
+
+fn dequantize_q1_0(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 18;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+    for i in 0..n_blocks {
+        let block = &data[i * block_bytes..(i + 1) * block_bytes];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for b in 0..16 {
+            let byte = block[2 + b];
+            for k in 0..8 {
+                let bit = (byte >> k) & 1;
+                let val = if bit == 1 { d } else { -d };
+                out[out_idx] = val;
+                out_idx += 1;
+            }
+        }
+    }
+}
+
+pub(crate) fn dequantize_q2_0(data: &[u8], out: &mut [f32]) {
+    let block_bytes = 34;
+    let n_blocks = data.len() / block_bytes;
+    let mut out_idx = 0;
+    for i in 0..n_blocks {
+        let block = &data[i * block_bytes..(i + 1) * block_bytes];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for b in 0..32 {
+            let byte = block[2 + b];
+            for k in 0..4 {
+                let slot = ((byte >> (k * 2)) & 0x3) as i8;
+                let val = (slot - 1) as f32 * d;
+                out[out_idx] = val;
+                out_idx += 1;
+            }
         }
     }
 }
@@ -3488,7 +3565,49 @@ pub fn quantized_matvec(
         GgmlType::Q8_0 => q8_0_matvec(input, data, rows, cols, output),
         GgmlType::F16 => f16_matvec(input, data, rows, cols, output),
         GgmlType::F32 => f32_matvec(input, data, rows, cols, output),
+        GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
+        GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
+    }
+}
+
+/// Scalar matvec fallback for PrismML `Q1_0` (Bonsai 27B binary g128).
+///
+/// Reference implementation: dequantize the row to f32, then a straightforward
+/// f32 dot product. Adequate for correctness verification; a native ternary
+/// dot product (mirroring the existing `dot_ternary_row` NEON path) belongs
+/// in the follow-up SIMD PR.
+fn q1_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let row_bytes = data.len() / rows;
+    let mut row_buf = vec![0.0f32; cols];
+    for r in 0..rows {
+        let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
+        dequantize_q1_0(row_data, &mut row_buf);
+        let mut acc = 0.0f32;
+        for i in 0..cols {
+            acc += row_buf[i] * input[i];
+        }
+        output[r] = acc;
+    }
+}
+
+/// Scalar matvec fallback for PrismML `Q2_0` (Bonsai 27B ternary g128).
+///
+/// Same dequant-and-dot pattern as `q1_0_matvec_fallback`. Ternary values are
+/// {−1, 0, +1}, so the 0-slot pattern gives natural sparsity that a native
+/// kernel can exploit (bitmask filter + branch-free select, matching the
+/// existing `ternary` SIMD path in this crate).
+fn q2_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let row_bytes = data.len() / rows;
+    let mut row_buf = vec![0.0f32; cols];
+    for r in 0..rows {
+        let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
+        dequantize_q2_0(row_data, &mut row_buf);
+        let mut acc = 0.0f32;
+        for i in 0..cols {
+            acc += row_buf[i] * input[i];
+        }
+        output[r] = acc;
     }
 }
 
@@ -5270,6 +5389,124 @@ mod tests {
         assert_eq!(GgmlType::Q4_K.block_bytes(), 144);
         assert_eq!(GgmlType::Q4_K.elements_per_block(), 256);
         assert_eq!(GgmlType::Q8_0.elements_per_block(), 32);
+        // Q1_0 / Q2_0: PrismML Bonsai 27B group-128 layout.
+        assert_eq!(GgmlType::Q1_0.block_bytes(), 18);
+        assert_eq!(GgmlType::Q1_0.elements_per_block(), 128);
+        assert_eq!(GgmlType::Q2_0.block_bytes(), 34);
+        assert_eq!(GgmlType::Q2_0.elements_per_block(), 128);
+        // Type IDs from the PrismML llama.cpp fork.
+        assert_eq!(GgmlType::from_u32(41), GgmlType::Q1_0);
+        assert_eq!(GgmlType::from_u32(42), GgmlType::Q2_0);
+    }
+
+    #[test]
+    fn q1_0_dequantize_binary_ternary() {
+        // Two group-128 blocks: scale=1.0, alternating +1/-1 pattern in block 0,
+        // scale=0.5, all +1 in block 1.
+        let mut data = vec![0u8; 2 * 18];
+        let scale_1_f16: u16 = 0x3C00; // f16(1.0)
+        let scale_half_f16: u16 = 0x3800; // f16(0.5)
+
+        // Block 0: alternating pattern 0b10101010 = 0xAA (bit0=0→−1, bit1=1→+1, ...)
+        data[0..2].copy_from_slice(&scale_1_f16.to_le_bytes());
+        for b in 0..16 {
+            data[2 + b] = 0xAA;
+        }
+        // Block 1: all 1s → +0.5
+        data[18..20].copy_from_slice(&scale_half_f16.to_le_bytes());
+        for b in 0..16 {
+            data[18 + 2 + b] = 0xFF;
+        }
+
+        let mut out = vec![0.0f32; 256];
+        dequantize_q1_0(&data, &mut out);
+
+        // Block 0 alternating {−1, +1, −1, +1, ...}
+        for (i, chunk) in out[0..128].chunks_exact(2).enumerate() {
+            assert!(
+                (chunk[0] - -1.0).abs() < 1e-4,
+                "b0 elem {}: got {}, expected -1",
+                i * 2,
+                chunk[0]
+            );
+            assert!(
+                (chunk[1] - 1.0).abs() < 1e-4,
+                "b0 elem {}: got {}, expected +1",
+                i * 2 + 1,
+                chunk[1]
+            );
+        }
+        // Block 1 all +0.5
+        for (i, &v) in out[128..256].iter().enumerate() {
+            assert!(
+                (v - 0.5).abs() < 1e-4,
+                "b1 elem {}: got {}, expected +0.5",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn q2_0_dequantize_ternary_values() {
+        // Single group-128 block: scale=2.0, alternating slot pattern
+        //   slot 0 = 0b00 → −1
+        //   slot 1 = 0b01 → 0
+        //   slot 2 = 0b10 → +1
+        //   slot 3 = 0b11 → +2 (reserved, but the formula gives +2)
+        // Byte = 0b_11_10_01_00 = 0xE4 repeated 32 times.
+        let mut data = vec![0u8; 34];
+        let scale_2_f16: u16 = 0x4000; // f16(2.0)
+        data[0..2].copy_from_slice(&scale_2_f16.to_le_bytes());
+        for b in 0..32 {
+            data[2 + b] = 0xE4;
+        }
+
+        let mut out = vec![0.0f32; 128];
+        dequantize_q2_0(&data, &mut out);
+
+        // Pattern repeats every 4 elements: [−2, 0, +2, +4] × scale=1
+        // (with scale=2, we get [−2, 0, +2, +4]).
+        let expected = [-2.0, 0.0, 2.0, 4.0];
+        for (i, &v) in out.iter().enumerate() {
+            let want = expected[i % 4];
+            assert!(
+                (v - want).abs() < 1e-4,
+                "q2_0 elem {}: got {}, expected {}",
+                i,
+                v,
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn q2_0_matvec_fallback_sanity() {
+        // 1×128 matrix, ternary weights = alternating (+1, 0, -1, 0, ...)
+        //   slot 0 = 0b10 → +1
+        //   slot 1 = 0b01 → 0
+        //   slot 2 = 0b00 → −1
+        //   slot 3 = 0b01 → 0
+        // Byte = 0b_01_00_01_10 = 0x46 repeated 32 times.
+        let mut data = vec![0u8; 34];
+        let scale_1_f16: u16 = 0x3C00; // f16(1.0)
+        data[0..2].copy_from_slice(&scale_1_f16.to_le_bytes());
+        for b in 0..32 {
+            data[2 + b] = 0x46;
+        }
+
+        // Input: [1, 2, 3, 4, ...128]. Dot with weights (+1, 0, −1, 0, +1, 0, −1, 0, ...)
+        // = Σ (+1 · x[4k]) + Σ (−1 · x[4k+2])
+        // For x[i] = i+1: pairs contribute (4k+1) − (4k+3) = −2 per group of 4.
+        // Total = 32 groups × −2 = −64.
+        let input: Vec<f32> = (1..=128).map(|i| i as f32).collect();
+        let mut out = vec![0.0f32; 1];
+        q2_0_matvec_fallback(&input, &data, 1, 128, &mut out);
+        assert!(
+            (out[0] - -64.0).abs() < 1e-3,
+            "q2_0 matvec: got {}, expected −64",
+            out[0]
+        );
     }
 
     #[test]
