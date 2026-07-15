@@ -1625,6 +1625,69 @@ mod neon_dot {
         total
     }
 
+    /// Optimised sibling of [`q1_0_dot_row`] that exploits Q1_0's binary
+    /// symmetry `value ∈ {−d, +d}`:
+    ///
+    /// ```text
+    /// d * (pos_sum − neg_sum)
+    ///   = d * (pos_sum − (block_input_sum − pos_sum))
+    ///   = d * (2 * pos_sum − block_input_sum)
+    /// ```
+    ///
+    /// The `block_input_sum` for each 128-element window depends only on
+    /// the input vector, so the caller precomputes it once per matvec and
+    /// passes the slice in via `input_block_sums`. The per-byte NEON work
+    /// then only needs to expand the "bit set → +d" mask; the negative
+    /// half is subsumed into the algebraic identity above. This roughly
+    /// halves the SIMD instruction count per Q1_0 dot compared with
+    /// [`q1_0_dot_row`].
+    ///
+    /// `input_block_sums.len()` must equal `row_data.len() / 18`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn q1_0_dot_row_pos_only(
+        row_data: &[u8],
+        input: &[f32],
+        input_block_sums: &[f32],
+    ) -> f32 {
+        let bit_lanes_lo: uint32x4_t = vld1q_u32([0x01u32, 0x02, 0x04, 0x08].as_ptr());
+        let bit_lanes_hi: uint32x4_t = vld1q_u32([0x10u32, 0x20, 0x40, 0x80].as_ptr());
+
+        let block_bytes = 18usize;
+        let n_blocks = row_data.len() / block_bytes;
+        let mut total = 0.0f32;
+
+        for i in 0..n_blocks {
+            let block = &row_data[i * block_bytes..(i + 1) * block_bytes];
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let mut pos_acc: float32x4_t = vdupq_n_f32(0.0);
+            let block_input = &input[i * 128..(i + 1) * 128];
+
+            for b in 0..16 {
+                let byte = block[2 + b];
+                let pm = u32::from(byte);
+                let in_ptr = block_input.as_ptr().add(b * 8);
+                let in_lo = vld1q_f32(in_ptr);
+                let in_hi = vld1q_f32(in_ptr.add(4));
+
+                let bcast_p = vdupq_n_u32(pm);
+                let mask_p_lo = vceqq_u32(vandq_u32(bcast_p, bit_lanes_lo), bit_lanes_lo);
+                let mask_p_hi = vceqq_u32(vandq_u32(bcast_p, bit_lanes_hi), bit_lanes_hi);
+                let contrib_p_lo = vandq_u32(mask_p_lo, vreinterpretq_u32_f32(in_lo));
+                let contrib_p_hi = vandq_u32(mask_p_hi, vreinterpretq_u32_f32(in_hi));
+                pos_acc = vaddq_f32(pos_acc, vreinterpretq_f32_u32(contrib_p_lo));
+                pos_acc = vaddq_f32(pos_acc, vreinterpretq_f32_u32(contrib_p_hi));
+            }
+
+            let pos = vaddvq_f32(pos_acc);
+            // d * (2 * pos − block_input_sum) — the negative half of the
+            // dot is absorbed by the algebraic identity, so only one mask
+            // expansion pass is needed per byte.
+            total += d * (2.0 * pos - input_block_sums[i]);
+        }
+
+        total
+    }
+
     /// Bonsai 27B / PrismML `Q2_0` (ternary g128) full-row matvec via NEON.
     ///
     /// Layout per block (34 bytes / 128 elements):
@@ -3698,11 +3761,21 @@ fn q1_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, ou
     let row_bytes = data.len() / rows;
     #[cfg(target_arch = "aarch64")]
     {
+        // Precompute per-128-element block sums of the input vector once
+        // and reuse across every row. The Q1_0 pos-only kernel folds them
+        // into `d * (2 * pos_sum − block_sum)`, halving the per-byte NEON
+        // instruction count.
+        let n_blocks = cols / 128;
+        let mut block_sums = vec![0.0f32; n_blocks];
+        for (b, chunk) in input[..cols].chunks_exact(128).enumerate() {
+            block_sums[b] = chunk.iter().sum();
+        }
         for r in 0..rows {
             let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
             // SAFETY: NEON is baseline on every aarch64 target Rust supports;
             // input length is validated by the caller via `cols`.
-            output[r] = unsafe { neon_dot::q1_0_dot_row(row_data, &input[..cols]) };
+            output[r] =
+                unsafe { neon_dot::q1_0_dot_row_pos_only(row_data, &input[..cols], &block_sums) };
         }
         return;
     }
