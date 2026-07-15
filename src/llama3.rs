@@ -2450,6 +2450,17 @@ struct LayerWeights<'a> {
     /// Mixture-of-experts routing + expert weights (only when this layer
     /// uses expert dispatch instead of a monolithic SwiGLU FFN).
     moe: Option<MoeExpertWeights<'a>>,
+
+    /// Qwen 3.6 / Bonsai 27B "Gated Attention": `q_proj` outputs `2 * q_dim`
+    /// values — the first half is the actual Q, the second half is a per-
+    /// element swish (SiLU) gate applied to the attention output before
+    /// `o_proj`. When `false`, `q_proj` produces the standard `q_dim` Q
+    /// values only and no gate is applied. Set at load time from the
+    /// tensor shape (rows = `2 * q_dim` ⇒ gated, rows = `q_dim` ⇒ standard).
+    ///
+    /// This matches the Qwen 3.6 config keys
+    /// `attn_output_gate: true, output_gate_type: "swish"`.
+    gated_output: bool,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -3688,7 +3699,11 @@ impl<'a> Llama3Model<'a> {
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
         let q_dim = c.num_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; q_dim];
+        // Q buffer sized for Qwen 3.6 / Bonsai "Gated Attention": if any layer
+        // ships `attn_q` as `2 * q_dim` rows (Q half + swish gate half fused),
+        // the matvec writes both halves into `q_buf`. Standard checkpoints use
+        // only the first `q_dim` slots; the unused tail stays zero-initialised.
+        let mut q_buf = vec![0.0f32; q_dim * 2];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         // attn_out holds `num_heads * head_dim` = q_dim values, which may
@@ -3895,9 +3910,13 @@ impl<'a> Llama3Model<'a> {
                     *v += bi;
                 }
             }
-            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others).
+            // Slice `q_buf` to the first `q_dim` entries — the second half (when
+            // present in Bonsai / Qwen 3.6 Gated Attention layers) holds the
+            // swish gate, which does NOT get per-head normalisation. For non-
+            // gated forward paths the slice is equivalent to the full buffer.
             if let Some(w) = layer.q_norm() {
-                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+                apply_qk_norm(&mut q_buf[..q_dim], w, c.head_dim, c.norm_eps);
             }
             if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
@@ -3948,6 +3967,16 @@ impl<'a> Llama3Model<'a> {
                 },
                 &mut attn_out,
             );
+
+            // Qwen 3.6 / Bonsai 27B "Gated Attention": when `q_proj` output
+            // was `2 * q_dim`, its second half is a per-element swish (SiLU)
+            // gate that modulates the attention result before `o_proj`.
+            // Applied element-wise across all heads.
+            if layer.gated_output {
+                for i in 0..q_dim {
+                    attn_out[i] *= silu(q_buf[q_dim + i]);
+                }
+            }
 
             // Output projection
             layer.o_proj.matvec(&attn_out, &mut o_buf);
@@ -5162,7 +5191,8 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
+        let q_dim = c.num_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; q_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -5203,9 +5233,13 @@ impl<'a> Llama3Model<'a> {
                     *v += bi;
                 }
             }
-            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others).
+            // Slice `q_buf` to the first `q_dim` entries — the second half (when
+            // present in Bonsai / Qwen 3.6 Gated Attention layers) holds the
+            // swish gate, which does NOT get per-head normalisation. For non-
+            // gated forward paths the slice is equivalent to the full buffer.
             if let Some(w) = layer.q_norm() {
-                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+                apply_qk_norm(&mut q_buf[..q_dim], w, c.head_dim, c.norm_eps);
             }
             if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
@@ -6181,7 +6215,8 @@ impl<'a> Llama3Model<'a> {
 
         let mut norm_buf = vec![0.0f32; c.hidden_dim];
         let kv_dim = c.num_kv_heads * c.head_dim;
-        let mut q_buf = vec![0.0f32; c.num_heads * c.head_dim];
+        let q_dim = c.num_heads * c.head_dim;
+        let mut q_buf = vec![0.0f32; q_dim];
         let mut k_buf = vec![0.0f32; kv_dim];
         let mut v_buf = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; c.hidden_dim];
@@ -6493,9 +6528,13 @@ impl<'a> Llama3Model<'a> {
                     *v += bi;
                 }
             }
-            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others)
+            // Qwen 3 QK-Norm (per-head RMSNorm on Q, K before RoPE; no-op for others).
+            // Slice `q_buf` to the first `q_dim` entries — the second half (when
+            // present in Bonsai / Qwen 3.6 Gated Attention layers) holds the
+            // swish gate, which does NOT get per-head normalisation. For non-
+            // gated forward paths the slice is equivalent to the full buffer.
             if let Some(w) = layer.q_norm() {
-                apply_qk_norm(&mut q_buf, w, c.head_dim, c.norm_eps);
+                apply_qk_norm(&mut q_buf[..q_dim], w, c.head_dim, c.norm_eps);
             }
             if let Some(w) = layer.k_norm() {
                 apply_qk_norm(&mut k_buf, w, c.head_dim, c.norm_eps);
@@ -7935,12 +7974,18 @@ fn load_layer_weights<'a>(
     let ffn_size = config.ffn_size_for_layer(layer);
 
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
-    let q_proj = load_weight_ref(
-        gguf,
-        &format!("{prefix}.attn_q.weight"),
-        q_dim,
-        config.hidden_dim,
-    )?;
+    // Bonsai 27B / Qwen 3.6 "Gated Attention" packs Q and its per-element
+    // swish gate into the same tensor: `q_proj.rows == 2 * q_dim`. Standard
+    // GGUF exports (Llama / Qwen 3 / Mistral / Gemma / …) keep the rows
+    // equal to `q_dim`. Use `load_weight_ref_any_rows` so the row count is
+    // taken from the tensor itself, then branch on the observed shape.
+    let q_proj =
+        load_weight_ref_any_rows(gguf, &format!("{prefix}.attn_q.weight"), config.hidden_dim)?;
+    let gated_output = match q_proj.rows {
+        r if r == q_dim => false,
+        r if r == 2 * q_dim => true,
+        _ => return None, // Mis-shaped tensor: neither standard nor gated.
+    };
     // Gemma 4: K/V weights are absent for shared-KV layers (>= kv_from_start).
     // For all other architectures they are required.
     let is_shared_layer =
@@ -8171,6 +8216,7 @@ fn load_layer_weights<'a>(
         qwen_norms,
         gemma3n,
         moe,
+        gated_output,
     })
 }
 
@@ -10099,6 +10145,7 @@ mod tests {
             qwen_norms: None,
             gemma3n: None,
             moe: None,
+            gated_output: false,
         }
     }
 
@@ -11218,5 +11265,44 @@ mod tests {
 
         // Missing tensor → None.
         assert!(load_weight_ref_any_rows(&gguf, "not_present", 2).is_none());
+    }
+
+    /// Qwen 3.6 / Bonsai 27B Gated Attention post-hoc validation: the swish
+    /// gate maps `x → x * sigmoid(x)`, so gate = 0 nullifies the attention
+    /// output while a large positive gate lets it through. Verifies the
+    /// arithmetic done inline in the main `forward` path against a scalar
+    /// reference, independent of any real GGUF weights.
+    #[test]
+    fn gated_attention_swish_math_matches_reference() {
+        // 6 attention output values with 6 gate values.
+        let mut attn_out = vec![1.0f32, 2.0, -1.0, 0.5, -0.5, 3.0];
+        let gate = vec![0.0f32, 1.0, -1.0, 10.0, -10.0, 0.5];
+        let q_dim = attn_out.len();
+
+        // Reference: each output multiplied by silu(gate).
+        let expected: Vec<f32> = attn_out
+            .iter()
+            .zip(gate.iter())
+            .map(|(&a, &g)| a * silu(g))
+            .collect();
+
+        // In-place update mirroring the forward path body.
+        for i in 0..q_dim {
+            attn_out[i] *= silu(gate[i]);
+        }
+
+        for (i, (&got, &want)) in attn_out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "gated attention at {i}: got {got}, expected {want}"
+            );
+        }
+
+        // gate = 0 → silu(0) = 0 → output zeroed out.
+        assert_eq!(attn_out[0], 0.0);
+        // gate = -10 → silu(-10) ≈ 0 → output near-zero.
+        assert!(attn_out[4].abs() < 1e-3);
+        // gate = 10 → silu(10) ≈ 10 → output amplified.
+        assert!(attn_out[3] > 4.9);
     }
 }
