@@ -463,16 +463,10 @@ fn main() {
             "Speedup vs Step 1 single-matvec (Q1_0): {:.2}×",
             gpu_us / gpu_r4_us
         );
-        println!(
-            "Speedup CPU / GPU-row4: {:.2}×",
-            cpu_us / gpu_r4_us
-        );
+        println!("Speedup CPU / GPU-row4: {:.2}×", cpu_us / gpu_r4_us);
 
         let r4_bandwidth_gb_s = bytes_per_matvec / (gpu_r4_us * 1000.0);
-        println!(
-            "Effective bandwidth: {:.2} GB/s",
-            r4_bandwidth_gb_s
-        );
+        println!("Effective bandwidth: {:.2} GB/s", r4_bandwidth_gb_s);
 
         // Parity: single-batch row4 output should match CPU Q1_0 matvec.
         let gpu_r4_output = engine.read_f32(&output_buf);
