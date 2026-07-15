@@ -2787,38 +2787,43 @@ struct DeltaNetLayerWeights<'a> {
     /// [`attn_qkv`]: DeltaNetLayerWeights::attn_qkv
     /// [`attn_gate`]: DeltaNetLayerWeights::attn_gate
     ssm_in: Option<WeightRef<'a>>,
-    /// Bonsai 27B fused input projection: `hidden → q + k + v + gate` packed
-    /// (10240-dim for the 27B config). See [`ssm_in`] for the standard
-    /// Qwen 3.5 counterpart.
+    /// Bonsai 27B / Qwen 3.6 fused input projection: `hidden → q + k + v`
+    /// packed (10240-dim for the 27B config). Together with [`attn_gate`]
+    /// this pair replaces the standard Qwen 3.5 [`ssm_in`]. Consumed by
+    /// the DeltaNet forward path (Phase X.3.e.2).
     ///
-    /// The exact split of the 10240 output columns into per-head Q/K/V/gate
-    /// slices belongs to Phase X.3.e (forward-path integration) and is
-    /// still being reverse-engineered from the PrismML llama.cpp fork; the
-    /// current forward path takes the standard [`ssm_in`] branch only and
-    /// panics with a Bonsai-specific message if it is asked to consume this
-    /// tensor.
+    /// Row layout matches the standard Qwen 3.5 QKV split:
+    /// `[Q (qk_dim * num_kv_heads) | K (qk_dim * num_kv_heads) | V (v_dim * num_v_heads)]`.
     ///
     /// [`ssm_in`]: DeltaNetLayerWeights::ssm_in
-    #[allow(dead_code)]
+    /// [`attn_gate`]: DeltaNetLayerWeights::attn_gate
     attn_qkv: Option<WeightRef<'a>>,
-    /// Bonsai 27B DeltaNet output gate projection (6144-dim for 27B).
-    /// Applied after `ssm_out` in a `SiLU(gate) * value` pattern.
-    /// Consumer wiring is deferred to Phase X.3.e.
-    #[allow(dead_code)]
+    /// Bonsai 27B / Qwen 3.6 DeltaNet Z (output-gate) projection: `hidden → z`
+    /// (6144-dim for the 27B config, matches `v_dim * num_v_heads`). Consumed
+    /// by the DeltaNet forward path (Phase X.3.e.2) as the `z` slice inside
+    /// `gated_deltanet_step`.
     attn_gate: Option<WeightRef<'a>>,
-    /// Bonsai 27B learnable SSM state-transition parameter (`num_heads`
+    /// Qwen 3.6 learnable SSM state-transition parameter (`num_v_heads`
     /// entries, f32). Corresponds to the `A` matrix in the discretised
-    /// state-space update `h_next = A * h_prev + B * x`. Consumer wiring
-    /// is deferred to Phase X.3.e.
+    /// state-space update `h_next = A * h_prev + B * x`. Currently loaded
+    /// but not applied to the delta-rule integration — the reference
+    /// `gated_deltanet_head_disjoint` uses only `alpha_h` for the state
+    /// decay. Phase X.3.e.3 (post-load numerical comparison against
+    /// llama.cpp Qwen 3.6) will decide where to fold this in.
     #[allow(dead_code)]
     ssm_a: Option<Vec<f32>>,
-    /// Bonsai 27B SSM discretisation-step bias (`num_heads` entries, f32).
-    /// Consumer wiring is deferred to Phase X.3.e.
+    /// Qwen 3.6 SSM discretisation-step bias (`num_v_heads` entries, f32).
+    /// Loaded but not applied yet; see [`ssm_a`] for the follow-up plan.
+    ///
+    /// [`ssm_a`]: DeltaNetLayerWeights::ssm_a
     #[allow(dead_code)]
     ssm_dt_bias: Option<Vec<f32>>,
-    /// Bonsai 27B SSM state RMSNorm weight (`state_size` entries, f32),
-    /// applied per-head to the hidden state before the output projection.
-    /// Consumer wiring is deferred to Phase X.3.e.
+    /// Qwen 3.6 SSM state RMSNorm weight (`state_size` = per-head qk_dim
+    /// entries, f32), applied per-head to the hidden state before the
+    /// output projection. Loaded but not applied yet; see [`ssm_a`] for
+    /// the follow-up plan.
+    ///
+    /// [`ssm_a`]: DeltaNetLayerWeights::ssm_a
     #[allow(dead_code)]
     ssm_norm: Option<Vec<f32>>,
     /// Causal depthwise conv1d kernel: `[kernel_size, conv_dim]` (f32).
@@ -3763,39 +3768,52 @@ impl<'a> Llama3Model<'a> {
                     // 1. Attention norm.
                     rms_norm(&hidden, &dn_layer.attn_norm, c.norm_eps, &mut norm_buf);
 
-                    // 2. Fused input projection: `norm → q + k + v + z packed`.
-                    // Bonsai 27B DeltaNet layers ship `attn_qkv` instead of
-                    // `ssm_in` and expose additional gate/A/dt/norm tensors
-                    // that this forward branch has not yet been wired up to
-                    // consume. Fail fast with a clear message so the panic
-                    // surface points at the intended follow-up rather than
-                    // manifesting as garbled output. See Issue #60 (Phase X.3.e).
+                    // 2. Fused input projection.
                     //
-                    // Phase X.3.d research summary (Issue #60 comment):
-                    // - Bonsai splits Qwen 3.5's fused `ssm_in [16384]` into
-                    //   `attn_qkv [10240]` (Q+K+V only) and `attn_gate [6144]`
-                    //   (the Z projection). Both tensors together carry the
-                    //   same information as the standard `ssm_in`.
-                    // - For Qwen 3.5-style config, in_proj_out is derived as
-                    //   `qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2`.
-                    //   With Qwen 3.6-27B / Bonsai values (qk_dim=128,
-                    //   num_kv_heads=16, v_dim=128, num_v_heads=48) that is
-                    //   `128 * 16 * 2 + 128 * 48 * 2 = 16384`, i.e. exactly
-                    //   `attn_qkv (10240) + attn_gate (6144)`.
-                    // - Additional Bonsai tensors (`ssm_a`, `ssm_dt_bias`,
-                    //   `ssm_norm`) refine the delta-rule integration and
-                    //   are surfaced through the corresponding Option fields;
-                    //   Phase X.3.e will consume them alongside the recurrent
-                    //   state update.
-                    let ssm_in = dn_layer.ssm_in.as_ref().unwrap_or_else(|| {
-                        todo!(
-                            "Bonsai-style DeltaNet forward not yet implemented \
-                             (attn_qkv [10240] + attn_gate [6144] carry the same \
-                             information as the standard `ssm_in [16384]`; \
-                             consumer wiring is Phase X.3.e, see Issue #60)"
-                        )
-                    });
-                    ssm_in.matvec(&norm_buf, &mut dn_in_proj);
+                    // Two GGUF variants coexist:
+                    //
+                    // * **Standard Qwen 3.5** — ships a single fused tensor
+                    //   `ssm_in.weight` with rows = `qk_dim * num_kv_heads * 2
+                    //   + v_dim * num_v_heads * 2` (16384 in the 27B config),
+                    //   packing `[Q | K | V | Z]` back-to-back.
+                    // * **Bonsai 27B / Qwen 3.6** — splits the fused tensor
+                    //   into `attn_qkv.weight` (rows = `qk_dim * num_kv_heads
+                    //   * 2 + v_dim * num_v_heads` = 10240, holds `[Q | K | V]`
+                    //   only) plus `attn_gate.weight` (rows = `v_dim *
+                    //   num_v_heads` = 6144, holds `[Z]`). The two tensors
+                    //   together carry the same information as `ssm_in`;
+                    //   see Phase X.3.d research in Issue #60.
+                    //
+                    // We reuse the single `dn_in_proj` buffer: the QKV portion
+                    // lives at `[0..qkv_len]`, Z at `[qkv_len..in_proj_out]`.
+                    // For the Bonsai variant the two halves are populated by
+                    // two independent matvecs; for the Qwen 3.5 variant the
+                    // single `ssm_in` matvec fills both halves at once.
+                    //
+                    // The additional Bonsai tensors (`ssm_a`, `ssm_dt_bias`,
+                    // `ssm_norm`) are Qwen 3.6-specific SSM-math refinements
+                    // that shape the delta-rule integration in ways the
+                    // reference implementation (`gated_deltanet_head_disjoint`)
+                    // does not yet model. They stay `#[allow(dead_code)]`
+                    // pending numerical comparison against llama.cpp Qwen 3.6
+                    // output; see the follow-up Phase X.3.e.3 note below.
+                    let qkv_len = dn_conv_dim;
+                    if let Some(ssm_in) = dn_layer.ssm_in.as_ref() {
+                        // Standard Qwen 3.5 fused path.
+                        ssm_in.matvec(&norm_buf, &mut dn_in_proj);
+                    } else {
+                        // Bonsai / Qwen 3.6 split path.
+                        let attn_qkv = dn_layer
+                            .attn_qkv
+                            .as_ref()
+                            .expect("DeltaNet layer with neither ssm_in nor attn_qkv slipped past the loader");
+                        let attn_gate = dn_layer
+                            .attn_gate
+                            .as_ref()
+                            .expect("Bonsai DeltaNet layer requires attn_gate alongside attn_qkv");
+                        attn_qkv.matvec(&norm_buf, &mut dn_in_proj[..qkv_len]);
+                        attn_gate.matvec(&norm_buf, &mut dn_in_proj[qkv_len..]);
+                    }
                     // 2a/2b. alpha / beta decay-rate + update-rate projections.
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
                     dn_layer.beta_proj.matvec(&norm_buf, &mut dn_beta);
@@ -3803,8 +3821,9 @@ impl<'a> Llama3Model<'a> {
                     // Split fused output. Layout (matches GPU-side loader):
                     //   [ q | k | v | z ]
                     // with `q` and `k` each `qk_dim * num_kv_heads` long and
-                    // `v` and `z` each `v_dim * num_v_heads` long.
-                    let qkv_len = dn_conv_dim;
+                    // `v` and `z` each `v_dim * num_v_heads` long. `qkv_len`
+                    // was declared above alongside the input-projection
+                    // matvec branching.
                     let q_start = 0;
                     let k_start = dn_qk_dim * dn_num_kv_heads;
                     let v_start = dn_qk_dim * dn_num_kv_heads * 2;
