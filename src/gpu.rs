@@ -2019,6 +2019,42 @@ impl GpuModel {
     ) -> Self {
         use crate::gguf::GgmlType;
 
+        // Bonsai / Qwen 3.6-27B detection — the GGUF splits attention QKV into
+        // `blk.0.attn_qkv.weight` (Q + swish gate for full-attention layers, or
+        // Q + K + V for DeltaNet layers) + `blk.0.attn_gate.weight` (Z for
+        // DeltaNet layers). This layout requires gated attention shader support
+        // and DeltaNet SSM refinement pipelines (`ssm_a` / `ssm_dt_bias` /
+        // `ssm_norm` consumers) that GpuModel does not yet implement.
+        //
+        // Rather than panicking at a random `.unwrap()` inside `upload_w(...
+        // "ssm_in.weight" ...)` when `ssm_in` is absent from the Bonsai GGUF,
+        // fail fast here with an actionable error message so the caller
+        // knows to use the CPU forward path (`llama3.rs`) instead.
+        if gguf.tensor_info("blk.0.attn_qkv.weight").is_some()
+            || gguf.tensor_info("blk.0.attn_gate.weight").is_some()
+            || gguf.tensor_info("blk.0.ssm_a.weight").is_some()
+            || gguf.tensor_info("blk.0.ssm_dt_bias.weight").is_some()
+        {
+            panic!(
+                "Bonsai / Qwen 3.6-27B GPU forward is not yet supported.\n\
+                 \n\
+                 This GGUF contains Bonsai-style tensors (`attn_qkv` split, `attn_gate`, \n\
+                 or SSM refinement tensors `ssm_a` / `ssm_dt_bias` / `ssm_norm`) which \n\
+                 require gated attention shader support and DeltaNet SSM refinement \n\
+                 pipelines that GpuModel does not implement.\n\
+                 \n\
+                 Use the CPU forward path via `llama3::Llama3Model` instead:\n\
+                 \n\
+                     let mut model = alice_llm::llama3::Llama3Model::load(&gguf)?;\n\
+                     let logits = model.forward(&token_ids)?;\n\
+                 \n\
+                 CPU forward has full Bonsai support including Phase X.3.e.3 SSM\n\
+                 refinements and Q1_0 / Q2_0 NEON kernels (Bonsai 27B runs on Jetson\n\
+                 8GB at ~10s / token). See `docs/BONSAI_GPU_SUPPORT.md` for the\n\
+                 GPU implementation scope."
+            );
+        }
+
         // OOM prevention: estimate peak memory usage and log warning if projected
         // to exceed available system memory. On integrated GPU (Jetson / Apple Silicon /
         // AMD APU / Intel iGPU), wgpu Vulkan / Metal typically double-allocates weight
