@@ -3755,10 +3755,28 @@ impl<'a> Llama3Model<'a> {
                     // consume. Fail fast with a clear message so the panic
                     // surface points at the intended follow-up rather than
                     // manifesting as garbled output. See Issue #60 (Phase X.3.e).
+                    //
+                    // Phase X.3.d research summary (Issue #60 comment):
+                    // - Bonsai splits Qwen 3.5's fused `ssm_in [16384]` into
+                    //   `attn_qkv [10240]` (Q+K+V only) and `attn_gate [6144]`
+                    //   (the Z projection). Both tensors together carry the
+                    //   same information as the standard `ssm_in`.
+                    // - For Qwen 3.5-style config, in_proj_out is derived as
+                    //   `qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2`.
+                    //   With Qwen 3.6-27B / Bonsai values (qk_dim=128,
+                    //   num_kv_heads=16, v_dim=128, num_v_heads=48) that is
+                    //   `128 * 16 * 2 + 128 * 48 * 2 = 16384`, i.e. exactly
+                    //   `attn_qkv (10240) + attn_gate (6144)`.
+                    // - Additional Bonsai tensors (`ssm_a`, `ssm_dt_bias`,
+                    //   `ssm_norm`) refine the delta-rule integration and
+                    //   are surfaced through the corresponding Option fields;
+                    //   Phase X.3.e will consume them alongside the recurrent
+                    //   state update.
                     let ssm_in = dn_layer.ssm_in.as_ref().unwrap_or_else(|| {
                         todo!(
                             "Bonsai-style DeltaNet forward not yet implemented \
-                             (attn_qkv / attn_gate / ssm_a / ssm_dt_bias / ssm_norm \
+                             (attn_qkv [10240] + attn_gate [6144] carry the same \
+                             information as the standard `ssm_in [16384]`; \
                              consumer wiring is Phase X.3.e, see Issue #60)"
                         )
                     });
