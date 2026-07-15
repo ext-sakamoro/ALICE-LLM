@@ -32,15 +32,23 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// 32 partial-sum slots × 16 subgroups = 2 KB smem.
-var<workgroup> sg00: array<f32, 16>; var<workgroup> sg01: array<f32, 16>; var<workgroup> sg02: array<f32, 16>; var<workgroup> sg03: array<f32, 16>;
-var<workgroup> sg10: array<f32, 16>; var<workgroup> sg11: array<f32, 16>; var<workgroup> sg12: array<f32, 16>; var<workgroup> sg13: array<f32, 16>;
-var<workgroup> sg20: array<f32, 16>; var<workgroup> sg21: array<f32, 16>; var<workgroup> sg22: array<f32, 16>; var<workgroup> sg23: array<f32, 16>;
-var<workgroup> sg30: array<f32, 16>; var<workgroup> sg31: array<f32, 16>; var<workgroup> sg32: array<f32, 16>; var<workgroup> sg33: array<f32, 16>;
-var<workgroup> sg40: array<f32, 16>; var<workgroup> sg41: array<f32, 16>; var<workgroup> sg42: array<f32, 16>; var<workgroup> sg43: array<f32, 16>;
-var<workgroup> sg50: array<f32, 16>; var<workgroup> sg51: array<f32, 16>; var<workgroup> sg52: array<f32, 16>; var<workgroup> sg53: array<f32, 16>;
-var<workgroup> sg60: array<f32, 16>; var<workgroup> sg61: array<f32, 16>; var<workgroup> sg62: array<f32, 16>; var<workgroup> sg63: array<f32, 16>;
-var<workgroup> sg70: array<f32, 16>; var<workgroup> sg71: array<f32, 16>; var<workgroup> sg72: array<f32, 16>; var<workgroup> sg73: array<f32, 16>;
+// Single consolidated threadgroup array — 32 accumulator slots (8 rows ×
+// 4 batches) × 16 subgroups = 512 f32 = 2 KB smem. Indexed as
+// `sg_all[(row * 4 + batch) * 16 + sg_id]`.
+//
+// Metal has a per-shader hard limit on the *number* of distinct
+// `threadgroup` resources (each `var<workgroup>` becomes one Metal
+// threadgroup slot). 32 separate arrays hit that limit ("no 'threadgroup'
+// resource location available"), so we consolidate into one flat array.
+// WGSL naga transpiles this into a single Metal `threadgroup type_4&`,
+// staying under the resource-slot budget while preserving the same
+// per-accumulator 16 subgroup partial-sum layout.
+var<workgroup> sg_all: array<f32, 512>;
+
+// Convenience: base index of accumulator `(row, batch)` in `sg_all`.
+fn sg_base(row: u32, batch: u32) -> u32 {
+    return (row * 4u + batch) * 16u;
+}
 
 const BLOCK_BYTES: u32 = 18u;
 
@@ -195,14 +203,22 @@ fn matvec_q1_0_row8_batch4(
 
     let sg_id = tid / sg_size;
     if (sg_lane == 0u) {
-        sg00[sg_id] = s00; sg01[sg_id] = s01; sg02[sg_id] = s02; sg03[sg_id] = s03;
-        sg10[sg_id] = s10; sg11[sg_id] = s11; sg12[sg_id] = s12; sg13[sg_id] = s13;
-        sg20[sg_id] = s20; sg21[sg_id] = s21; sg22[sg_id] = s22; sg23[sg_id] = s23;
-        sg30[sg_id] = s30; sg31[sg_id] = s31; sg32[sg_id] = s32; sg33[sg_id] = s33;
-        sg40[sg_id] = s40; sg41[sg_id] = s41; sg42[sg_id] = s42; sg43[sg_id] = s43;
-        sg50[sg_id] = s50; sg51[sg_id] = s51; sg52[sg_id] = s52; sg53[sg_id] = s53;
-        sg60[sg_id] = s60; sg61[sg_id] = s61; sg62[sg_id] = s62; sg63[sg_id] = s63;
-        sg70[sg_id] = s70; sg71[sg_id] = s71; sg72[sg_id] = s72; sg73[sg_id] = s73;
+        sg_all[sg_base(0u, 0u) + sg_id] = s00; sg_all[sg_base(0u, 1u) + sg_id] = s01;
+        sg_all[sg_base(0u, 2u) + sg_id] = s02; sg_all[sg_base(0u, 3u) + sg_id] = s03;
+        sg_all[sg_base(1u, 0u) + sg_id] = s10; sg_all[sg_base(1u, 1u) + sg_id] = s11;
+        sg_all[sg_base(1u, 2u) + sg_id] = s12; sg_all[sg_base(1u, 3u) + sg_id] = s13;
+        sg_all[sg_base(2u, 0u) + sg_id] = s20; sg_all[sg_base(2u, 1u) + sg_id] = s21;
+        sg_all[sg_base(2u, 2u) + sg_id] = s22; sg_all[sg_base(2u, 3u) + sg_id] = s23;
+        sg_all[sg_base(3u, 0u) + sg_id] = s30; sg_all[sg_base(3u, 1u) + sg_id] = s31;
+        sg_all[sg_base(3u, 2u) + sg_id] = s32; sg_all[sg_base(3u, 3u) + sg_id] = s33;
+        sg_all[sg_base(4u, 0u) + sg_id] = s40; sg_all[sg_base(4u, 1u) + sg_id] = s41;
+        sg_all[sg_base(4u, 2u) + sg_id] = s42; sg_all[sg_base(4u, 3u) + sg_id] = s43;
+        sg_all[sg_base(5u, 0u) + sg_id] = s50; sg_all[sg_base(5u, 1u) + sg_id] = s51;
+        sg_all[sg_base(5u, 2u) + sg_id] = s52; sg_all[sg_base(5u, 3u) + sg_id] = s53;
+        sg_all[sg_base(6u, 0u) + sg_id] = s60; sg_all[sg_base(6u, 1u) + sg_id] = s61;
+        sg_all[sg_base(6u, 2u) + sg_id] = s62; sg_all[sg_base(6u, 3u) + sg_id] = s63;
+        sg_all[sg_base(7u, 0u) + sg_id] = s70; sg_all[sg_base(7u, 1u) + sg_id] = s71;
+        sg_all[sg_base(7u, 2u) + sg_id] = s72; sg_all[sg_base(7u, 3u) + sg_id] = s73;
     }
     workgroupBarrier();
 
@@ -217,14 +233,22 @@ fn matvec_q1_0_row8_batch4(
         var t70: f32 = 0.0; var t71: f32 = 0.0; var t72: f32 = 0.0; var t73: f32 = 0.0;
         let n_sg = 128u / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
-            t00 += sg00[s]; t01 += sg01[s]; t02 += sg02[s]; t03 += sg03[s];
-            t10 += sg10[s]; t11 += sg11[s]; t12 += sg12[s]; t13 += sg13[s];
-            t20 += sg20[s]; t21 += sg21[s]; t22 += sg22[s]; t23 += sg23[s];
-            t30 += sg30[s]; t31 += sg31[s]; t32 += sg32[s]; t33 += sg33[s];
-            t40 += sg40[s]; t41 += sg41[s]; t42 += sg42[s]; t43 += sg43[s];
-            t50 += sg50[s]; t51 += sg51[s]; t52 += sg52[s]; t53 += sg53[s];
-            t60 += sg60[s]; t61 += sg61[s]; t62 += sg62[s]; t63 += sg63[s];
-            t70 += sg70[s]; t71 += sg71[s]; t72 += sg72[s]; t73 += sg73[s];
+            t00 += sg_all[sg_base(0u, 0u) + s]; t01 += sg_all[sg_base(0u, 1u) + s];
+            t02 += sg_all[sg_base(0u, 2u) + s]; t03 += sg_all[sg_base(0u, 3u) + s];
+            t10 += sg_all[sg_base(1u, 0u) + s]; t11 += sg_all[sg_base(1u, 1u) + s];
+            t12 += sg_all[sg_base(1u, 2u) + s]; t13 += sg_all[sg_base(1u, 3u) + s];
+            t20 += sg_all[sg_base(2u, 0u) + s]; t21 += sg_all[sg_base(2u, 1u) + s];
+            t22 += sg_all[sg_base(2u, 2u) + s]; t23 += sg_all[sg_base(2u, 3u) + s];
+            t30 += sg_all[sg_base(3u, 0u) + s]; t31 += sg_all[sg_base(3u, 1u) + s];
+            t32 += sg_all[sg_base(3u, 2u) + s]; t33 += sg_all[sg_base(3u, 3u) + s];
+            t40 += sg_all[sg_base(4u, 0u) + s]; t41 += sg_all[sg_base(4u, 1u) + s];
+            t42 += sg_all[sg_base(4u, 2u) + s]; t43 += sg_all[sg_base(4u, 3u) + s];
+            t50 += sg_all[sg_base(5u, 0u) + s]; t51 += sg_all[sg_base(5u, 1u) + s];
+            t52 += sg_all[sg_base(5u, 2u) + s]; t53 += sg_all[sg_base(5u, 3u) + s];
+            t60 += sg_all[sg_base(6u, 0u) + s]; t61 += sg_all[sg_base(6u, 1u) + s];
+            t62 += sg_all[sg_base(6u, 2u) + s]; t63 += sg_all[sg_base(6u, 3u) + s];
+            t70 += sg_all[sg_base(7u, 0u) + s]; t71 += sg_all[sg_base(7u, 1u) + s];
+            t72 += sg_all[sg_base(7u, 2u) + s]; t73 += sg_all[sg_base(7u, 3u) + s];
         }
 
         // Output layout matches batch4 family: output_vec[batch * rows + row].
