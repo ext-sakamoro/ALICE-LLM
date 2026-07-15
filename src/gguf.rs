@@ -3628,6 +3628,23 @@ pub fn quantized_matvec_preq(
         GgmlType::Q5_K => q5k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q6_K => q6k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::IQ4_XS => iq4_xs_matvec_preq(data, rows, cols, q8_blocks, output),
+        // Bonsai / PrismML ternary formats: no native `_preq` path exists
+        // yet, so dequantise the pre-quantised Q8_K activations back to f32
+        // and delegate to the standard `quantized_matvec` dispatcher, which
+        // hits the Q1_0 / Q2_0 fallback implementations added in Phase X.1.
+        GgmlType::Q1_0 | GgmlType::Q2_0 => {
+            let mut input_f32 = vec![0.0f32; cols];
+            for (b, block) in q8_blocks.iter().enumerate() {
+                let base = b * QK_K;
+                for i in 0..QK_K {
+                    if base + i >= cols {
+                        break;
+                    }
+                    input_f32[base + i] = block.d * block.qs[i] as f32;
+                }
+            }
+            quantized_matvec(&input_f32, data, qtype, rows, cols, output);
+        }
         _ => panic!("quantized_matvec_preq only supports Q2_K-Q6_K and IQ4_XS, got {qtype:?}"),
     }
 }
