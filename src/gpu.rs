@@ -13,6 +13,8 @@ const MATVEC_Q1_0_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0.wgsl"
 const MATVEC_Q1_0_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0_batch4.wgsl");
 const MATVEC_Q1_0_ROW4_BATCH4_SHADER: &str =
     include_str!("shaders/dequant_matvec_q1_0_row4_batch4.wgsl");
+const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
+    include_str!("shaders/dequant_matvec_q1_0_row8_batch4.wgsl");
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
@@ -150,6 +152,13 @@ pub struct GpuEngine {
     /// and 4× less total input-read traffic. Register / smem cost: 16 f32
     /// accumulators + 16 subgroup partial-sum arrays (1 KB smem).
     matvec_q1_0_row4_batch4_pipeline: wgpu::ComputePipeline,
+    /// Q1_0 row8×batch4 matvec — 1 workgroup produces 8 rows × 4 batches =
+    /// 32 outputs. Doubles the row-batching factor over row4×batch4:
+    /// workgroup count drops another 2× (2560 → 1280 on Bonsai attn_qkv)
+    /// and total input-read traffic drops another 2×. Register cost: 32 f32
+    /// accumulators (scalar named vars, no dynamic indexing → no spill).
+    /// Shared memory: 2 KB (32 subgroup partial-sum arrays).
+    matvec_q1_0_row8_batch4_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
     silu_mul_pipeline: wgpu::ComputePipeline,
     residual_add_pipeline: wgpu::ComputePipeline,
@@ -268,6 +277,11 @@ impl GpuEngine {
             "matvec_q1_0_row4_batch4",
             "matvec_q1_0_row4_batch4",
         );
+        let matvec_q1_0_row8_batch4_pipeline = make_pipeline(
+            MATVEC_Q1_0_ROW8_BATCH4_SHADER,
+            "matvec_q1_0_row8_batch4",
+            "matvec_q1_0_row8_batch4",
+        );
         let swiglu_fused_q4k_pipeline = make_pipeline(
             SWIGLU_FUSED_Q4K_SHADER,
             "swiglu_fused_q4k",
@@ -327,6 +341,7 @@ impl GpuEngine {
             matvec_q1_0_pipeline,
             matvec_q1_0_batch4_pipeline,
             matvec_q1_0_row4_batch4_pipeline,
+            matvec_q1_0_row8_batch4_pipeline,
             rmsnorm_pipeline: make_pipeline(RMSNORM_SHADER, "rmsnorm", "rmsnorm"),
             silu_mul_pipeline: make_pipeline(SILU_MUL_SHADER, "silu_mul", "silu_mul"),
             residual_add_pipeline: make_pipeline(
@@ -787,6 +802,76 @@ impl<'a> GpuPass<'a> {
     /// The shader itself clamps to `params.rows` internally, so callers that
     /// pass a row count that isn't a multiple of 4 still produce correct
     /// output (the trailing 1..3 rows of the last row-group are guarded).
+    /// Q1_0 row8×batch4 GPU matvec — 1 workgroup produces 8 rows × 4 batches
+    /// = 32 outputs. Compounds `matvec_q1_0_row4_batch4` by doubling the row
+    /// batching factor, dropping workgroup count another 2× and total
+    /// input-read traffic another 2× on top of Step 4's row4×batch4.
+    ///
+    /// Register cost: 32 f32 accumulators per thread (scalar named vars,
+    /// no dynamic indexing) — verified compiles clean on Vulkan iGPU
+    /// (Jetson Orin Nano, Ampere) and Metal (Apple Silicon).
+    ///
+    /// Input / output layout matches `matvec_q1_0_row4_batch4`:
+    ///   input[batch * cols  + col]   for batch ∈ [0..4)
+    ///   output[batch * rows + row]   for batch ∈ [0..4), row ∈ [0..rows)
+    pub fn matvec_q1_0_row8_batch4(
+        &mut self,
+        weights: &GpuWeightBuffer,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+    ) {
+        // 8 rows per workgroup → workgroup count is ceil(rows / 8).
+        let row_groups = weights.rows.div_ceil(8);
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(row_groups);
+        let params = self.engine.make_uniform(&MatvecParams {
+            rows: weights.rows,
+            cols: weights.cols,
+            blocks_per_row: weights.blocks_per_row,
+            grid_x,
+            batch_size: 4,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        });
+        let layout = self
+            .engine
+            .matvec_q1_0_row8_batch4_pipeline
+            .get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.matvec_q1_0_row8_batch4_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
     pub fn matvec_q1_0_row4_batch4(
         &mut self,
         weights: &GpuWeightBuffer,
