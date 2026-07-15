@@ -1679,9 +1679,23 @@ mod avx2_dot {
     /// Q6_K × Q8_K dot product using AVX2.
     ///
     /// Reconstructs 6-bit values from the low 4 bits (`ql`) and top 2 bits
-    /// (`qh`), subtracts 32 to shift `[0, 63]` into signed `[-32, 31]`,
-    /// then uses the sign trick (`dot_32_i8_signed`) to reuse the u8×i8
-    /// madd path for signed×signed dots.
+    /// (`qh`) via vectorised bit unpacking (mirrors the NEON kernel — see
+    /// `neon_dot::q6k_q8k_dot`), then does 16-element sub-block dots with
+    /// `dot_16_i8_widened`.
+    ///
+    /// Per outer iteration (2 iters cover the 256-element block) we load 64
+    /// ql bytes as two 32-byte AVX2 vectors plus 32 qh bytes as one vector,
+    /// then produce four 32-byte quadrants of aux8 via shift/mask/or:
+    ///   Q0: (ql_lo & 0xF) | ((qh << 4) & 0x30) - 32
+    ///   Q1: (ql_hi & 0xF) | ((qh << 2) & 0x30) - 32
+    ///   Q2: (ql_lo >> 4)  | ( qh       & 0x30) - 32
+    ///   Q3: (ql_hi >> 4)  | ((qh >> 2) & 0x30) - 32
+    ///
+    /// AVX2 lacks a native 8-bit shift, so we shift as u16 and rely on the
+    /// `0x30` / `0x0F` byte mask to discard any bits that leaked across the
+    /// byte boundary — those bits land outside the target byte positions
+    /// (bits 4-5 for the high nibble, bits 0-3 for the low nibble) and are
+    /// therefore killed by the mask.
     #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
@@ -1693,19 +1707,49 @@ mod avx2_dot {
         // Reconstruct 256 signed i8 values on the stack. The layout matches
         // `q6k_q8k_dot_scalar`: 16 sub-blocks of 16 elements each.
         let mut aux8 = [0i8; QK_K];
+        let mask_nib = _mm256_set1_epi8(0x0F);
+        let mask_hi = _mm256_set1_epi8(0x30);
+        let bias = _mm256_set1_epi8(-32);
         let mut a_off = 0usize;
         let mut ql_off = 0usize;
         let mut qh_off = 0usize;
         for _ in 0..2 {
-            for l in 0..32 {
-                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 32] =
-                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 64] =
-                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 96] =
-                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
-            }
+            let ql_lo = _mm256_loadu_si256(ql.as_ptr().add(ql_off).cast());
+            let ql_hi = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32).cast());
+            let qh_v = _mm256_loadu_si256(qh.as_ptr().add(qh_off).cast());
+
+            // Quadrant 0: (ql_lo & 0xF) | ((qh << 4) & 0x30) - 32
+            let hi0 = _mm256_and_si256(_mm256_slli_epi16(qh_v, 4), mask_hi);
+            let q0 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(ql_lo, mask_nib), hi0),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off).cast(), q0);
+
+            // Quadrant 1: (ql_hi & 0xF) | ((qh << 2) & 0x30) - 32
+            let hi1 = _mm256_and_si256(_mm256_slli_epi16(qh_v, 2), mask_hi);
+            let q1 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(ql_hi, mask_nib), hi1),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 32).cast(), q1);
+
+            // Quadrant 2: (ql_lo >> 4) | (qh & 0x30) - 32
+            let hi2 = _mm256_and_si256(qh_v, mask_hi);
+            let q2 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_nib), hi2),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 64).cast(), q2);
+
+            // Quadrant 3: (ql_hi >> 4) | ((qh >> 2) & 0x30) - 32
+            let hi3 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 2), mask_hi);
+            let q3 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_nib), hi3),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 96).cast(), q3);
+
             a_off += 128;
             ql_off += 64;
             qh_off += 32;
@@ -1983,53 +2027,6 @@ mod avx512_dot {
     use super::*;
     use std::arch::x86_64::*;
 
-    /// Horizontal sum of `__m512i` interpreted as 16 lanes of i32.
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn hsum_i32_avx512(v: __m512i) -> i32 {
-        // Reduce 512 → 256 → 128 → 32.
-        let lo = _mm512_castsi512_si256(v);
-        let hi = _mm512_extracti64x4_epi64(v, 1);
-        let sum256 = _mm256_add_epi32(lo, hi);
-        let lo128 = _mm256_castsi256_si128(sum256);
-        let hi128 = _mm256_extracti128_si256(sum256, 1);
-        let sum128 = _mm_add_epi32(lo128, hi128);
-        let sh = _mm_shuffle_epi32(sum128, 0b1110);
-        let sum64 = _mm_add_epi32(sum128, sh);
-        let sh2 = _mm_shufflelo_epi16(sum64, 0b1110);
-        let sum32 = _mm_add_epi32(sum64, sh2);
-        _mm_cvtsi128_si32(sum32)
-    }
-
-    /// AVX-512 signed dot product of 64 i8 values, seeded into an accumulator.
-    ///
-    /// Same sign trick as [`avx2_dot::dot_32_i8_signed`], widened to 64
-    /// lanes per iteration. Uses AVX-512BW for `maddubs` / `madd`.
-    #[inline]
-    #[target_feature(enable = "avx512bw")]
-    unsafe fn dot_64_i8_signed(acc: __m512i, w: *const i8, x: *const i8) -> __m512i {
-        let wv = _mm512_loadu_si512(w.cast());
-        let xv = _mm512_loadu_si512(x.cast());
-        // AVX-512 has no `_mm512_sign_epi8`; the equivalent is a blend
-        // driven by the sign bit of `w`.
-        let zero = _mm512_setzero_si512();
-        let neg_w = _mm512_sub_epi8(zero, wv);
-        // AVX-512BW compare returning a mask (kmask).
-        let is_neg = _mm512_cmpgt_epi8_mask(zero, wv);
-        let is_zero = _mm512_cmpeq_epi8_mask(wv, zero);
-        // |w|: pick negated `w` where `w < 0`, else `w`; zeros stay zero.
-        let w_abs = _mm512_mask_blend_epi8(is_neg, wv, neg_w);
-        let neg_x = _mm512_sub_epi8(zero, xv);
-        // sign(w) * x: negate where `w < 0`, keep where `w > 0`, zero where `w == 0`.
-        let x_signed_no_zero = _mm512_mask_blend_epi8(is_neg, xv, neg_x);
-        let x_signed = _mm512_mask_blend_epi8(is_zero, x_signed_no_zero, zero);
-
-        let prod16 = _mm512_maddubs_epi16(w_abs, x_signed);
-        let ones = _mm512_set1_epi16(1);
-        let prod32 = _mm512_madd_epi16(prod16, ones);
-        _mm512_add_epi32(acc, prod32)
-    }
-
     /// AVX-512 dot product of 64 unsigned nibbles × 64 signed i8 values.
     #[inline]
     #[target_feature(enable = "avx512bw")]
@@ -2112,11 +2109,47 @@ mod avx512_dot {
         d * q8k.d * total as f32 - dmin * q8k.d * sumi as f32
     }
 
+    /// 16-element i8 × i8 dot using AVX2 widening. Local copy of
+    /// `avx2_dot::dot_16_i8_widened` — AVX-512BW implies AVX2 support so the
+    /// intrinsics compile fine under the enclosing `avx512bw` feature gate.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_16_i8_widened_avx2(acc: __m256i, w: *const i8, x: *const i8) -> __m256i {
+        let w16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.cast()));
+        let x16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.cast()));
+        let prod32 = _mm256_madd_epi16(w16, x16);
+        _mm256_add_epi32(acc, prod32)
+    }
+
+    /// AVX2 horizontal-sum helper. Mirrors `avx2_dot::hsum_i32_avx2`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256(v, 1);
+        let sum128 = _mm_add_epi32(lo, hi);
+        let sh = _mm_shuffle_epi32(sum128, 0b1110);
+        let sum64 = _mm_add_epi32(sum128, sh);
+        let sh2 = _mm_shufflelo_epi16(sum64, 0b1110);
+        let sum32 = _mm_add_epi32(sum64, sh2);
+        _mm_cvtsi128_si32(sum32)
+    }
+
     /// Q6_K × Q8_K dot product using AVX-512BW.
     ///
-    /// Reconstructs 256 signed i8 values, then processes 4 iterations of
-    /// 64-lane signed dot. Weights are applied per 16-element sub-block
-    /// so we split each 64-lane dot into four scalar 16-element halves.
+    /// Two hot paths were previously scalar in this kernel:
+    ///
+    /// 1. **6-bit unpack** — 128 iterations of `((ql & 0xF) | ((qh >> …) << 4)) - 32`
+    ///    per outer block. Replaced with the AVX2 parallel bit unpacking
+    ///    pattern (mirrors `avx2_dot::q6k_q8k_dot` and the NEON kernel):
+    ///    load `ql_lo` / `ql_hi` (two 32-byte AVX2 vectors) and `qh` (one
+    ///    32-byte vector), then produce four 32-byte aux8 quadrants via
+    ///    byte-wise shift/mask/or.
+    /// 2. **Per-sub-block dot** — the previous implementation issued a
+    ///    64-lane signed dot, discarded its result, and manually re-computed
+    ///    the 16-element dots in scalar. Replaced with a proper
+    ///    `_mm256_madd_epi16`-based 16-lane sub-block dot
+    ///    (`dot_16_i8_widened_avx2`), matching the AVX2 kernel.
     #[inline]
     #[target_feature(enable = "avx512bw")]
     pub(super) unsafe fn q6k_q8k_dot(q6k_block: &[u8], q8k: &BlockQ8K) -> f32 {
@@ -2125,45 +2158,66 @@ mod avx512_dot {
         let scales = &q6k_block[192..208];
         let d = f16_to_f32(u16::from_le_bytes([q6k_block[208], q6k_block[209]]));
 
+        // Vectorised bit unpacking (AVX2 subset, safe under avx512bw).
         let mut aux8 = [0i8; QK_K];
+        let mask_nib = _mm256_set1_epi8(0x0F);
+        let mask_hi = _mm256_set1_epi8(0x30);
+        let bias = _mm256_set1_epi8(-32);
         let mut a_off = 0usize;
         let mut ql_off = 0usize;
         let mut qh_off = 0usize;
         for _ in 0..2 {
-            for l in 0..32 {
-                aux8[a_off + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 32] =
-                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 64] =
-                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                aux8[a_off + l + 96] =
-                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
-            }
+            let ql_lo = _mm256_loadu_si256(ql.as_ptr().add(ql_off).cast());
+            let ql_hi = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32).cast());
+            let qh_v = _mm256_loadu_si256(qh.as_ptr().add(qh_off).cast());
+
+            // Q0: (ql_lo & 0xF) | ((qh << 4) & 0x30) - 32
+            let hi0 = _mm256_and_si256(_mm256_slli_epi16(qh_v, 4), mask_hi);
+            let q0 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(ql_lo, mask_nib), hi0),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off).cast(), q0);
+
+            // Q1: (ql_hi & 0xF) | ((qh << 2) & 0x30) - 32
+            let hi1 = _mm256_and_si256(_mm256_slli_epi16(qh_v, 2), mask_hi);
+            let q1 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(ql_hi, mask_nib), hi1),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 32).cast(), q1);
+
+            // Q2: (ql_lo >> 4) | (qh & 0x30) - 32
+            let hi2 = _mm256_and_si256(qh_v, mask_hi);
+            let q2 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_nib), hi2),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 64).cast(), q2);
+
+            // Q3: (ql_hi >> 4) | ((qh >> 2) & 0x30) - 32
+            let hi3 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 2), mask_hi);
+            let q3 = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_nib), hi3),
+                bias,
+            );
+            _mm256_storeu_si256(aux8.as_mut_ptr().add(a_off + 96).cast(), q3);
+
             a_off += 128;
             ql_off += 64;
             qh_off += 32;
         }
 
-        // 4 iterations × 64 lanes = 256 elements. Each iteration covers 4
-        // 16-element Q6_K sub-blocks. We use the 64-lane dot to amortise
-        // loads / sign extraction and then split back to 16-element groups
-        // for the per-sub-block scale weighting.
+        // 16 sub-blocks of 16 elements — SIMD per-sub-block dot via
+        // widened i8 → i16 → i32 madd. Matches the AVX2 kernel.
         let mut total: i32 = 0;
-        for group in 0..4 {
-            let a_ptr = aux8.as_ptr().add(group * 64);
-            let q8_ptr = q8k.qs.as_ptr().add(group * 64);
-            let acc0 = _mm512_setzero_si512();
-            let acc = dot_64_i8_signed(acc0, a_ptr, q8_ptr);
-            let _full_dot = hsum_i32_avx512(acc);
-            // Split into 4 × 16-element per-scale sub-dots.
-            for sub in 0..4 {
-                let mut d_sub = 0i32;
-                let off = group * 64 + sub * 16;
-                for l in 0..16 {
-                    d_sub += aux8[off + l] as i32 * q8k.qs[off + l] as i32;
-                }
-                total += scales[group * 4 + sub] as i8 as i32 * d_sub;
-            }
+        for is in 0..16 {
+            let a_ptr = aux8.as_ptr().add(is * 16);
+            let q8_ptr = q8k.qs.as_ptr().add(is * 16);
+            let acc0 = _mm256_setzero_si256();
+            let acc = dot_16_i8_widened_avx2(acc0, a_ptr, q8_ptr);
+            let sub_dot = hsum_i32_avx2(acc);
+            total += scales[is] as i8 as i32 * sub_dot;
         }
 
         d * q8k.d * total as f32
