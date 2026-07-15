@@ -2193,6 +2193,7 @@ fn gated_deltanet_step(
     num_v_heads: usize,
     qk_dim: usize,
     v_dim: usize,
+    bonsai_semantics: bool,
 ) {
     debug_assert!(num_kv_heads > 0);
     debug_assert!(num_v_heads > 0);
@@ -2230,6 +2231,7 @@ fn gated_deltanet_step(
                 num_v_heads,
                 qk_dim,
                 v_dim,
+                bonsai_semantics,
             );
             return;
         }
@@ -2253,6 +2255,7 @@ fn gated_deltanet_step(
             &mut out[v_off..v_off + v_dim],
             qk_dim,
             v_dim,
+            bonsai_semantics,
         );
     }
 }
@@ -2279,6 +2282,7 @@ fn gated_deltanet_step_parallel(
     _num_v_heads: usize,
     qk_dim: usize,
     v_dim: usize,
+    bonsai_semantics: bool,
 ) {
     use rayon::iter::{IndexedParallelIterator, ParallelIterator};
     use rayon::slice::ParallelSliceMut;
@@ -2305,6 +2309,7 @@ fn gated_deltanet_step_parallel(
                 out_slab,
                 qk_dim,
                 v_dim,
+                bonsai_semantics,
             );
         });
 }
@@ -2348,6 +2353,7 @@ fn gated_deltanet_head(
         &mut out[v_off..v_off + v_dim],
         qk_dim,
         v_dim,
+        false,
     );
 }
 
@@ -2365,6 +2371,7 @@ fn gated_deltanet_head_disjoint(
     out: &mut [f32],
     qk_dim: usize,
     v_dim: usize,
+    bonsai_semantics: bool,
 ) {
     // L2 normalize q with a tiny epsilon so a zero vector produces a
     // zero output rather than NaN (matches WGSL `max(sqrt(sum_sq), 1e-12)`).
@@ -2382,9 +2389,15 @@ fn gated_deltanet_head_disjoint(
 
     for j in 0..v_dim {
         // Column j of `S^T @ k` = sum_i state[i, j] * k_i.
+        // Bonsai / Qwen 3.6 path skips the internal silu because the
+        // caller pre-silu'd q / k post-conv1d (qwen35.cpp:502).
         let mut st_k = 0.0f32;
         for i in 0..qk_dim {
-            let k_i = silu(k[i]) * k_norm;
+            let k_i = if bonsai_semantics {
+                k[i] * k_norm
+            } else {
+                silu(k[i]) * k_norm
+            };
             st_k += state[i * v_dim + j] * k_i;
         }
         let error_j = v[j] - alpha_h * st_k;
@@ -2392,16 +2405,25 @@ fn gated_deltanet_head_disjoint(
         // Update state column j while computing the new output entry.
         let mut out_j = 0.0f32;
         for i in 0..qk_dim {
-            let k_i = silu(k[i]) * k_norm;
-            let q_i = silu(q[i]) * q_norm;
+            let (k_i, q_i) = if bonsai_semantics {
+                (k[i] * k_norm, q[i] * q_norm)
+            } else {
+                (silu(k[i]) * k_norm, silu(q[i]) * q_norm)
+            };
             let idx = i * v_dim + j;
             let s_new = alpha_h * state[idx] + beta_h * k_i * error_j;
             state[idx] = s_new;
             out_j += s_new * q_i;
         }
 
-        // Gated output: `output_j *= silu(z_j)`.
-        out[j] = out_j * silu(z[j]);
+        // Gated output: legacy path multiplies by silu(z_j) inline; the
+        // Bonsai path defers the z-gate to after ssm-norm (matches
+        // qwen35.cpp:562 build_norm_gated) so we leave `out_j` untouched.
+        out[j] = if bonsai_semantics {
+            out_j
+        } else {
+            out_j * silu(z[j])
+        };
     }
 }
 
@@ -3943,19 +3965,18 @@ impl<'a> Llama3Model<'a> {
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
                     dn_layer.beta_proj.matvec(&norm_buf, &mut dn_beta);
 
+                    // Detect Bonsai / Qwen 3.6 path once. Presence of both
+                    // `ssm_a` and `ssm_dt_bias` toggles four reference-aligned
+                    // refinements: SSM discretisation (Gap B), beta sigmoid
+                    // (Gap B extra), pre-silu on Q/K/V post-conv1d
+                    // (§Q/K L2Norm) and z-gate after ssm-norm (§silu(z) order).
+                    // Qwen 3.5 GGUFs ship neither tensor and take the legacy
+                    // path, preserving pre-Phase-X.3.e.3.2 numerics.
+                    let is_bonsai_path = dn_layer.ssm_a.is_some() && dn_layer.ssm_dt_bias.is_some();
+
                     // 2c. Bonsai / Qwen 3.6 SSM discretisation (Phase X.3.e.3.2
                     // Gap B). Reference: PrismML llama.cpp fork qwen35.cpp:443
-                    // -451, where the raw alpha projection is transformed into
-                    // an actual per-V-head decay factor via
-                    //   alpha_biased = alpha + ssm_dt_bias
-                    //   alpha_softplus = softplus(alpha_biased)     // > 0
-                    //   gate = alpha_softplus * ssm_a               // < 0 (ssm_a stored ≈ -exp(A_log))
-                    //   decay = exp(gate)                           // ∈ (0, 1]
-                    // The transformed `decay` replaces `alpha_h` inside the
-                    // recurrence, matching the Mamba-style selective SSM math.
-                    // Standard Qwen 3.5 GGUFs ship neither `ssm_a` nor
-                    // `ssm_dt.bias`; the branch below is a no-op for those
-                    // and preserves the pre-Phase-X.3.e.3.2 numerics.
+                    // -451.
                     if let (Some(ssm_a), Some(ssm_dt_bias)) =
                         (dn_layer.ssm_a.as_ref(), dn_layer.ssm_dt_bias.as_ref())
                     {
@@ -4006,6 +4027,18 @@ impl<'a> Llama3Model<'a> {
                         dn_conv_kernel,
                     );
 
+                    // 3.5. Bonsai / Qwen 3.6 post-conv1d SiLU (Phase X.3.e.3.2
+                    // §Q/K L2Norm). Reference qwen35.cpp:502 applies
+                    // ggml_silu(conv_output) before the recurrence; the
+                    // head kernel with bonsai_semantics=true then skips
+                    // its internal silu. Qwen 3.5 legacy path leaves the
+                    // raw conv output and silu's Q/K in-line.
+                    if is_bonsai_path {
+                        for val in dn_conv_out[..qkv_len].iter_mut() {
+                            *val = silu(*val);
+                        }
+                    }
+
                     // 4. Gated DeltaNet recurrence: reads q/k/v from the
                     //    convolved buffer, z from the unconvolved fused
                     //    output, alpha / beta from the dedicated projections.
@@ -4027,17 +4060,33 @@ impl<'a> Llama3Model<'a> {
                         dn_num_v_heads,
                         dn_qk_dim,
                         dn_v_dim,
+                        is_bonsai_path,
                     );
 
                     // 4.5. Bonsai / Qwen 3.6 per-V-head state RMSNorm on the
                     // recurrence output, prior to the `ssm_out` projection.
                     // Standard Qwen 3.5 exports no `ssm_norm` tensor and this
                     // block is skipped, preserving the pre-Phase-X.3.e.3.2
-                    // numerics. `apply_qk_norm` broadcasts the [v_dim] weight
-                    // across every V head slab, matching llama.cpp's
-                    // `ggml_rms_norm_ext(x, weight, eps)` semantics.
+                    // numerics.
                     if let Some(ssm_norm) = dn_layer.ssm_norm.as_ref() {
                         apply_qk_norm(&mut dn_delta_out, ssm_norm, dn_v_dim, c.norm_eps);
+                    }
+
+                    // 4.6. Bonsai / Qwen 3.6 z-gate (Phase X.3.e.3.2
+                    // §silu(z) order). Reference qwen35.cpp:562
+                    // build_norm_gated(rms_norm(x, w) * silu(z)) applies
+                    // the z-gate after ssm-norm. The Bonsai head kernel
+                    // skipped its inline `out *= silu(z)` so we multiply
+                    // externally here. Qwen 3.5 legacy already has the
+                    // z-gate applied inside the kernel and this block
+                    // is a no-op.
+                    if is_bonsai_path {
+                        for h in 0..dn_num_v_heads {
+                            for j in 0..dn_v_dim {
+                                let idx = h * dn_v_dim + j;
+                                dn_delta_out[idx] *= silu(z_slice[idx]);
+                            }
+                        }
                     }
 
                     // 5. Output projection to hidden dim.
@@ -10200,7 +10249,7 @@ mod tests {
 
         gated_deltanet_step(
             &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, num_heads, qk_dim,
-            v_dim,
+            v_dim, false,
         );
 
         // Sanity: state should be non-zero and finite (recurrence absorbed
@@ -10234,7 +10283,7 @@ mod tests {
 
         gated_deltanet_step(
             &q, &k, &v, &alpha, &beta, &z, &mut state, &mut out, num_heads, num_heads, qk_dim,
-            v_dim,
+            v_dim, false,
         );
 
         assert!(state.iter().all(|v| v.is_finite()));
@@ -10306,6 +10355,7 @@ mod tests {
             num_heads,
             qk_dim,
             v_dim,
+            false,
         );
 
         for (i, (a, s)) in out_actual.iter().zip(out_serial.iter()).enumerate() {
@@ -10375,6 +10425,7 @@ mod tests {
             num_v_heads,
             qk_dim,
             v_dim,
+            false,
         );
 
         assert!(state.iter().all(|val| val.is_finite()));
@@ -10609,6 +10660,105 @@ mod tests {
 
         // Anchor: middle head (raw=0) must land at exactly 0.5.
         assert!((dn_beta[2] - 0.5_f32).abs() < 1e-6);
+    }
+
+    /// Phase X.3.e.3.2 (§Q/K L2Norm + §silu(z) order): the Bonsai
+    /// semantics flag toggles two independent reference alignments —
+    /// skip the internal silu(k)/silu(q) since the caller pre-silu'd
+    /// q / k post-conv1d, and skip the internal out *= silu(z) since
+    /// the caller multiplies after ssm-norm. Verify the two modes
+    /// diverge (branch is live) and that Bonsai output ignores z
+    /// entirely (z-gate skip works).
+    #[test]
+    fn gated_deltanet_step_bonsai_semantics_toggle() {
+        let num_heads = 1;
+        let qk_dim = 4;
+        let v_dim = 4;
+        // Non-zero q/k so silu vs no-silu produces different scales.
+        let q = vec![0.7f32, -0.3, 0.5, 0.2];
+        let k = vec![0.6f32, 0.4, -0.2, 0.8];
+        let v = vec![0.1f32, -0.5, 0.3, 0.7];
+        let alpha = vec![0.5f32];
+        let beta = vec![0.4f32];
+        let z = vec![1.5f32, -1.0, 0.5, 2.0];
+
+        let mut state_legacy = vec![0.0f32; num_heads * qk_dim * v_dim];
+        let mut out_legacy = vec![0.0f32; num_heads * v_dim];
+        gated_deltanet_step(
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &z,
+            &mut state_legacy,
+            &mut out_legacy,
+            num_heads,
+            num_heads,
+            qk_dim,
+            v_dim,
+            false,
+        );
+
+        let mut state_bonsai = vec![0.0f32; num_heads * qk_dim * v_dim];
+        let mut out_bonsai = vec![0.0f32; num_heads * v_dim];
+        gated_deltanet_step(
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &z,
+            &mut state_bonsai,
+            &mut out_bonsai,
+            num_heads,
+            num_heads,
+            qk_dim,
+            v_dim,
+            true,
+        );
+
+        for &val in out_legacy.iter().chain(out_bonsai.iter()) {
+            assert!(val.is_finite(), "non-finite value in output");
+        }
+
+        // Outputs must diverge — proves the branch is actually live and
+        // Bonsai semantics are not a silent no-op.
+        let max_diff = out_legacy
+            .iter()
+            .zip(out_bonsai.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "legacy vs Bonsai output max_diff={max_diff}, expected > 1e-4",
+        );
+
+        // Bonsai-mode output must be independent of z (z-gate skip).
+        let z_alt = vec![-3.0f32, 5.0, -0.5, 7.5];
+        let mut state_bonsai_alt = vec![0.0f32; num_heads * qk_dim * v_dim];
+        let mut out_bonsai_alt = vec![0.0f32; num_heads * v_dim];
+        gated_deltanet_step(
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &z_alt,
+            &mut state_bonsai_alt,
+            &mut out_bonsai_alt,
+            num_heads,
+            num_heads,
+            qk_dim,
+            v_dim,
+            true,
+        );
+        for (i, (a, b)) in out_bonsai.iter().zip(out_bonsai_alt.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Bonsai output must be z-independent, lane {i}: {a} vs {b}",
+            );
+        }
     }
 
     // ── LayerWeights sub-struct accessors (Issue #11) ────────────────────
