@@ -2908,12 +2908,11 @@ struct DeltaNetLayerWeights<'a> {
     #[allow(dead_code)]
     ssm_dt_bias: Option<Vec<f32>>,
     /// Qwen 3.6 SSM state RMSNorm weight (`state_size` = per-head qk_dim
-    /// entries, f32), applied per-head to the hidden state before the
-    /// output projection. Loaded but not applied yet; see [`ssm_a`] for
-    /// the follow-up plan.
-    ///
-    /// [`ssm_a`]: DeltaNetLayerWeights::ssm_a
-    #[allow(dead_code)]
+    /// entries = `v_dim`, f32). Broadcast across V heads and applied to
+    /// `dn_delta_out` between the recurrence and the `ssm_out` projection
+    /// (Phase X.3.e.3.2). Standard Qwen 3.5 GGUF exports omit this tensor
+    /// and the forward path skips the normalisation, preserving pre-refactor
+    /// numerics for those checkpoints.
     ssm_norm: Option<Vec<f32>>,
     /// Causal depthwise conv1d kernel: `[kernel_size, conv_dim]` (f32).
     ///
@@ -3961,6 +3960,17 @@ impl<'a> Llama3Model<'a> {
                         dn_qk_dim,
                         dn_v_dim,
                     );
+
+                    // 4.5. Bonsai / Qwen 3.6 per-V-head state RMSNorm on the
+                    // recurrence output, prior to the `ssm_out` projection.
+                    // Standard Qwen 3.5 exports no `ssm_norm` tensor and this
+                    // block is skipped, preserving the pre-Phase-X.3.e.3.2
+                    // numerics. `apply_qk_norm` broadcasts the [v_dim] weight
+                    // across every V head slab, matching llama.cpp's
+                    // `ggml_rms_norm_ext(x, weight, eps)` semantics.
+                    if let Some(ssm_norm) = dn_layer.ssm_norm.as_ref() {
+                        apply_qk_norm(&mut dn_delta_out, ssm_norm, dn_v_dim, c.norm_eps);
+                    }
 
                     // 5. Output projection to hidden dim.
                     dn_layer.ssm_out.matvec(&dn_delta_out, &mut o_buf);
@@ -10327,6 +10337,51 @@ mod tests {
             assert!(
                 max_diff > 1e-6,
                 "KV group {kv}: V head {head_a} state ≈ V head {head_b} state (max_diff={max_diff}), per-V-head alpha/beta collapsed",
+            );
+        }
+    }
+
+    /// Phase X.3.e.3.2 (Gap C): Bonsai / Qwen 3.6 `ssm_norm` is applied
+    /// between the recurrence output and the `ssm_out` projection via
+    /// `apply_qk_norm`, which broadcasts a `[v_dim]` weight vector across
+    /// every V-head slab. Verify the math matches a hand-computed
+    /// per-head reference (`out_i = x_i / sqrt(mean(x²) + eps) * w_i`)
+    /// so a future refactor of `apply_qk_norm` cannot silently break the
+    /// `ssm_norm` code path.
+    #[test]
+    fn ssm_norm_broadcasts_across_v_heads() {
+        let num_v_heads = 3;
+        let v_dim = 4;
+        let eps = 1e-5f32;
+        // Two-head fixture: head 0 has small magnitude, head 1 large, head 2
+        // mixed sign — covers scale variance across V heads.
+        let mut buf = vec![
+            0.1, -0.2, 0.3, -0.4, // head 0
+            2.0, -3.0, 4.0, -5.0, // head 1
+            -1.0, 0.5, 1.5, -0.5, // head 2
+        ];
+        let weight = vec![1.0, -0.5, 2.0, 0.25];
+
+        // Hand-computed reference: per head, x_i / sqrt(mean(x²) + eps) * w_i.
+        let mut expected = Vec::with_capacity(num_v_heads * v_dim);
+        for h in 0..num_v_heads {
+            let slice = &buf[h * v_dim..(h + 1) * v_dim];
+            let ss: f64 = slice.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let mean = (ss / v_dim as f64) as f32;
+            let scale = 1.0f32 / (mean + eps).sqrt();
+            for i in 0..v_dim {
+                expected.push(slice[i] * scale * weight[i]);
+            }
+        }
+
+        apply_qk_norm(&mut buf, &weight, v_dim, eps);
+
+        for (i, (actual, expected)) in buf.iter().zip(expected.iter()).enumerate() {
+            let head = i / v_dim;
+            let lane = i % v_dim;
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "head {head} lane {lane}: got {actual}, expected {expected}",
             );
         }
     }
