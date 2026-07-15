@@ -351,5 +351,82 @@ fn main() {
             "Parity (row4×batch4[0] vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
             l2_rel_r4, max_abs_err_r4
         );
+
+        // ---- Step 5: row8×batch4 kernel (8 rows × 4 batches / workgroup) ----
+        //
+        // Doubles the row batching factor over Step 4: workgroup count
+        // drops another 2× (2560 → 1280 on Bonsai attn_qkv), total
+        // input-read traffic drops another 2×, and per-thread register
+        // pressure grows to 32 f32 accumulators.
+        //
+        // The main risk is register spilling — if the compiler can't fit
+        // all 32 accumulators in physical registers, they land in local
+        // memory (VRAM) and every FMA becomes a load/store round trip. We
+        // measure to check whether the extra amortization outweighs any
+        // spill cost.
+        println!("\n--- Step 5: row8×batch4 kernel (8 rows × 4 batches / workgroup) ---");
+
+        for _ in 0..5 {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_row8_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            pass.execute();
+            engine.sync();
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..n_iter {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_row8_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            pass.execute();
+            engine.sync();
+        }
+        let gpu_r8b4_per_dispatch = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        // Each dispatch produces 8 rows × 4 batches = 32 outputs; comparing
+        // "per matvec" (rows × batch=1 = rows outputs), one dispatch is
+        // worth 4 matvecs (same as row4×batch4, since we still amortize
+        // across 4 batches — the row batching contributes to per-dispatch
+        // throughput, not per-matvec cost normalization).
+        let gpu_r8b4_per_matvec = gpu_r8b4_per_dispatch / 4.0;
+
+        println!(
+            "GPU row8×batch4:  {:.1} µs/dispatch (32 outputs / dispatch), {:.1} µs/matvec",
+            gpu_r8b4_per_dispatch, gpu_r8b4_per_matvec
+        );
+        println!(
+            "Speedup vs Step 4 row4×batch4 (per matvec): {:.2}×",
+            gpu_r4b4_per_matvec / gpu_r8b4_per_matvec
+        );
+        println!(
+            "Speedup vs Step 2 batch4 (per matvec): {:.2}×",
+            gpu_b4_per_matvec / gpu_r8b4_per_matvec
+        );
+        println!(
+            "Speedup CPU / GPU-row8×batch4: {:.2}× per matvec",
+            cpu_us / gpu_r8b4_per_matvec
+        );
+
+        let r8b4_bandwidth_gb_s = bytes_per_matvec / (gpu_r8b4_per_matvec * 1000.0);
+        println!(
+            "Effective per-matvec bandwidth: {:.2} GB/s",
+            r8b4_bandwidth_gb_s
+        );
+
+        // Parity: row8×batch4 batch element 0 should match single-dispatch CPU.
+        let gpu_r8b4_output = engine.read_f32(&output_buf_b4);
+        let r8b4_batch0 = &gpu_r8b4_output[..rows];
+        let mut l2_num_r8 = 0.0f64;
+        let mut l2_den_r8 = 0.0f64;
+        let mut max_abs_err_r8 = 0.0f32;
+        for (c, g) in cpu_output.iter().zip(r8b4_batch0.iter()) {
+            let diff = (c - g).abs();
+            max_abs_err_r8 = max_abs_err_r8.max(diff);
+            l2_num_r8 += (diff as f64) * (diff as f64);
+            l2_den_r8 += (*c as f64) * (*c as f64);
+        }
+        let l2_rel_r8 = (l2_num_r8 / l2_den_r8.max(1e-30)).sqrt();
+        println!(
+            "Parity (row8×batch4[0] vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
+            l2_rel_r8, max_abs_err_r8
+        );
     }
 }
