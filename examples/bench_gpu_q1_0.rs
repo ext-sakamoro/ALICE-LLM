@@ -428,5 +428,61 @@ fn main() {
             "Parity (row8×batch4[0] vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
             l2_rel_r8, max_abs_err_r8
         );
+
+        // ---- Step 6: row4 kernel (single batch, 4 rows / workgroup) ----
+        //
+        // The real batch=1 decode-path companion to Step 4's row4×batch4.
+        // Speculative decoding needs batch4; interactive prompt/decode
+        // does not. This kernel gives us the same 4× workgroup-count
+        // amortization as row4×batch4 without requiring a 4-token input
+        // buffer — the natural choice for wiring into the Bonsai forward
+        // path when integrating GPU matvec end-to-end.
+        println!("\n--- Step 6: row4 kernel (single batch, 4 rows / workgroup) ---");
+
+        for _ in 0..5 {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_row4(&weights, &input_buf, &output_buf);
+            pass.execute();
+            engine.sync();
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..n_iter {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_row4(&weights, &input_buf, &output_buf);
+            pass.execute();
+            engine.sync();
+        }
+        let gpu_r4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+
+        println!(
+            "GPU row4 (single-batch):  {:.1} µs/iter (single matvec = 1 batch × rows outputs)",
+            gpu_r4_us
+        );
+        println!(
+            "Speedup vs Step 1 single-matvec (Q1_0): {:.2}×",
+            gpu_us / gpu_r4_us
+        );
+        println!("Speedup CPU / GPU-row4: {:.2}×", cpu_us / gpu_r4_us);
+
+        let r4_bandwidth_gb_s = bytes_per_matvec / (gpu_r4_us * 1000.0);
+        println!("Effective bandwidth: {:.2} GB/s", r4_bandwidth_gb_s);
+
+        // Parity: single-batch row4 output should match CPU Q1_0 matvec.
+        let gpu_r4_output = engine.read_f32(&output_buf);
+        let mut l2_num_r4s = 0.0f64;
+        let mut l2_den_r4s = 0.0f64;
+        let mut max_abs_err_r4s = 0.0f32;
+        for (c, g) in cpu_output.iter().zip(gpu_r4_output.iter()) {
+            let diff = (c - g).abs();
+            max_abs_err_r4s = max_abs_err_r4s.max(diff);
+            l2_num_r4s += (diff as f64) * (diff as f64);
+            l2_den_r4s += (*c as f64) * (*c as f64);
+        }
+        let l2_rel_r4s = (l2_num_r4s / l2_den_r4s.max(1e-30)).sqrt();
+        println!(
+            "Parity (row4 vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
+            l2_rel_r4s, max_abs_err_r4s
+        );
     }
 }
