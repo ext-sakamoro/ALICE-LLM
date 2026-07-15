@@ -1,0 +1,72 @@
+name: Bench
+
+# Runs the quantized-matvec micro-bench harness on CI runners so Issue #25
+# (x86_64 SIMD) and Issue #30 (aarch64 NEON) get real numbers without
+# needing a physical box of each arch.
+#
+# ubuntu-latest is Intel Xeon Platinum (AVX2 baseline, AVX-512BW on newer
+# variants). macos-latest is Apple silicon (M1/M2 depending on hostpool
+# rotation). Both are covered so we can compare arch-specific SIMD paths
+# side by side.
+#
+# Triggered manually via workflow_dispatch or weekly via cron so the
+# numbers stay fresh as SIMD kernels evolve.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday 03:00 UTC (12:00 JST). Cheap enough not to notice.
+    - cron: '0 3 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-matvec:
+    name: bench_simd_matvec (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run all runners even if one fails so we always publish partial
+      # numbers instead of aborting the whole matrix on the first hiccup.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+      - name: Runner CPU info
+        id: cpuinfo
+        run: |
+          {
+            echo "## Runner info (${{ matrix.os }})"
+            echo ""
+            echo "\`\`\`"
+            if [ -f /proc/cpuinfo ]; then
+              # Linux: pull the first model + flags line, avoids the 8-core
+              # duplicate spam that would otherwise flood the summary.
+              grep -m1 'model name' /proc/cpuinfo
+              grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -Ei 'avx|sse|fma|bmi' | sort -u | tr '\n' ' '
+              echo ""
+            else
+              # macOS: sysctl is the equivalent path.
+              sysctl -n machdep.cpu.brand_string
+              sysctl -a 2>/dev/null | grep -i features || true
+            fi
+            echo "\`\`\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build bench harness
+        run: cargo build --release --example bench_simd_matvec --features gguf
+      - name: Run bench_simd_matvec
+        id: bench
+        run: |
+          {
+            echo "## bench_simd_matvec (${{ matrix.os }})"
+            echo ""
+            echo "\`\`\`"
+            ./target/release/examples/bench_simd_matvec
+            echo "\`\`\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
