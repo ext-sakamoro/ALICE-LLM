@@ -60,6 +60,10 @@ name = "bench_gpu"
 required-features = ["gguf", "gpu"]
 
 [[example]]
+name = "bench_gpu_q1_0"
+required-features = ["gguf", "gpu"]
+
+[[example]]
 name = "bench_gpu_ffn"
 required-features = ["gguf", "gpu"]
 
