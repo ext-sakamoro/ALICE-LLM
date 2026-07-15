@@ -8662,7 +8662,15 @@ fn load_deltanet_layer_weights<'a>(
         config.hidden_dim,
     )?;
     let conv1d_weight = gguf.tensor_to_f32(&format!("{prefix}.ssm_conv1d.weight"))?;
-    let conv1d_bias = gguf.tensor_to_f32(&format!("{prefix}.ssm_conv1d.bias"))?;
+    // conv_dim = q + k + v (excludes z), derived to match the conv1d layout
+    // (`conv1d_weight` shape is `[kernel_size, conv_dim]`).
+    let conv_dim = qk_dim * num_kv_heads * 2 + v_dim * num_v_heads;
+    // Bonsai 27B and some Qwen 3.6 checkpoints omit `ssm_conv1d.bias` entirely.
+    // Treating it as optional (zero-fill fallback) is behaviour-preserving for
+    // standard Qwen 3.5 exports, which continue to load the shipped bias.
+    let conv1d_bias = gguf
+        .tensor_to_f32(&format!("{prefix}.ssm_conv1d.bias"))
+        .unwrap_or_else(|| vec![0.0f32; conv_dim]);
     let alpha_proj = load_weight_ref(
         gguf,
         &format!("{prefix}.ssm_alpha.weight"),
