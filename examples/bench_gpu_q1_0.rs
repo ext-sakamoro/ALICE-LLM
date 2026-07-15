@@ -154,5 +154,70 @@ fn main() {
             "  GPU[0..4]  = {:?}",
             &gpu_output[..4.min(gpu_output.len())]
         );
+
+        // ---- GPU batch4 (Step 2) ----
+        // Layout: input buffer packs 4 input vectors of length `cols`
+        // back-to-back; output buffer packs 4 output vectors of length `rows`
+        // back-to-back. Same weight tensor, one dispatch produces all 4
+        // outputs, so the weight decode work is shared across the batch.
+        println!("\n--- Step 2: batch-4 kernel ---");
+        let mut input_batch4: Vec<f32> = Vec::with_capacity(cols * 4);
+        for k in 0..4 {
+            let shift = (k as f32) * 0.13;
+            input_batch4.extend((0..cols).map(|i| ((i as f32) * 0.017 + shift).sin() * 0.1));
+        }
+        let input_buf_b4 = engine.upload_f32(&input_batch4);
+        let output_buf_b4 = engine.alloc_f32(rows * 4);
+
+        // Warmup
+        for _ in 0..5 {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            pass.execute();
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..n_iter {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q1_0_batch4(&weights, &input_buf_b4, &output_buf_b4);
+            pass.execute();
+        }
+        engine.sync();
+        let gpu_b4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_b4_per_matvec = gpu_b4_us / 4.0;
+
+        println!(
+            "GPU batch4:  {:>10.1} µs/dispatch (4 matvecs / dispatch), {:.1} µs/matvec",
+            gpu_b4_us, gpu_b4_per_matvec
+        );
+        println!(
+            "Speedup batch4/single: {:.2}× per matvec (dispatch overhead 分散)",
+            gpu_us / gpu_b4_per_matvec
+        );
+        println!(
+            "Speedup CPU / GPU-batch4: {:.2}× per matvec",
+            cpu_us / gpu_b4_per_matvec
+        );
+
+        // Parity check on batch element 0 (should match single-dispatch output)
+        let gpu_b4_output = engine.read_f32(&output_buf_b4);
+        // The batch4 shader stores output as [rows] × 4 batches:
+        //   output_vec[batch * rows + row]
+        // So batch 0's output is `gpu_b4_output[0..rows]`.
+        let batch0 = &gpu_b4_output[..rows];
+        let mut l2_num_b4 = 0.0f64;
+        let mut l2_den_b4 = 0.0f64;
+        let mut max_abs_err_b4 = 0.0f32;
+        for (c, g) in cpu_output.iter().zip(batch0.iter()) {
+            let diff = (c - g).abs();
+            max_abs_err_b4 = max_abs_err_b4.max(diff);
+            l2_num_b4 += (diff as f64) * (diff as f64);
+            l2_den_b4 += (*c as f64) * (*c as f64);
+        }
+        let l2_rel_b4 = (l2_num_b4 / l2_den_b4.max(1e-30)).sqrt();
+        println!(
+            "Parity (batch4[0] vs CPU): L2_rel = {:.3e}, max_abs_err = {:.3e}",
+            l2_rel_b4, max_abs_err_b4
+        );
     }
 }
