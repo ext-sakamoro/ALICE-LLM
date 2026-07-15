@@ -2766,16 +2766,57 @@ enum RoutedExpertStorage<'a> {
 
 struct DeltaNetLayerWeights<'a> {
     attn_norm: Vec<f32>,
-    /// Fused input projection: `hidden → q + k + v + z` packed.
+    /// Standard Qwen 3.5 fused input projection: `hidden → q + k + v + z`
+    /// packed. Rows = `qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2`.
     ///
-    /// Rows = `qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2`.
-    ssm_in: WeightRef<'a>,
+    /// `None` for Bonsai 27B (which uses [`attn_qkv`] + [`attn_gate`]
+    /// instead). Exactly one of `ssm_in` / `attn_qkv` is `Some` per layer;
+    /// the loader guarantees this.
+    ///
+    /// [`attn_qkv`]: DeltaNetLayerWeights::attn_qkv
+    /// [`attn_gate`]: DeltaNetLayerWeights::attn_gate
+    ssm_in: Option<WeightRef<'a>>,
+    /// Bonsai 27B fused input projection: `hidden → q + k + v + gate` packed
+    /// (10240-dim for the 27B config). See [`ssm_in`] for the standard
+    /// Qwen 3.5 counterpart.
+    ///
+    /// The exact split of the 10240 output columns into per-head Q/K/V/gate
+    /// slices belongs to Phase X.3.e (forward-path integration) and is
+    /// still being reverse-engineered from the PrismML llama.cpp fork; the
+    /// current forward path takes the standard [`ssm_in`] branch only and
+    /// panics with a Bonsai-specific message if it is asked to consume this
+    /// tensor.
+    ///
+    /// [`ssm_in`]: DeltaNetLayerWeights::ssm_in
+    #[allow(dead_code)]
+    attn_qkv: Option<WeightRef<'a>>,
+    /// Bonsai 27B DeltaNet output gate projection (6144-dim for 27B).
+    /// Applied after `ssm_out` in a `SiLU(gate) * value` pattern.
+    /// Consumer wiring is deferred to Phase X.3.e.
+    #[allow(dead_code)]
+    attn_gate: Option<WeightRef<'a>>,
+    /// Bonsai 27B learnable SSM state-transition parameter (`num_heads`
+    /// entries, f32). Corresponds to the `A` matrix in the discretised
+    /// state-space update `h_next = A * h_prev + B * x`. Consumer wiring
+    /// is deferred to Phase X.3.e.
+    #[allow(dead_code)]
+    ssm_a: Option<Vec<f32>>,
+    /// Bonsai 27B SSM discretisation-step bias (`num_heads` entries, f32).
+    /// Consumer wiring is deferred to Phase X.3.e.
+    #[allow(dead_code)]
+    ssm_dt_bias: Option<Vec<f32>>,
+    /// Bonsai 27B SSM state RMSNorm weight (`state_size` entries, f32),
+    /// applied per-head to the hidden state before the output projection.
+    /// Consumer wiring is deferred to Phase X.3.e.
+    #[allow(dead_code)]
+    ssm_norm: Option<Vec<f32>>,
     /// Causal depthwise conv1d kernel: `[kernel_size, conv_dim]` (f32).
     ///
     /// `conv_dim = qk_dim * num_kv_heads * 2 + v_dim * num_v_heads`
     /// (covers q + k + v, excludes z).
     conv1d_weight: Vec<f32>,
-    /// Causal conv1d bias: `[conv_dim]` (f32).
+    /// Causal conv1d bias: `[conv_dim]` (f32). Optional at load time
+    /// (Bonsai 27B ships no bias); missing values default to zeros.
     conv1d_bias: Vec<f32>,
     /// Alpha decay-gate projection: `hidden → alpha [num_kv_heads]`.
     alpha_proj: WeightRef<'a>,
@@ -3708,7 +3749,20 @@ impl<'a> Llama3Model<'a> {
                     rms_norm(&hidden, &dn_layer.attn_norm, c.norm_eps, &mut norm_buf);
 
                     // 2. Fused input projection: `norm → q + k + v + z packed`.
-                    dn_layer.ssm_in.matvec(&norm_buf, &mut dn_in_proj);
+                    // Bonsai 27B DeltaNet layers ship `attn_qkv` instead of
+                    // `ssm_in` and expose additional gate/A/dt/norm tensors
+                    // that this forward branch has not yet been wired up to
+                    // consume. Fail fast with a clear message so the panic
+                    // surface points at the intended follow-up rather than
+                    // manifesting as garbled output. See Issue #60 (Phase X.3.e).
+                    let ssm_in = dn_layer.ssm_in.as_ref().unwrap_or_else(|| {
+                        todo!(
+                            "Bonsai-style DeltaNet forward not yet implemented \
+                             (attn_qkv / attn_gate / ssm_a / ssm_dt_bias / ssm_norm \
+                             consumer wiring is Phase X.3.e, see Issue #60)"
+                        )
+                    });
+                    ssm_in.matvec(&norm_buf, &mut dn_in_proj);
                     // 2a/2b. alpha / beta decay-rate + update-rate projections.
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
                     dn_layer.beta_proj.matvec(&norm_buf, &mut dn_beta);
@@ -6737,6 +6791,30 @@ fn load_weight_ref<'a>(
     })
 }
 
+/// Load a weight where the row count is only known from the tensor itself
+/// (GGUF tensor shape `[cols, rows]`, row-major storage). Used for arch
+/// variants whose output dimension is not derivable from the standard config
+/// metadata — currently Bonsai 27B's `attn_qkv` / `attn_gate` (10240 / 6144
+/// respectively), which fall outside the Qwen 3.5 DeltaNet layout.
+fn load_weight_ref_any_rows<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+    cols: usize,
+) -> Option<WeightRef<'a>> {
+    let info = gguf.tensor_info(name)?;
+    let data = gguf.tensor_data(name)?;
+    // GGUF shape convention: `dims[0]` is the row stride (= cols), `dims[1]`
+    // is the number of rows. For a `[cols, rows]` tensor stored in row-major
+    // order, this maps to `rows = dims[1]`.
+    let rows = *info.dims.get(1)?;
+    Some(WeightRef {
+        data,
+        qtype: info.qtype,
+        rows: rows as usize,
+        cols,
+    })
+}
+
 /// Run one MoE layer's expert dispatch.
 ///
 /// - `norm_buf`: the RMS-normalised hidden state, `[hidden_dim]`.
@@ -8655,12 +8733,37 @@ fn load_deltanet_layer_weights<'a>(
     // Fused in_proj output: q + k (both num_kv_heads * qk_dim) + v + z (both num_v_heads * v_dim).
     let in_proj_out = qk_dim * num_kv_heads * 2 + v_dim * num_v_heads * 2;
 
+    // Standard Qwen 3.5 exports fuse Q/K/V/Z into `ssm_in.weight`. Bonsai 27B
+    // exports fuse Q/K/V/gate into `attn_qkv.weight` instead. Try both and
+    // populate whichever exists. The loader returns `None` if neither is
+    // present (the layer is not a valid DeltaNet layer).
     let ssm_in = load_weight_ref(
         gguf,
         &format!("{prefix}.ssm_in.weight"),
         in_proj_out,
         config.hidden_dim,
-    )?;
+    );
+    // Bonsai's `attn_qkv` output dim (10240 for the 27B config) is not
+    // derivable from the standard Qwen 3.5 metadata, so the loader accepts
+    // whatever the GGUF ships and defers per-head splitting to Phase X.3.e.
+    let attn_qkv = load_weight_ref_any_rows(
+        gguf,
+        &format!("{prefix}.attn_qkv.weight"),
+        config.hidden_dim,
+    );
+    if ssm_in.is_none() && attn_qkv.is_none() {
+        return None;
+    }
+    // Bonsai 27B DeltaNet output gate; standard Qwen 3.5 has no such tensor.
+    let attn_gate = load_weight_ref_any_rows(
+        gguf,
+        &format!("{prefix}.attn_gate.weight"),
+        config.hidden_dim,
+    );
+    let ssm_a = gguf.tensor_to_f32(&format!("{prefix}.ssm_a"));
+    let ssm_dt_bias = gguf.tensor_to_f32(&format!("{prefix}.ssm_dt.bias"));
+    let ssm_norm = gguf.tensor_to_f32(&format!("{prefix}.ssm_norm.weight"));
+
     let conv1d_weight = gguf.tensor_to_f32(&format!("{prefix}.ssm_conv1d.weight"))?;
     // conv_dim = q + k + v (excludes z), derived to match the conv1d layout
     // (`conv1d_weight` shape is `[kernel_size, conv_dim]`).
@@ -8714,6 +8817,11 @@ fn load_deltanet_layer_weights<'a>(
     Some(DeltaNetLayerWeights {
         attn_norm,
         ssm_in,
+        attn_qkv,
+        attn_gate,
+        ssm_a,
+        ssm_dt_bias,
+        ssm_norm,
         conv1d_weight,
         conv1d_bias,
         alpha_proj,
@@ -11042,5 +11150,55 @@ mod tests {
         let bytes = tiny_gguf_with("blk.0.something_else.weight");
         let gguf = crate::gguf::GgufFile::parse(&bytes).expect("parse other");
         assert!(load_ffn_norm(&gguf, "blk.0").is_none());
+    }
+
+    /// `load_weight_ref_any_rows` derives the row count from the tensor's
+    /// GGUF `dims` metadata rather than requiring the caller to pass one.
+    /// Bonsai 27B's `attn_qkv` (10240 rows) and `attn_gate` (6144 rows)
+    /// depend on this because their sizes are not implied by the standard
+    /// Qwen 3.5 config keys.
+    #[test]
+    fn load_weight_ref_any_rows_derives_shape_from_gguf() {
+        // Tiny GGUF with a single f32 tensor `w` of shape `[cols=2, rows=3]`
+        // = 6 f32 values. `load_weight_ref_any_rows` must pick `rows=3` up
+        // from the header without being told.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
+        buf.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+
+        // One kv (alignment=32).
+        let key = "general.alignment";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes()); // U32
+        buf.extend_from_slice(&32u32.to_le_bytes());
+
+        // Tensor info for `w` with shape `[2, 3]`.
+        let name = "w";
+        buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes()); // ndims
+        buf.extend_from_slice(&2u64.to_le_bytes()); // dims[0] = 2 (cols)
+        buf.extend_from_slice(&3u64.to_le_bytes()); // dims[1] = 3 (rows)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type = F32
+        buf.extend_from_slice(&0u64.to_le_bytes()); // data_offset = 0
+
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        // 6 f32 values = 24 bytes.
+        for x in 0..6 {
+            buf.extend_from_slice(&(x as f32).to_le_bytes());
+        }
+
+        let gguf = crate::gguf::GgufFile::parse(&buf).expect("parse ok");
+        let w = load_weight_ref_any_rows(&gguf, "w", 2).expect("load ok");
+        assert_eq!(w.rows, 3, "rows must be derived from dims[1]");
+        assert_eq!(w.cols, 2, "cols is passed by caller");
+
+        // Missing tensor → None.
+        assert!(load_weight_ref_any_rows(&gguf, "not_present", 2).is_none());
     }
 }
