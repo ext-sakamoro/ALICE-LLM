@@ -1699,11 +1699,15 @@ fn timed_dispatch(
 }
 
 /// Timed matvec dispatch (auto-selects pipeline by quant type).
+///
+/// Q1_0 uses the row4 kernel to match the production `dispatch_mv` path
+/// (Step 6, PR #74) — timing reflects the same kernel the forward pass
+/// actually runs.
 fn timed_mv(engine: &GpuEngine, mv: &MatvecBG) -> (f64, GpuQuantType) {
     let pipeline = match mv.quant {
         GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
         GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
-        GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
+        GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
     };
     let us = timed_dispatch(engine, pipeline, &mv.bg, mv.dispatch_x, mv.dispatch_y, 1);
     (us, mv.quant)
@@ -1803,7 +1807,16 @@ impl GpuModel {
         input: &GpuBuffer,
         output: &GpuBuffer,
     ) -> MatvecBG {
-        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(w.rows);
+        // Q1_0 uses the row4 kernel by default in the batch=1 decode path:
+        // 1 workgroup produces 4 output rows (input read shared across the
+        // 4 rows), cutting workgroup count 4× and total input-read traffic
+        // 4×. Empirically 1.82× vs the base `matvec_q1_0` kernel on
+        // Jetson Vulkan iGPU for Bonsai 27B attn_qkv (Step 6, PR #74).
+        let dispatch_rows = match w.quant {
+            GpuQuantType::Q1_0 => w.rows.div_ceil(4),
+            GpuQuantType::Q4K | GpuQuantType::Q6K => w.rows,
+        };
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(dispatch_rows);
         let params_buf = engine.make_persistent_uniform(&MatvecParams {
             rows: w.rows,
             cols: w.cols,
@@ -1817,7 +1830,7 @@ impl GpuModel {
         let pipeline = match w.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
-            GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
+            GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
         };
         let layout = pipeline.get_bind_group_layout(0);
         let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3128,10 +3141,15 @@ impl GpuModel {
 
     /// Dispatch a pre-cached matvec bind group.
     fn dispatch_mv(engine: &GpuEngine, cp: &mut wgpu::ComputePass, mv: &MatvecBG) {
+        // Q1_0 uses the row4 kernel by default (Step 6, PR #74): 1 workgroup
+        // produces 4 output rows, cutting workgroup count 4× and total
+        // input-read traffic 4×. Empirically 1.82× vs base `matvec_q1_0`
+        // on Jetson Vulkan iGPU for Bonsai 27B attn_qkv. Dispatch dims
+        // pre-computed in `build_matvec_bg` for ceil(rows / 4).
         let pipeline = match mv.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
-            GpuQuantType::Q1_0 => &engine.matvec_q1_0_pipeline,
+            GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
         };
         cp.set_pipeline(pipeline);
         cp.set_bind_group(0, &mv.bg, &[]);
@@ -3874,10 +3892,12 @@ impl GpuModel {
 
         macro_rules! ts_dispatch_mv {
             ($mv:expr) => {{
+                // Q1_0 uses the row4 kernel (Step 6, PR #74) to stay
+                // consistent with the production `dispatch_mv` path.
                 let pipeline = match $mv.quant {
                     GpuQuantType::Q4K => &self.engine.matvec_q4k_pipeline,
                     GpuQuantType::Q6K => &self.engine.matvec_q6k_pipeline,
-                    GpuQuantType::Q1_0 => &self.engine.matvec_q1_0_pipeline,
+                    GpuQuantType::Q1_0 => &self.engine.matvec_q1_0_row4_pipeline,
                 };
                 let tag = match $mv.quant {
                     GpuQuantType::Q4K => 1u8,
