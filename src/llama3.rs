@@ -7812,6 +7812,19 @@ pub fn speculative_decode_v2(
     result
 }
 
+/// Load the FFN input norm for layer `prefix`, trying `ffn_norm.weight` first
+/// and falling back to `post_attention_norm.weight`.
+///
+/// Standard Qwen 3 / Llama-3 / Gemma GGUF exports call this tensor
+/// `blk.N.ffn_norm.weight`. Bonsai 27B (PrismML, qwen35 arch) and some
+/// Qwen 3.6 checkpoints export it as `blk.N.post_attention_norm.weight`
+/// instead. Both names refer to the same "post-attention / pre-FFN" RMSNorm
+/// weight in the Transformer block.
+fn load_ffn_norm<'a>(gguf: &'a GgufFile<'a>, prefix: &str) -> Option<Vec<f32>> {
+    gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))
+        .or_else(|| gguf.tensor_to_f32(&format!("{prefix}.post_attention_norm.weight")))
+}
+
 fn load_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
@@ -7861,7 +7874,7 @@ fn load_layer_weights<'a>(
         q_dim,
     )?;
 
-    let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+    let ffn_norm = load_ffn_norm(gguf, &prefix)?;
     // Standard FFN weights are optional: MoE layers omit them in favour of
     // expert-dispatched ffn_gate_inp + ffn_{gate,up,down}_exps tensors.
     let gate_proj = load_weight_ref(
@@ -8290,7 +8303,7 @@ fn load_deepseek_v3_layer_weights<'a>(
     let first_k_dense = config.deepseek_first_k_dense_replace().unwrap_or(0);
     let (ffn_norm, gate_proj, up_proj, down_proj, moe) = if layer < first_k_dense {
         let ffn_size = config.ffn_size_for_layer(layer);
-        let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+        let ffn_norm = load_ffn_norm(gguf, &prefix)?;
         let gate_proj = load_weight_ref(
             gguf,
             &format!("{prefix}.ffn_gate.weight"),
@@ -8321,7 +8334,7 @@ fn load_deepseek_v3_layer_weights<'a>(
         let n_shared = config.deepseek_n_shared_experts()?;
         let moe_ffn = config.deepseek_moe_intermediate_size()?;
         let shared_ffn = n_shared * moe_ffn;
-        let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+        let ffn_norm = load_ffn_norm(gguf, &prefix)?;
         let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"))?;
         // noaux_tc bias — optional (older DeepSeek-V2 doesn't ship this).
         let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
@@ -8548,7 +8561,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
     let moe_ffn = config.deepseek_moe_intermediate_size()?;
     let shared_ffn = n_shared * moe_ffn;
 
-    let ffn_norm_v = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+    let ffn_norm_v = load_ffn_norm(gguf, prefix)?;
     let ffn_gate_inp = gguf.tensor_to_f32(&format!("{prefix}.ffn_gate_inp.weight"))?;
     let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
     let ffn_gate_shexp = load_weight_ref(
@@ -8669,7 +8682,7 @@ fn load_deltanet_layer_weights<'a>(
         v_dim * num_v_heads,
     )?;
 
-    let ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))?;
+    let ffn_norm = load_ffn_norm(gguf, &prefix)?;
     let ffn_size = config.ffn_size_for_layer(layer);
     let gate_proj = load_weight_ref(
         gguf,
@@ -10958,5 +10971,68 @@ mod tests {
         assert!(d.qk_nope_head_dim.is_some());
         assert!(d.qk_rope_head_dim.is_some());
         assert!(d.v_head_dim.is_some());
+    }
+
+    /// The `load_ffn_norm` helper must resolve either `ffn_norm.weight` or
+    /// `post_attention_norm.weight`, so that Bonsai 27B (which exports the
+    /// latter under the qwen35 arch) can be loaded alongside standard Qwen /
+    /// Llama-3 GGUF exports without a per-arch branch.
+    #[test]
+    fn load_ffn_norm_accepts_both_names() {
+        // Build a tiny in-memory GGUF containing only what `load_ffn_norm`
+        // needs: one f32 tensor `blk.0.ffn_norm.weight` in the "standard"
+        // case, then again `blk.0.post_attention_norm.weight` in the
+        // "Bonsai" case. Both must round-trip through the loader.
+
+        fn tiny_gguf_with(tensor_name: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            // Header
+            buf.extend_from_slice(b"GGUF");
+            buf.extend_from_slice(&3u32.to_le_bytes()); // version
+            buf.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
+            buf.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+
+            // Single kv: general.alignment = 32 (u32)
+            let key = "general.alignment";
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&4u32.to_le_bytes()); // type=U32
+            buf.extend_from_slice(&32u32.to_le_bytes());
+
+            // Tensor info
+            buf.extend_from_slice(&(tensor_name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(tensor_name.as_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes()); // ndims
+            buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0] = 4
+            buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type = F32
+            buf.extend_from_slice(&0u64.to_le_bytes()); // data_offset
+
+            // Pad to alignment 32
+            while !buf.len().is_multiple_of(32) {
+                buf.push(0);
+            }
+            // Tensor data: 4 f32 values
+            for x in [1.0f32, 2.0, 3.0, 4.0] {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            buf
+        }
+
+        // Standard name (`ffn_norm.weight`)
+        let bytes = tiny_gguf_with("blk.0.ffn_norm.weight");
+        let gguf = crate::gguf::GgufFile::parse(&bytes).expect("parse standard");
+        let v = load_ffn_norm(&gguf, "blk.0").expect("load standard ffn_norm");
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Bonsai alias (`post_attention_norm.weight`)
+        let bytes = tiny_gguf_with("blk.0.post_attention_norm.weight");
+        let gguf = crate::gguf::GgufFile::parse(&bytes).expect("parse bonsai");
+        let v = load_ffn_norm(&gguf, "blk.0").expect("load bonsai post_attention_norm");
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Neither present → None (upstream `?` will propagate the miss).
+        let bytes = tiny_gguf_with("blk.0.something_else.weight");
+        let gguf = crate::gguf::GgufFile::parse(&bytes).expect("parse other");
+        assert!(load_ffn_norm(&gguf, "blk.0").is_none());
     }
 }
