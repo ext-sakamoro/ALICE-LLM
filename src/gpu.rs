@@ -2939,8 +2939,13 @@ impl GpuModel {
                         ),
                     });
 
-                    // Recurrent state: [num_kv_heads, qk_dim, v_dim]
-                    deltanet_states.push(engine.alloc_f32(dn_num_kv_heads * dn_qk_dim * dn_v_dim));
+                    // Recurrent state: [num_v_heads, qk_dim, v_dim].
+                    // Phase X.3.e.3.11 fix: previous `dn_num_kv_heads` sizing
+                    // allocated half the required memory when num_v_heads >
+                    // num_kv_heads (Qwen 3.5: 32/16, Bonsai: 48/16). Under
+                    // cyclic V→KV mapping each V-head has its own recurrent
+                    // state slab even though V-heads share Q/K per KV group.
+                    deltanet_states.push(engine.alloc_f32(dn_num_v_heads * dn_qk_dim * dn_v_dim));
                     // Conv1d ring buffer: [kernel_size - 1, conv_dim]
                     deltanet_conv_states.push(engine.alloc_f32((dn_conv_kernel - 1) * dn_conv_dim));
 
@@ -3196,7 +3201,14 @@ impl GpuModel {
             0u32,
             0u32, // dim, ring_pos, pad, pad
         ]));
-        // Layout: (num_heads, qk_dim, v_dim, is_bonsai).
+        // Layout: (num_heads, qk_dim, v_dim, is_bonsai, num_kv_heads, pad, pad, pad).
+        // Phase X.3.e.3.11 fix: `num_heads` is num_v_heads (32 for Qwen 3.5,
+        // 48 for Bonsai 27B); shader iterates one workgroup per V-head and
+        // computes cyclic KV slice via `head % num_kv_heads` to match
+        // reference qwen35.cpp:547-548 `ggml_repeat_4d` + fused GDN
+        // `iv1 % neq1`. Previous code passed dn_num_kv_heads (16) which
+        // meant only half the V-heads were processed.
+        //
         // `is_bonsai` = 1 when the GGUF is Bonsai / Qwen 3.6-27B (detected
         // by `blk.0.attn_qkv.weight` presence — see
         // `is_bonsai_deltanet_gguf` above). Consumed by `gated_deltanet.wgsl`
@@ -3204,10 +3216,14 @@ impl GpuModel {
         // externally in the Bonsai path (silu_inplace on conv output before
         // the recurrence, silu_gate_apply after ssm_norm).
         let dn_params_buf = make_persistent(bytemuck::cast_slice(&[
-            dn_num_kv_heads as u32,
+            dn_num_v_heads as u32,
             dn_qk_dim as u32,
             dn_v_dim as u32,
             u32::from(is_bonsai_deltanet_gguf),
+            dn_num_kv_heads as u32,
+            0u32,
+            0u32,
+            0u32,
         ]));
 
         for i in 0..config.num_layers {
@@ -4085,10 +4101,14 @@ impl GpuModel {
                     //    The shader handles the Bonsai path via the `is_bonsai`
                     //    uniform (dn_params_buf fourth u32) — Phase 2 Step 4
                     //    shader-side PR #84.
+                    //    Phase X.3.e.3.11 fix: dispatch one workgroup per V-head
+                    //    (not KV-head) so all V-heads are processed. Cyclic
+                    //    KV mapping is applied inside the shader via
+                    //    `head % num_kv_heads` (params.num_kv_heads slot).
                     let dn_num_heads = self
                         .config
-                        .linear_num_kv_heads
-                        .unwrap_or(self.config.num_kv_heads);
+                        .linear_num_v_heads
+                        .unwrap_or(self.config.num_heads);
                     cp.set_pipeline(&self.engine.gated_deltanet_pipeline);
                     cp.set_bind_group(0, &dbg.deltanet_bg, &[]);
                     cp.dispatch_workgroups(dn_num_heads, 1, 1);
