@@ -2352,6 +2352,11 @@ pub struct GpuModel {
     rope_k_params_buf: wgpu::Buffer,
     kv_append_params_buf: wgpu::Buffer,
     attn_params_buf: wgpu::Buffer,
+    /// DeltaNet conv1d params — layout `[dim, ring_pos, _pad, _pad]`.
+    /// `ring_pos` is updated per-token to `pos % (kernel_size - 1)`
+    /// (Phase X.3.e.3.25 fix). `None` when the model has no DeltaNet
+    /// layers (e.g., pure-attention Qwen 2 / 2.5 / 3).
+    dn_conv_params_buf: Option<wgpu::Buffer>,
 
     // Dispatch constants
     residual_dispatch_x: u32,
@@ -4211,6 +4216,12 @@ impl GpuModel {
         let total_bgs = layer_bgs.len() * 10 + 7;
         eprintln!("[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs");
 
+        // Capture the "has DeltaNet layers" flag before `deltanet_bgs` is
+        // moved into the struct — the struct literal below moves the Vec
+        // and we still need the boolean afterwards to gate
+        // `dn_conv_params_buf`.
+        let has_deltanet = !deltanet_bgs.is_empty();
+
         Self {
             engine,
             config,
@@ -4250,6 +4261,11 @@ impl GpuModel {
             rope_k_params_buf,
             kv_append_params_buf,
             attn_params_buf,
+            dn_conv_params_buf: if has_deltanet {
+                Some(dn_conv_params_buf)
+            } else {
+                None
+            },
             residual_dispatch_x,
             rope_q_dispatch_x,
             rope_k_dispatch_x,
@@ -4639,6 +4655,25 @@ impl GpuModel {
         self.engine
             .queue
             .write_buffer(&self.attn_params_buf, 0, bytemuck::bytes_of(&seq_len));
+        // Phase X.3.e.3.25 fix: advance the DeltaNet conv1d ring position
+        // for the current token. The CPU implementation stores `ring_pos`
+        // as per-layer state and advances it after each `causal_conv1d_step`
+        // (see `llama3.rs:2183` `*ring_pos = write_slot;`). On GPU we
+        // computed `pos % ring_size` (= `pos % (kernel_size - 1)`) directly
+        // and write it into the shared uniform before the compute pass. The
+        // shader at `shaders/conv1d_causal.wgsl` reads the same slot from
+        // `params.ring_pos`, so all DeltaNet layers see the correct history
+        // window. Without this update `ring_pos` stayed at 0 forever, so
+        // the shader wrote every token's activation into the same slot,
+        // effectively discarding the conv1d history — the primary source
+        // of GPU vs CPU state-accumulation divergence starting at layer 6.
+        if let Some(buf) = self.dn_conv_params_buf.as_ref() {
+            // Layout offset: word 1 (bytes 4..8) holds `ring_pos`.
+            let ring_pos: u32 = pos % 3;
+            self.engine
+                .queue
+                .write_buffer(buf, 4, bytemuck::bytes_of(&ring_pos));
+        }
     }
 
     /// Upload token embedding to the hidden buffer.
@@ -4993,6 +5028,20 @@ impl GpuModel {
         for i in 0..self.k_caches.len() {
             self.engine.write_f32(&self.k_caches[i], &zeros);
             self.engine.write_f32(&self.v_caches[i], &zeros);
+        }
+        // Phase X.3.e.3.25 fix: also zero out the DeltaNet recurrent /
+        // conv1d states so multi-run tests (`--layer-bisect` prefill × 5)
+        // don't carry leftover state from a prior forward. The conv1d
+        // ring position resets naturally on the next `update_uniforms`
+        // (pos = 0 → ring_pos = 0), but the state buffers themselves
+        // need to be zeroed here.
+        for state in &self.deltanet_states {
+            let zeros = vec![0.0f32; state.len];
+            self.engine.write_f32(state, &zeros);
+        }
+        for state in &self.deltanet_conv_states {
+            let zeros = vec![0.0f32; state.len];
+            self.engine.write_f32(state, &zeros);
         }
     }
 
