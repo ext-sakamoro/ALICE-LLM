@@ -1928,6 +1928,13 @@ struct LayerBGs {
     k_proj: MatvecBG,
     v_proj: MatvecBG,
     o_proj: MatvecBG,
+    /// Bonsai / Qwen 3.6-27B full-attention layer swish gate projection.
+    /// Same shape as `q_proj` ([q_dim, hidden]) — it's the second half of
+    /// the Bonsai `attn_q [q_dim*2, hidden]` tensor, split at load time.
+    /// The gate output is silu-multiplied into `attn_out` after the
+    /// scaled-dot-product attention, before the `o_proj` matvec.
+    /// `None` on standard Qwen 3.5 / Llama / Qwen 2/3 / Gemma layers.
+    bonsai_attn_q_gate_proj: Option<MatvecBG>,
     /// Qwen 2 / 2.5 QKV bias-add bind groups (None for arch without biases).
     q_bias_bg: Option<wgpu::BindGroup>,
     k_bias_bg: Option<wgpu::BindGroup>,
@@ -1949,6 +1956,10 @@ struct LayerWeightBufs {
     k_proj: GpuWeightBuffer,
     v_proj: GpuWeightBuffer,
     o_proj: GpuWeightBuffer,
+    /// Bonsai / Qwen 3.6-27B full-attention swish gate weights. Shape
+    /// [q_dim, hidden] — the second half of Bonsai's `attn_q [q_dim*2, hidden]`
+    /// after load-time byte-level split. `None` on non-Bonsai layers.
+    bonsai_attn_q_gate: Option<GpuWeightBuffer>,
     /// Qwen 2 / 2.5 attention QKV projection biases (absent for Llama / Mistral /
     /// Gemma / Qwen 3+ which removed biases). Added element-wise to q/k/v projection
     /// outputs before RoPE.
@@ -2550,32 +2561,32 @@ impl GpuModel {
                  remaining Phase 2 Step 4 work. See docs/BONSAI_GPU_SUPPORT.md."
             );
         }
-        // Full-attention Bonsai layout (attn_q with 2×q_dim rows for Q + swish
-        // gate) is not yet supported at the loader level. Detect and fail fast
-        // with a clear message pointing to Phase 2 Step 1 completion work.
-        // Bonsai full-attn tensors live at layers indicated by
-        // `full_attention_interval`; check the first such layer.
-        if let Some(interval) = config.full_attention_interval {
+        // Full-attention Bonsai detection — Bonsai stores Q and the swish gate
+        // as a single stacked tensor `attn_q [q_dim*2, hidden]`; the loader
+        // splits the byte data at the midpoint into two separate
+        // `GpuWeightBuffer`s (`q_proj` + `bonsai_attn_q_gate`) so both halves
+        // can be dispatched as separate matvecs during forward.
+        //
+        // Load succeeds; forward path for full-attn Bonsai still requires
+        // wiring the gate multiplication (deferred to Phase 2 Step 4b —
+        // this PR only completes the loader side).
+        let is_bonsai_full_attn_gguf = if let Some(interval) = config.full_attention_interval {
             let full_attn_layer = interval - 1;
             let expected_q_rows = config.num_heads * config.head_dim;
-            if let Some(info) = gguf.tensor_info(&format!("blk.{full_attn_layer}.attn_q.weight")) {
-                if info.dims[1] as u32 == expected_q_rows * 2 {
-                    panic!(
-                        "Bonsai / Qwen 3.6-27B full-attention Q+gate split \
-                         (attn_q with 2×q_dim rows) is not yet supported by \
-                         the GPU loader.\n\
-                         \n\
-                         This is Phase 2 Step 1 completion work — the loader \
-                         needs to split `attn_q [q_dim*2, hidden]` at load \
-                         time into two separate MatvecBGs (Q half and gate \
-                         half). Landed as separate PR.\n\
-                         \n\
-                         Meanwhile use the CPU forward path:\n\
-                         let mut model = alice_llm::llama3::Llama3Model::load(&gguf)?;\n\
-                         See docs/BONSAI_GPU_SUPPORT.md for scope details."
-                    );
-                }
-            }
+            gguf.tensor_info(&format!("blk.{full_attn_layer}.attn_q.weight"))
+                .is_some_and(|info| info.dims[1] as u32 == expected_q_rows * 2)
+        } else {
+            false
+        };
+        if is_bonsai_full_attn_gguf {
+            eprintln!(
+                "[GpuModel] Bonsai / Qwen 3.6-27B full-attention layer layout \
+                 detected (attn_q with 2×q_dim rows). Loader will split into \
+                 q_proj + bonsai_attn_q_gate. Forward path for full-attn \
+                 Bonsai (silu(gate) multiplication into attn_out before \
+                 o_proj) is Phase 2 Step 4b — expect a panic at full-attn \
+                 layer forward if not yet wired."
+            );
         }
 
         // OOM prevention: estimate peak memory usage and log warning if projected
@@ -2625,9 +2636,38 @@ impl GpuModel {
             let data = gguf.tensor_data(name).unwrap();
             match info.qtype {
                 GgmlType::Q6_K => engine.upload_weights_q6k(data, rows, cols),
+                GgmlType::Q1_0 => engine.upload_weights_q1_0(data, rows, cols),
                 _ => engine.upload_weights(data, rows, cols),
             }
         };
+
+        // Split a Bonsai `attn_q [q_dim*2, hidden]` tensor at load time into
+        // (Q half, gate half). Each half becomes an independent
+        // `GpuWeightBuffer` referencing a disjoint byte range of the original
+        // GGUF tensor data. Both halves have the same shape [q_dim, hidden]
+        // and same quantization type.
+        let upload_w_bonsai_split =
+            |name: &str, half_rows: usize, cols: usize| -> (GpuWeightBuffer, GpuWeightBuffer) {
+                let info = gguf.tensor_info(name).unwrap();
+                let data = gguf.tensor_data(name).unwrap();
+                // Byte layout is [half_rows_0 | half_rows_1] where each row
+                // occupies `data.len() / (half_rows * 2)` bytes.
+                let bytes_per_row = data.len() / (half_rows * 2);
+                let split_at = half_rows * bytes_per_row;
+                let q_bytes = &data[..split_at];
+                let gate_bytes = &data[split_at..];
+                let q = match info.qtype {
+                    GgmlType::Q6_K => engine.upload_weights_q6k(q_bytes, half_rows, cols),
+                    GgmlType::Q1_0 => engine.upload_weights_q1_0(q_bytes, half_rows, cols),
+                    _ => engine.upload_weights(q_bytes, half_rows, cols),
+                };
+                let gate = match info.qtype {
+                    GgmlType::Q6_K => engine.upload_weights_q6k(gate_bytes, half_rows, cols),
+                    GgmlType::Q1_0 => engine.upload_weights_q1_0(gate_bytes, half_rows, cols),
+                    _ => engine.upload_weights(gate_bytes, half_rows, cols),
+                };
+                (q, gate)
+            };
 
         eprintln!("[GpuModel] uploading weights...");
         let t0 = std::time::Instant::now();
@@ -2658,17 +2698,36 @@ impl GpuModel {
         for i in 0..config.num_layers {
             match layer_types[i] {
                 LayerType::Attention => {
+                    // Bonsai full-attn detection per-layer: `attn_q` has
+                    // 2×hidden_dim rows (Q + swish gate stacked). Split at
+                    // load time so both halves are queryable individually.
+                    let attn_q_name = format!("blk.{i}.attn_q.weight");
+                    let attn_q_actual_rows = gguf
+                        .tensor_info(&attn_q_name)
+                        .map(|info| info.dims[1] as usize)
+                        .unwrap_or(config.hidden_dim);
+                    let is_bonsai_full_attn_layer = attn_q_actual_rows == config.hidden_dim * 2;
+                    let (q_proj_val, bonsai_attn_q_gate_val) = if is_bonsai_full_attn_layer {
+                        let (q, gate) = upload_w_bonsai_split(
+                            &attn_q_name,
+                            config.hidden_dim,
+                            config.hidden_dim,
+                        );
+                        (q, Some(gate))
+                    } else {
+                        (
+                            upload_w(&attn_q_name, config.hidden_dim, config.hidden_dim),
+                            None,
+                        )
+                    };
                     layer_weights.push(LayerWeightBufs {
                         attn_norm: engine.upload_f32(
                             &gguf
                                 .tensor_to_f32(&format!("blk.{i}.attn_norm.weight"))
                                 .unwrap(),
                         ),
-                        q_proj: upload_w(
-                            &format!("blk.{i}.attn_q.weight"),
-                            config.hidden_dim,
-                            config.hidden_dim,
-                        ),
+                        q_proj: q_proj_val,
+                        bonsai_attn_q_gate: bonsai_attn_q_gate_val,
                         k_proj: upload_w(
                             &format!("blk.{i}.attn_k.weight"),
                             kv_dim,
@@ -2847,6 +2906,7 @@ impl GpuModel {
                     layer_weights.push(LayerWeightBufs {
                         attn_norm: engine.alloc_f32(1),
                         q_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        bonsai_attn_q_gate: None,
                         k_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         v_proj: engine.upload_weights(&[0u8; 256], 1, 1),
                         o_proj: engine.upload_weights(&[0u8; 256], 1, 1),
@@ -3228,6 +3288,11 @@ impl GpuModel {
                         k_proj,
                         v_proj,
                         o_proj,
+                        // Phase 2 Step 4b (forward wiring for full-attn Bonsai)
+                        // will create the MatvecBG from `lw.bonsai_attn_q_gate`
+                        // when it lands. For Step 4a (loader-only), the weight
+                        // is present but no bind group is pre-cached.
+                        bonsai_attn_q_gate_proj: None,
                         q_bias_bg,
                         k_bias_bg,
                         v_bias_bg,
@@ -3596,6 +3661,7 @@ impl GpuModel {
                         k_bias_bg: None,
                         v_bias_bg: None,
                         // DeltaNet layers do not carry per-head QK norms (unused placeholder).
+                        bonsai_attn_q_gate_proj: None,
                         q_norm_bg: None,
                         k_norm_bg: None,
                         kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3762,6 +3828,35 @@ impl GpuModel {
             match self.layer_types[i] {
                 LayerType::Attention => {
                     let lbg = &self.layer_bgs[i];
+                    let lw = &self._layer_weights[i];
+
+                    // Bonsai / Qwen 3.6-27B full-attention gate: the loader
+                    // splits `attn_q [q_dim*2, hidden]` into `q_proj` (Q half)
+                    // + `bonsai_attn_q_gate` (swish gate half). Forward path
+                    // for full-attn Bonsai needs to dispatch the gate matvec
+                    // + silu(gate) multiplication into attn_out before o_proj
+                    // — that's Phase 2 Step 4b (deferred).
+                    //
+                    // For now, fail fast when we encounter a full-attn Bonsai
+                    // layer at forward time (Q-only forward would silently
+                    // produce numerically wrong output which is worse than
+                    // a clear panic).
+                    if lw.bonsai_attn_q_gate.is_some() {
+                        panic!(
+                            "Bonsai / Qwen 3.6-27B full-attention layer forward \
+                             path is not yet wired (Phase 2 Step 4b pending). \
+                             Loader split `attn_q` into Q + gate halves at \
+                             load time (this PR), but the forward path still \
+                             needs to dispatch the gate matvec + silu(gate) \
+                             multiplication into attn_out before o_proj. \
+                             DeltaNet Bonsai forward (75% of Bonsai layers) is \
+                             already wired (PR #85); this panic is expected \
+                             at the first full-attn layer (blk.3 for \
+                             full_attention_interval=4) until Step 4b lands. \
+                             Use CPU forward (`llama3::Llama3Model`) \
+                             meanwhile."
+                        );
+                    }
 
                     // --- Attention sub-block ---
                     // RMSNorm: hidden → norm_buf
