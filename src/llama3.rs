@@ -2375,11 +2375,17 @@ fn gated_deltanet_head_disjoint(
 ) {
     // L2 normalize q with a tiny epsilon so a zero vector produces a
     // zero output rather than NaN (matches WGSL `max(sqrt(sum_sq), 1e-12)`).
+    // Q is additionally scaled by `1/sqrt(qk_dim)` to match reference
+    // `qwen35.cpp:319-321` `q = ggml_scale(q, 1.0f / sqrtf(S_k))` applied
+    // before the recurrence (Phase X.3.e.3.5 discovery). Fold the scale
+    // into `q_norm` so downstream `q_i = q[i] * q_norm` picks it up
+    // automatically without touching the per-column reduction loop.
     let mut q_sum_sq = 0.0f32;
     for &val in q {
         q_sum_sq += val * val;
     }
-    let q_norm = 1.0 / q_sum_sq.sqrt().max(1e-12);
+    let q_scale = 1.0 / (qk_dim as f32).sqrt();
+    let q_norm = q_scale / q_sum_sq.sqrt().max(1e-12);
 
     let mut k_sum_sq = 0.0f32;
     for &val in k {
