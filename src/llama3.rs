@@ -3967,6 +3967,14 @@ impl<'a> Llama3Model<'a> {
                     // 1. Attention norm.
                     rms_norm(&hidden, &dn_layer.attn_norm, c.norm_eps, &mut norm_buf);
 
+                    // Phase X.3.e.3.14: dump attn_norm for DeltaNet layers to
+                    // track cascade divergence between attention-layer dumps.
+                    if std::env::var("ALICE_DUMP_ATTN_ALL").is_ok()
+                        && matches!(layer_idx, 4 | 5 | 6 | 8 | 9 | 10)
+                    {
+                        dump_slice(&format!("attn{layer_idx}_norm"), &norm_buf, 3);
+                    }
+
                     // Phase X.3.e.3.5 layer-0 first-forward dump for reference
                     // parity comparison (guarded by env `ALICE_DUMP_DN0`).
                     let dump_dn0 = std::env::var("ALICE_DUMP_DN0").is_ok() && dn_idx == 0 && {
@@ -4396,6 +4404,15 @@ impl<'a> Llama3Model<'a> {
                 dump_slice("attn3_v_head0", &v_buf[..c.head_dim], 3);
                 dump_slice("attn3_k_head0", &k_buf[..c.head_dim], 3);
             }
+            // Phase X.3.e.3.14: additional attention-layer attn_norm dumps for
+            // cascade divergence progression tracking (layers 7/11/15/19/23/27/31).
+            // Env-gated by ALICE_DUMP_ATTN_ALL so first-forward captures each
+            // attention layer's input norm to compare against reference dump.
+            if std::env::var("ALICE_DUMP_ATTN_ALL").is_ok()
+                && matches!(layer_idx, 7 | 11 | 15 | 19 | 23 | 27 | 31)
+            {
+                dump_slice(&format!("attn{layer_idx}_norm"), &norm_buf, 3);
+            }
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
             if let Some(b) = layer.q_bias() {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
@@ -4470,13 +4487,16 @@ impl<'a> Llama3Model<'a> {
                 &mut attn_out,
             );
 
-            // Qwen 3.6 / Bonsai 27B "Gated Attention": when `q_proj` output
-            // was `2 * q_dim`, its second half is a per-element swish (SiLU)
-            // gate that modulates the attention result before `o_proj`.
-            // Applied element-wise across all heads.
+            // Qwen 3.5 / 3.6 / Bonsai 27B "Gated Attention": when `q_proj`
+            // output was `2 * q_dim`, its second half is a per-element
+            // sigmoid gate that modulates the attention result before
+            // `o_proj`. Phase X.3.e.3.14 fix: previously silu (swish) was
+            // applied, but reference qwen35.cpp:401-404 uses ggml_sigmoid
+            // (not silu), which caused massive divergence propagating from
+            // attention layer 3 onwards (attn_norm-4 sign-flip vs reference).
             if layer.gated_output {
                 for i in 0..q_dim {
-                    attn_out[i] *= silu(q_buf[q_dim + i]);
+                    attn_out[i] *= sigmoid(q_buf[q_dim + i]);
                 }
             }
 
@@ -12226,28 +12246,30 @@ mod tests {
         assert!(load_weight_ref_any_rows(&gguf, "not_present", 2).is_none());
     }
 
-    /// Qwen 3.6 / Bonsai 27B Gated Attention post-hoc validation: the swish
-    /// gate maps `x → x * sigmoid(x)`, so gate = 0 nullifies the attention
-    /// output while a large positive gate lets it through. Verifies the
-    /// arithmetic done inline in the main `forward` path against a scalar
-    /// reference, independent of any real GGUF weights.
+    /// Qwen 3.5 / 3.6 / Bonsai 27B Gated Attention post-hoc validation: the
+    /// sigmoid gate maps `x → 1 / (1 + exp(-x))`, so gate = 0 halves the
+    /// attention output, large positive lets it through, large negative
+    /// nullifies. Verifies the arithmetic done inline in the main `forward`
+    /// path against a scalar reference, independent of any real GGUF
+    /// weights. Phase X.3.e.3.14 fix: previously tested silu (swish) which
+    /// mismatched reference qwen35.cpp:401-404 ggml_sigmoid semantics.
     #[test]
-    fn gated_attention_swish_math_matches_reference() {
+    fn gated_attention_sigmoid_math_matches_reference() {
         // 6 attention output values with 6 gate values.
         let mut attn_out = vec![1.0f32, 2.0, -1.0, 0.5, -0.5, 3.0];
         let gate = vec![0.0f32, 1.0, -1.0, 10.0, -10.0, 0.5];
         let q_dim = attn_out.len();
 
-        // Reference: each output multiplied by silu(gate).
+        // Reference: each output multiplied by sigmoid(gate).
         let expected: Vec<f32> = attn_out
             .iter()
             .zip(gate.iter())
-            .map(|(&a, &g)| a * silu(g))
+            .map(|(&a, &g)| a * sigmoid(g))
             .collect();
 
         // In-place update mirroring the forward path body.
         for i in 0..q_dim {
-            attn_out[i] *= silu(gate[i]);
+            attn_out[i] *= sigmoid(gate[i]);
         }
 
         for (i, (&got, &want)) in attn_out.iter().zip(expected.iter()).enumerate() {
@@ -12257,11 +12279,11 @@ mod tests {
             );
         }
 
-        // gate = 0 → silu(0) = 0 → output zeroed out.
-        assert_eq!(attn_out[0], 0.0);
-        // gate = -10 → silu(-10) ≈ 0 → output near-zero.
+        // gate = 0 → sigmoid(0) = 0.5 → output halved (attn_out[0] = 1.0 * 0.5).
+        assert!((attn_out[0] - 0.5).abs() < 1e-6);
+        // gate = -10 → sigmoid(-10) ≈ 0 → output near-zero.
         assert!(attn_out[4].abs() < 1e-3);
-        // gate = 10 → silu(10) ≈ 10 → output amplified.
-        assert!(attn_out[3] > 4.9);
+        // gate = 10 → sigmoid(10) ≈ 1 → output ≈ unchanged (0.5 * ~1).
+        assert!((attn_out[3] - 0.5).abs() < 1e-3);
     }
 }
