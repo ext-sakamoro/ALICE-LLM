@@ -4394,10 +4394,61 @@ impl GpuModel {
     }
 
     fn encode_forward_impl(&self, encoder: &mut wgpu::CommandEncoder, stop_after: Option<usize>) {
-        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        let mut dn_fwd_idx: usize = 0; // index into deltanet_layer_bgs
+        // Standard full-layer forward is the layer loop plus the output
+        // head. Split as helpers so the Phase A2 per-layer hybrid path
+        // (`run_attention_layer_only`) can reuse the same per-layer
+        // dispatch code without duplicating the ~730 line attention/FFN
+        // sequence.
+        self.encode_layers_range(encoder, 0..self.config.num_layers, stop_after);
+        // Skip the output head when the caller requested an early stop —
+        // matches the pre-refactor behaviour so `--layer-bisect` still
+        // reads the correct hidden state at each checkpoint.
+        if stop_after.is_none() {
+            self.encode_output_head(encoder);
+        }
+    }
 
-        for i in 0..self.config.num_layers {
+    /// Phase A2: dispatch just the output-head compute (RMSNorm + output
+    /// projection). Reads from `self.hidden` (already populated by the
+    /// caller) and writes logits into `self.logits`. Used by the per-layer
+    /// hybrid path to finalise a forward whose main layer loop was split
+    /// across CPU (DeltaNet) and GPU (Attention).
+    fn encode_output_head(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+        cp.set_bind_group(0, &self.output_norm_bg, &[]);
+        cp.dispatch_workgroups(1, 1, 1);
+        Self::dispatch_mv(&self.engine, &mut cp, &self.output_proj_bg);
+    }
+
+    /// Phase A2 per-layer forward. Runs the same per-layer dispatches as
+    /// `encode_forward_impl` but only for layer indices in `range`.
+    ///
+    /// Assumes `self.hidden` has already been written with the correct
+    /// input hidden state before this call, and `update_uniforms(pos,
+    /// seq_len)` has already fired. `stop_after` is checked exactly like
+    /// the full-forward variant so `--layer-bisect` continues to work.
+    ///
+    /// For hybrid orchestration (`run_attention_layer_only`), the caller
+    /// typically passes `range = layer_idx..layer_idx+1` and skips the
+    /// output-norm / output-projection tail.
+    fn encode_layers_range(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        range: std::ops::Range<usize>,
+        stop_after: Option<usize>,
+    ) {
+        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        // dn_fwd_idx must count all DeltaNet layers before `range.start`
+        // so per-layer DeltaNet bind-group lookups stay aligned with the
+        // model config. For the standard forward path (`range.start == 0`)
+        // this evaluates to 0, matching the previous behaviour.
+        let mut dn_fwd_idx: usize = self.layer_types[..range.start]
+            .iter()
+            .filter(|t| **t == LayerType::DeltaNet)
+            .count();
+
+        for i in range {
             match self.layer_types[i] {
                 LayerType::Attention => {
                     let lbg = &self.layer_bgs[i];
@@ -4702,15 +4753,6 @@ impl GpuModel {
                 return;
             }
         }
-
-        // --- Output head ---
-        // RMSNorm: hidden → norm_buf
-        cp.set_pipeline(&self.engine.rmsnorm_pipeline);
-        cp.set_bind_group(0, &self.output_norm_bg, &[]);
-        cp.dispatch_workgroups(1, 1, 1);
-
-        // Output projection from norm_buf
-        Self::dispatch_mv(&self.engine, &mut cp, &self.output_proj_bg);
     }
 
     /// Dispatch a pre-cached matvec bind group.
@@ -5030,6 +5072,81 @@ impl GpuModel {
     }
 
     /// Issue #40 layer bisection diagnostic. Executes forward but stops
+    /// Phase A2 hybrid entry point. Runs one attention layer on the GPU
+    /// given an externally-supplied hidden state and returns the updated
+    /// hidden. Used by `run_hybrid_per_layer` in the qwen_gpu example,
+    /// where the CPU orchestrator processes DeltaNet layers and delegates
+    /// attention layers to the GPU while the KV cache stays alive on the
+    /// GPU side.
+    ///
+    /// - `layer_idx` **must** be an attention layer (not DeltaNet). Panics
+    ///   otherwise so the orchestrator can rely on layer-kind routing.
+    /// - `pos` is the current sequence position (used by RoPE + kv_cache
+    ///   append); the caller advances the token stream — this method does
+    ///   NOT touch `self.seq_len`, so hybrid runs share the same position
+    ///   space as any subsequent single-op reads.
+    /// - `hidden_input` length must equal `hidden_dim`; longer buffers are
+    ///   ignored beyond the first `hidden_dim` elements.
+    ///
+    /// # Side effects
+    ///
+    /// Advances the KV cache for this attention layer at `pos`. The
+    /// caller should invoke this exactly once per attention layer per
+    /// token so the layer's KV cache stays consistent.
+    pub fn run_attention_layer_only(
+        &mut self,
+        layer_idx: usize,
+        hidden_input: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
+        assert_eq!(
+            self.layer_types[layer_idx],
+            LayerType::Attention,
+            "run_attention_layer_only: layer {layer_idx} is not an Attention layer \
+             (per-layer hybrid must delegate only attention layers to GPU)"
+        );
+        assert!(
+            hidden_input.len() >= self.config.hidden_dim,
+            "run_attention_layer_only: hidden_input.len() = {} < hidden_dim {}",
+            hidden_input.len(),
+            self.config.hidden_dim,
+        );
+
+        // 1. Publish the current hidden vector to the GPU so the layer's
+        //    RMSNorm + Q/K/V matvecs see the up-to-date state produced by
+        //    the previous CPU DeltaNet slice.
+        self.engine
+            .write_f32(&self.hidden, &hidden_input[..self.config.hidden_dim]);
+
+        // 2. Update RoPE / KV-cache / attention params for `pos`. The
+        //    layer's dispatches read these uniforms exactly as the
+        //    full-forward path does.
+        self.update_uniforms(pos, pos + 1);
+
+        // 3. Encode + submit just this one layer.
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_layers_range(&mut encoder, layer_idx..layer_idx + 1, None);
+        // Copy the post-FFN-residual `hidden` back to a staging buffer
+        // in the same submission so the readback is coalesced with the
+        // compute pass.
+        let hidden_dim = self.config.hidden_dim;
+        let hidden_size = (hidden_dim * 4) as u64;
+        let staging = self.hidden_staging.get_or_init(|| {
+            self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hidden_staging"),
+                size: hidden_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        encoder.copy_buffer_to_buffer(&self.hidden.buffer, 0, staging, 0, hidden_size);
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.engine.map_staging(staging, hidden_dim)
+    }
+
     /// after the given layer's FFN residual add, then returns that layer's
     /// output hidden state. Skips the output head entirely so downstream
     /// state is untouched.
