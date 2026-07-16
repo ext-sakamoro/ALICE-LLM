@@ -2890,14 +2890,22 @@ impl GpuModel {
                         ssm_norm: ssm_norm_opt,
                         conv1d_weight: engine.upload_f32(&conv1d_w),
                         conv1d_bias: conv1d_b_opt,
+                        // Phase X.3.e.3.12 fix: ssm_alpha/beta rows count is
+                        // `num_v_heads` (32 for Qwen 3.5, 48 for Bonsai 27B),
+                        // NOT `num_kv_heads` (16). Previous code loaded only
+                        // half the weight for GGUFs where the tensor has 32
+                        // rows, producing undefined alpha/beta for V-heads
+                        // 16..31. CPU loader uses `load_weight_ref_any_rows`
+                        // which reads the actual GGUF row count (see
+                        // llama3.rs:9351-9360).
                         alpha_proj: upload_w(
                             &format!("blk.{i}.ssm_alpha.weight"),
-                            dn_num_kv_heads,
+                            dn_num_v_heads,
                             config.hidden_dim,
                         ),
                         beta_proj: upload_w(
                             &format!("blk.{i}.ssm_beta.weight"),
-                            dn_num_kv_heads,
+                            dn_num_v_heads,
                             config.hidden_dim,
                         ),
                         ssm_out: upload_w(
@@ -3014,13 +3022,15 @@ impl GpuModel {
         let gate_buf = engine.alloc_f32(MAX_BATCH * config.intermediate_dim);
         let down_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
         // DeltaNet decay-gate / update-rate scratch (Qwen 3.5 hybrid). Sized to
-        // `linear_num_kv_heads` (per-head scalar) with MAX_BATCH lanes reserved
-        // for future batch-inference support. Reused across all DeltaNet
-        // layers within a single forward pass.
-        let dn_num_kv_heads_scratch =
-            config.linear_num_kv_heads.unwrap_or(config.num_kv_heads) as usize;
-        let alpha_buf = engine.alloc_f32(MAX_BATCH * dn_num_kv_heads_scratch);
-        let beta_buf = engine.alloc_f32(MAX_BATCH * dn_num_kv_heads_scratch);
+        // `linear_num_v_heads` (per-V-head scalar under cyclic V→KV mapping,
+        // Phase X.3.e.3.11 fix) with MAX_BATCH lanes reserved for future
+        // batch-inference support. Reused across all DeltaNet layers within
+        // a single forward pass. Previously sized to `linear_num_kv_heads`
+        // which left V-heads 16..31 (Qwen 3.5) or 16..47 (Bonsai) with
+        // undefined alpha/beta.
+        let dn_num_v_heads_scratch = config.linear_num_v_heads.unwrap_or(config.num_heads) as usize;
+        let alpha_buf = engine.alloc_f32(MAX_BATCH * dn_num_v_heads_scratch);
+        let beta_buf = engine.alloc_f32(MAX_BATCH * dn_num_v_heads_scratch);
         let logits = engine.alloc_f32(MAX_BATCH * vocab_size);
         let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("logits_staging"),
