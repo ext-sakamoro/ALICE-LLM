@@ -67,6 +67,35 @@ jobs:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
         run: cargo test --lib --features simd
 
+  gpu_pipeline_smoke:
+    # Phase 2 Step 6: catches shader / pipeline compilation regressions that
+    # only surface at Metal / Vulkan runtime (e.g., PR #73 row8×batch4
+    # exceeded Metal per-shader threadgroup slot limit — CI test passed on
+    # ubuntu default features but Mac Metal panicked at GpuEngine::new()).
+    #
+    # Runs `smoke_test_gpu_pipeline_creation_all_pipelines_valid` which
+    # instantiates GpuEngine::new() and catches any pipeline compilation
+    # panic, distinguishing "no GPU adapter" (acceptable on headless CI)
+    # from real shader validation errors (test fails).
+    name: GPU pipeline creation smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest has Apple Metal (Apple Silicon runner), so pipeline
+        # creation actually exercises the Metal shader compiler.
+        # ubuntu-latest does not have GPU hardware, but the test skips
+        # gracefully (compile-check + adapter-absence path).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --features gpu (pipeline smoke test)
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
+        run: cargo test --lib --features gpu smoke_test_gpu_pipeline_creation
+
   build_release:
     name: Build (release)
     runs-on: ubuntu-latest

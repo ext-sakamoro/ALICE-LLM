@@ -4955,4 +4955,86 @@ mod tests {
         let weight = vec![1.0f32; 3]; // must be v_dim=4
         ssm_norm_per_head_cpu(&mut input, &weight, 4, 1e-6);
     }
+
+    /// GPU pipeline creation smoke test — instantiates `GpuEngine::new()` to
+    /// force all compute pipelines to compile on the runtime backend (Metal
+    /// on macOS, Vulkan on Linux with lavapipe, DirectX on Windows).
+    ///
+    /// This is the sentinel that catches shader-side regressions that only
+    /// surface at Metal / Vulkan pipeline-creation time and are missed by
+    /// naga transpile (which validates WGSL syntax but does not exercise
+    /// the target backend's shader compiler).
+    ///
+    /// # Historical context
+    ///
+    /// PR #73 (row8×batch4 shader) introduced 32 separate `var<workgroup>`
+    /// arrays which exceeded Metal's per-shader threadgroup resource slot
+    /// limit. WGSL syntax was valid, naga transpiled cleanly, ubuntu Vulkan
+    /// tests passed — but any Mac Metal user hit `GpuEngine::new()` panic:
+    ///
+    /// ```text
+    /// Internal error: Metal: program_source:89:23: error:
+    /// no 'threadgroup' resource location available for 'sg73_'
+    /// ```
+    ///
+    /// PR #76 fixed the shader by consolidating the 32 arrays into a single
+    /// `array<f32, 512>`. This smoke test exists to prevent regression: if
+    /// any shader change re-triggers a Metal / Vulkan / DirectX validation
+    /// error at pipeline creation time, this test fails at CI green-gate
+    /// time rather than in production.
+    ///
+    /// # Behavior on GPU-less CI runners
+    ///
+    /// If no GPU adapter is available (headless Linux CI without lavapipe),
+    /// `GpuEngine::new()` panics with "no GPU adapter found" during
+    /// `.expect()`. The test uses `std::panic::catch_unwind` to distinguish:
+    /// - "no GPU adapter found" → SKIP (test passes with note)
+    /// - Any other panic (Metal validation, etc.) → FAIL
+    ///
+    /// This lets the test compile-check on any CI runner and actually
+    /// exercise pipeline creation whenever a GPU (real or software) exists.
+    #[test]
+    fn smoke_test_gpu_pipeline_creation_all_pipelines_valid() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _engine = GpuEngine::new();
+            // If we reach this line, all pipelines compiled successfully on
+            // the runtime backend. GpuEngine::new() creates all pipelines
+            // eagerly, so any Metal / Vulkan / DirectX validation error would
+            // have panicked above.
+        }));
+
+        match result {
+            Ok(()) => {
+                eprintln!("[smoke_test] GpuEngine::new() succeeded — all pipelines compiled");
+            }
+            Err(err) => {
+                let msg = if let Some(s) = err.downcast_ref::<String>() {
+                    s.as_str()
+                } else if let Some(s) = err.downcast_ref::<&str>() {
+                    *s
+                } else {
+                    "(non-string panic payload)"
+                };
+
+                // Distinguish "no GPU available" (acceptable on headless CI)
+                // from actual shader / pipeline compilation failure.
+                if msg.contains("no GPU adapter found") {
+                    eprintln!(
+                        "[smoke_test] SKIP: no GPU adapter available on this runner \
+                         (this is expected on headless Linux CI without lavapipe). \
+                         Pipeline creation validation deferred to macOS / Linux+lavapipe runners."
+                    );
+                    // Test passes — the intent is to catch pipeline compilation
+                    // errors, not adapter availability.
+                } else {
+                    // Any other panic message is a real shader / pipeline
+                    // compilation error — fail the test with the diagnostic.
+                    panic!(
+                        "GpuEngine::new() failed with an unexpected panic \
+                         (likely shader / pipeline compilation error on this backend): {msg}"
+                    );
+                }
+            }
+        }
+    }
 }
