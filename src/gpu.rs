@@ -19,6 +19,7 @@ const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const SILU_GATE_APPLY_SHADER: &str = include_str!("shaders/silu_gate_apply.wgsl");
+const SILU_INPLACE_SHADER: &str = include_str!("shaders/silu_inplace.wgsl");
 const BETA_SIGMOID_SHADER: &str = include_str!("shaders/beta_sigmoid.wgsl");
 const SSM_DISCRETISATION_SHADER: &str = include_str!("shaders/ssm_discretisation.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
@@ -61,6 +62,18 @@ pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
         // silu(g) = g / (1 + exp(-g)) = g * sigmoid(g)
         // attn_out[i] *= silu(g)
         *a = *a * g / (1.0 + (-g).exp());
+    }
+}
+
+/// CPU reference implementation of the `silu_inplace` WGSL shader.
+///
+/// Computes `buf[i] = silu(buf[i])` in-place, matching
+/// `src/shaders/silu_inplace.wgsl` line-by-line. Used by Bonsai / Qwen
+/// 3.6-27B DeltaNet post-conv1d silu (Phase X.3.e.3 Gap A).
+pub fn silu_inplace_cpu(buf: &mut [f32]) {
+    for x in buf.iter_mut() {
+        // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+        *x = *x / (1.0 + (-*x).exp());
     }
 }
 
@@ -325,6 +338,11 @@ pub struct GpuEngine {
     /// — exposed via `GpuPass::silu_gate_apply` for future integration and
     /// standalone parity validation.
     silu_gate_apply_pipeline: wgpu::ComputePipeline,
+    /// Element-wise SiLU in-place: `buf[i] = buf[i] * sigmoid(buf[i])`.
+    /// Bonsai / Qwen 3.6-27B post-conv1d silu (Phase X.3.e.3 Gap A). Distinct
+    /// from `silu_mul` (SwiGLU two-input) and `silu_gate_apply` (Bonsai attn
+    /// output modulation, two-buffer): this is the single-input variant.
+    silu_inplace_pipeline: wgpu::ComputePipeline,
     /// Bonsai / Qwen 3.6-27B DeltaNet beta transformation: element-wise
     /// `beta[i] = sigmoid(beta_raw[i])` in-place on beta buffer. Phase X.3.e.3
     /// Gap B extra (commit `2d55f2b` CPU implementation reference). Only
@@ -529,6 +547,11 @@ impl GpuEngine {
                 SILU_GATE_APPLY_SHADER,
                 "silu_gate_apply",
                 "silu_gate_apply",
+            ),
+            silu_inplace_pipeline: make_pipeline(
+                SILU_INPLACE_SHADER,
+                "silu_inplace",
+                "silu_inplace",
             ),
             beta_sigmoid_pipeline: make_pipeline(
                 BETA_SIGMOID_SHADER,
@@ -1382,6 +1405,39 @@ impl<'a> GpuPass<'a> {
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.engine.silu_mul_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, 1, 1);
+        }
+    }
+
+    /// Element-wise SiLU in-place: `buf[i] = buf[i] * sigmoid(buf[i])`.
+    ///
+    /// Bonsai / Qwen 3.6-27B DeltaNet post-conv1d silu (Phase X.3.e.3 Gap A):
+    /// applied to the causal-conv1d output for the Q+K+V portion before
+    /// delta-rule integration. Distinct from `silu_mul` (SwiGLU two-input)
+    /// and `silu_gate_apply` (Bonsai attn output modulation).
+    ///
+    /// Not yet wired into `encode_forward_impl` — awaiting Phase 2 Step 4
+    /// (Bonsai DeltaNet forward path wiring).
+    pub fn silu_inplace(&mut self, buf: &GpuBuffer) {
+        let layout = self.engine.silu_inplace_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.buffer.as_entire_binding(),
+                }],
+            });
+        let dispatch_x = ((buf.len as u32) + 255) / 256;
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.silu_inplace_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(dispatch_x, 1, 1);
         }
@@ -4845,6 +4901,60 @@ mod tests {
         let mut attn_out = vec![1.0f32; 4];
         let gate = vec![1.0f32; 5];
         silu_gate_apply_cpu(&mut attn_out, &gate);
+    }
+
+    /// Verify `silu_inplace_cpu` produces standard silu values for key anchor points.
+    #[test]
+    fn silu_inplace_cpu_matches_math() {
+        // silu(x) = x * sigmoid(x)
+        //   silu(0)         = 0
+        //   silu(1)         ≈ 0.7310586
+        //   silu(-1)        ≈ -0.2689414
+        //   silu(large +)   ≈ x (asymptotic)
+        //   silu(large -)   ≈ 0 (asymptotic)
+        let mut buf = vec![0.0f32, 1.0, -1.0, 20.0, -20.0];
+        silu_inplace_cpu(&mut buf);
+
+        assert!(buf[0].abs() < 1e-6, "silu(0) = 0, got {}", buf[0]);
+        assert!(
+            (buf[1] - 0.7310586).abs() < 1e-5,
+            "silu(1) ≈ 0.7310586, got {}",
+            buf[1]
+        );
+        assert!(
+            (buf[2] - (-0.2689414)).abs() < 1e-5,
+            "silu(-1) ≈ -0.2689414, got {}",
+            buf[2]
+        );
+        assert!(
+            (buf[3] - 20.0).abs() < 1e-4,
+            "silu(20) ≈ 20, got {}",
+            buf[3]
+        );
+        assert!(buf[4].abs() < 1e-4, "silu(-20) ≈ 0, got {}", buf[4]);
+    }
+
+    /// Verify `silu_inplace_cpu` matches `silu_gate_apply_cpu` when the
+    /// gate operand of the latter is a unit vector (attn_out=silu(gate)).
+    #[test]
+    fn silu_inplace_cpu_matches_silu_gate_apply_with_unit_gate() {
+        let src = vec![0.5f32, -1.2, 3.7, 0.0, 100.0, -100.0];
+
+        // silu_inplace on src
+        let mut inplace = src.clone();
+        silu_inplace_cpu(&mut inplace);
+
+        // silu_gate_apply with attn_out = [1, 1, ..., 1], gate = src
+        // → attn_out[i] = 1 * silu(src[i]) = silu(src[i])
+        let mut gate_apply = vec![1.0f32; src.len()];
+        silu_gate_apply_cpu(&mut gate_apply, &src);
+
+        for (i, (&a, &b)) in inplace.iter().zip(gate_apply.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "silu_inplace[{i}] = {a}, silu_gate_apply[{i}] = {b} (should match)",
+            );
+        }
     }
 
     /// Verify `beta_sigmoid_cpu` produces standard sigmoid values.
