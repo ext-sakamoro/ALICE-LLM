@@ -4260,6 +4260,29 @@ impl<'a> Llama3Model<'a> {
                 .as_ref()
                 .expect("v_proj required for non-shared layer")
                 .matvec_preq(&q8_attn, &mut v_buf);
+            // Reference qwen35.cpp:347-370 の view stride 精読で確定:
+            // GGUF `attn_q.weight` は per-head interleaved layout
+            // (`nb1 = element_size * n_embd_head * 2`)、
+            // [q_h0(head_dim), gate_h0(head_dim), q_h1, gate_h1, ...] で
+            // `2 * q_dim` rows を格納。downstream code は consecutive
+            // [Q(q_dim), Gate(q_dim)] を仮定しているため de-interleave が必要。
+            if layer.gated_output {
+                let head_dim = c.head_dim;
+                let mut gate_extract = vec![0f32; q_dim];
+                for h in 0..c.num_heads {
+                    for p in 0..head_dim {
+                        gate_extract[h * head_dim + p] = q_buf[h * head_dim * 2 + head_dim + p];
+                    }
+                }
+                for h in 1..c.num_heads {
+                    let src = h * head_dim * 2;
+                    let dst = h * head_dim;
+                    for p in 0..head_dim {
+                        q_buf[dst + p] = q_buf[src + p];
+                    }
+                }
+                q_buf[q_dim..2 * q_dim].copy_from_slice(&gate_extract);
+            }
             // Phase X.3.e.3.5 layer-3 first-forward dump for reference parity.
             let dump_attn3 = std::env::var("ALICE_DUMP_ATTN3").is_ok() && layer_idx == 3 && {
                 static ONCE_A3: std::sync::Once = std::sync::Once::new();
