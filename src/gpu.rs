@@ -2300,6 +2300,11 @@ pub struct GpuModel {
     _k_buf: GpuBuffer,
     _v_buf: GpuBuffer,
     _attn_out: GpuBuffer,
+    /// Post-`ssm_norm_per_head` scratch for the Bonsai DeltaNet path (see
+    /// scratch alloc in `GpuModel::load`). Kept as an owned field so its
+    /// storage buffer outlives the bind groups that reference it via
+    /// `attn_out_normed.buffer`.
+    _attn_out_normed: GpuBuffer,
     _o_buf: GpuBuffer,
     _gate_buf: GpuBuffer,
     _down_buf: GpuBuffer,
@@ -4218,6 +4223,7 @@ impl GpuModel {
             _k_buf: k_buf,
             _v_buf: v_buf,
             _attn_out: attn_out,
+            _attn_out_normed: attn_out_normed,
             _o_buf: o_buf,
             _gate_buf: gate_buf,
             _down_buf: down_buf,
@@ -4663,6 +4669,8 @@ impl GpuModel {
                 (self.config.num_kv_heads * self.config.head_dim) as usize,
             ),
             "attn_out" => (&self._attn_out, self.config.hidden_dim),
+            "attn_out_normed" => (&self._attn_out_normed, self.config.hidden_dim),
+            "o_buf" => (&self._o_buf, self.config.hidden_dim),
             "hidden" => (&self.hidden, self.config.hidden_dim),
             "alpha_buf" => (
                 &self._alpha_buf,
@@ -4689,6 +4697,15 @@ impl GpuModel {
         encoder.copy_buffer_to_buffer(&buf.buffer, 0, &staging, 0, bytes);
         self.engine.queue.submit(Some(encoder.finish()));
         self.engine.map_staging(&staging, read_len)
+    }
+
+    /// Phase X.3.e.3.24 diagnostic: upload the embedding for `token_id` into
+    /// `hidden` and read the first 5 dimensions. No RMSNorm applied — used
+    /// to check that the embedding weight table (GGUF `token_embd.weight`)
+    /// matches the CPU implementation's expected values byte-for-byte.
+    pub fn debug_read_embedding_head(&mut self, token_id: u32) -> Vec<f32> {
+        self.upload_embedding(token_id);
+        self.debug_read_scratch("hidden", 5)
     }
 
     /// Phase X.3.e.3.21 diagnostic: run only layer 0's RMSNorm (attn_norm)
@@ -4745,6 +4762,7 @@ impl GpuModel {
         Vec<f32>, // alpha_buf head 5
         Vec<f32>, // beta_buf head 5
         Vec<f32>, // attn_out head 5 (post gated_deltanet)
+        Vec<f32>, // attn_out_normed head 5 (post ssm_norm + silu(z))
         Vec<f32>, // o_buf head 5 (post ssm_out_proj)
         Vec<f32>, // hidden head 5 (post residual add for layer 0)
     ) {
@@ -4761,24 +4779,8 @@ impl GpuModel {
         let alpha = self.debug_read_scratch("alpha_buf", 5);
         let beta = self.debug_read_scratch("beta_buf", 5);
         let attn_out = self.debug_read_scratch("attn_out", 5);
-        // `o_buf` isn't in the current debug_read_scratch match set; add it.
-        // (We inline the map-copy here to avoid a second Edit round-trip.)
-        let o_buf_head = {
-            let bytes = 5 * 4;
-            let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dbg_o_buf_staging"),
-                size: bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut encoder = self
-                .engine
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            encoder.copy_buffer_to_buffer(&self._o_buf.buffer, 0, &staging, 0, bytes);
-            self.engine.queue.submit(Some(encoder.finish()));
-            self.engine.map_staging(&staging, 5)
-        };
+        let attn_out_normed = self.debug_read_scratch("attn_out_normed", 5);
+        let o_buf_head = self.debug_read_scratch("o_buf", 5);
         // The `hidden0` return of `forward_stop_after_layer_and_read_hidden`
         // is the entire hidden vector — take the first 5.
         let hidden_head = hidden0.into_iter().take(5).collect();
@@ -4790,6 +4792,7 @@ impl GpuModel {
             alpha,
             beta,
             attn_out,
+            attn_out_normed,
             o_buf_head,
             hidden_head,
         )
