@@ -2127,17 +2127,26 @@ fn causal_conv1d_step(
     let rp = *ring_pos;
     // Read `kernel_size - 1` history slots + current x, weighted-sum with
     // the kernel row corresponding to that timestep.
+    //
+    // GGUF `ssm_conv1d.weight` shape is `[kernel_size, dim]` in ggml notation
+    // (`ne[0] = kernel_size` inner, `ne[1] = dim` outer). Storage is
+    // dim-outer × kernel-inner — for each channel `d`, the `kernel_size`
+    // weight values are contiguous in `weight[d * kernel_size + k]`
+    // (Phase X.3.e.3.5 fix: previous `weight[k * dim + d]` treated storage
+    // as kernel-outer, causing catastrophic mismatch for Qwen 3.5 DeltaNet
+    // and every hybrid arch that ships an `ssm_conv1d` tensor).
     for d in 0..dim {
         let mut acc = bias[d];
+        let w_base = d * kernel_size;
         for k in 0..(kernel_size - 1) {
             // Slot at offset (rp + 1 + k) % ring maps kernel timestep k
             // to the (kernel_size - 1 - k)-oldest history entry, matching
             // the WGSL layout `state[((rp + 1 + k) % ring) * dim + d]`.
             let hist = state[((rp + 1 + k) % ring) * dim + d];
-            acc += weight[k * dim + d] * hist;
+            acc += weight[w_base + k] * hist;
         }
         // Kernel row `kernel_size - 1` is applied to the current input.
-        acc += weight[(kernel_size - 1) * dim + d] * x[d];
+        acc += weight[w_base + (kernel_size - 1)] * x[d];
         out[d] = acc;
     }
 
@@ -10230,6 +10239,58 @@ mod tests {
                 expected_ch1[i]
             );
         }
+    }
+
+    /// Regression test for Phase X.3.e.3.5 — `ssm_conv1d.weight` in GGUF
+    /// is stored dim-outer × kernel-inner (`ne[0] = kernel_size` fastest).
+    /// A `dim=2, kernel=4` case with per-channel unique weights
+    /// distinguishes the correct `weight[d * kernel + k]` indexing from
+    /// the transposed `weight[k * dim + d]` — the earlier `dim=1` test
+    /// is degenerate because both indexings collapse to `weight[k]`.
+    #[test]
+    fn causal_conv1d_step_weight_layout_dim_outer_kernel_inner() {
+        let dim = 2;
+        let kernel = 4;
+        // Weight stored dim-outer × kernel-inner:
+        //   channel 0 kernel = [1, 2, 3, 4]
+        //   channel 1 kernel = [10, 20, 30, 40]
+        let weight: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let bias: Vec<f32> = vec![0.0, 0.0];
+        // Constant input per channel: channel 0 = 1, channel 1 = 100.
+        let inputs = [
+            vec![1.0f32, 100.0],
+            vec![1.0, 100.0],
+            vec![1.0, 100.0],
+            vec![1.0, 100.0], // after this call, the window is fully populated
+        ];
+        let mut state = vec![0.0f32; (kernel - 1) * dim];
+        let mut ring_pos = 0usize;
+        let mut out = vec![0.0f32; dim];
+        for x in &inputs {
+            causal_conv1d_step(
+                x,
+                &mut state,
+                &mut ring_pos,
+                &weight,
+                &bias,
+                &mut out,
+                dim,
+                kernel,
+            );
+        }
+        // Fully populated window, all inputs = 1 (ch0) or 100 (ch1):
+        //   ch0 out = (1+2+3+4) * 1 = 10
+        //   ch1 out = (10+20+30+40) * 100 = 10_000
+        assert!(
+            (out[0] - 10.0).abs() < 1e-5,
+            "ch0 expected 10.0 got {} (weight indexing likely transposed)",
+            out[0]
+        );
+        assert!(
+            (out[1] - 10_000.0).abs() < 1e-3,
+            "ch1 expected 10000.0 got {} (weight indexing likely transposed)",
+            out[1]
+        );
     }
 
     /// alpha = 0 means the state loses its history, beta = 1 means the
