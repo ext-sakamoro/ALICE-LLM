@@ -313,12 +313,29 @@ fn main() {
         let mut model = GpuModel::load(engine, &gguf, config);
         println!("  GPU model ready: {}ms", t_gpu.elapsed().as_millis());
 
-        // --- Qwen ChatML template ---
-        let formatted =
-            format!("<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n");
+        // --- Qwen 3 / 3.5 ChatML template with thinking-mode disabled ---
+        // Same template as CPU (`examples/elyza_gguf.rs:163-165`) — pre-fills
+        // empty `<think></think>` so greedy sampling doesn't loop the
+        // thinking block. Required for apples-to-apples CPU/GPU diff.
+        let formatted = format!(
+            "<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
 
         // --- Tokenize ---
-        let prompt_tokens = tokenizer.encode(&formatted);
+        // Mirror CPU `Llama3Model::generate` (llama3.rs:5974-5979): prepend
+        // BOS if the tokenizer requests it and the encoded prompt doesn't
+        // already start with the BOS ID. Without this, GPU processes
+        // `<|im_start|>` (token 248045 for Qwen 3.5) as the first token,
+        // while CPU processes BOS (token 1) first — producing entirely
+        // different KV cache / DeltaNet state, which is the primary source
+        // of GPU vs CPU numerical divergence at layers 6+ (Phase X.3.e.3.24
+        // Step 1 diagnostic finding).
+        let mut prompt_tokens = tokenizer.encode(&formatted);
+        if tokenizer.add_bos_token
+            && (prompt_tokens.is_empty() || prompt_tokens[0] != tokenizer.bos_id)
+        {
+            prompt_tokens.insert(0, tokenizer.bos_id);
+        }
         println!("  Prompt: {} tokens", prompt_tokens.len());
         println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
         println!("---");
@@ -327,6 +344,11 @@ fn main() {
         if debug_nan {
             let token = *prompt_tokens.first().unwrap();
             eprintln!("[debug-nan] token = {token}");
+
+            // Step 0: raw embedding (no RMSNorm applied)
+            let emb_head = model.debug_read_embedding_head(token);
+            eprintln!("[debug-nan] embedding hidden head 5 = {emb_head:?}");
+            model.reset();
 
             // Step 1: only RMSNorm
             let norm_head = model.debug_forward_layer0_attn_norm_only(token);
@@ -343,7 +365,7 @@ fn main() {
 
             // Phase X.3.e.3.23: full layer 0 DeltaNet pipeline dump.
             model.reset();
-            let (norm, q, k, v, alpha, beta, attn_out, o_buf, hidden) =
+            let (norm, q, k, v, alpha, beta, attn_out, attn_normed, o_buf, hidden) =
                 model.debug_dump_layer0_deltanet_stages(token);
             eprintln!("[debug-dn0] norm_buf head 5      = {norm:?}");
             eprintln!("[debug-dn0] q_buf head 5 (pre-conv1d) = {q:?}");
@@ -352,6 +374,9 @@ fn main() {
             eprintln!("[debug-dn0] alpha_buf head 5    = {alpha:?}");
             eprintln!("[debug-dn0] beta_buf head 5     = {beta:?}");
             eprintln!("[debug-dn0] attn_out head 5     = {attn_out:?}");
+            eprintln!(
+                "[debug-dn0] attn_out_normed head 5 (post ssm_norm+silu(z)) = {attn_normed:?}"
+            );
             eprintln!("[debug-dn0] o_buf head 5        = {o_buf:?}");
             eprintln!("[debug-dn0] hidden head 5 (post residual) = {hidden:?}");
 
