@@ -3076,11 +3076,18 @@ impl GpuModel {
             0u32,
             0u32, // dim, ring_pos, pad, pad
         ]));
+        // Layout: (num_heads, qk_dim, v_dim, is_bonsai).
+        // `is_bonsai` = 1 when the GGUF is Bonsai / Qwen 3.6-27B (detected
+        // by `blk.0.attn_qkv.weight` presence — see
+        // `is_bonsai_deltanet_gguf` above). Consumed by `gated_deltanet.wgsl`
+        // to skip internal silu(q) / silu(k) / silu(z) — those are applied
+        // externally in the Bonsai path (silu_inplace on conv output before
+        // the recurrence, silu_gate_apply after ssm_norm).
         let dn_params_buf = make_persistent(bytemuck::cast_slice(&[
             dn_num_kv_heads as u32,
             dn_qk_dim as u32,
             dn_v_dim as u32,
-            0u32, // num_heads, qk_dim, v_dim, pad
+            u32::from(is_bonsai_deltanet_gguf),
         ]));
 
         for i in 0..config.num_layers {
