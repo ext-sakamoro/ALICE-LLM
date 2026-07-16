@@ -71,14 +71,19 @@ fn gated_deltanet(@builtin(global_invocation_id) gid: vec3<u32>) {
     let alpha = alpha_buf[head];
     let beta = beta_buf[head];
 
-    // L2 norm for q (computed on raw q — matches CPU implementation
-    // `llama3::gated_deltanet_head_disjoint` for both paths).
+    // Q normalisation follows the reference `qwen35.cpp:319-321`:
+    //   q = q * (1/sqrt(qk_dim))   // scale
+    //   q = q / ||q||               // L2-normalise
+    // These fold into a single per-element multiplier `q_scale / ||q||`,
+    // matching the CPU implementation in `llama3::gated_deltanet_head_disjoint`
+    // (see commit 8af6ffb — Phase X.3.e.3.5 Q scale fix).
     var q_sum_sq: f32 = 0.0;
     for (var i = 0u; i < qk_dim; i += 1u) {
         let val = q_buf[q_off + i];
         q_sum_sq += val * val;
     }
-    let q_norm = 1.0 / max(sqrt(q_sum_sq), 1e-12);
+    let q_scale = 1.0 / sqrt(f32(qk_dim));
+    let q_norm = q_scale / max(sqrt(q_sum_sq), 1e-12);
 
     // L2 norm for k (same treatment as q).
     var k_sum_sq: f32 = 0.0;
