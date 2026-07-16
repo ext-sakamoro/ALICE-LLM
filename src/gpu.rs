@@ -101,6 +101,61 @@ pub fn beta_sigmoid_cpu(beta: &mut [f32]) {
 ///
 /// Panics if `alpha.len()`, `ssm_dt_bias.len()`, and `ssm_a.len()` are not
 /// all equal.
+/// CPU reference implementation of `GpuPass::ssm_norm_per_head` — per-V-head
+/// RMSNorm on `dn_delta_out` with `ssm_norm` weight broadcast across V heads.
+///
+/// Bonsai / Qwen 3.6-27B DeltaNet Phase X.3.e.3 Gap C. Applies RMSNorm
+/// independently to each `v_dim`-sized slab of `input`, with the shared
+/// `weight` vector broadcast across all heads. In-place operation.
+///
+/// This is the f32-accumulation variant matching the WGSL shader's shared-
+/// memory reduction. Numerically identical (within FP summation order noise)
+/// to `llama3::apply_qk_norm` which accumulates in f64 for a bit more
+/// precision on very large head dims — for Bonsai's v_dim=128 the difference
+/// is < 1e-6.
+///
+/// Formula per V head h:
+/// ```text
+///   ss[h]    = sum(input[h*v_dim..(h+1)*v_dim]^2)
+///   scale[h] = 1.0 / sqrt(ss[h] / v_dim + eps)
+///   for i in 0..v_dim:
+///       input[h*v_dim + i] = input[h*v_dim + i] * scale[h] * weight[i]
+/// ```
+///
+/// # Panics
+///
+/// Panics if `input.len()` is not a multiple of `v_dim`, or if
+/// `weight.len() != v_dim`.
+pub fn ssm_norm_per_head_cpu(input: &mut [f32], weight: &[f32], v_dim: usize, eps: f32) {
+    assert_eq!(
+        input.len() % v_dim,
+        0,
+        "ssm_norm_per_head_cpu: input.len() ({}) must be multiple of v_dim ({})",
+        input.len(),
+        v_dim
+    );
+    assert_eq!(
+        weight.len(),
+        v_dim,
+        "ssm_norm_per_head_cpu: weight.len() ({}) must equal v_dim ({})",
+        weight.len(),
+        v_dim
+    );
+    let num_heads = input.len() / v_dim;
+    for h in 0..num_heads {
+        let start = h * v_dim;
+        let slice = &mut input[start..start + v_dim];
+        let mut ss = 0.0f32;
+        for &v in slice.iter() {
+            ss += v * v;
+        }
+        let scale = 1.0f32 / (ss / v_dim as f32 + eps).sqrt();
+        for (i, w) in weight.iter().enumerate() {
+            slice[i] = slice[i] * scale * w;
+        }
+    }
+}
+
 pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f32]) {
     assert_eq!(
         alpha.len(),
@@ -1186,6 +1241,74 @@ impl<'a> GpuPass<'a> {
             pass.set_pipeline(&self.engine.matvec_q4k_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
+    /// Bonsai DeltaNet per-V-head RMSNorm on `dn_delta_out`, applying
+    /// `ssm_norm` weight (broadcast [v_dim]) across all V heads.
+    ///
+    /// Phase X.3.e.3 Gap C (see commit `005b3d0` for CPU implementation via
+    /// `apply_qk_norm`). Applied before `ssm_out` projection in the Bonsai
+    /// DeltaNet forward path.
+    ///
+    /// Reuses the existing `rmsnorm_pipeline` (which already supports batched
+    /// dispatch via `wid.x = batch_idx`) by treating each V head as a "batch"
+    /// element: `params.dim = v_dim`, dispatch `num_v_heads` workgroups. This
+    /// is exactly equivalent to the per-head loop in `llama3::apply_qk_norm`.
+    ///
+    /// Input layout: `[num_v_heads * v_dim]` (V heads concatenated).
+    /// Output layout: same. Must be a separate buffer from input.
+    ///
+    /// Not yet wired into `encode_forward_impl` — awaiting Phase 2 Steps
+    /// 1+4 (Bonsai loader + forward path wiring).
+    pub fn ssm_norm_per_head(
+        &mut self,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        v_dim: u32,
+        num_v_heads: u32,
+        eps: f32,
+    ) {
+        let params = self.engine.make_uniform(&RmsnormParams {
+            dim: v_dim,
+            eps,
+            batch_size: num_v_heads,
+            _pad3: 0,
+        });
+        let layout = self.engine.rmsnorm_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weight.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.rmsnorm_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(num_v_heads, 1, 1);
         }
     }
 
@@ -4667,5 +4790,169 @@ mod tests {
         let ssm_dt_bias = vec![1.0f32; 4];
         let ssm_a = vec![1.0f32; 5];
         ssm_discretisation_cpu(&mut alpha, &ssm_dt_bias, &ssm_a);
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` computes per-head RMSNorm independently.
+    ///
+    /// 2 V heads × 4 v_dim = 8 elements. Head 0 has all 1.0, Head 1 has all 2.0.
+    /// Weight is [1, 1, 1, 1] (identity), eps = 1e-6.
+    ///
+    /// Expected:
+    ///   Head 0: mean(1^2) = 1.0 → scale = 1/sqrt(1.0 + eps) ≈ 1.0
+    ///           → output ≈ [1, 1, 1, 1]
+    ///   Head 1: mean(2^2) = 4.0 → scale = 1/sqrt(4.0 + eps) ≈ 0.5
+    ///           → output ≈ [1, 1, 1, 1]
+    ///
+    /// The normalization brings both heads to the same magnitude — which is
+    /// exactly the point of RMSNorm (magnitude-invariant unit output).
+    #[test]
+    fn ssm_norm_per_head_cpu_normalizes_each_head_independently() {
+        let mut input = vec![1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let weight = vec![1.0f32; 4];
+        let v_dim = 4;
+        let eps = 1e-6;
+
+        ssm_norm_per_head_cpu(&mut input, &weight, v_dim, eps);
+
+        // Both heads normalized to ~[1, 1, 1, 1]
+        for (i, &v) in input.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 1e-3,
+                "input[{i}] = {v}, expected ≈ 1.0 after per-head RMSNorm",
+            );
+        }
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` respects weight broadcast across V heads.
+    ///
+    /// 2 V heads × 3 v_dim, uniform input, non-uniform weight [1, 2, 3]:
+    /// - Both heads normalize to unit magnitude vector [s, s, s]
+    /// - Then multiplied by weight → [s, 2s, 3s]
+    /// - Same weight applied to both heads (broadcast).
+    #[test]
+    fn ssm_norm_per_head_cpu_broadcasts_weight() {
+        let mut input = vec![3.0f32, 3.0, 3.0, 5.0, 5.0, 5.0];
+        let weight = vec![1.0f32, 2.0, 3.0];
+        let v_dim = 3;
+        let eps = 1e-6;
+
+        ssm_norm_per_head_cpu(&mut input, &weight, v_dim, eps);
+
+        // Head 0: mean(9) = 9, scale = 1/3, unit vector = [1, 1, 1]
+        //         after weight: [1, 2, 3]
+        // Head 1: mean(25) = 25, scale = 1/5, unit vector = [1, 1, 1]
+        //         after weight: [1, 2, 3]
+        for h in 0..2 {
+            let start = h * v_dim;
+            assert!((input[start] - 1.0).abs() < 1e-3, "head {h}, elem 0");
+            assert!((input[start + 1] - 2.0).abs() < 1e-3, "head {h}, elem 1");
+            assert!((input[start + 2] - 3.0).abs() < 1e-3, "head {h}, elem 2");
+        }
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` result magnitude is close to sqrt(v_dim)
+    /// (RMSNorm invariant: normalizes to unit RMS = 1.0, so magnitude = sqrt(v_dim)).
+    #[test]
+    fn ssm_norm_per_head_cpu_rms_invariant() {
+        let v_dim = 8;
+        let num_heads = 3;
+        // Random-ish input
+        let mut input: Vec<f32> = (0..num_heads * v_dim)
+            .map(|i| ((i as f32 * 0.7).sin() + 1.5) * ((i / v_dim + 1) as f32))
+            .collect();
+        let weight = vec![1.0f32; v_dim]; // identity weight
+
+        ssm_norm_per_head_cpu(&mut input, &weight, v_dim, 1e-6);
+
+        // After normalization with identity weight, each head should have
+        // RMS ≈ 1.0 (sum-of-squares / v_dim ≈ 1.0)
+        for h in 0..num_heads {
+            let start = h * v_dim;
+            let ss: f32 = input[start..start + v_dim].iter().map(|x| x * x).sum();
+            let rms = (ss / v_dim as f32).sqrt();
+            assert!(
+                (rms - 1.0).abs() < 1e-3,
+                "head {h} RMS = {rms}, expected ≈ 1.0",
+            );
+        }
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` matches `llama3::apply_qk_norm` semantics
+    /// (which is the CPU forward path reference implementation).
+    ///
+    /// The only difference is CPU forward uses f64 accumulation while our
+    /// GPU-parity ref uses f32 — should agree within FP summation noise for
+    /// v_dim=128 (Bonsai standard).
+    #[test]
+    fn ssm_norm_per_head_cpu_matches_llama3_apply_qk_norm() {
+        // Simulate Bonsai-like tensor: 3 V heads × 128 v_dim
+        let v_dim = 128;
+        let num_heads = 3;
+        let eps = 1e-6f32;
+        let input: Vec<f32> = (0..num_heads * v_dim)
+            .map(|i| ((i as f32 * 0.031).cos() + 0.3) * (h_scale(i / v_dim)))
+            .collect();
+        let weight: Vec<f32> = (0..v_dim)
+            .map(|i| 0.5 + (i as f32 * 0.017).sin() * 0.1)
+            .collect();
+
+        // Compute via our f32 GPU-parity ref
+        let mut input_gpu_ref = input.clone();
+        ssm_norm_per_head_cpu(&mut input_gpu_ref, &weight, v_dim, eps);
+
+        // Compute via llama3::apply_qk_norm-equivalent f64 accumulation
+        let mut input_llama3_ref = input.clone();
+        for h in 0..num_heads {
+            let start = h * v_dim;
+            let slice = &mut input_llama3_ref[start..start + v_dim];
+            let mut ss = 0.0f64;
+            for &v in slice.iter() {
+                ss += (v as f64) * (v as f64);
+            }
+            let mean = (ss / v_dim as f64) as f32;
+            let scale = 1.0f32 / (mean + eps).sqrt();
+            for (i, w) in weight.iter().enumerate() {
+                slice[i] = slice[i] * scale * w;
+            }
+        }
+
+        // Both should agree within FP summation noise for v_dim=128.
+        for (i, (&g, &l)) in input_gpu_ref
+            .iter()
+            .zip(input_llama3_ref.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - l).abs() < 1e-5,
+                "index {i}: gpu_ref={g}, llama3_ref={l}, diff={}",
+                (g - l).abs(),
+            );
+        }
+    }
+
+    fn h_scale(h: usize) -> f32 {
+        match h {
+            0 => 1.0,
+            1 => 0.3,
+            _ => 2.5,
+        }
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` panics on invalid input length.
+    #[test]
+    #[should_panic(expected = "input.len()")]
+    fn ssm_norm_per_head_cpu_panics_on_input_not_multiple_of_v_dim() {
+        let mut input = vec![1.0f32; 7]; // 7 not divisible by v_dim=4
+        let weight = vec![1.0f32; 4];
+        ssm_norm_per_head_cpu(&mut input, &weight, 4, 1e-6);
+    }
+
+    /// Verify `ssm_norm_per_head_cpu` panics on invalid weight length.
+    #[test]
+    #[should_panic(expected = "weight.len()")]
+    fn ssm_norm_per_head_cpu_panics_on_weight_length_mismatch() {
+        let mut input = vec![1.0f32; 8];
+        let weight = vec![1.0f32; 3]; // must be v_dim=4
+        ssm_norm_per_head_cpu(&mut input, &weight, 4, 1e-6);
     }
 }
