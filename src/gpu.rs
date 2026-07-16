@@ -2737,19 +2737,24 @@ impl GpuModel {
                         .tensor_info(&attn_q_name)
                         .map(|info| info.dims[1] as usize)
                         .unwrap_or(config.hidden_dim);
-                    let is_bonsai_full_attn_layer = attn_q_actual_rows == config.hidden_dim * 2;
+                    // Phase X.3.e.3.19 fix: gated attention layer detection uses
+                    // q_dim = num_heads * head_dim (NOT hidden_dim). For Qwen
+                    // 3.5-4B, hidden_dim=2560 but q_dim=16*256=4096, and
+                    // attn_q rows = 2 * q_dim = 8192. Previous condition
+                    // `attn_q_actual_rows == hidden_dim * 2` (== 5120) missed
+                    // the actual `== q_dim * 2` (== 8192) pattern, causing
+                    // Qwen 3.5-4B gated attention layers to load through the
+                    // non-Bonsai path with `upload_w(name, hidden_dim, hidden_dim)`
+                    // = wrong row count = 31% of Q4_K tensor bytes only =
+                    // massive weight data corruption on GPU forward.
+                    let q_dim_attn = (config.num_heads as usize) * (config.head_dim as usize);
+                    let is_bonsai_full_attn_layer = attn_q_actual_rows == q_dim_attn * 2;
                     let (q_proj_val, bonsai_attn_q_gate_val) = if is_bonsai_full_attn_layer {
-                        let (q, gate) = upload_w_bonsai_split(
-                            &attn_q_name,
-                            config.hidden_dim,
-                            config.hidden_dim,
-                        );
+                        let (q, gate) =
+                            upload_w_bonsai_split(&attn_q_name, q_dim_attn, config.hidden_dim);
                         (q, Some(gate))
                     } else {
-                        (
-                            upload_w(&attn_q_name, config.hidden_dim, config.hidden_dim),
-                            None,
-                        )
+                        (upload_w(&attn_q_name, q_dim_attn, config.hidden_dim), None)
                     };
                     layer_weights.push(LayerWeightBufs {
                         attn_norm: engine.upload_f32(
@@ -3277,8 +3282,13 @@ impl GpuModel {
                         if let Some(gate_weight) = lw.bonsai_attn_q_gate.as_ref() {
                             let gate_proj_mv =
                                 Self::build_matvec_bg(&engine, gate_weight, &norm_buf, &gate_buf);
+                            // Phase X.3.e.3.16 fix: use sigmoid_gate_apply
+                            // pipeline layout (Qwen 3.5 / 3.6 / Bonsai gated
+                            // attention uses sigmoid, not silu). Field name
+                            // `bonsai_full_attn_silu_gate_bg` kept for
+                            // continuity but semantic is sigmoid now.
                             let silu_gate_layout =
-                                engine.silu_gate_apply_pipeline.get_bind_group_layout(0);
+                                engine.sigmoid_gate_apply_pipeline.get_bind_group_layout(0);
                             let silu_gate_bg =
                                 engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                     label: None,
