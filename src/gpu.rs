@@ -3507,24 +3507,67 @@ impl GpuModel {
                         ],
                     });
 
-                    // DeltaNet recurrence bind group
-                    // q=q_buf(qk part), k=q_buf(qk part offset), v=q_buf(v part), alpha, beta, z, state, out
+                    // DeltaNet recurrence bind group (Phase X.3.e.3.18 rework).
+                    //
+                    // Reference (CPU llama3.rs:4133-4136, after conv1d):
+                    //   q_slice = dn_conv_out[0..q_dim]              // post-conv1d Q
+                    //   k_slice = dn_conv_out[q_dim..2*q_dim]        // post-conv1d K
+                    //   v_slice = dn_conv_out[2*q_dim..qkv_len]      // post-conv1d V
+                    //   z_slice = dn_in_proj[qkv_len..qkv_len+v_out] // pre-conv1d Z
+                    //
+                    // GPU mapping:
+                    //   - `k_buf` receives conv1d output (Q+K+V packed, Z portion
+                    //     unchanged from prior contents)
+                    //   - For standard Qwen 3.5 (`ssm_in.is_some()`): Z lives at
+                    //     q_buf offset qkv_len (fused matvec output layout)
+                    //   - For Bonsai (`attn_qkv.is_some() + attn_gate.is_some()`):
+                    //     Z lives at v_buf offset 0 (`attn_gate_proj` output)
+                    //
+                    // Prior code bound all four (q/k/v/z) to entire buffers,
+                    // meaning shader indexing `kv_head*qk_dim` picked wrong
+                    // slices (K, V, Z reads were nonsense). This was the root
+                    // cause of GPU DeltaNet garbage output.
+                    let q_dim_bytes = (dn_qk_dim * dn_num_kv_heads * 4) as u64;
+                    let v_out_bytes = (dn_v_dim * dn_num_v_heads * 4) as u64;
+                    let qkv_len_bytes = 2 * q_dim_bytes + v_out_bytes;
+                    let z_buffer_ref = if dlw.attn_gate.is_some() {
+                        &v_buf.buffer // Bonsai: attn_gate output in v_buf
+                    } else {
+                        &q_buf.buffer // Standard Qwen 3.5: fused ssm_in output in q_buf
+                    };
+                    let z_offset_bytes = if dlw.attn_gate.is_some() {
+                        0
+                    } else {
+                        qkv_len_bytes
+                    };
                     let deltanet_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &deltanet_layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: q_buf.buffer.as_entire_binding(),
-                            }, // q
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &k_buf.buffer,
+                                    offset: 0,
+                                    size: std::num::NonZeroU64::new(q_dim_bytes),
+                                }),
+                            }, // q = post-conv1d Q
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: k_buf.buffer.as_entire_binding(),
-                            }, // k (after conv1d)
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &k_buf.buffer,
+                                    offset: q_dim_bytes,
+                                    size: std::num::NonZeroU64::new(q_dim_bytes),
+                                }),
+                            }, // k = post-conv1d K
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: v_buf.buffer.as_entire_binding(),
-                            }, // v
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &k_buf.buffer,
+                                    offset: 2 * q_dim_bytes,
+                                    size: std::num::NonZeroU64::new(v_out_bytes),
+                                }),
+                            }, // v = post-conv1d V
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: alpha_buf.buffer.as_entire_binding(),
@@ -3535,8 +3578,12 @@ impl GpuModel {
                             }, // beta (populated by beta_proj_mv)
                             wgpu::BindGroupEntry {
                                 binding: 5,
-                                resource: v_buf.buffer.as_entire_binding(),
-                            }, // z (output gate)
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: z_buffer_ref,
+                                    offset: z_offset_bytes,
+                                    size: std::num::NonZeroU64::new(v_out_bytes),
+                                }),
+                            }, // z = pre-conv1d Z (from ssm_in_proj tail or attn_gate)
                             wgpu::BindGroupEntry {
                                 binding: 6,
                                 resource: deltanet_states[dn_idx].buffer.as_entire_binding(),
