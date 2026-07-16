@@ -2097,6 +2097,30 @@ fn sigmoid(x: f32) -> f32 {
 /// `state` is a ring buffer of length `(kernel_size - 1) * dim` that keeps
 /// the previous `kernel_size - 1` activations per channel. `ring_pos`
 /// tracks the write cursor within the ring; the read order
+/// Phase X.3.e.3.5 debug helper: dump a slice's first / last / sum values
+/// in a compact JSONL line to stderr so it can be diffed against the reference
+/// `llama-eval-callback` output for layer 0 first-forward divergence hunting.
+#[inline]
+fn dump_slice(name: &str, s: &[f32], head_n: usize) {
+    let sum: f64 = s.iter().map(|&v| v as f64).sum();
+    let head: Vec<String> = s.iter().take(head_n).map(|v| format!("{v:.6}")).collect();
+    let tail: Vec<String> = s
+        .iter()
+        .rev()
+        .take(head_n)
+        .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    eprintln!(
+        "DN0 {name} len={} head=[{}] tail=[{}] sum={sum:.6}",
+        s.len(),
+        head.join(","),
+        tail.join(","),
+    );
+}
+
 /// `[(rp+1) % ring, (rp+2) % ring, rp]` recovers the oldest → most recent
 /// history slice used by the kernel.
 ///
@@ -3848,6 +3872,15 @@ impl<'a> Llama3Model<'a> {
         // Embedding lookup
         let emb_start = token_id as usize * c.hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + c.hidden_dim].to_vec();
+        if std::env::var("ALICE_DUMP_DN0").is_ok() {
+            static ONCE_EMB: std::sync::Once = std::sync::Once::new();
+            let mut fire = false;
+            ONCE_EMB.call_once(|| fire = true);
+            if fire {
+                dump_slice("input_embed", &hidden, 3);
+                eprintln!("DN0 token_id={}", token_id);
+            }
+        }
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
         if c.arch == ModelArch::Gemma2 {
             let scale = (c.hidden_dim as f32).sqrt();
@@ -3930,6 +3963,20 @@ impl<'a> Llama3Model<'a> {
                     // 1. Attention norm.
                     rms_norm(&hidden, &dn_layer.attn_norm, c.norm_eps, &mut norm_buf);
 
+                    // Phase X.3.e.3.5 layer-0 first-forward dump for reference
+                    // parity comparison (guarded by env `ALICE_DUMP_DN0`).
+                    let dump_dn0 = std::env::var("ALICE_DUMP_DN0").is_ok() && dn_idx == 0 && {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        let mut fire = false;
+                        ONCE.call_once(|| fire = true);
+                        fire
+                    };
+                    if dump_dn0 {
+                        dump_slice("attn_norm", &norm_buf, 3);
+                    }
+
+                    // 2. Fused input projection (populates dn_in_proj).
+
                     // 2. Fused input projection.
                     //
                     // Two GGUF variants coexist:
@@ -3976,9 +4023,17 @@ impl<'a> Llama3Model<'a> {
                         attn_qkv.matvec(&norm_buf, &mut dn_in_proj[..qkv_len]);
                         attn_gate.matvec(&norm_buf, &mut dn_in_proj[qkv_len..]);
                     }
+                    if dump_dn0 {
+                        dump_slice("qkv_mixed", &dn_in_proj[..qkv_len], 3);
+                        dump_slice("z_pre", &dn_in_proj[qkv_len..], 3);
+                    }
                     // 2a/2b. alpha / beta decay-rate + update-rate projections.
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
                     dn_layer.beta_proj.matvec(&norm_buf, &mut dn_beta);
+                    if dump_dn0 {
+                        dump_slice("alpha_raw", &dn_alpha[..dn_num_v_heads], 3);
+                        dump_slice("beta_raw", &dn_beta[..dn_num_v_heads], 3);
+                    }
 
                     // Detect Bonsai / Qwen 3.6 path once. Presence of both
                     // `ssm_a` and `ssm_dt_bias` toggles four reference-aligned
@@ -4015,6 +4070,10 @@ impl<'a> Llama3Model<'a> {
                             }
                         }
                     }
+                    if dump_dn0 {
+                        dump_slice("alpha_after_gapB", &dn_alpha[..dn_num_v_heads], 3);
+                        dump_slice("beta_after_gapB", &dn_beta[..dn_num_v_heads], 3);
+                    }
 
                     // Split fused output. Layout (matches GPU-side loader):
                     //   [ q | k | v | z ]
@@ -4045,10 +4104,17 @@ impl<'a> Llama3Model<'a> {
                     // head kernel with bonsai_semantics=true then skips
                     // its internal silu. Qwen 3.5 legacy path leaves the
                     // raw conv output and silu's Q/K in-line.
+                    if dump_dn0 {
+                        dump_slice("conv_out_raw", &dn_conv_out[..qkv_len], 3);
+                    }
                     if is_bonsai_path {
                         for val in dn_conv_out[..qkv_len].iter_mut() {
                             *val = silu(*val);
                         }
+                    }
+                    if dump_dn0 {
+                        dump_slice("conv_out_silu", &dn_conv_out[..qkv_len], 3);
+                        dump_slice("q_conv_head0", &dn_conv_out[0..dn_qk_dim], 3);
                     }
 
                     // 4. Gated DeltaNet recurrence: reads q/k/v from the
@@ -4074,6 +4140,16 @@ impl<'a> Llama3Model<'a> {
                         dn_v_dim,
                         is_bonsai_path,
                     );
+                    if dump_dn0 {
+                        dump_slice("attn_output", &dn_delta_out, 3);
+                    }
+
+                    if dump_dn0 {
+                        // Sample the first V-head's 128 dims to compare with
+                        // reference `norm-0 = RMS_NORM(attn_output-0)` first row.
+                        let head0 = &dn_delta_out[..dn_v_dim];
+                        dump_slice("attn_head0", head0, 3);
+                    }
 
                     // 4.5. Bonsai / Qwen 3.6 per-V-head state RMSNorm on the
                     // recurrence output, prior to the `ssm_out` projection.
@@ -4084,6 +4160,9 @@ impl<'a> Llama3Model<'a> {
                         if std::env::var("ALICE_DISABLE_GAP_C").is_err() {
                             apply_qk_norm(&mut dn_delta_out, ssm_norm, dn_v_dim, c.norm_eps);
                         }
+                    }
+                    if dump_dn0 {
+                        dump_slice("post_ssm_norm_head0", &dn_delta_out[..dn_v_dim], 3);
                     }
 
                     // 4.6. Bonsai / Qwen 3.6 z-gate (Phase X.3.e.3.2
@@ -4102,9 +4181,37 @@ impl<'a> Llama3Model<'a> {
                             }
                         }
                     }
+                    if dump_dn0 {
+                        // Suspects: head 1 (small ref value), head 18 (big neg),
+                        // head 31 (very small). Compare first-3 values per head
+                        // against reference node_55 first / mid / last rows.
+                        for h in [1, 2, 18, 31] {
+                            dump_slice(
+                                &format!("post_zgate_head{h}"),
+                                &dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim],
+                                3,
+                            );
+                        }
+                        dump_slice("post_zgate_head0", &dn_delta_out[..dn_v_dim], 3);
+                        dump_slice("post_zgate_all", &dn_delta_out, 3);
+                        // Per-V-head sums so we can spot head-specific divergence
+                        // against the reference `final_output-0` (which reference
+                        // reports at whole-tensor granularity only).
+                        let mut per_head = String::from("DN0 post_zgate_per_head_sum=[");
+                        for h in 0..dn_num_v_heads {
+                            let s: f32 =
+                                dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
+                            per_head.push_str(&format!("{s:.4},"));
+                        }
+                        per_head.push(']');
+                        eprintln!("{per_head}");
+                    }
 
                     // 5. Output projection to hidden dim.
                     dn_layer.ssm_out.matvec(&dn_delta_out, &mut o_buf);
+                    if dump_dn0 {
+                        dump_slice("ssm_out_o", &o_buf[..c.hidden_dim], 3);
+                    }
 
                     // 6. Residual add.
                     for i in 0..c.hidden_dim {
