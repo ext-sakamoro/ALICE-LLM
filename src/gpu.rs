@@ -3330,8 +3330,25 @@ impl GpuModel {
         let hidden = zero_init(MAX_BATCH * config.hidden_dim);
         let norm_buf = zero_init(MAX_BATCH * config.hidden_dim);
         let q_buf = zero_init(MAX_BATCH * config.hidden_dim);
-        let k_buf = zero_init(MAX_BATCH * kv_dim);
-        let v_buf = zero_init(MAX_BATCH * kv_dim);
+        // Scratch buffers `k_buf` / `v_buf` are shared between the attention
+        // path (holds `k_proj` / `v_proj` output, sized `kv_dim`) and the
+        // DeltaNet path (holds `conv1d` output at `dn_conv_dim` = q+k+v
+        // packed, and `attn_gate` output at `dn_v_dim * dn_num_v_heads` for
+        // the Bonsai z-gate). Take the max of both consumers so hybrid
+        // models (Qwen 3.5 / Bonsai 27B) don't overflow the buffer inside
+        // the DeltaNet bind group's `BufferBinding { offset, size }`.
+        //
+        // Bonsai 27B example: `dn_conv_dim = 128*16*2 + 128*48 = 10240` f32
+        // (40960 bytes/token), which exceeds the attention `kv_dim = 1024`
+        // (4096 bytes/token). Without this max the layer-load bind group
+        // creation panicked with `Buffer bound range 16384..40960 overflows
+        // its size (32768)` (Phase X.3.e.3.26 Bonsai 27B verification).
+        let dn_conv_dim_usize = dn_conv_dim as usize;
+        let dn_v_out = dn_v_dim * dn_num_v_heads;
+        let k_buf_dim = kv_dim.max(dn_conv_dim_usize);
+        let v_buf_dim = kv_dim.max(dn_v_out);
+        let k_buf = zero_init(MAX_BATCH * k_buf_dim);
+        let v_buf = zero_init(MAX_BATCH * v_buf_dim);
         let attn_out = zero_init(MAX_BATCH * config.hidden_dim);
         // Bonsai DeltaNet writes the post-`ssm_norm_per_head` result into
         // this scratch instead of aliasing `attn_out` — WebGPU forbids
