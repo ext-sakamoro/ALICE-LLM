@@ -10,6 +10,13 @@
 //
 // For decode (single token): out[d] = sum_k(conv_weight[k, d] * history[k, d]) + bias[d]
 // where history = [conv_state[0..2], current_x] (4 timesteps total)
+//
+// Storage note (Phase X.3.e.3.5): GGUF `ssm_conv1d.weight` has ggml shape
+// `{kernel_size, dim}` with `ne[0] = kernel_size` fastest-varying, so the
+// storage layout is dim-outer × kernel-inner. Access element `(k, d)` via
+// `conv_weight[d * kernel_size + k]`, NOT `conv_weight[k * dim + d]` — the
+// latter is transposed and produces garbage for every hybrid arch that ships
+// an `ssm_conv1d` tensor (Qwen 3.5, Bonsai, Qwen 3.6, etc.).
 
 struct Params {
     dim: u32,
@@ -40,11 +47,14 @@ fn conv1d_causal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h2 = conv_state[rp * dim + d];                // t-1
     let h3 = x_buf[d];                                // t (current)
 
-    // Depthwise conv: sum over kernel dimension
-    let w0 = conv_weight[0u * dim + d];
-    let w1 = conv_weight[1u * dim + d];
-    let w2 = conv_weight[2u * dim + d];
-    let w3 = conv_weight[3u * dim + d];
+    // Depthwise conv: sum over kernel dimension. GGUF stores conv_weight as
+    // dim-outer × kernel-inner (`ne[0] = kernel_size = 4`), so for each
+    // channel `d` the 4 kernel positions are contiguous at `d * 4 + k`.
+    let w_base = d * 4u;
+    let w0 = conv_weight[w_base + 0u];
+    let w1 = conv_weight[w_base + 1u];
+    let w2 = conv_weight[w_base + 2u];
+    let w3 = conv_weight[w_base + 3u];
 
     out_buf[d] = w0 * h0 + w1 * h1 + w2 * h2 + w3 * h3 + conv_bias[d];
 
