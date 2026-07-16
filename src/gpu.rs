@@ -1935,6 +1935,13 @@ struct LayerBGs {
     /// scaled-dot-product attention, before the `o_proj` matvec.
     /// `None` on standard Qwen 3.5 / Llama / Qwen 2/3 / Gemma layers.
     bonsai_attn_q_gate_proj: Option<MatvecBG>,
+    /// Bonsai / Qwen 3.6-27B full-attention swish gate modulation:
+    /// `silu_gate_apply(attn_out, gate_buf)` applied after standard
+    /// scaled-dot-product attention, before `o_proj`. Reuses the FFN SwiGLU
+    /// `gate_buf` (size `intermediate_dim` ≥ `hidden_dim`) — the shader's
+    /// `arrayLength(&attn_out)` guard confines the iteration to the actual
+    /// gate output length. `None` on non-Bonsai layers.
+    bonsai_full_attn_silu_gate_bg: Option<wgpu::BindGroup>,
     /// Qwen 2 / 2.5 QKV bias-add bind groups (None for arch without biases).
     q_bias_bg: Option<wgpu::BindGroup>,
     k_bias_bg: Option<wgpu::BindGroup>,
@@ -3184,6 +3191,40 @@ impl GpuModel {
                     let v_proj = Self::build_matvec_bg(&engine, &lw.v_proj, &norm_buf, &v_buf);
                     let o_proj = Self::build_matvec_bg(&engine, &lw.o_proj, &attn_out, &o_buf);
 
+                    // Bonsai / Qwen 3.6-27B full-attention gate: (a) gate matvec
+                    // dispatches `bonsai_attn_q_gate` weight → gate_buf (reusing
+                    // the FFN SwiGLU gate_buf, which is intermediate_dim ≥
+                    // hidden_dim so it can hold the gate output); (b) silu
+                    // modulation bind group for `silu_gate_apply(attn_out,
+                    // gate_buf)` applied after standard attention, before
+                    // o_proj. Constructed only when `bonsai_attn_q_gate` is
+                    // loaded (Bonsai full-attn layer).
+                    let (bonsai_attn_q_gate_proj, bonsai_full_attn_silu_gate_bg) =
+                        if let Some(gate_weight) = lw.bonsai_attn_q_gate.as_ref() {
+                            let gate_proj_mv =
+                                Self::build_matvec_bg(&engine, gate_weight, &norm_buf, &gate_buf);
+                            let silu_gate_layout =
+                                engine.silu_gate_apply_pipeline.get_bind_group_layout(0);
+                            let silu_gate_bg =
+                                engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &silu_gate_layout,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: attn_out.buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: gate_buf.buffer.as_entire_binding(),
+                                        },
+                                    ],
+                                });
+                            (Some(gate_proj_mv), Some(silu_gate_bg))
+                        } else {
+                            (None, None)
+                        };
+
                     // Qwen 2 / 2.5 attention QKV biases (None for Llama / Mistral /
                     // Gemma / Qwen 3+ which do not carry attention biases).
                     let q_bias_bg = lw
@@ -3288,11 +3329,8 @@ impl GpuModel {
                         k_proj,
                         v_proj,
                         o_proj,
-                        // Phase 2 Step 4b (forward wiring for full-attn Bonsai)
-                        // will create the MatvecBG from `lw.bonsai_attn_q_gate`
-                        // when it lands. For Step 4a (loader-only), the weight
-                        // is present but no bind group is pre-cached.
-                        bonsai_attn_q_gate_proj: None,
+                        bonsai_attn_q_gate_proj,
+                        bonsai_full_attn_silu_gate_bg,
                         q_bias_bg,
                         k_bias_bg,
                         v_bias_bg,
@@ -3662,6 +3700,7 @@ impl GpuModel {
                         v_bias_bg: None,
                         // DeltaNet layers do not carry per-head QK norms (unused placeholder).
                         bonsai_attn_q_gate_proj: None,
+                        bonsai_full_attn_silu_gate_bg: None,
                         q_norm_bg: None,
                         k_norm_bg: None,
                         kv_append_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3828,35 +3867,6 @@ impl GpuModel {
             match self.layer_types[i] {
                 LayerType::Attention => {
                     let lbg = &self.layer_bgs[i];
-                    let lw = &self._layer_weights[i];
-
-                    // Bonsai / Qwen 3.6-27B full-attention gate: the loader
-                    // splits `attn_q [q_dim*2, hidden]` into `q_proj` (Q half)
-                    // + `bonsai_attn_q_gate` (swish gate half). Forward path
-                    // for full-attn Bonsai needs to dispatch the gate matvec
-                    // + silu(gate) multiplication into attn_out before o_proj
-                    // — that's Phase 2 Step 4b (deferred).
-                    //
-                    // For now, fail fast when we encounter a full-attn Bonsai
-                    // layer at forward time (Q-only forward would silently
-                    // produce numerically wrong output which is worse than
-                    // a clear panic).
-                    if lw.bonsai_attn_q_gate.is_some() {
-                        panic!(
-                            "Bonsai / Qwen 3.6-27B full-attention layer forward \
-                             path is not yet wired (Phase 2 Step 4b pending). \
-                             Loader split `attn_q` into Q + gate halves at \
-                             load time (this PR), but the forward path still \
-                             needs to dispatch the gate matvec + silu(gate) \
-                             multiplication into attn_out before o_proj. \
-                             DeltaNet Bonsai forward (75% of Bonsai layers) is \
-                             already wired (PR #85); this panic is expected \
-                             at the first full-attn layer (blk.3 for \
-                             full_attention_interval=4) until Step 4b lands. \
-                             Use CPU forward (`llama3::Llama3Model`) \
-                             meanwhile."
-                        );
-                    }
 
                     // --- Attention sub-block ---
                     // RMSNorm: hidden → norm_buf
@@ -3868,6 +3878,16 @@ impl GpuModel {
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.q_proj);
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.k_proj);
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.v_proj);
+
+                    // Bonsai / Qwen 3.6-27B full-attention gate projection:
+                    // dispatch `bonsai_attn_q_gate` matvec into gate_buf
+                    // (reused FFN SwiGLU buffer; larger than hidden_dim so
+                    // holds the gate output). The silu(gate) multiplication
+                    // into attn_out is applied after the attention core
+                    // (see silu_gate_apply dispatch below, before o_proj).
+                    if let Some(gate_proj) = &lbg.bonsai_attn_q_gate_proj {
+                        Self::dispatch_mv(&self.engine, &mut cp, gate_proj);
+                    }
 
                     // Qwen 2 / 2.5 attention biases: add pointwise to Q/K/V before RoPE.
                     // No-op for arch without biases (Llama / Mistral / Gemma / Qwen 3+).
@@ -3915,6 +3935,17 @@ impl GpuModel {
                     cp.set_pipeline(&self.engine.attention_pipeline);
                     cp.set_bind_group(0, &lbg.attention_bg, &[]);
                     cp.dispatch_workgroups(self.config.num_heads, 1, 1);
+
+                    // Bonsai / Qwen 3.6-27B full-attention swish gate modulation:
+                    // `attn_out[i] *= silu(gate_buf[i])` (applied AFTER the
+                    // scaled-dot-product attention, BEFORE `o_proj`).
+                    // No-op for non-Bonsai layers (bind group is None).
+                    if let Some(bg) = &lbg.bonsai_full_attn_silu_gate_bg {
+                        cp.set_pipeline(&self.engine.silu_gate_apply_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        let attn_out_len = self.config.num_heads * self.config.head_dim;
+                        cp.dispatch_workgroups((attn_out_len + 255) / 256, 1, 1);
+                    }
 
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
 
