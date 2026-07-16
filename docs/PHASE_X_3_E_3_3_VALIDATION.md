@@ -1,6 +1,48 @@
 # Phase X.3.e.3.3 — End-to-end numerical validation (execution plan)
 
-**Status**: 📋 **Planned** (blocked on Mac disk free space)
+**Status**: 🟡 **Partially executed** (2026-07-16、Bonsai 1.7B forward validated、DeltaNet SSM 検証は 27B / Qwen3.5-4B DL 要)
+
+## Execution Log (2026-07-16)
+
+Session で実行して判明した事項:
+
+### ✅ Achieved
+
+- **Mac disk cleanup**: 900 MB → **66 GB free** (`cargo clean` on ALICE-CodeTracker + ALICE-Eco-System で 65 GB 回復)
+- **PrismML llama.cpp fork build**: `~/llama.cpp-prismml/build/bin/llama-cli` (Metal enabled)
+- **Bonsai 1.7B Q2_0 DL**: `~/models/bonsai/Ternary-Bonsai-1.7B-Q2_0.gguf` (450 MB)
+- **ALICE-LLM Bonsai 1.7B forward path validated**:
+  - Load 成功 (310 tensors, 35 metadata keys, arch=qwen3, config Llama3Config)
+  - Forward pass が sensible logits 生成:
+    - pos=-1: top-1 "The" (21.93), Tokyo 系 "Tok" が top-2 (14.09)
+    - pos=0: top-1 " capital" (26.70)
+    - pos=1: top-1 " of" (26.60)
+    - pos=2: top-1 " Japan" (31.27), " Tokyo" top-4 (17.22)
+  - Speed: 4.0 tok/s (Q2_0 scalar fallback、SIMD kernel 未実装)
+- **llama.cpp fork Bonsai 1.7B 動作確認**:
+  - Prefill 322 t/s、Generation 167 t/s (Metal accelerated)
+  - Interactive chat mode で "The capital of Japan is" → "| The capital of" 応答生成
+
+### 🟡 Discovered Blockers
+
+- **Bonsai 1.7B / 4B / 8B is std GQA (no DeltaNet)** — HF README で「GQA, SwiGLU MLP, RoPE, RMSNorm」明記、DeltaNet SSM 検証には使用不可
+- **Bonsai 27B のみ hybrid-attention DeltaNet** (`Qwen3.6-27B backbone, ~75% linear attention`)、DL は 7.17 GB (~4h @ 500 KB/s)
+- **PrismML fork の `llama-cli` は interactive-only** — `-no-cnv` flag 非対応、`echo prompt\n/exit` で pipe すると chat mode 経由で動作するが、raw prompt (no chat template) では不可
+- **ALICE-LLM Bonsai 1.7B は `arch=qwen3` として load** (`ssm: None`) — DeltaNet path を通らず、SSM refinement (Phase X.3.e.3 全 6 subphase) は unused
+
+### 🎯 Alternative: Qwen3.5-4B for DeltaNet validation
+
+`unsloth/Qwen3.5-4B-GGUF` に Q3_K_S (2.11 GB) / Q4_K_M (2.74 GB) 等の GGUF 存在、Qwen3.5-4B safetensors は `linear_attn.A_log` / `dt_bias` / `norm.weight` 等 SSM tensors 全て含む (HF API で確認済)、Q4_K quantization は ALICE-LLM 実装済 = **Qwen3.5-4B Q4_K_M で DeltaNet SSM validation 可能** (2.74 GB DL、~40 min)
+
+将来 session の推奨手順:
+1. Qwen3.5-4B Q4_K_M DL
+2. llama.cpp fork で reference 生成 (interactive で prompt + /exit の流れ、chat template 依存)
+3. ALICE-LLM elyza_gguf 例で同 prompt 生成 (chat template 一致必要、要確認)
+4. `--logits-dump` mode で top-5 logits を JSONL 出力、Python diff script で cos-sim + top-k rank agreement 計算
+
+---
+
+## Original design (2026-07-15、Bonsai 27B 想定)
 **Predecessor**: Phase X.3.e.3 (5 commit landing、`146ee22` + `005b3d0` + `6d43602` + `2d55f2b` + `c342f10`)
 **Objective**: PrismML llama.cpp fork Bonsai 27B の tensor dump と ALICE-LLM `gated_deltanet_step` の出力を step-by-step で数値比較し、Phase X.3.e.3 の 6 subphase (Gap A + C + B + B extra + §Q/K + §silu(z)) が reference formula (`qwen35.cpp:436-562`) と bit-exact 圏内 (`rel_diff < 1e-3`) で一致することを実証する
 
