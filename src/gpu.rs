@@ -2775,9 +2775,23 @@ impl GpuModel {
         // the gated_deltanet shader must run the standard silu(q)/silu(k) +
         // silu(z) semantics (is_bonsai=0). Only Qwen 3.6-27B ("real" Bonsai)
         // ships the SSM refinement tensors and requires is_bonsai=1.
+        // GGUF tensor names for these refinements omit the `.weight` suffix
+        // (`blk.N.ssm_a`) and use dot-separated `ssm_dt.bias` — matching the
+        // CPU loader at `llama3.rs:9477-9478`. Previous GPU-side names
+        // (`ssm_a.weight` / `ssm_dt_bias.weight`) never matched any GGUF
+        // tensor, so `is_bonsai_deltanet_gguf` was always false for
+        // Qwen 3.5-4B / Bonsai 27B, causing:
+        //   - `dn_params_buf.is_bonsai = 0` → shader used raw `alpha`
+        //     values from `alpha_proj` (~7 in magnitude) as decay
+        //     factors, blowing up recurrent state 7× per token.
+        //   - `ssm_a_opt` / `ssm_dt_bias_opt` load returned None → Gap B
+        //     SSM discretisation dispatch was skipped, so no
+        //     `alpha → exp(softplus(...) * ssm_a)` transform to bring
+        //     alpha into [0, 1].
+        // Root cause of Phase X.3.e.3.23 layer-0 L2 = 2328 (CPU: 2.43).
         let is_bonsai_deltanet_gguf = gguf.tensor_info("blk.0.attn_qkv.weight").is_some()
-            && gguf.tensor_info("blk.0.ssm_a.weight").is_some()
-            && gguf.tensor_info("blk.0.ssm_dt_bias.weight").is_some();
+            && gguf.tensor_info("blk.0.ssm_a").is_some()
+            && gguf.tensor_info("blk.0.ssm_dt.bias").is_some();
         if is_bonsai_deltanet_gguf {
             eprintln!(
                 "[GpuModel] Bonsai / Qwen 3.6-27B tensor layout detected \
@@ -3089,11 +3103,15 @@ impl GpuModel {
 
                     // Bonsai SSM refinement tensors — all optional. Standard
                     // Qwen 3.5 GGUFs omit these; Bonsai GGUFs include them.
+                    // Tensor names (no `.weight` suffix on `ssm_a`;
+                    // dot-separated `ssm_dt.bias`) mirror the CPU loader at
+                    // `llama3.rs:9477-9478`. See root-cause note above
+                    // (Phase X.3.e.3.23).
                     let ssm_a_opt = gguf
-                        .tensor_to_f32(&format!("blk.{i}.ssm_a.weight"))
+                        .tensor_to_f32(&format!("blk.{i}.ssm_a"))
                         .map(|v| engine.upload_f32(&v));
                     let ssm_dt_bias_opt = gguf
-                        .tensor_to_f32(&format!("blk.{i}.ssm_dt_bias.weight"))
+                        .tensor_to_f32(&format!("blk.{i}.ssm_dt.bias"))
                         .map(|v| engine.upload_f32(&v));
                     let ssm_norm_opt = gguf
                         .tensor_to_f32(&format!("blk.{i}.ssm_norm.weight"))
@@ -3263,6 +3281,19 @@ impl GpuModel {
         let k_buf = zero_init(MAX_BATCH * kv_dim);
         let v_buf = zero_init(MAX_BATCH * kv_dim);
         let attn_out = zero_init(MAX_BATCH * config.hidden_dim);
+        // Bonsai DeltaNet writes the post-`ssm_norm_per_head` result into
+        // this scratch instead of aliasing `attn_out` — WebGPU forbids
+        // binding the same buffer as both `read` and `read_write` inside a
+        // single compute pass. Sized to hold the `attn_out` slice used by
+        // the DeltaNet pipeline (`num_v_heads * v_dim`), fallback to the
+        // legacy `hidden_dim` size when the model is not Bonsai.
+        let attn_out_normed_size = {
+            let dn_v_dim = config.linear_kv_head_dim.unwrap_or(0) as usize;
+            let dn_num_v_heads = config.linear_num_v_heads.unwrap_or(config.num_heads) as usize;
+            let bonsai_size = dn_num_v_heads * dn_v_dim;
+            MAX_BATCH * bonsai_size.max(config.hidden_dim)
+        };
+        let attn_out_normed = zero_init(attn_out_normed_size);
         let o_buf = zero_init(MAX_BATCH * config.hidden_dim);
         let gate_buf = zero_init(MAX_BATCH * config.intermediate_dim);
         let down_buf = zero_init(MAX_BATCH * config.hidden_dim);
@@ -3837,17 +3868,25 @@ impl GpuModel {
                         ],
                     });
 
-                    let ssm_out_proj =
-                        Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
-
-                    // Bonsai SSM refinement bind groups. Gated on the presence
-                    // of `ssm_a` + `ssm_dt_bias` + `ssm_norm` tensors — which
-                    // Qwen 3.6-27B ("real" Bonsai) ships but Qwen 3.5-4B does
-                    // NOT (Qwen 3.5-4B has the `attn_qkv` split layout but
-                    // omits the SSM refinement tensors, matching the CPU
-                    // `is_bonsai_path` gate at `llama3.rs:3975`
-                    // `ssm_a.is_some() && ssm_dt_bias.is_some()`).
+                    // Detect the Bonsai / Qwen 3.6 SSM refinement path.
+                    // Gated on the presence of `ssm_a` + `ssm_dt_bias` +
+                    // `ssm_norm` tensors — Qwen 3.5-4B and Qwen 3.6-27B both
+                    // ship these (Phase X.3.e.3.23 tensor-name fix moved
+                    // Qwen 3.5-4B into the same Bonsai path as the 27B
+                    // variant), matching the CPU `is_bonsai_path` gate at
+                    // `llama3.rs:4082` `ssm_a.is_some() && ssm_dt_bias.is_some()`.
+                    // Determined here (moved up from below `ssm_out_proj`
+                    // build) so the Bonsai flow can route `ssm_out_proj` to
+                    // read from the post-`ssm_norm`/post-silu(z) scratch
+                    // `attn_out_normed` — while non-Bonsai layers keep
+                    // reading `attn_out` directly.
                     let is_bonsai_layer = dlw.ssm_a.is_some() && dlw.ssm_dt_bias.is_some();
+
+                    let ssm_out_proj = if is_bonsai_layer {
+                        Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out_normed, &o_buf)
+                    } else {
+                        Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf)
+                    };
                     let bonsai_beta_sigmoid_bg = if is_bonsai_layer {
                         let layout = engine.beta_sigmoid_pipeline.get_bind_group_layout(0);
                         Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3938,7 +3977,14 @@ impl GpuModel {
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 2,
-                                    resource: attn_out.buffer.as_entire_binding(),
+                                    // Output to a dedicated scratch — WebGPU
+                                    // rejects aliasing `read` binding 0 and
+                                    // `read_write` binding 2 on the same
+                                    // `attn_out` buffer within a compute
+                                    // pass. `attn_out_normed` is sized to
+                                    // hold `num_v_heads * v_dim` (see
+                                    // scratch alloc above).
+                                    resource: attn_out_normed.buffer.as_entire_binding(),
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 3,
@@ -3959,7 +4005,10 @@ impl GpuModel {
                             entries: &[
                                 wgpu::BindGroupEntry {
                                     binding: 0,
-                                    resource: attn_out.buffer.as_entire_binding(),
+                                    // Read from the post-ssm_norm scratch
+                                    // (`attn_out_normed`) so the gate
+                                    // applies to the correct DeltaNet path.
+                                    resource: attn_out_normed.buffer.as_entire_binding(),
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 1,
@@ -4666,6 +4715,84 @@ impl GpuModel {
         self.engine.queue.submit(Some(encoder.finish()));
 
         self.debug_read_scratch("norm_buf", 5)
+    }
+
+    /// Phase X.3.e.3.23 diagnostic: run one full layer 0 forward and read
+    /// every DeltaNet-pipeline intermediate scratch buffer at head-5 depth.
+    /// Returned in stage order so a caller can eyeball where amplification
+    /// starts:
+    ///
+    ///   (norm_buf, q_buf_head_after_qkv, k_buf_head_after_conv1d,
+    ///    v_buf_head, alpha_buf, beta_buf,
+    ///    attn_out_head_after_deltanet, o_buf_head_after_ssm_out,
+    ///    hidden_after_residual)
+    ///
+    /// Each Vec<f32> has 5 elements. Executes the full first-token forward
+    /// (not just stage-by-stage) then reads back — accurate for a healthy
+    /// pipeline, useful signal even for a broken one.
+    ///
+    /// **Not thread-safe** and mutates `seq_len`. Reset before running any
+    /// subsequent forward.
+    #[allow(clippy::type_complexity)]
+    pub fn debug_dump_layer0_deltanet_stages(
+        &mut self,
+        token_id: u32,
+    ) -> (
+        Vec<f32>, // norm_buf head 5
+        Vec<f32>, // q_buf head 5 (after attn_qkv, pre-conv1d)
+        Vec<f32>, // k_buf head 5 (after conv1d, DeltaNet Q slice)
+        Vec<f32>, // v_buf head 5 (attn_gate output = z)
+        Vec<f32>, // alpha_buf head 5
+        Vec<f32>, // beta_buf head 5
+        Vec<f32>, // attn_out head 5 (post gated_deltanet)
+        Vec<f32>, // o_buf head 5 (post ssm_out_proj)
+        Vec<f32>, // hidden head 5 (post residual add for layer 0)
+    ) {
+        // Run one full layer 0 forward.
+        let hidden0 = self.forward_stop_after_layer_and_read_hidden(token_id, 0);
+        // Now read the various scratch buffers that were populated in the
+        // layer 0 forward. `debug_read_scratch` does a copy_buffer_to_buffer
+        // → submit → map_staging cycle each call — inefficient but fine for a
+        // one-off diagnostic.
+        let norm = self.debug_read_scratch("norm_buf", 5);
+        let q = self.debug_read_scratch("q_buf", 5);
+        let k = self.debug_read_scratch("k_buf", 5);
+        let v = self.debug_read_scratch("v_buf", 5);
+        let alpha = self.debug_read_scratch("alpha_buf", 5);
+        let beta = self.debug_read_scratch("beta_buf", 5);
+        let attn_out = self.debug_read_scratch("attn_out", 5);
+        // `o_buf` isn't in the current debug_read_scratch match set; add it.
+        // (We inline the map-copy here to avoid a second Edit round-trip.)
+        let o_buf_head = {
+            let bytes = 5 * 4;
+            let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dbg_o_buf_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = self
+                .engine
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            encoder.copy_buffer_to_buffer(&self._o_buf.buffer, 0, &staging, 0, bytes);
+            self.engine.queue.submit(Some(encoder.finish()));
+            self.engine.map_staging(&staging, 5)
+        };
+        // The `hidden0` return of `forward_stop_after_layer_and_read_hidden`
+        // is the entire hidden vector — take the first 5.
+        let hidden_head = hidden0.into_iter().take(5).collect();
+        (
+            norm,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            attn_out,
+            o_buf_head,
+            hidden_head,
+        )
     }
 
     /// Phase X.3.e.3.21 diagnostic: run RMSNorm + attn_qkv projection,
