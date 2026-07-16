@@ -2558,7 +2558,19 @@ impl GpuModel {
         // DeltaNet layer, so checking `blk.0.attn_qkv.weight` cleanly
         // distinguishes the Bonsai layout from standard Qwen 3.5 (which
         // exports `blk.0.ssm_in.weight` instead).
-        let is_bonsai_deltanet_gguf = gguf.tensor_info("blk.0.attn_qkv.weight").is_some();
+        // Bonsai SSM-refinement path is gated on the presence of BOTH
+        // `attn_qkv` layout (split QKV) AND `ssm_a`/`ssm_dt_bias` tensors —
+        // matching CPU semantics at `llama3.rs:3975`:
+        //     is_bonsai_path = dn_layer.ssm_a.is_some() && dn_layer.ssm_dt_bias.is_some()
+        //
+        // Qwen 3.5-4B has the `attn_qkv` split layout (loader dispatches two
+        // matvecs instead of fused ssm_in) BUT NO `ssm_a`/`ssm_dt_bias`, so
+        // the gated_deltanet shader must run the standard silu(q)/silu(k) +
+        // silu(z) semantics (is_bonsai=0). Only Qwen 3.6-27B ("real" Bonsai)
+        // ships the SSM refinement tensors and requires is_bonsai=1.
+        let is_bonsai_deltanet_gguf = gguf.tensor_info("blk.0.attn_qkv.weight").is_some()
+            && gguf.tensor_info("blk.0.ssm_a.weight").is_some()
+            && gguf.tensor_info("blk.0.ssm_dt_bias.weight").is_some();
         if is_bonsai_deltanet_gguf {
             eprintln!(
                 "[GpuModel] Bonsai / Qwen 3.6-27B tensor layout detected \
@@ -2766,9 +2778,21 @@ impl GpuModel {
                             .tensor_to_f32(&format!("blk.{i}.attn_k_norm.weight"))
                             .map(|v| engine.upload_f32(&v)),
                         ffn_norm: engine.upload_f32(
+                            // Standard Qwen 3.5 / Llama / Qwen 2/3 / Gemma
+                            // ship `ffn_norm.weight`; Bonsai / Qwen 3.6-27B
+                            // exports it as `post_attention_norm.weight`.
+                            // Mirrors `llama3::load_ffn_norm` fallback.
                             &gguf
                                 .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
-                                .unwrap(),
+                                .or_else(|| {
+                                    gguf.tensor_to_f32(&format!(
+                                        "blk.{i}.post_attention_norm.weight"
+                                    ))
+                                })
+                                .expect(
+                                    "neither blk.N.ffn_norm.weight nor \
+                                     blk.N.post_attention_norm.weight found",
+                                ),
                         ),
                         gate_proj: upload_w(
                             &format!("blk.{i}.ffn_gate.weight"),
@@ -2882,9 +2906,21 @@ impl GpuModel {
                             dn_v_dim * dn_num_v_heads,
                         ),
                         ffn_norm: engine.upload_f32(
+                            // Standard Qwen 3.5 / Llama / Qwen 2/3 / Gemma
+                            // ship `ffn_norm.weight`; Bonsai / Qwen 3.6-27B
+                            // exports it as `post_attention_norm.weight`.
+                            // Mirrors `llama3::load_ffn_norm` fallback.
                             &gguf
                                 .tensor_to_f32(&format!("blk.{i}.ffn_norm.weight"))
-                                .unwrap(),
+                                .or_else(|| {
+                                    gguf.tensor_to_f32(&format!(
+                                        "blk.{i}.post_attention_norm.weight"
+                                    ))
+                                })
+                                .expect(
+                                    "neither blk.N.ffn_norm.weight nor \
+                                     blk.N.post_attention_norm.weight found",
+                                ),
                         ),
                         gate_proj: upload_w(
                             &format!("blk.{i}.ffn_gate.weight"),
@@ -3481,10 +3517,14 @@ impl GpuModel {
                     let ssm_out_proj =
                         Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
 
-                    // Bonsai-only bind groups. Created only when the layer is
-                    // Bonsai (has attn_qkv + attn_gate loaded); None for
-                    // standard Qwen 3.5 layers.
-                    let is_bonsai_layer = dlw.attn_qkv.is_some();
+                    // Bonsai SSM refinement bind groups. Gated on the presence
+                    // of `ssm_a` + `ssm_dt_bias` + `ssm_norm` tensors — which
+                    // Qwen 3.6-27B ("real" Bonsai) ships but Qwen 3.5-4B does
+                    // NOT (Qwen 3.5-4B has the `attn_qkv` split layout but
+                    // omits the SSM refinement tensors, matching the CPU
+                    // `is_bonsai_path` gate at `llama3.rs:3975`
+                    // `ssm_a.is_some() && ssm_dt_bias.is_some()`).
+                    let is_bonsai_layer = dlw.ssm_a.is_some() && dlw.ssm_dt_bias.is_some();
                     let bonsai_beta_sigmoid_bg = if is_bonsai_layer {
                         let layout = engine.beta_sigmoid_pipeline.get_bind_group_layout(0);
                         Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
