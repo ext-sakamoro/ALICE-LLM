@@ -10,7 +10,7 @@
 //!     --max-tokens 100 --temperature 0.0
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
-use alice_llm::llama3::Llama3Config;
+use alice_llm::llama3::{Llama3Config, Llama3Model};
 use alice_llm::{
     apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter,
 };
@@ -105,6 +105,116 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
     }
 }
 
+/// Phase X.3.e.3.17 Option C MVP: hybrid mode fallback path.
+///
+/// Loads the model via `Llama3Model::from_gguf` (CPU-only, no GPU allocation),
+/// applies Qwen ChatML template, runs autoregressive generation. Purpose is
+/// to avoid the wgpu-hal Vulkan weight 2× duplication on Jetson unified
+/// memory (Bonsai 27B Q1_0: 3.6 GB weight × 2 = 7.2 GB, tight in Jetson 8 GB;
+/// hybrid mode uses 3.6 GB total).
+///
+/// True per-layer hybrid (DeltaNet on CPU + Attention on GPU) requires
+/// `Llama3Model::forward_layers_range()` refactor and is Phase A2 (next
+/// session) work — landing here is the memory-fix MVP that ships now.
+fn run_hybrid_cpu_delegate(
+    model_path: &str,
+    raw_prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    max_seq_len_override: Option<usize>,
+) {
+    println!("Loading model: {model_path} (hybrid mode: CPU delegate)");
+    let t0 = Instant::now();
+    let data = std::fs::read(model_path).expect("Failed to read GGUF file");
+    let gguf = GgufFile::parse(&data).expect("Failed to parse GGUF");
+    let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
+    println!(
+        "  GGUF parsed: {}ms (vocab={})",
+        t0.elapsed().as_millis(),
+        tokenizer.vocab_size()
+    );
+
+    let config = Llama3Config::from_gguf(&gguf).expect("Failed to load Llama3Config from GGUF");
+    if let Some(override_len) = max_seq_len_override {
+        eprintln!(
+            "  Note: --max-seq-len {} (hybrid CPU forward uses GGUF context_length {} directly)",
+            override_len, config.max_seq_len
+        );
+    }
+    println!(
+        "  Config: layers={} hidden={} heads={}/{} head_dim={}",
+        config.num_layers,
+        config.hidden_dim,
+        config.num_heads,
+        config.num_kv_heads,
+        config.head_dim
+    );
+
+    let t_load = Instant::now();
+    let mut model = Llama3Model::from_gguf(&gguf).expect("Failed to load Llama3Model");
+    println!("  Model loaded (CPU): {}ms", t_load.elapsed().as_millis());
+    println!("  [hybrid] GPU allocation skipped; weights on CPU only (mmap'd)");
+
+    let formatted = format!("<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n");
+    let prompt_tokens = tokenizer.encode(&formatted);
+    println!("  Prompt: {} tokens", prompt_tokens.len());
+    println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
+    println!("---");
+
+    let t_prefill = Instant::now();
+    for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
+        let _ = model.forward(tok);
+    }
+    let last_prompt = *prompt_tokens.last().unwrap();
+    let mut logits = model.forward(last_prompt);
+    let prefill_ms = t_prefill.elapsed().as_millis();
+
+    let t_decode = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::new();
+    let eos_id = tokenizer.eos_id;
+    let im_end_id: u32 = 151645;
+    let endoftext_id: u32 = 151643;
+
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1234;
+    let mut next_rand = || -> f32 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        (rng_state as f32) / (u64::MAX as f32)
+    };
+
+    for _step in 0..max_tokens {
+        let next_token = if temperature < 1e-6 {
+            sample_argmax(&logits) as u32
+        } else {
+            apply_temperature(&mut logits, temperature);
+            top_k_filter(&mut logits, top_k);
+            softmax_inplace(&mut logits);
+            sample_with_random(&logits, next_rand()) as u32
+        };
+
+        if next_token == eos_id || next_token == im_end_id || next_token == endoftext_id {
+            break;
+        }
+        generated_tokens.push(next_token);
+        let text = tokenizer.decode(&[next_token]);
+        print!("{text}");
+        std::io::stdout().flush().ok();
+        logits = model.forward(next_token);
+    }
+    println!();
+    println!("---");
+
+    let decode_ms = t_decode.elapsed().as_millis();
+    let n_tokens = generated_tokens.len();
+    println!(
+        "{n_tokens} tokens generated, {:.1} tok/s ({prefill_ms}ms prefill + {decode_ms}ms decode = {}ms)",
+        (n_tokens as f64 * 1000.0) / (prefill_ms + decode_ms) as f64,
+        prefill_ms + decode_ms
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -130,9 +240,31 @@ fn main() {
     // one full prefill per checkpoint (5x prefill cost) because each stop
     // point mutates KV cache differently and needs a clean reset.
     let layer_bisect = args.iter().any(|a| a == "--layer-bisect");
+    // Phase X.3.e.3.17 Option C MVP: `--hybrid` skips GPU entirely and falls
+    // back to CPU-only `Llama3Model::forward()`. This delivers the Jetson OOM
+    // fix (no GPU weight allocation) at the cost of speed (~0.05-0.1 tok/s on
+    // Jetson Cortex-A78AE for Bonsai 27B Q1_0). True per-layer hybrid
+    // (DeltaNet on CPU + Attention on GPU) requires `Llama3Model::
+    // forward_layers_range()` refactor and is next-session work (Phase A2).
+    let hybrid_mode = args.iter().any(|a| a == "--hybrid");
 
     #[cfg(feature = "gpu")]
     {
+        // Phase X.3.e.3.17 Option C MVP: `--hybrid` bypasses GPU entirely and
+        // uses `Llama3Model::forward()` (CPU) so weights are not duplicated on
+        // GPU. Delivers Jetson OOM fix (no GPU weight allocation) at speed cost.
+        if hybrid_mode {
+            run_hybrid_cpu_delegate(
+                &model_path,
+                &raw_prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                max_seq_len_override,
+            );
+            return;
+        }
+
         // --- Load GGUF ---
         println!("Loading model: {model_path}");
         let t0 = Instant::now();
