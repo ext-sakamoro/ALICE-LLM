@@ -152,7 +152,8 @@ fn main() {
     let formatted = match arch_str {
         // Qwen 3 has "thinking mode" default-on which loops <think>...</think>
         // in greedy sampling. Pre-fill empty <think></think> to disable it.
-        "qwen3" | "qwen3moe" => format!(
+        // Qwen 3.5 (DeltaNet hybrid arch) shares the Qwen 3 chat template.
+        "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" => format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ),
         "qwen2" => format!(

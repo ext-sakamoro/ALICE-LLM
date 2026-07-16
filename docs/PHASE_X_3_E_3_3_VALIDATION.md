@@ -6,6 +6,32 @@
 
 Session で実行して判明した事項:
 
+### 🚨 CRITICAL FINDING (2026-07-16 update)
+
+Qwen3.5-4B Q4_K_M (DeltaNet ある) で ALICE-LLM が完全な garbage output ("雜誌" "影像" "ци" "朽" "軍" 等の多言語 random fragments) を生成、llama.cpp fork の同モデル同 prompt では sensible output ("[Start thinking] Thinking Process: 1. **Analyze"、Qwen 3.5 の chain-of-thought 動作) → **Phase X.3.e.3 の 6 refinement のどれかに math bug が存在**
+
+**Diagnostic evidence**:
+- Bonsai 1.7B (Q2_0、DeltaNet なし std GQA) は llama.cpp と一致 (top-1 "The"、"Tokyo" top-5) → 基本 forward path は正常
+- Qwen3.5-4B (Q4_K_M、DeltaNet あり) のみ broken → DeltaNet 経路が原因
+- ALICE-LLM の logit values: top-1 ~11、top-5 ~8 で分散 3 程度 = model が near-uniform (random) 出力
+- Load 状態は正常: `arch=qwen35, ssm=Some(SsmDeltaNetConfig { full_attention_interval=4, linear_num_kv_heads=16, linear_num_v_heads=32, ssm_state_size=128, ssm_time_step_rank=32, ... })`
+- GGUF tensor values 正常: ssm_a [32]: min=-74.6, max=-0.17, all negative (Mamba convention `-exp(A_log)` 通り) / ssm_dt.bias [32]: min=-6.4, max=-1.1, all negative / ssm_norm.weight [128]: 0.12〜1.04, mean=0.98
+
+**Phase X.3.e.3 の 6 refinement は unit test では pass (304 tests) しても、実 GGUF end-to-end で broken**。次段 debug task **Phase X.3.e.3.5** として bug 特定 + fix + regression test 追加が必要。
+
+Suspected bug locations (優先度順):
+1. Gap A (per-V-head loop): index / stride 計算誤り可能性
+2. Gap B (ssm_a / ssm_dt_bias exp discretisation): formula 実装ミス or ssm_a の scale convention 誤解
+3. §Q/K L2Norm (post-conv1d silu): silu 適用位置誤り
+4. §silu(z) order (z-gate after ssm_norm): 順序 or index 誤り
+5. Gap C (ssm_norm apply_qk_norm): weight broadcast 誤り
+6. Gap B extra (beta sigmoid): 適用対象誤り
+
+Isolation methodology (次段):
+- forward path で is_bonsai_path=false 強制 → 全 refinement 無効化 → 出力比較 → refinements 全体が原因かを分離
+- 1 refinement ずつ enable → binary search で bug 箇所特定
+- Reference llama.cpp fork の qwen35.cpp:436-562 を再精読、各 step の中間値 dump で数値比較
+
 ### ✅ Achieved
 
 - **Mac disk cleanup**: 900 MB → **66 GB free** (`cargo clean` on ALICE-CodeTracker + ALICE-Eco-System で 65 GB 回復)
