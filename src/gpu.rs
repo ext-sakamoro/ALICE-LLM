@@ -2970,9 +2970,22 @@ impl GpuModel {
                     // num_kv_heads (Qwen 3.5: 32/16, Bonsai: 48/16). Under
                     // cyclic V→KV mapping each V-head has its own recurrent
                     // state slab even though V-heads share Q/K per KV group.
-                    deltanet_states.push(engine.alloc_f32(dn_num_v_heads * dn_qk_dim * dn_v_dim));
+                    // Phase X.3.e.3.20 fix: explicitly zero-initialize both
+                    // buffers. `alloc_f32` returns uninitialized memory on
+                    // Metal (wgpu-hal doesn't guarantee zero-init unless
+                    // `mapped_at_creation` is true) → first forward reads
+                    // NaN/Inf from uninitialized DeltaNet state → propagates
+                    // through recurrence → hidden state = NaN → PAD248319
+                    // (argmax picks last valid token).
+                    let dn_state_len = dn_num_v_heads * dn_qk_dim * dn_v_dim;
+                    let dn_state_buf = engine.alloc_f32(dn_state_len);
+                    engine.write_f32(&dn_state_buf, &vec![0.0f32; dn_state_len]);
+                    deltanet_states.push(dn_state_buf);
                     // Conv1d ring buffer: [kernel_size - 1, conv_dim]
-                    deltanet_conv_states.push(engine.alloc_f32((dn_conv_kernel - 1) * dn_conv_dim));
+                    let conv_state_len = (dn_conv_kernel - 1) * dn_conv_dim;
+                    let conv_state_buf = engine.alloc_f32(conv_state_len);
+                    engine.write_f32(&conv_state_buf, &vec![0.0f32; conv_state_len]);
+                    deltanet_conv_states.push(conv_state_buf);
 
                     // Push a dummy LayerWeightBufs placeholder so indexing stays aligned
                     // (DeltaNet layers use deltanet_layer_weights instead)
@@ -3027,17 +3040,26 @@ impl GpuModel {
             output_proj_weight.quant,
         );
 
-        // Scratch buffers (MAX_BATCH sized for batch forward support)
+        // Scratch buffers (MAX_BATCH sized for batch forward support).
+        // Phase X.3.e.3.20 fix: explicit zero-initialization to prevent NaN
+        // propagation from uninitialized memory (wgpu-hal Metal does not
+        // guarantee zero-init for `alloc_f32`; DeltaNet recurrence + RMSNorm
+        // + matvec on uninitialized garbage → NaN → PAD248319 output).
         const MAX_BATCH: usize = 8;
-        let hidden = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
-        let norm_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
-        let q_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
-        let k_buf = engine.alloc_f32(MAX_BATCH * kv_dim);
-        let v_buf = engine.alloc_f32(MAX_BATCH * kv_dim);
-        let attn_out = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
-        let o_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
-        let gate_buf = engine.alloc_f32(MAX_BATCH * config.intermediate_dim);
-        let down_buf = engine.alloc_f32(MAX_BATCH * config.hidden_dim);
+        let zero_init = |sz: usize| -> GpuBuffer {
+            let b = engine.alloc_f32(sz);
+            engine.write_f32(&b, &vec![0.0f32; sz]);
+            b
+        };
+        let hidden = zero_init(MAX_BATCH * config.hidden_dim);
+        let norm_buf = zero_init(MAX_BATCH * config.hidden_dim);
+        let q_buf = zero_init(MAX_BATCH * config.hidden_dim);
+        let k_buf = zero_init(MAX_BATCH * kv_dim);
+        let v_buf = zero_init(MAX_BATCH * kv_dim);
+        let attn_out = zero_init(MAX_BATCH * config.hidden_dim);
+        let o_buf = zero_init(MAX_BATCH * config.hidden_dim);
+        let gate_buf = zero_init(MAX_BATCH * config.intermediate_dim);
+        let down_buf = zero_init(MAX_BATCH * config.hidden_dim);
         // DeltaNet decay-gate / update-rate scratch (Qwen 3.5 hybrid). Sized to
         // `linear_num_v_heads` (per-V-head scalar under cyclic V→KV mapping,
         // Phase X.3.e.3.11 fix) with MAX_BATCH lanes reserved for future
@@ -4506,11 +4528,17 @@ impl GpuModel {
     }
 
     /// Reset KV caches and position counter.
+    ///
+    /// Phase X.3.e.3.20 fix: KV caches are only allocated for attention
+    /// layers (`n_attn_layers`), not all layers. Previous code iterated
+    /// `0..num_layers` (e.g., 32 for Qwen 3.5-4B) but `k_caches.len() ==
+    /// n_attn_layers` (8) → index-out-of-bounds panic on any reset() call
+    /// (encountered via `--layer-bisect` mode).
     pub fn reset(&mut self) {
         self.seq_len = 0;
         let kv_dim = (self.config.num_kv_heads * self.config.head_dim) as usize;
         let zeros = vec![0.0f32; self.config.max_seq_len * kv_dim];
-        for i in 0..self.config.num_layers {
+        for i in 0..self.k_caches.len() {
             self.engine.write_f32(&self.k_caches[i], &zeros);
             self.engine.write_f32(&self.v_caches[i], &zeros);
         }
