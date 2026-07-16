@@ -18,6 +18,7 @@ const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
     include_str!("shaders/dequant_matvec_q1_0_row8_batch4.wgsl");
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
+const SILU_GATE_APPLY_SHADER: &str = include_str!("shaders/silu_gate_apply.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
 const ADD_BIAS_SHADER: &str = include_str!("shaders/add_bias.wgsl");
 const QK_NORM_SHADER: &str = include_str!("shaders/qk_norm.wgsl");
@@ -30,6 +31,36 @@ const MATVEC_Q6K_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q6k_
 const SWIGLU_FUSED_Q4K_BATCH4_SHADER: &str = include_str!("shaders/swiglu_fused_q4k_batch4.wgsl");
 const CONV1D_CAUSAL_SHADER: &str = include_str!("shaders/conv1d_causal.wgsl");
 const GATED_DELTANET_SHADER: &str = include_str!("shaders/gated_deltanet.wgsl");
+
+// --- CPU reference helpers for GPU shaders ---
+
+/// CPU reference implementation of the `silu_gate_apply` WGSL shader.
+///
+/// Computes `attn_out[i] *= silu(gate[i])` in-place on `attn_out`, matching
+/// `src/shaders/silu_gate_apply.wgsl` line-by-line. Used by Bonsai / Qwen
+/// 3.6-27B full-attention layers to modulate the raw attention output by the
+/// swish gate (from `attn_q [q_dim*2, hidden]` lower half) before the
+/// `o_proj` matvec.
+///
+/// This is the definitive CPU parity reference for the GPU shader — any
+/// future integration test comparing GPU output to CPU should call this
+/// function to produce the expected values.
+///
+/// # Panics
+///
+/// Panics if `attn_out.len() != gate.len()`.
+pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
+    assert_eq!(
+        attn_out.len(),
+        gate.len(),
+        "silu_gate_apply_cpu: attn_out and gate must have same length"
+    );
+    for (a, &g) in attn_out.iter_mut().zip(gate.iter()) {
+        // silu(g) = g / (1 + exp(-g)) = g * sigmoid(g)
+        // attn_out[i] *= silu(g)
+        *a = *a * g / (1.0 + (-g).exp());
+    }
+}
 
 // --- Uniform param structs (must match WGSL) ---
 
@@ -167,6 +198,13 @@ pub struct GpuEngine {
     matvec_q1_0_row8_batch4_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
     silu_mul_pipeline: wgpu::ComputePipeline,
+    /// Bonsai / Qwen 3.6-27B gated attention output modulation:
+    /// `attn_out[i] *= silu(gate[i])` in-place on `attn_out`. Building block
+    /// for Phase 2 Step 3-6 forward-path integration (see
+    /// `docs/BONSAI_GPU_SUPPORT.md`). Not yet wired into `encode_forward_impl`
+    /// — exposed via `GpuPass::silu_gate_apply` for future integration and
+    /// standalone parity validation.
+    silu_gate_apply_pipeline: wgpu::ComputePipeline,
     residual_add_pipeline: wgpu::ComputePipeline,
     /// Element-wise bias add (Qwen 2 / 2.5 attention QKV biases).
     add_bias_pipeline: wgpu::ComputePipeline,
@@ -356,6 +394,11 @@ impl GpuEngine {
             matvec_q1_0_row8_batch4_pipeline,
             rmsnorm_pipeline: make_pipeline(RMSNORM_SHADER, "rmsnorm", "rmsnorm"),
             silu_mul_pipeline: make_pipeline(SILU_MUL_SHADER, "silu_mul", "silu_mul"),
+            silu_gate_apply_pipeline: make_pipeline(
+                SILU_GATE_APPLY_SHADER,
+                "silu_gate_apply",
+                "silu_gate_apply",
+            ),
             residual_add_pipeline: make_pipeline(
                 RESIDUAL_ADD_SHADER,
                 "residual_add",
@@ -1130,6 +1173,53 @@ impl<'a> GpuPass<'a> {
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.engine.silu_mul_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, 1, 1);
+        }
+    }
+
+    /// Bonsai gated attention output modulation: `attn_out *= silu(gate)`
+    /// in-place on `attn_out` buffer.
+    ///
+    /// Distinct from `silu_mul` (which writes to `gate` for SwiGLU FFN): here
+    /// the write target is `attn_out` and the silu-transformed operand is
+    /// `gate` (read-only). Used by Bonsai / Qwen 3.6-27B full-attention
+    /// layers where `attn_q [q_dim*2, hidden]` produces both Q and the swish
+    /// gate; after standard scaled-dot-product attention completes, the raw
+    /// output is modulated by silu(gate) before the `o_proj` matvec.
+    ///
+    /// Not yet wired into `encode_forward_impl` — awaiting Phase 2 Steps 3-6
+    /// (see `docs/BONSAI_GPU_SUPPORT.md`). Exposed publicly for standalone
+    /// parity validation against the CPU reference and for future forward
+    /// path integration.
+    pub fn silu_gate_apply(&mut self, attn_out: &GpuBuffer, gate: &GpuBuffer) {
+        let layout = self
+            .engine
+            .silu_gate_apply_pipeline
+            .get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: attn_out.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: gate.buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let dispatch_x = ((attn_out.len as u32) + 255) / 256;
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.silu_gate_apply_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(dispatch_x, 1, 1);
         }
@@ -4178,5 +4268,98 @@ impl GpuModel {
 
         self.seq_len = seq_len;
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify `silu_gate_apply_cpu` produces the mathematically correct
+    /// values for the Bonsai gated attention output modulation.
+    ///
+    /// This is the CPU reference for the WGSL `silu_gate_apply` shader —
+    /// they must produce bit-exact identical outputs (modulo FP summation
+    /// order which is irrelevant here since the operation is fully
+    /// element-wise). Any change to the shader must have a corresponding
+    /// change to `silu_gate_apply_cpu` and this test must still pass.
+    #[test]
+    fn silu_gate_apply_cpu_matches_math() {
+        // Key values of silu(x) = x / (1 + exp(-x)) = x * sigmoid(x):
+        //   silu(0)         = 0
+        //   silu(1)         ≈ 0.7310586
+        //   silu(-1)        ≈ -0.2689414
+        //   silu(large +)   ≈ x (asymptotic)
+        //   silu(large -)   ≈ 0 (asymptotic)
+        let mut attn_out = vec![1.0f32, 1.0, 1.0, 1.0, 1.0];
+        let gate = vec![0.0f32, 1.0, -1.0, 20.0, -20.0];
+
+        silu_gate_apply_cpu(&mut attn_out, &gate);
+
+        // attn_out[i] *= silu(gate[i]), initial attn_out = 1 → attn_out = silu(gate)
+        assert!(
+            (attn_out[0] - 0.0).abs() < 1e-6,
+            "silu(0) = 0 expected, got {}",
+            attn_out[0]
+        );
+        assert!(
+            (attn_out[1] - 0.7310586).abs() < 1e-5,
+            "silu(1) ≈ 0.7310586 expected, got {}",
+            attn_out[1]
+        );
+        assert!(
+            (attn_out[2] - (-0.2689414)).abs() < 1e-5,
+            "silu(-1) ≈ -0.2689414 expected, got {}",
+            attn_out[2]
+        );
+        // silu(20) ≈ 20 (sigmoid(20) ≈ 1.0)
+        assert!(
+            (attn_out[3] - 20.0).abs() < 1e-4,
+            "silu(20) ≈ 20 expected, got {}",
+            attn_out[3]
+        );
+        // silu(-20) ≈ 0 (sigmoid(-20) ≈ 0)
+        assert!(
+            attn_out[4].abs() < 1e-4,
+            "silu(-20) ≈ 0 expected, got {}",
+            attn_out[4]
+        );
+    }
+
+    /// Verify `silu_gate_apply_cpu` respects multiplicative structure:
+    /// `attn_out *= silu(gate)` with non-unit `attn_out`.
+    #[test]
+    fn silu_gate_apply_cpu_multiplicative() {
+        let mut attn_out = vec![2.0f32, -3.0, 0.5, 0.0];
+        let gate = vec![1.0f32, 1.0, -1.0, 5.0];
+
+        // Expected: attn_out[i] = attn_out[i] * silu(gate[i])
+        // silu(1)  ≈ 0.7310586
+        // silu(-1) ≈ -0.2689414
+        // silu(5)  ≈ 4.9665358
+        let expected = [
+            2.0 * 0.7310586,  // ≈  1.4621172
+            -3.0 * 0.7310586, // ≈ -2.1931758
+            0.5 * -0.2689414, // ≈ -0.1344707
+            0.0 * 4.9665358,  // =  0.0
+        ];
+
+        silu_gate_apply_cpu(&mut attn_out, &gate);
+
+        for (i, (&got, &want)) in attn_out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "silu_gate_apply_cpu[{i}]: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// Verify `silu_gate_apply_cpu` panics on mismatched lengths (contract test).
+    #[test]
+    #[should_panic(expected = "attn_out and gate must have same length")]
+    fn silu_gate_apply_cpu_panics_on_length_mismatch() {
+        let mut attn_out = vec![1.0f32; 4];
+        let gate = vec![1.0f32; 5];
+        silu_gate_apply_cpu(&mut attn_out, &gate);
     }
 }
