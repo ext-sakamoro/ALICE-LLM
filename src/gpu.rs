@@ -8,7 +8,9 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 const MATVEC_Q4K_SHADER: &str = include_str!("shaders/dequant_matvec_q4k.wgsl");
+const MATVEC_Q5K_SHADER: &str = include_str!("shaders/dequant_matvec_q5k.wgsl");
 const MATVEC_Q6K_SHADER: &str = include_str!("shaders/dequant_matvec_q6k.wgsl");
+const MATVEC_Q8_0_SHADER: &str = include_str!("shaders/dequant_matvec_q8_0.wgsl");
 const MATVEC_Q1_0_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0.wgsl");
 const MATVEC_Q1_0_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0_batch4.wgsl");
 const MATVEC_Q1_0_ROW4_SHADER: &str = include_str!("shaders/dequant_matvec_q1_0_row4.wgsl");
@@ -270,7 +272,15 @@ pub struct GpuBuffer {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GpuQuantType {
     Q4K,
+    /// Q5_K (256 elements / block, 176 bytes). Mixed with Q4_K in Q4_K_M
+    /// GGUFs — Qwen 3.5-4B uses this for `attn_qkv` and `ssm_out` weights.
+    Q5K,
     Q6K,
+    /// Q8_0 (32 elements / block, 34 bytes packed to 36 bytes on GPU upload
+    /// for u32 alignment). Used for small tensors like `ssm_alpha` and
+    /// `ssm_beta` in Qwen 3.5-4B (which need higher precision on the tiny
+    /// 32-row projection matrices).
+    Q8_0,
     /// PrismML Q1_0 (Bonsai 27B binary g128) — 128 elements per block,
     /// 18 bytes per block (2 FP16 scale + 16 × 1-bit packed values).
     Q1_0,
@@ -305,7 +315,14 @@ pub struct GpuEngine {
     /// requires higher peak memory factor since wgpu Vulkan / Metal double-allocates.
     pub device_type: wgpu::DeviceType,
     matvec_q4k_pipeline: wgpu::ComputePipeline,
+    /// Q5_K matvec (176 byte blocks with 32-byte qh + 128-byte qs). Same
+    /// bind-group layout as Q4_K so `MatvecBG` structures are reused.
+    matvec_q5k_pipeline: wgpu::ComputePipeline,
     matvec_q6k_pipeline: wgpu::ComputePipeline,
+    /// Q8_0 matvec (32 elements/block, 36-byte padded upload for word
+    /// alignment — see `upload_weights_q8_0`). Workgroup size 32 (one
+    /// thread per element in a block).
+    matvec_q8_0_pipeline: wgpu::ComputePipeline,
     /// PrismML Q1_0 (Bonsai 27B binary g128) matvec, 128 elements/block,
     /// 18 bytes/block, byte-level indexed (blocks straddle `u32` word boundaries).
     matvec_q1_0_pipeline: wgpu::ComputePipeline,
@@ -465,7 +482,9 @@ impl GpuEngine {
 
         // Create original pipelines first
         let matvec_q4k_pipeline = make_pipeline(MATVEC_Q4K_SHADER, "matvec_q4k", "matvec_q4k");
+        let matvec_q5k_pipeline = make_pipeline(MATVEC_Q5K_SHADER, "matvec_q5k", "matvec_q5k");
         let matvec_q6k_pipeline = make_pipeline(MATVEC_Q6K_SHADER, "matvec_q6k", "matvec_q6k");
+        let matvec_q8_0_pipeline = make_pipeline(MATVEC_Q8_0_SHADER, "matvec_q8_0", "matvec_q8_0");
         let matvec_q1_0_pipeline = make_pipeline(MATVEC_Q1_0_SHADER, "matvec_q1_0", "matvec_q1_0");
         let matvec_q1_0_batch4_pipeline = make_pipeline(
             MATVEC_Q1_0_BATCH4_SHADER,
@@ -542,7 +561,9 @@ impl GpuEngine {
 
         Self {
             matvec_q4k_pipeline,
+            matvec_q5k_pipeline,
             matvec_q6k_pipeline,
+            matvec_q8_0_pipeline,
             matvec_q1_0_pipeline,
             matvec_q1_0_batch4_pipeline,
             matvec_q1_0_row4_pipeline,
@@ -648,9 +669,61 @@ impl GpuEngine {
         self.upload_weights_typed(data, rows, cols, GpuQuantType::Q4K)
     }
 
+    /// Upload Q5_K weight tensor to GPU. Layout is 176 bytes / 256 elements
+    /// per block — u32-aligned so no repacking is needed.
+    pub fn upload_weights_q5k(&self, data: &[u8], rows: usize, cols: usize) -> GpuWeightBuffer {
+        self.upload_weights_typed(data, rows, cols, GpuQuantType::Q5K)
+    }
+
     /// Upload Q6_K weight tensor to GPU.
     pub fn upload_weights_q6k(&self, data: &[u8], rows: usize, cols: usize) -> GpuWeightBuffer {
         self.upload_weights_typed(data, rows, cols, GpuQuantType::Q6K)
+    }
+
+    /// Upload Q8_0 weight tensor to GPU. GGUF stores Q8_0 as 34-byte blocks
+    /// which are not u32-aligned; we pad each block to 36 bytes (adding two
+    /// zero bytes after `d`) so the WGSL shader can read the block layout as
+    /// 9 u32 words. Overhead: 5.88 % memory per Q8_0 tensor (negligible for
+    /// small projection matrices like `ssm_alpha` / `ssm_beta`).
+    pub fn upload_weights_q8_0(&self, data: &[u8], rows: usize, cols: usize) -> GpuWeightBuffer {
+        const RAW_BLOCK_BYTES: usize = 34;
+        const PADDED_BLOCK_BYTES: usize = 36;
+        assert!(
+            cols.is_multiple_of(32),
+            "Q8_0 requires cols to be a multiple of 32 (got {cols})"
+        );
+        let blocks_per_row = cols / 32;
+        let total_blocks = rows * blocks_per_row;
+        assert_eq!(
+            data.len(),
+            total_blocks * RAW_BLOCK_BYTES,
+            "Q8_0 data length mismatch: rows={rows} cols={cols} \
+             expected {} raw bytes, got {}",
+            total_blocks * RAW_BLOCK_BYTES,
+            data.len(),
+        );
+        let mut padded = vec![0u8; total_blocks * PADDED_BLOCK_BYTES];
+        for b in 0..total_blocks {
+            let src = &data[b * RAW_BLOCK_BYTES..(b + 1) * RAW_BLOCK_BYTES];
+            let dst = &mut padded[b * PADDED_BLOCK_BYTES..b * PADDED_BLOCK_BYTES + 2];
+            dst.copy_from_slice(&src[0..2]);
+            // Bytes 2..3 of the padded block are zero (word 0 upper 16 bits).
+            padded[b * PADDED_BLOCK_BYTES + 4..b * PADDED_BLOCK_BYTES + 36]
+                .copy_from_slice(&src[2..34]);
+        }
+        GpuWeightBuffer {
+            buffer: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("q8_0_weights"),
+                    contents: &padded,
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+            rows: rows as u32,
+            cols: cols as u32,
+            blocks_per_row: blocks_per_row as u32,
+            quant: GpuQuantType::Q8_0,
+        }
     }
 
     /// Upload Q1_0 (PrismML Bonsai binary g128) weight tensor to GPU.
@@ -665,9 +738,18 @@ impl GpuEngine {
         cols: usize,
         quant: GpuQuantType,
     ) -> GpuWeightBuffer {
+        // Q8_0 has a non-u32-aligned 34-byte block layout that must go
+        // through `upload_weights_q8_0` for padding — reject here to catch
+        // any accidental call path that skipped the padded helper.
+        assert!(
+            !matches!(quant, GpuQuantType::Q8_0),
+            "upload_weights_typed does not support Q8_0 directly — use upload_weights_q8_0"
+        );
         let (label, elements_per_block) = match quant {
             GpuQuantType::Q4K => ("q4k_weights", 256usize),
+            GpuQuantType::Q5K => ("q5k_weights", 256),
             GpuQuantType::Q6K => ("q6k_weights", 256),
+            GpuQuantType::Q8_0 => unreachable!("gated by assert above"),
             GpuQuantType::Q1_0 => ("q1_0_weights", 128),
         };
         GpuWeightBuffer {
@@ -1678,6 +1760,111 @@ impl<'a> GpuPass<'a> {
     }
 
     /// Q6_K matvec: output = weights × input (GPU buffers, no readback).
+    /// Q5_K matvec (standalone). Same bind group layout as Q4_K, only pipeline
+    /// differs — see `matvec_q5k` shader for the block-layout math.
+    pub fn matvec_q5k(&mut self, weights: &GpuWeightBuffer, input: &GpuBuffer, output: &GpuBuffer) {
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
+        let params = self.engine.make_uniform(&MatvecParams {
+            rows: weights.rows,
+            cols: weights.cols,
+            blocks_per_row: weights.blocks_per_row,
+            grid_x,
+            batch_size: 1,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        });
+        let layout = self.engine.matvec_q5k_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.matvec_q5k_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
+    /// Q8_0 matvec (standalone). Same bind group layout as Q4_K, only pipeline
+    /// differs — see `matvec_q8_0` shader for the padded 9-word block layout.
+    pub fn matvec_q8_0(
+        &mut self,
+        weights: &GpuWeightBuffer,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+    ) {
+        let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
+        let params = self.engine.make_uniform(&MatvecParams {
+            rows: weights.rows,
+            cols: weights.cols,
+            blocks_per_row: weights.blocks_per_row,
+            grid_x,
+            batch_size: 1,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        });
+        let layout = self.engine.matvec_q8_0_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.matvec_q8_0_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+    }
+
     pub fn matvec_q6k(&mut self, weights: &GpuWeightBuffer, input: &GpuBuffer, output: &GpuBuffer) {
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(weights.rows);
         let params = self.engine.make_uniform(&MatvecParams {
@@ -1735,7 +1922,9 @@ impl<'a> GpuPass<'a> {
     ) {
         match weights.quant {
             GpuQuantType::Q4K => self.matvec_q4k(weights, input, output),
+            GpuQuantType::Q5K => self.matvec_q5k(weights, input, output),
             GpuQuantType::Q6K => self.matvec_q6k(weights, input, output),
+            GpuQuantType::Q8_0 => self.matvec_q8_0(weights, input, output),
             GpuQuantType::Q1_0 => self.matvec_q1_0(weights, input, output),
         }
     }
@@ -2229,7 +2418,9 @@ fn timed_dispatch(
 fn timed_mv(engine: &GpuEngine, mv: &MatvecBG) -> (f64, GpuQuantType) {
     let pipeline = match mv.quant {
         GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
+        GpuQuantType::Q5K => &engine.matvec_q5k_pipeline,
         GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+        GpuQuantType::Q8_0 => &engine.matvec_q8_0_pipeline,
         GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
     };
     let us = timed_dispatch(engine, pipeline, &mv.bg, mv.dispatch_x, mv.dispatch_y, 1);
@@ -2337,7 +2528,9 @@ impl GpuModel {
         // Jetson Vulkan iGPU for Bonsai 27B attn_qkv (Step 6, PR #74).
         let dispatch_rows = match w.quant {
             GpuQuantType::Q1_0 => w.rows.div_ceil(4),
-            GpuQuantType::Q4K | GpuQuantType::Q6K => w.rows,
+            GpuQuantType::Q4K | GpuQuantType::Q5K | GpuQuantType::Q6K | GpuQuantType::Q8_0 => {
+                w.rows
+            }
         };
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(dispatch_rows);
         let params_buf = engine.make_persistent_uniform(&MatvecParams {
@@ -2352,7 +2545,9 @@ impl GpuModel {
         });
         let pipeline = match w.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
+            GpuQuantType::Q5K => &engine.matvec_q5k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+            GpuQuantType::Q8_0 => &engine.matvec_q8_0_pipeline,
             GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
         };
         let layout = pipeline.get_bind_group_layout(0);
@@ -2666,9 +2861,15 @@ impl GpuModel {
             let info = gguf.tensor_info(name).unwrap();
             let data = gguf.tensor_data(name).unwrap();
             match info.qtype {
+                GgmlType::Q4_K => engine.upload_weights(data, rows, cols),
+                GgmlType::Q5_K => engine.upload_weights_q5k(data, rows, cols),
                 GgmlType::Q6_K => engine.upload_weights_q6k(data, rows, cols),
+                GgmlType::Q8_0 => engine.upload_weights_q8_0(data, rows, cols),
                 GgmlType::Q1_0 => engine.upload_weights_q1_0(data, rows, cols),
-                _ => engine.upload_weights(data, rows, cols),
+                other => panic!(
+                    "GPU upload for tensor `{name}` unsupported quant type {other:?} \
+                     (row=[{rows} col={cols}]) — extend GpuQuantType + upload_weights_typed"
+                ),
             }
         };
 
@@ -2687,16 +2888,21 @@ impl GpuModel {
                 let split_at = half_rows * bytes_per_row;
                 let q_bytes = &data[..split_at];
                 let gate_bytes = &data[split_at..];
-                let q = match info.qtype {
-                    GgmlType::Q6_K => engine.upload_weights_q6k(q_bytes, half_rows, cols),
-                    GgmlType::Q1_0 => engine.upload_weights_q1_0(q_bytes, half_rows, cols),
-                    _ => engine.upload_weights(q_bytes, half_rows, cols),
+                let upload_half = |bytes: &[u8]| -> GpuWeightBuffer {
+                    match info.qtype {
+                        GgmlType::Q4_K => engine.upload_weights(bytes, half_rows, cols),
+                        GgmlType::Q5_K => engine.upload_weights_q5k(bytes, half_rows, cols),
+                        GgmlType::Q6_K => engine.upload_weights_q6k(bytes, half_rows, cols),
+                        GgmlType::Q8_0 => engine.upload_weights_q8_0(bytes, half_rows, cols),
+                        GgmlType::Q1_0 => engine.upload_weights_q1_0(bytes, half_rows, cols),
+                        other => panic!(
+                            "GPU upload for tensor `{name}` (bonsai split) unsupported quant \
+                             type {other:?} — extend GpuQuantType + upload_weights_typed"
+                        ),
+                    }
                 };
-                let gate = match info.qtype {
-                    GgmlType::Q6_K => engine.upload_weights_q6k(gate_bytes, half_rows, cols),
-                    GgmlType::Q1_0 => engine.upload_weights_q1_0(gate_bytes, half_rows, cols),
-                    _ => engine.upload_weights(gate_bytes, half_rows, cols),
-                };
+                let q = upload_half(q_bytes);
+                let gate = upload_half(gate_bytes);
                 (q, gate)
             };
 
@@ -4329,7 +4535,9 @@ impl GpuModel {
         // pre-computed in `build_matvec_bg` for ceil(rows / 4).
         let pipeline = match mv.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,
+            GpuQuantType::Q5K => &engine.matvec_q5k_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_pipeline,
+            GpuQuantType::Q8_0 => &engine.matvec_q8_0_pipeline,
             GpuQuantType::Q1_0 => &engine.matvec_q1_0_row4_pipeline,
         };
         cp.set_pipeline(pipeline);
@@ -4344,6 +4552,18 @@ impl GpuModel {
             GpuQuantType::Q4K => &engine.matvec_q4k_batch4_pipeline,
             GpuQuantType::Q6K => &engine.matvec_q6k_batch4_pipeline,
             GpuQuantType::Q1_0 => &engine.matvec_q1_0_batch4_pipeline,
+            // Q5_K and Q8_0 batch4 kernels are not yet implemented — the
+            // speculative-decoding path (`encode_forward_batch4`) is not
+            // supported on Qwen 3.5-4B-style Q4_K_M GGUFs that mix these
+            // quantisations into the projection matmuls. The single-token
+            // forward path (`encode_forward_impl`, `dispatch_mv`) does
+            // handle them via the new pipelines.
+            other @ (GpuQuantType::Q5K | GpuQuantType::Q8_0) => panic!(
+                "dispatch_mv_batch4 is not implemented for {other:?} \
+                 (speculative decoding with Q4_K_M mixed-quant GGUFs). \
+                 Use single-token `encode_forward_impl` or implement \
+                 dequant_matvec_q5k_batch4.wgsl / dequant_matvec_q8_0_batch4.wgsl."
+            ),
         };
         cp.set_pipeline(pipeline);
         cp.set_bind_group(0, &mv.bg, &[]);
@@ -4375,6 +4595,108 @@ impl GpuModel {
             0,
             bytemuck::cast_slice(&self.embedding[start..end]),
         );
+    }
+
+    /// Phase X.3.e.3.21 diagnostic: read back the current contents of a
+    /// scratch buffer for NaN source hunting. Executes a full forward first,
+    /// then dumps the requested buffer's first N f32 values. Call after
+    /// `forward(token)` to inspect end-of-forward state.
+    pub fn debug_read_scratch(&mut self, which: &str, n_head: usize) -> Vec<f32> {
+        let (buf, dim) = match which {
+            "norm_buf" => (&self._norm_buf, self.config.hidden_dim),
+            "q_buf" => (&self._q_buf, self.config.hidden_dim),
+            "k_buf" => (
+                &self._k_buf,
+                (self.config.num_kv_heads * self.config.head_dim) as usize,
+            ),
+            "v_buf" => (
+                &self._v_buf,
+                (self.config.num_kv_heads * self.config.head_dim) as usize,
+            ),
+            "attn_out" => (&self._attn_out, self.config.hidden_dim),
+            "hidden" => (&self.hidden, self.config.hidden_dim),
+            "alpha_buf" => (
+                &self._alpha_buf,
+                self.config.linear_num_v_heads.unwrap_or(0) as usize,
+            ),
+            "beta_buf" => (
+                &self._beta_buf,
+                self.config.linear_num_v_heads.unwrap_or(0) as usize,
+            ),
+            _ => panic!("unknown buffer: {which}"),
+        };
+        let read_len = n_head.min(dim);
+        let bytes = (read_len * 4) as u64;
+        let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug_staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(&buf.buffer, 0, &staging, 0, bytes);
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.engine.map_staging(&staging, read_len)
+    }
+
+    /// Phase X.3.e.3.21 diagnostic: run only layer 0's RMSNorm (attn_norm)
+    /// and return the resulting norm_buf. Used to isolate whether RMSNorm
+    /// or a downstream op is the NaN source.
+    pub fn debug_forward_layer0_attn_norm_only(&mut self, token_id: u32) -> Vec<f32> {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            // Run only the first layer's RMSNorm.
+            let dbg = &self.deltanet_layer_bgs[0];
+            cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+            cp.set_bind_group(0, &dbg.attn_norm_bg, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+        }
+        self.engine.queue.submit(Some(encoder.finish()));
+
+        self.debug_read_scratch("norm_buf", 5)
+    }
+
+    /// Phase X.3.e.3.21 diagnostic: run RMSNorm + attn_qkv projection,
+    /// return q_buf head (first N values). Isolates whether matvec Q4_K
+    /// dequantization is producing NaN.
+    pub fn debug_forward_layer0_qkv_only(&mut self, token_id: u32) -> Vec<f32> {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let dbg = &self.deltanet_layer_bgs[0];
+            cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+            cp.set_bind_group(0, &dbg.attn_norm_bg, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+            // Fused in_proj (Standard) or attn_qkv (Bonsai) writes to q_buf.
+            if let Some(ref mv) = dbg.ssm_in_proj {
+                Self::dispatch_mv(&self.engine, &mut cp, mv);
+            } else if let Some(ref qkv) = dbg.attn_qkv_proj {
+                Self::dispatch_mv(&self.engine, &mut cp, qkv);
+            }
+        }
+        self.engine.queue.submit(Some(encoder.finish()));
+
+        self.debug_read_scratch("q_buf", 5)
     }
 
     /// Execute forward pass without logits readback.
@@ -4614,10 +4936,11 @@ impl GpuModel {
                         r.matvec_q6k_us += us;
                         r.matvec_q6k_n += 1;
                     }
-                    GpuQuantType::Q1_0 => {
-                        // Bin Q1_0 timings into the Q6K accumulator until a
-                        // dedicated counter is added — keeps the profile
-                        // summary total accurate for mixed-quant models.
+                    GpuQuantType::Q5K | GpuQuantType::Q8_0 | GpuQuantType::Q1_0 => {
+                        // Bin Q5_K / Q8_0 / Q1_0 timings into the Q6K
+                        // accumulator until dedicated counters are added —
+                        // keeps the profile summary total accurate for
+                        // mixed-quant models.
                         r.matvec_q6k_us += us;
                         r.matvec_q6k_n += 1;
                     }
@@ -4703,7 +5026,7 @@ impl GpuModel {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
-                GpuQuantType::Q1_0 => {
+                GpuQuantType::Q5K | GpuQuantType::Q8_0 | GpuQuantType::Q1_0 => {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
@@ -4743,7 +5066,7 @@ impl GpuModel {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
-                GpuQuantType::Q1_0 => {
+                GpuQuantType::Q5K | GpuQuantType::Q8_0 | GpuQuantType::Q1_0 => {
                     r.matvec_q6k_us += us;
                     r.matvec_q6k_n += 1;
                 }
@@ -4774,7 +5097,7 @@ impl GpuModel {
                 r.matvec_q6k_us += us;
                 r.matvec_q6k_n += 1;
             }
-            GpuQuantType::Q1_0 => {
+            GpuQuantType::Q5K | GpuQuantType::Q8_0 | GpuQuantType::Q1_0 => {
                 r.matvec_q6k_us += us;
                 r.matvec_q6k_n += 1;
             }
@@ -5083,12 +5406,16 @@ impl GpuModel {
                 // consistent with the production `dispatch_mv` path.
                 let pipeline = match $mv.quant {
                     GpuQuantType::Q4K => &self.engine.matvec_q4k_pipeline,
+                    GpuQuantType::Q5K => &self.engine.matvec_q5k_pipeline,
                     GpuQuantType::Q6K => &self.engine.matvec_q6k_pipeline,
+                    GpuQuantType::Q8_0 => &self.engine.matvec_q8_0_pipeline,
                     GpuQuantType::Q1_0 => &self.engine.matvec_q1_0_row4_pipeline,
                 };
                 let tag = match $mv.quant {
                     GpuQuantType::Q4K => 1u8,
+                    GpuQuantType::Q5K => 4u8,
                     GpuQuantType::Q6K => 2u8,
+                    GpuQuantType::Q8_0 => 5u8,
                     GpuQuantType::Q1_0 => 3u8,
                 };
                 ts_dispatch!(pipeline, &$mv.bg, $mv.dispatch_x, $mv.dispatch_y, 1, tag);
@@ -5850,6 +6177,240 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Try to instantiate `GpuEngine::new()`. Returns `None` if no adapter is
+    /// available on the host (typical for headless CI without lavapipe) so
+    /// callers can `return` to skip the test cleanly.
+    fn try_gpu_engine() -> Option<GpuEngine> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(GpuEngine::new));
+        match result {
+            Ok(e) => Some(e),
+            Err(err) => {
+                let msg = if let Some(s) = err.downcast_ref::<String>() {
+                    s.as_str()
+                } else if let Some(s) = err.downcast_ref::<&str>() {
+                    *s
+                } else {
+                    "(non-string panic payload)"
+                };
+                if msg.contains("no GPU adapter found") {
+                    eprintln!("[test] SKIP: no GPU adapter available");
+                    None
+                } else {
+                    panic!("GpuEngine::new() failed unexpectedly: {msg}");
+                }
+            }
+        }
+    }
+
+    /// Encode f16 (IEEE 754 half) bits from an f32. Round-to-nearest without
+    /// bit-perfect edge case handling — sufficient for test scale/min
+    /// constants which are well within the normalised f16 range.
+    fn f32_to_f16_bits(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x7fffff;
+        if exp == 0 && mant == 0 {
+            return sign;
+        }
+        if exp == 0xff {
+            // inf or nan
+            return sign | 0x7c00 | (if mant != 0 { 0x200 } else { 0 });
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp <= 0 {
+            // subnormal / underflow — round to zero for simplicity.
+            return sign;
+        }
+        if new_exp >= 0x1f {
+            // overflow → inf
+            return sign | 0x7c00;
+        }
+        sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    /// Build a minimal Q5_K test block (176 bytes) with `d = 1.0`,
+    /// `dmin = 0.0`, all 8 sub-block scales = 1 (so per-element output =
+    /// f32(nibble)), and all mins = 0. `qh` bits and `qs` nibbles are
+    /// supplied by the caller. This is enough coverage to test the shader's
+    /// dequant + accumulation math against `dequantize_q5_k` without
+    /// implementing a full Q5_K quantiser.
+    fn build_q5k_block(qh: &[u8; 32], qs: &[u8; 128]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(176);
+        block.extend_from_slice(&f32_to_f16_bits(1.0).to_le_bytes()); // d
+        block.extend_from_slice(&f32_to_f16_bits(0.0).to_le_bytes()); // dmin
+                                                                      // scales / mins packed for 8 sub-blocks. `get_scale_min_k4` for `j<4`
+                                                                      // reads sc = s0[j] & 63, mn = s1[j] & 63. For `j>=4` it uses the
+                                                                      // combined layout across s0, s1, s2. Set:
+                                                                      //   s0[0..4] = 1, s1[0..4] = 0    (sc[0..4] = 1, mn[0..4] = 0)
+                                                                      //   s0[4..8] = 0, s1[4..8] = 0, s2 encodes sc[4..8]=1 mn[4..8]=0.
+                                                                      // For j>=4 (from the shader):
+                                                                      //   sc = (s2[j-4] & 0xF) | ((s0[j-4] >> 6) << 4)
+                                                                      //   mn = (s2[j-4] >> 4)  | ((s1[j-4] >> 6) << 4)
+                                                                      // Setting s0/s1/s2 zero except:
+                                                                      //   s0[0..4] = 1  → sc[0..4] = 1
+                                                                      //   s2[0..4] = 1  → sc[4..8] = 1
+                                                                      // and mn stays 0.
+        let mut scales = [0u8; 12];
+        for i in 0..4 {
+            scales[i] = 1; // s0[i]
+        }
+        for i in 0..4 {
+            scales[8 + i] = 1; // s2[i]
+        }
+        block.extend_from_slice(&scales);
+        block.extend_from_slice(qh); // 32 bytes
+        block.extend_from_slice(qs); // 128 bytes
+        assert_eq!(block.len(), 176);
+        block
+    }
+
+    /// Build a Q8_0 test block (34 bytes). Caller supplies `d` (super-scale)
+    /// and 32 signed int8 quantised values (represented as `i8` — packed as
+    /// two's-complement bytes on write).
+    fn build_q8_0_block(d: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        for &q in qs.iter() {
+            block.push(q as u8);
+        }
+        assert_eq!(block.len(), 34);
+        block
+    }
+
+    /// GPU Q5_K matvec produces the same output as the naive CPU reference
+    /// (dequantize → f32 matmul) for a small hand-crafted single-block
+    /// weight tensor. Verifies both the shader's dequant math (5-bit
+    /// nibble+qh combination, sub-block scale/min lookup) and the workgroup
+    /// reduction against the CPU dequant reference (`dequantize_q5_k` in
+    /// `gguf.rs`).
+    #[test]
+    fn q5k_matvec_matches_cpu_dequant_reference() {
+        let engine = match try_gpu_engine() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let rows = 8usize;
+        let cols = 256usize; // Exactly 1 Q5_K block per row.
+
+        // Deterministic per-row qs / qh patterns — enough coverage over the
+        // 4-bit and 5-bit branches without needing PRNG.
+        let mut data = Vec::with_capacity(rows * 176);
+        for r in 0..rows {
+            let mut qs = [0u8; 128];
+            let mut qh = [0u8; 32];
+            for k in 0..128 {
+                let low = ((r + k) & 0xF) as u8;
+                let high = ((r + k + 3) & 0xF) as u8;
+                qs[k] = low | (high << 4);
+            }
+            for k in 0..32 {
+                qh[k] = ((r + k) & 0xFF) as u8;
+            }
+            data.extend_from_slice(&build_q5k_block(&qh, &qs));
+        }
+
+        // CPU: dequantise to f32 then dense matvec against the input.
+        let mut cpu_weights = vec![0.0f32; rows * cols];
+        crate::gguf::dequantize_weight_row(&data, crate::gguf::GgmlType::Q5_K, &mut cpu_weights);
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.001 - 0.128).collect();
+        let mut expected = vec![0.0f32; rows];
+        for r in 0..rows {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += cpu_weights[r * cols + c] * input[c];
+            }
+            expected[r] = acc;
+        }
+
+        // GPU: upload weights + input, run Q5_K matvec.
+        let weights = engine.upload_weights_q5k(&data, rows, cols);
+        let input_buf = engine.upload_f32(&input);
+        let output_buf = engine.alloc_f32(rows);
+        {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q5k(&weights, &input_buf, &output_buf);
+            pass.execute();
+        }
+        let gpu_out = engine.read_f32(&output_buf);
+
+        for r in 0..rows {
+            let diff = (gpu_out[r] - expected[r]).abs();
+            let scale = expected[r].abs().max(1.0);
+            assert!(
+                diff < 5e-3 * scale,
+                "row {r}: gpu={} expected={} diff={} scale={scale}",
+                gpu_out[r],
+                expected[r],
+                diff
+            );
+        }
+    }
+
+    /// GPU Q8_0 matvec matches the naive CPU reference. Verifies the padded
+    /// 9-word block layout and int8 sign extension against `dequantize_q8_0`.
+    #[test]
+    fn q8_0_matvec_matches_cpu_dequant_reference() {
+        let engine = match try_gpu_engine() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Q8_0 blocks: 32 elements each. Use 8 blocks/row = cols=256, rows=8.
+        let rows = 8usize;
+        let blocks_per_row = 8usize;
+        let cols = blocks_per_row * 32;
+
+        let mut data = Vec::with_capacity(rows * blocks_per_row * 34);
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let d = 0.05 + (r as f32 + b as f32) * 0.01;
+                let mut qs = [0i8; 32];
+                for k in 0..32 {
+                    // Cover both positive and negative i8 values.
+                    let v = ((r * 3 + b * 7 + k * 5) as i32 % 200) - 100;
+                    qs[k] = v as i8;
+                }
+                data.extend_from_slice(&build_q8_0_block(d, &qs));
+            }
+        }
+
+        let mut cpu_weights = vec![0.0f32; rows * cols];
+        crate::gguf::dequantize_weight_row(&data, crate::gguf::GgmlType::Q8_0, &mut cpu_weights);
+        let input: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.007).sin()).collect();
+        let mut expected = vec![0.0f32; rows];
+        for r in 0..rows {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += cpu_weights[r * cols + c] * input[c];
+            }
+            expected[r] = acc;
+        }
+
+        let weights = engine.upload_weights_q8_0(&data, rows, cols);
+        let input_buf = engine.upload_f32(&input);
+        let output_buf = engine.alloc_f32(rows);
+        {
+            let mut pass = engine.begin_pass();
+            pass.matvec_q8_0(&weights, &input_buf, &output_buf);
+            pass.execute();
+        }
+        let gpu_out = engine.read_f32(&output_buf);
+
+        for r in 0..rows {
+            let diff = (gpu_out[r] - expected[r]).abs();
+            let scale = expected[r].abs().max(1.0);
+            assert!(
+                diff < 5e-3 * scale,
+                "row {r}: gpu={} expected={} diff={} scale={scale}",
+                gpu_out[r],
+                expected[r],
+                diff
+            );
         }
     }
 }

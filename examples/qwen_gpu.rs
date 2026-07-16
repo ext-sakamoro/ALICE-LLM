@@ -240,6 +240,7 @@ fn main() {
     // one full prefill per checkpoint (5x prefill cost) because each stop
     // point mutates KV cache differently and needs a clean reset.
     let layer_bisect = args.iter().any(|a| a == "--layer-bisect");
+    let debug_nan = args.iter().any(|a| a == "--debug-nan");
     // Phase X.3.e.3.17 Option C MVP: `--hybrid` skips GPU entirely and falls
     // back to CPU-only `Llama3Model::forward()`. This delivers the Jetson OOM
     // fix (no GPU weight allocation) at the cost of speed (~0.05-0.1 tok/s on
@@ -321,6 +322,27 @@ fn main() {
         println!("  Prompt: {} tokens", prompt_tokens.len());
         println!("  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k})");
         println!("---");
+
+        // --- Phase X.3.e.3.21 NaN source hunting ---
+        if debug_nan {
+            let token = *prompt_tokens.first().unwrap();
+            eprintln!("[debug-nan] token = {token}");
+
+            // Step 1: only RMSNorm
+            let norm_head = model.debug_forward_layer0_attn_norm_only(token);
+            eprintln!("[debug-nan] after RMSNorm norm_buf head 5 = {norm_head:?}");
+            let has_nan = norm_head.iter().any(|v| v.is_nan());
+            eprintln!("[debug-nan] RMSNorm output has NaN: {has_nan}");
+
+            // Step 2: RMSNorm + attn_qkv
+            model.reset();
+            let q_head = model.debug_forward_layer0_qkv_only(token);
+            eprintln!("[debug-nan] after attn_qkv q_buf head 5 = {q_head:?}");
+            let has_nan = q_head.iter().any(|v| v.is_nan());
+            eprintln!("[debug-nan] attn_qkv output has NaN: {has_nan}");
+
+            return;
+        }
 
         // --- Issue #40 layer bisection mode ---
         if layer_bisect {
