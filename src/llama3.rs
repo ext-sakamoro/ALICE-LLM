@@ -3978,35 +3978,32 @@ impl<'a> Llama3Model<'a> {
                     // (§Q/K L2Norm) and z-gate after ssm-norm (§silu(z) order).
                     // Qwen 3.5 GGUFs ship neither tensor and take the legacy
                     // path, preserving pre-Phase-X.3.e.3.2 numerics.
-                    let is_bonsai_path = dn_layer.ssm_a.is_some() && dn_layer.ssm_dt_bias.is_some();
+                    let is_bonsai_path = if std::env::var("ALICE_DISABLE_BONSAI_FLAG").is_ok() {
+                        false
+                    } else {
+                        dn_layer.ssm_a.is_some() && dn_layer.ssm_dt_bias.is_some()
+                    };
 
                     // 2c. Bonsai / Qwen 3.6 SSM discretisation (Phase X.3.e.3.2
                     // Gap B). Reference: PrismML llama.cpp fork qwen35.cpp:443
                     // -451.
-                    if let (Some(ssm_a), Some(ssm_dt_bias)) =
-                        (dn_layer.ssm_a.as_ref(), dn_layer.ssm_dt_bias.as_ref())
-                    {
-                        debug_assert_eq!(ssm_a.len(), dn_num_v_heads);
-                        debug_assert_eq!(ssm_dt_bias.len(), dn_num_v_heads);
-                        for h in 0..dn_num_v_heads {
-                            let alpha_biased = dn_alpha[h] + ssm_dt_bias[h];
-                            let gate = softplus(alpha_biased) * ssm_a[h];
-                            dn_alpha[h] = gate.exp();
-                        }
+                    let disable_gap_b = std::env::var("ALICE_DISABLE_GAP_B").is_ok();
+                    if !disable_gap_b {
+                        if let (Some(ssm_a), Some(ssm_dt_bias)) =
+                            (dn_layer.ssm_a.as_ref(), dn_layer.ssm_dt_bias.as_ref())
+                        {
+                            debug_assert_eq!(ssm_a.len(), dn_num_v_heads);
+                            debug_assert_eq!(ssm_dt_bias.len(), dn_num_v_heads);
+                            for h in 0..dn_num_v_heads {
+                                let alpha_biased = dn_alpha[h] + ssm_dt_bias[h];
+                                let gate = softplus(alpha_biased) * ssm_a[h];
+                                dn_alpha[h] = gate.exp();
+                            }
 
-                        // 2d. Beta sigmoid (Phase X.3.e.3.2 Gap B extra).
-                        // Reference qwen35.cpp:440-441 applies `ggml_sigmoid`
-                        // to the raw beta projection so it enters the
-                        // recurrence as an update-rate coefficient in `(0, 1)`
-                        // rather than an unbounded real. Gated to the same
-                        // Bonsai / Qwen 3.6 branch as the alpha SSM discretis-
-                        // ation above — standard Qwen 3.5 GGUFs stay on the
-                        // raw-beta path, preserving pre-refactor numerics
-                        // until an end-to-end reference comparison can
-                        // decide whether Qwen 3.5 should also switch. See
-                        // docs/PHASE_X_3_E_3_DESIGN.md §5 for the follow-up.
-                        for h in 0..dn_num_v_heads {
-                            dn_beta[h] = sigmoid(dn_beta[h]);
+                            // 2d. Beta sigmoid (Phase X.3.e.3.2 Gap B extra).
+                            for h in 0..dn_num_v_heads {
+                                dn_beta[h] = sigmoid(dn_beta[h]);
+                            }
                         }
                     }
 
@@ -4075,7 +4072,9 @@ impl<'a> Llama3Model<'a> {
                     // block is skipped, preserving the pre-Phase-X.3.e.3.2
                     // numerics.
                     if let Some(ssm_norm) = dn_layer.ssm_norm.as_ref() {
-                        apply_qk_norm(&mut dn_delta_out, ssm_norm, dn_v_dim, c.norm_eps);
+                        if std::env::var("ALICE_DISABLE_GAP_C").is_err() {
+                            apply_qk_norm(&mut dn_delta_out, ssm_norm, dn_v_dim, c.norm_eps);
+                        }
                     }
 
                     // 4.6. Bonsai / Qwen 3.6 z-gate (Phase X.3.e.3.2
