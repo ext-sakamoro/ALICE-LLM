@@ -2023,6 +2023,23 @@ struct DeltaNetLayerBGs {
     /// Bonsai / Qwen 3.6-27B Z (output-gate) projection bind group. `None`
     /// on standard Qwen 3.5.
     attn_gate_proj: Option<MatvecBG>,
+    /// Bonsai `beta_sigmoid` dispatch bind group: beta_buf in-place.
+    /// `None` on standard Qwen 3.5.
+    bonsai_beta_sigmoid_bg: Option<wgpu::BindGroup>,
+    /// Bonsai `ssm_discretisation` dispatch bind group: alpha_buf +
+    /// ssm_dt_bias + ssm_a. Per-layer because ssm_dt_bias and ssm_a are
+    /// per-layer tensors. `None` on standard Qwen 3.5.
+    bonsai_ssm_discretisation_bg: Option<wgpu::BindGroup>,
+    /// Bonsai `silu_inplace` on conv output (Q+K+V portion of k_buf).
+    /// `None` on standard Qwen 3.5.
+    bonsai_silu_inplace_kbuf_bg: Option<wgpu::BindGroup>,
+    /// Bonsai `ssm_norm_per_head` on attn_out with per-layer `ssm_norm`
+    /// weight. Uses the shared `rmsnorm_pipeline`; per-layer because
+    /// `ssm_norm` is a per-layer tensor. `None` on standard Qwen 3.5.
+    bonsai_ssm_norm_per_head_bg: Option<wgpu::BindGroup>,
+    /// Bonsai `silu_gate_apply(attn_out, v_buf)` where v_buf carries the
+    /// z projection from `attn_gate_proj`. `None` on standard Qwen 3.5.
+    bonsai_silu_gate_apply_bg: Option<wgpu::BindGroup>,
     /// alpha decay-gate projection: `norm_buf → alpha_buf` (`[num_kv_heads]`).
     alpha_proj_mv: MatvecBG,
     /// beta update-rate projection: `norm_buf → beta_buf` (`[num_kv_heads]`).
@@ -3361,6 +3378,133 @@ impl GpuModel {
                     let ssm_out_proj =
                         Self::build_matvec_bg(&engine, &dlw.ssm_out, &attn_out, &o_buf);
 
+                    // Bonsai-only bind groups. Created only when the layer is
+                    // Bonsai (has attn_qkv + attn_gate loaded); None for
+                    // standard Qwen 3.5 layers.
+                    let is_bonsai_layer = dlw.attn_qkv.is_some();
+                    let bonsai_beta_sigmoid_bg = if is_bonsai_layer {
+                        let layout = engine.beta_sigmoid_pipeline.get_bind_group_layout(0);
+                        Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: beta_buf.buffer.as_entire_binding(),
+                            }],
+                        }))
+                    } else {
+                        None
+                    };
+                    let bonsai_ssm_discretisation_bg = if is_bonsai_layer {
+                        let layout = engine.ssm_discretisation_pipeline.get_bind_group_layout(0);
+                        // Both ssm_a and ssm_dt_bias are present when has_attn_qkv is
+                        // true (Bonsai GGUFs ship all three refinement tensors).
+                        let ssm_dt_bias = dlw
+                            .ssm_dt_bias
+                            .as_ref()
+                            .expect("Bonsai layer requires ssm_dt_bias");
+                        let ssm_a = dlw.ssm_a.as_ref().expect("Bonsai layer requires ssm_a");
+                        Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: alpha_buf.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: ssm_dt_bias.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: ssm_a.buffer.as_entire_binding(),
+                                },
+                            ],
+                        }))
+                    } else {
+                        None
+                    };
+                    let bonsai_silu_inplace_kbuf_bg = if is_bonsai_layer {
+                        let layout = engine.silu_inplace_pipeline.get_bind_group_layout(0);
+                        Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: k_buf.buffer.as_entire_binding(),
+                            }],
+                        }))
+                    } else {
+                        None
+                    };
+                    let bonsai_ssm_norm_per_head_bg = if is_bonsai_layer {
+                        // Per-V-head RMSNorm on attn_out with ssm_norm weight.
+                        // Uses the shared rmsnorm_pipeline; params are the
+                        // per-Bonsai-layer RmsnormParams with dim=v_dim +
+                        // batch_size=num_v_heads (allocated per layer to
+                        // reference by the bind group's uniform slot).
+                        let layout = engine.rmsnorm_pipeline.get_bind_group_layout(0);
+                        let ssm_norm = dlw
+                            .ssm_norm
+                            .as_ref()
+                            .expect("Bonsai layer requires ssm_norm");
+                        // Persistent uniform: dim=v_dim, eps=norm_eps,
+                        // batch_size=num_v_heads. Reused across every forward
+                        // (the values are constant at load time).
+                        let params_buf = engine.make_persistent_uniform(&RmsnormParams {
+                            dim: dn_v_dim as u32,
+                            eps: config.eps,
+                            batch_size: dn_num_v_heads as u32,
+                            _pad3: 0,
+                        });
+                        let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: attn_out.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: ssm_norm.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: attn_out.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: params_buf.as_entire_binding(),
+                                },
+                            ],
+                        });
+                        drop(params_buf); // BindGroup holds Arc ref
+                        Some(bg)
+                    } else {
+                        None
+                    };
+                    let bonsai_silu_gate_apply_bg = if is_bonsai_layer {
+                        let layout = engine.silu_gate_apply_pipeline.get_bind_group_layout(0);
+                        Some(engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: attn_out.buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: v_buf.buffer.as_entire_binding(),
+                                },
+                            ],
+                        }))
+                    } else {
+                        None
+                    };
+
                     // FFN bind groups (same pattern as attention layers)
                     let ffn_norm_bg = Self::build_rmsnorm_bg(
                         &engine,
@@ -3384,6 +3528,11 @@ impl GpuModel {
                         ssm_in_proj,
                         attn_qkv_proj,
                         attn_gate_proj,
+                        bonsai_beta_sigmoid_bg,
+                        bonsai_ssm_discretisation_bg,
+                        bonsai_silu_inplace_kbuf_bg,
+                        bonsai_ssm_norm_per_head_bg,
+                        bonsai_silu_gate_apply_bg,
                         alpha_proj_mv,
                         beta_proj_mv,
                         conv1d_bg,
@@ -3687,34 +3836,58 @@ impl GpuModel {
                     cp.set_bind_group(0, &dbg.attn_norm_bg, &[]);
                     cp.dispatch_workgroups(1, 1, 1);
 
-                    // 2. Fused in_proj: norm_buf → q_buf (contains q, k, v, z packed)
+                    // 2. Fused in_proj: norm_buf → q_buf (contains q, k, v, z packed).
                     //
-                    // Standard Qwen 3.5 has `ssm_in_proj`. Bonsai / Qwen 3.6-27B
-                    // splits this into `attn_qkv_proj` + `attn_gate_proj` (loaded
-                    // at load time; forward wiring for the split path is
-                    // Phase 2 Step 4).
-                    match &dbg.ssm_in_proj {
-                        Some(mv) => Self::dispatch_mv(&self.engine, &mut cp, mv),
-                        None => {
-                            // Bonsai DeltaNet forward is not yet wired end-to-end.
-                            // The building-block shaders exist (see PR #78/#79/#80)
-                            // but the dispatch sequence is Phase 2 Step 4 work.
+                    // Standard Qwen 3.5: single `ssm_in_proj` produces Q+K+V+Z.
+                    // Bonsai / Qwen 3.6-27B: `attn_qkv_proj` produces Q+K+V into
+                    // q_buf; separate `attn_gate_proj` produces Z into v_buf.
+                    let is_bonsai_layer = dbg.ssm_in_proj.is_none();
+                    match (&dbg.ssm_in_proj, &dbg.attn_qkv_proj, &dbg.attn_gate_proj) {
+                        (Some(mv), _, _) => {
+                            Self::dispatch_mv(&self.engine, &mut cp, mv);
+                        }
+                        (None, Some(qkv), Some(gate)) => {
+                            Self::dispatch_mv(&self.engine, &mut cp, qkv);
+                            Self::dispatch_mv(&self.engine, &mut cp, gate);
+                        }
+                        (None, _, _) => {
                             panic!(
-                                "Bonsai / Qwen 3.6-27B DeltaNet forward path is \
-                                 not yet wired (Phase 2 Step 4 pending). Load \
-                                 succeeded — `attn_qkv` + `attn_gate` + SSM \
-                                 refinement tensors are all uploaded — but the \
-                                 dispatch sequence in `encode_forward_impl` \
-                                 still needs to route through them. Use CPU \
-                                 forward path (`llama3::Llama3Model`) meanwhile."
+                                "DeltaNet layer has neither ssm_in_proj nor \
+                                 (attn_qkv_proj + attn_gate_proj) — GGUF load \
+                                 detection is inconsistent."
                             );
                         }
                     }
 
-                    // 2a. Alpha decay-gate projection: norm_buf → alpha_buf ([num_kv_heads]).
+                    // 2a. Alpha decay-gate projection: norm_buf → alpha_buf ([num_v_heads]).
                     Self::dispatch_mv(&self.engine, &mut cp, &dbg.alpha_proj_mv);
-                    // 2b. Beta update-rate projection: norm_buf → beta_buf ([num_kv_heads]).
+                    // 2b. Beta update-rate projection: norm_buf → beta_buf ([num_v_heads]).
                     Self::dispatch_mv(&self.engine, &mut cp, &dbg.beta_proj_mv);
+
+                    // 2c. (Bonsai only) beta_sigmoid: beta_buf = sigmoid(beta_buf)
+                    //     Phase X.3.e.3 Gap B extra.
+                    if let Some(bg) = &dbg.bonsai_beta_sigmoid_bg {
+                        cp.set_pipeline(&self.engine.beta_sigmoid_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        let dn_num_v_heads = self
+                            .config
+                            .linear_num_v_heads
+                            .unwrap_or(self.config.num_heads);
+                        cp.dispatch_workgroups((dn_num_v_heads + 255) / 256, 1, 1);
+                    }
+
+                    // 2d. (Bonsai only) ssm_discretisation: alpha_buf =
+                    //     exp(softplus(alpha + ssm_dt_bias) * ssm_a).
+                    //     Phase X.3.e.3 Gap B.
+                    if let Some(bg) = &dbg.bonsai_ssm_discretisation_bg {
+                        cp.set_pipeline(&self.engine.ssm_discretisation_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        let dn_num_v_heads = self
+                            .config
+                            .linear_num_v_heads
+                            .unwrap_or(self.config.num_heads);
+                        cp.dispatch_workgroups((dn_num_v_heads + 255) / 256, 1, 1);
+                    }
 
                     // 3. Causal conv1d: q_buf → k_buf (preprocessed q, k, v)
                     let dn_conv_dim = self.config.linear_qk_head_dim.unwrap_or(128)
@@ -3733,7 +3906,19 @@ impl GpuModel {
                     cp.set_bind_group(0, &dbg.conv1d_bg, &[]);
                     cp.dispatch_workgroups(conv1d_dispatch, 1, 1);
 
-                    // 4. DeltaNet recurrence: state update + gated output → attn_out
+                    // 3.5. (Bonsai only) post-conv1d silu on k_buf (Q+K+V portion).
+                    //      Phase X.3.e.3 §silu(z) order (applied to conv output
+                    //      before delta-rule integration).
+                    if let Some(bg) = &dbg.bonsai_silu_inplace_kbuf_bg {
+                        cp.set_pipeline(&self.engine.silu_inplace_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        cp.dispatch_workgroups(conv1d_dispatch, 1, 1);
+                    }
+
+                    // 4. DeltaNet recurrence: state update + gated output → attn_out.
+                    //    The shader handles the Bonsai path via the `is_bonsai`
+                    //    uniform (dn_params_buf fourth u32) — Phase 2 Step 4
+                    //    shader-side PR #84.
                     let dn_num_heads = self
                         .config
                         .linear_num_kv_heads
@@ -3741,6 +3926,40 @@ impl GpuModel {
                     cp.set_pipeline(&self.engine.gated_deltanet_pipeline);
                     cp.set_bind_group(0, &dbg.deltanet_bg, &[]);
                     cp.dispatch_workgroups(dn_num_heads, 1, 1);
+
+                    // 4.5. (Bonsai only) per-V-head RMSNorm on attn_out with
+                    //      ssm_norm weight. Phase X.3.e.3 Gap C.
+                    if let Some(bg) = &dbg.bonsai_ssm_norm_per_head_bg {
+                        cp.set_pipeline(&self.engine.rmsnorm_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        let dn_num_v_heads = self
+                            .config
+                            .linear_num_v_heads
+                            .unwrap_or(self.config.num_heads);
+                        cp.dispatch_workgroups(dn_num_v_heads, 1, 1);
+                    }
+
+                    // 4.6. (Bonsai only) silu(z) multiply: attn_out *= silu(z_buf).
+                    //      Phase X.3.e.3 §silu(z) order — applied AFTER ssm_norm
+                    //      (in contrast to standard Qwen 3.5 where it happens
+                    //      inside gated_deltanet).
+                    if let Some(bg) = &dbg.bonsai_silu_gate_apply_bg {
+                        cp.set_pipeline(&self.engine.silu_gate_apply_pipeline);
+                        cp.set_bind_group(0, bg, &[]);
+                        let dn_num_v_heads = self
+                            .config
+                            .linear_num_v_heads
+                            .unwrap_or(self.config.num_heads);
+                        let attn_out_len =
+                            dn_num_v_heads * self.config.linear_kv_head_dim.unwrap_or(128);
+                        cp.dispatch_workgroups((attn_out_len + 255) / 256, 1, 1);
+                    }
+
+                    // Compile-check: silence unused warning when Bonsai path is
+                    // not exercised. `is_bonsai_layer` is retained as a signal
+                    // to future maintainers about the branching semantics of
+                    // the pipeline sequence above.
+                    let _ = is_bonsai_layer;
 
                     // 5. Output projection: attn_out → o_buf
                     Self::dispatch_mv(&self.engine, &mut cp, &dbg.ssm_out_proj);
