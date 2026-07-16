@@ -25,14 +25,23 @@
 // Dispatch: 1 workgroup per head. Each workgroup handles one [qk_dim, v_dim] state.
 
 struct Params {
-    num_heads: u32,
+    num_heads: u32,     // num_v_heads (Qwen 3.5: 32, Bonsai 27B: 48)
     qk_dim: u32,
     v_dim: u32,
-    is_bonsai: u32, // 0 = standard Qwen 3.5, 1 = Bonsai / Qwen 3.6-27B path
+    is_bonsai: u32,     // 0 = standard Qwen 3.5, 1 = Bonsai / Qwen 3.6-27B path
+    num_kv_heads: u32,  // Q/K per-KV-head granularity (Qwen 3.5: 16, Bonsai: 16)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-@group(0) @binding(0) var<storage, read> q_buf: array<f32>;      // [num_heads, qk_dim]
-@group(0) @binding(1) var<storage, read> k_buf: array<f32>;      // [num_heads, qk_dim]
+// Phase X.3.e.3.11: Q/K live at KV-head granularity (num_kv_heads slots each,
+// shared across V-heads inside the same KV group). V/Z/alpha/beta/state/out
+// live at V-head granularity (num_heads slots each). Reference qwen35.cpp
+// uses ggml_repeat_4d (cyclic mod pattern) so V-head `h` reads Q/K from
+// KV-head `h % num_kv_heads`, matching fused GDN `iv1 % neq1`.
+@group(0) @binding(0) var<storage, read> q_buf: array<f32>;      // [num_kv_heads, qk_dim]
+@group(0) @binding(1) var<storage, read> k_buf: array<f32>;      // [num_kv_heads, qk_dim]
 @group(0) @binding(2) var<storage, read> v_buf: array<f32>;      // [num_heads, v_dim]
 @group(0) @binding(3) var<storage, read> alpha_buf: array<f32>;  // [num_heads] decay gate
 @group(0) @binding(4) var<storage, read> beta_buf: array<f32>;   // [num_heads] update rate
@@ -62,8 +71,12 @@ fn gated_deltanet(@builtin(global_invocation_id) gid: vec3<u32>) {
     let qk_dim = params.qk_dim;
     let v_dim = params.v_dim;
     let is_bonsai = params.is_bonsai;
-    let q_off = head * qk_dim;
-    let k_off = head * qk_dim;
+    // Phase X.3.e.3.11 fix: cyclic V→KV mapping matches reference
+    // qwen35.cpp ggml_repeat_4d + fused GDN `iv1 % neq1`. Q/K are indexed
+    // by kv_head, V/Z/alpha/beta/state/out are per V-head.
+    let kv_head = head % params.num_kv_heads;
+    let q_off = kv_head * qk_dim;
+    let k_off = kv_head * qk_dim;
     let v_off = head * v_dim;
     let z_off = head * v_dim;
     let s_off = head * qk_dim * v_dim;
