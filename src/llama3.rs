@@ -2269,9 +2269,14 @@ fn gated_deltanet_step(
             return;
         }
     }
-    let v_per_kv = num_v_heads / num_kv_heads;
+    // GQA V-head → KV-head mapping: reference qwen35.cpp uses ggml_repeat_4d
+    // which duplicates KV-heads CYCLICALLY (V-head 16..31 map to KV 0..15,
+    // matching `iv1 % num_kv_heads` in ggml_compute_forward_gated_delta_net).
+    // Phase X.3.e.3.8 fix: previous `v_head / v_per_kv` (block/consecutive)
+    // mapping caused ~13/32 V-heads to use wrong Q/K slices, producing
+    // sign-flipped attn_output and cascading 12% linear_attn_out divergence.
     for v_head in 0..num_v_heads {
-        let kv_head = v_head / v_per_kv;
+        let kv_head = v_head % num_kv_heads;
         let q_off = kv_head * qk_dim;
         let k_off = kv_head * qk_dim;
         let v_off = v_head * v_dim;
@@ -2320,17 +2325,16 @@ fn gated_deltanet_step_parallel(
     use rayon::iter::{IndexedParallelIterator, ParallelIterator};
     use rayon::slice::ParallelSliceMut;
 
-    // Derive V-per-KV grouping from the caller-provided head counts. The
-    // `par_chunks_mut(state_stride)` split below iterates once per V head,
-    // so we recover `kv_head = v_head / v_per_kv` inside the closure.
-    let v_per_kv = _num_v_heads / num_kv_heads;
+    // Phase X.3.e.3.8 fix: cyclic V-head → KV-head mapping
+    // (`v_head % num_kv_heads`) matches reference qwen35.cpp `ggml_repeat_4d`
+    // + fused GDN `iv1 % neq1` (see gated_deltanet_step for full rationale).
     let state_stride = qk_dim * v_dim;
     state
         .par_chunks_mut(state_stride)
         .zip(out.par_chunks_mut(v_dim))
         .enumerate()
         .for_each(|(v_head, (state_slab, out_slab))| {
-            let kv_head = v_head / v_per_kv;
+            let kv_head = v_head % num_kv_heads;
             gated_deltanet_head_disjoint(
                 &q[kv_head * qk_dim..(kv_head + 1) * qk_dim],
                 &k[kv_head * qk_dim..(kv_head + 1) * qk_dim],
@@ -4025,7 +4029,26 @@ impl<'a> Llama3Model<'a> {
                     }
                     if dump_dn0 {
                         dump_slice("qkv_mixed", &dn_in_proj[..qkv_len], 3);
+                        // Phase X.3.e.3.8: dump dims 125-127 (KV-h 0 Q tail) to
+                        // check if pre-conv1d divergence starts here.
+                        eprintln!(
+                            "DN0 qkv_mixed[125..128] = [{:.6},{:.6},{:.6}]",
+                            dn_in_proj[125], dn_in_proj[126], dn_in_proj[127]
+                        );
+                        eprintln!(
+                            "DN0 qkv_mixed[2045..2048] (KV-h15 Q tail) = [{:.6},{:.6},{:.6}]",
+                            dn_in_proj[2045], dn_in_proj[2046], dn_in_proj[2047]
+                        );
                         dump_slice("z_pre", &dn_in_proj[qkv_len..], 3);
+                        // Phase X.3.e.3.8: per-V-head z-pre for divergence hunt.
+                        let z_slice = &dn_in_proj[qkv_len..];
+                        let mut per_head_z = String::from("DN0 z_pre_per_head_sum=[");
+                        for h in 0..dn_num_v_heads {
+                            let s: f32 = z_slice[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
+                            per_head_z.push_str(&format!("{s:.4},"));
+                        }
+                        per_head_z.push(']');
+                        eprintln!("{per_head_z}");
                     }
                     // 2a/2b. alpha / beta decay-rate + update-rate projections.
                     dn_layer.alpha_proj.matvec(&norm_buf, &mut dn_alpha);
@@ -4115,6 +4138,45 @@ impl<'a> Llama3Model<'a> {
                     if dump_dn0 {
                         dump_slice("conv_out_silu", &dn_conv_out[..qkv_len], 3);
                         dump_slice("q_conv_head0", &dn_conv_out[0..dn_qk_dim], 3);
+                        // Phase X.3.e.3.8: per-KV-head Q and K sums (before L2 norm).
+                        for kv in [0usize, 12, 15] {
+                            let q_off = kv * dn_qk_dim;
+                            let k_off = dn_qk_dim * dn_num_kv_heads + kv * dn_qk_dim;
+                            let q_first = &dn_conv_out[q_off..q_off + 3];
+                            let q_last = &dn_conv_out[q_off + dn_qk_dim - 3..q_off + dn_qk_dim];
+                            let k_first = &dn_conv_out[k_off..k_off + 3];
+                            let k_last = &dn_conv_out[k_off + dn_qk_dim - 3..k_off + dn_qk_dim];
+                            eprintln!("DN0 q_kv{kv}: first3={:?} last3={:?}", q_first, q_last);
+                            eprintln!("DN0 k_kv{kv}: first3={:?} last3={:?}", k_first, k_last);
+                            // Also compute dot product q · k for this KV-h
+                            let dot: f32 = (0..dn_qk_dim)
+                                .map(|i| dn_conv_out[q_off + i] * dn_conv_out[k_off + i])
+                                .sum();
+                            eprintln!("DN0 q_kv{kv} · k_kv{kv} = {dot:.6}");
+                        }
+                        let mut q_sums = String::from("DN0 q_per_kv_head_sum=[");
+                        let mut k_sums = String::from("DN0 k_per_kv_head_sum=[");
+                        let mut v_sums = String::from("DN0 v_per_v_head_sum=[");
+                        for h in 0..dn_num_kv_heads {
+                            let q_off = h * dn_qk_dim;
+                            let qs: f32 = dn_conv_out[q_off..q_off + dn_qk_dim].iter().sum();
+                            q_sums.push_str(&format!("{qs:.4},"));
+                            let k_off = dn_qk_dim * dn_num_kv_heads + h * dn_qk_dim;
+                            let ks: f32 = dn_conv_out[k_off..k_off + dn_qk_dim].iter().sum();
+                            k_sums.push_str(&format!("{ks:.4},"));
+                        }
+                        q_sums.push(']');
+                        k_sums.push(']');
+                        eprintln!("{q_sums}");
+                        eprintln!("{k_sums}");
+                        let v_base = dn_qk_dim * dn_num_kv_heads * 2;
+                        for h in 0..dn_num_v_heads {
+                            let v_off = v_base + h * dn_v_dim;
+                            let vs: f32 = dn_conv_out[v_off..v_off + dn_v_dim].iter().sum();
+                            v_sums.push_str(&format!("{vs:.4},"));
+                        }
+                        v_sums.push(']');
+                        eprintln!("{v_sums}");
                     }
 
                     // 4. Gated DeltaNet recurrence: reads q/k/v from the
@@ -4149,6 +4211,16 @@ impl<'a> Llama3Model<'a> {
                         // reference `norm-0 = RMS_NORM(attn_output-0)` first row.
                         let head0 = &dn_delta_out[..dn_v_dim];
                         dump_slice("attn_head0", head0, 3);
+                        // Phase X.3.e.3.8: attn_output per-V-head sums so we can
+                        // check if divergent V-heads originate at DeltaNet recurrence.
+                        let mut ao_sums = String::from("DN0 attn_output_per_head_sum=[");
+                        for h in 0..dn_num_v_heads {
+                            let s: f32 =
+                                dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
+                            ao_sums.push_str(&format!("{s:.6},"));
+                        }
+                        ao_sums.push(']');
+                        eprintln!("{ao_sums}");
                     }
 
                     // 4.5. Bonsai / Qwen 3.6 per-V-head state RMSNorm on the
@@ -4163,6 +4235,23 @@ impl<'a> Llama3Model<'a> {
                     }
                     if dump_dn0 {
                         dump_slice("post_ssm_norm_head0", &dn_delta_out[..dn_v_dim], 3);
+                        // Phase X.3.e.3.8: per-V-head post_ssm_norm sums and
+                        // divergent head detail dumps for root-cause hunting.
+                        let mut n51_sums = String::from("DN0 post_ssm_norm_per_head_sum=[");
+                        for h in 0..dn_num_v_heads {
+                            let s: f32 =
+                                dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
+                            n51_sums.push_str(&format!("{s:.4},"));
+                        }
+                        n51_sums.push(']');
+                        eprintln!("{n51_sums}");
+                        for h in [6, 15, 20, 25] {
+                            dump_slice(
+                                &format!("post_ssm_norm_head{h}"),
+                                &dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim],
+                                3,
+                            );
+                        }
                     }
 
                     // 4.6. Bonsai / Qwen 3.6 z-gate (Phase X.3.e.3.2
