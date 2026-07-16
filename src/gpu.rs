@@ -19,6 +19,7 @@ const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const SILU_GATE_APPLY_SHADER: &str = include_str!("shaders/silu_gate_apply.wgsl");
+const SIGMOID_GATE_APPLY_SHADER: &str = include_str!("shaders/sigmoid_gate_apply.wgsl");
 const SILU_INPLACE_SHADER: &str = include_str!("shaders/silu_inplace.wgsl");
 const BETA_SIGMOID_SHADER: &str = include_str!("shaders/beta_sigmoid.wgsl");
 const SSM_DISCRETISATION_SHADER: &str = include_str!("shaders/ssm_discretisation.wgsl");
@@ -338,6 +339,12 @@ pub struct GpuEngine {
     /// — exposed via `GpuPass::silu_gate_apply` for future integration and
     /// standalone parity validation.
     silu_gate_apply_pipeline: wgpu::ComputePipeline,
+    /// Element-wise sigmoid gate apply: `attn_out[i] *= sigmoid(gate[i])`.
+    /// Used by Qwen 3.5 / 3.6 / Bonsai 27B gated attention (reference
+    /// qwen35.cpp:401-404 `ggml_sigmoid(gate)` + `ggml_mul(attn, gate_sigmoid)`).
+    /// Phase X.3.e.3.14 introduced sigmoid variant to fix silu vs sigmoid
+    /// mismatch on GPU forward path (mirroring CPU b616219 lineage fix).
+    sigmoid_gate_apply_pipeline: wgpu::ComputePipeline,
     /// Element-wise SiLU in-place: `buf[i] = buf[i] * sigmoid(buf[i])`.
     /// Bonsai / Qwen 3.6-27B post-conv1d silu (Phase X.3.e.3 Gap A). Distinct
     /// from `silu_mul` (SwiGLU two-input) and `silu_gate_apply` (Bonsai attn
@@ -547,6 +554,11 @@ impl GpuEngine {
                 SILU_GATE_APPLY_SHADER,
                 "silu_gate_apply",
                 "silu_gate_apply",
+            ),
+            sigmoid_gate_apply_pipeline: make_pipeline(
+                SIGMOID_GATE_APPLY_SHADER,
+                "sigmoid_gate_apply",
+                "sigmoid_gate_apply",
             ),
             silu_inplace_pipeline: make_pipeline(
                 SILU_INPLACE_SHADER,
@@ -4002,12 +4014,14 @@ impl GpuModel {
                     cp.set_bind_group(0, &lbg.attention_bg, &[]);
                     cp.dispatch_workgroups(self.config.num_heads, 1, 1);
 
-                    // Bonsai / Qwen 3.6-27B full-attention swish gate modulation:
-                    // `attn_out[i] *= silu(gate_buf[i])` (applied AFTER the
-                    // scaled-dot-product attention, BEFORE `o_proj`).
-                    // No-op for non-Bonsai layers (bind group is None).
+                    // Qwen 3.5 / 3.6 / Bonsai 27B full-attention sigmoid gate
+                    // modulation: `attn_out[i] *= sigmoid(gate_buf[i])` (applied
+                    // AFTER the scaled-dot-product attention, BEFORE `o_proj`).
+                    // Reference qwen35.cpp:401-404 uses ggml_sigmoid (not silu).
+                    // Phase X.3.e.3.14 fix mirrored from CPU (`b616219` lineage).
+                    // No-op for non-gated layers (bind group is None).
                     if let Some(bg) = &lbg.bonsai_full_attn_silu_gate_bg {
-                        cp.set_pipeline(&self.engine.silu_gate_apply_pipeline);
+                        cp.set_pipeline(&self.engine.sigmoid_gate_apply_pipeline);
                         cp.set_bind_group(0, bg, &[]);
                         let attn_out_len = self.config.num_heads * self.config.head_dim;
                         cp.dispatch_workgroups((attn_out_len + 255) / 256, 1, 1);
