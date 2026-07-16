@@ -2899,36 +2899,73 @@ impl GpuModel {
 
         // Split a Bonsai `attn_q [q_dim*2, hidden]` tensor at load time into
         // (Q half, gate half). Each half becomes an independent
-        // `GpuWeightBuffer` referencing a disjoint byte range of the original
-        // GGUF tensor data. Both halves have the same shape [q_dim, hidden]
-        // and same quantization type.
-        let upload_w_bonsai_split =
-            |name: &str, half_rows: usize, cols: usize| -> (GpuWeightBuffer, GpuWeightBuffer) {
-                let info = gguf.tensor_info(name).unwrap();
-                let data = gguf.tensor_data(name).unwrap();
-                // Byte layout is [half_rows_0 | half_rows_1] where each row
-                // occupies `data.len() / (half_rows * 2)` bytes.
-                let bytes_per_row = data.len() / (half_rows * 2);
-                let split_at = half_rows * bytes_per_row;
-                let q_bytes = &data[..split_at];
-                let gate_bytes = &data[split_at..];
-                let upload_half = |bytes: &[u8]| -> GpuWeightBuffer {
-                    match info.qtype {
-                        GgmlType::Q4_K => engine.upload_weights(bytes, half_rows, cols),
-                        GgmlType::Q5_K => engine.upload_weights_q5k(bytes, half_rows, cols),
-                        GgmlType::Q6_K => engine.upload_weights_q6k(bytes, half_rows, cols),
-                        GgmlType::Q8_0 => engine.upload_weights_q8_0(bytes, half_rows, cols),
-                        GgmlType::Q1_0 => engine.upload_weights_q1_0(bytes, half_rows, cols),
-                        other => panic!(
-                            "GPU upload for tensor `{name}` (bonsai split) unsupported quant \
-                             type {other:?} — extend GpuQuantType + upload_weights_typed"
-                        ),
-                    }
-                };
-                let q = upload_half(q_bytes);
-                let gate = upload_half(gate_bytes);
-                (q, gate)
+        // `GpuWeightBuffer` with shape `[q_dim, hidden]` and the same
+        // quantisation type.
+        //
+        // Reference `qwen35.cpp:347-370` shows the GGUF stride for gated
+        // attention Q is `nb1 = element_size * n_embd_head * 2`, i.e. the
+        // rows are stored **per-head interleaved**:
+        //   `[q_h0, gate_h0, q_h1, gate_h1, ..., q_h(N-1), gate_h(N-1)]`
+        // where each `q_hi` / `gate_hi` is `head_dim` rows. CPU
+        // (`llama3.rs:4373-4394`) matvecs the raw tensor and de-interleaves
+        // the output vector after the fact. The GPU couldn't do the same
+        // without extra pipeline glue, so we de-interleave at load time
+        // by shuffling byte-aligned per-row blocks into two separate
+        // buffers. This works uniformly for Q4_K / Q5_K / Q6_K / Q8_0 /
+        // Q1_0 because each row occupies a fixed byte size (row-major
+        // GGUF storage).
+        //
+        // Previous naive midpoint split was correct only for consecutive
+        // `[Q(q_dim), Gate(q_dim)]` layout, which no known Qwen / Bonsai
+        // GGUF ships. On Qwen 3.5-4B the wrong split fed heads 0..7 of
+        // interleaved (q, gate, q, gate, ...) rows into the Q buffer,
+        // producing garbage attention outputs at layer 3 and cascading
+        // through the network (Phase X.3.e.3.26 diagnostic finding).
+        let upload_w_bonsai_split = |name: &str,
+                                     half_rows: usize,
+                                     cols: usize,
+                                     num_heads: usize,
+                                     head_dim: usize|
+         -> (GpuWeightBuffer, GpuWeightBuffer) {
+            let info = gguf.tensor_info(name).unwrap();
+            let data = gguf.tensor_data(name).unwrap();
+            let total_rows = half_rows * 2;
+            let bytes_per_row = data.len() / total_rows;
+            assert_eq!(
+                half_rows,
+                num_heads * head_dim,
+                "upload_w_bonsai_split: half_rows ({half_rows}) must equal \
+                 num_heads * head_dim ({num_heads} * {head_dim})"
+            );
+            let head_pair_rows = head_dim * 2;
+            let head_pair_bytes = head_pair_rows * bytes_per_row;
+            let half_bytes_per_head = head_dim * bytes_per_row;
+            let mut q_bytes: Vec<u8> = Vec::with_capacity(half_rows * bytes_per_row);
+            let mut gate_bytes: Vec<u8> = Vec::with_capacity(half_rows * bytes_per_row);
+            for h in 0..num_heads {
+                let head_start = h * head_pair_bytes;
+                let q_end = head_start + half_bytes_per_head;
+                let gate_end = q_end + half_bytes_per_head;
+                q_bytes.extend_from_slice(&data[head_start..q_end]);
+                gate_bytes.extend_from_slice(&data[q_end..gate_end]);
+            }
+            let upload_half = |bytes: &[u8]| -> GpuWeightBuffer {
+                match info.qtype {
+                    GgmlType::Q4_K => engine.upload_weights(bytes, half_rows, cols),
+                    GgmlType::Q5_K => engine.upload_weights_q5k(bytes, half_rows, cols),
+                    GgmlType::Q6_K => engine.upload_weights_q6k(bytes, half_rows, cols),
+                    GgmlType::Q8_0 => engine.upload_weights_q8_0(bytes, half_rows, cols),
+                    GgmlType::Q1_0 => engine.upload_weights_q1_0(bytes, half_rows, cols),
+                    other => panic!(
+                        "GPU upload for tensor `{name}` (bonsai split) unsupported quant \
+                         type {other:?} — extend GpuQuantType + upload_weights_typed"
+                    ),
+                }
             };
+            let q = upload_half(&q_bytes);
+            let gate = upload_half(&gate_bytes);
+            (q, gate)
+        };
 
         eprintln!("[GpuModel] uploading weights...");
         let t0 = std::time::Instant::now();
@@ -2980,8 +3017,13 @@ impl GpuModel {
                     let q_dim_attn = (config.num_heads as usize) * (config.head_dim as usize);
                     let is_bonsai_full_attn_layer = attn_q_actual_rows == q_dim_attn * 2;
                     let (q_proj_val, bonsai_attn_q_gate_val) = if is_bonsai_full_attn_layer {
-                        let (q, gate) =
-                            upload_w_bonsai_split(&attn_q_name, q_dim_attn, config.hidden_dim);
+                        let (q, gate) = upload_w_bonsai_split(
+                            &attn_q_name,
+                            q_dim_attn,
+                            config.hidden_dim,
+                            config.num_heads as usize,
+                            config.head_dim as usize,
+                        );
                         (q, Some(gate))
                     } else {
                         (upload_w(&attn_q_name, q_dim_attn, config.hidden_dim), None)
