@@ -19,6 +19,8 @@ const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const SILU_GATE_APPLY_SHADER: &str = include_str!("shaders/silu_gate_apply.wgsl");
+const BETA_SIGMOID_SHADER: &str = include_str!("shaders/beta_sigmoid.wgsl");
+const SSM_DISCRETISATION_SHADER: &str = include_str!("shaders/ssm_discretisation.wgsl");
 const RESIDUAL_ADD_SHADER: &str = include_str!("shaders/residual_add.wgsl");
 const ADD_BIAS_SHADER: &str = include_str!("shaders/add_bias.wgsl");
 const QK_NORM_SHADER: &str = include_str!("shaders/qk_norm.wgsl");
@@ -59,6 +61,69 @@ pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
         // silu(g) = g / (1 + exp(-g)) = g * sigmoid(g)
         // attn_out[i] *= silu(g)
         *a = *a * g / (1.0 + (-g).exp());
+    }
+}
+
+/// CPU reference implementation of the `beta_sigmoid` WGSL shader.
+///
+/// Computes `beta[i] = sigmoid(beta_raw[i])` in-place on `beta`, matching
+/// `src/shaders/beta_sigmoid.wgsl` line-by-line. Used by Bonsai / Qwen
+/// 3.6-27B DeltaNet layers to bring the raw beta projection into the
+/// stable delta-rule integration range (0, 1). Reference: llama.cpp
+/// PrismML fork `qwen35.cpp:440-441` (`ggml_sigmoid(beta)`).
+pub fn beta_sigmoid_cpu(beta: &mut [f32]) {
+    for b in beta.iter_mut() {
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        *b = 1.0 / (1.0 + (-*b).exp());
+    }
+}
+
+/// CPU reference implementation of the `ssm_discretisation` WGSL shader.
+///
+/// Computes per-V-head decay factor from raw alpha projection, ssm_dt_bias,
+/// and ssm_a, matching `src/shaders/ssm_discretisation.wgsl` line-by-line.
+/// Writes decay back into `alpha` buffer in-place.
+///
+/// Formula (per llama.cpp PrismML fork `qwen35.cpp:443-451`):
+/// ```text
+///   alpha_biased[h]   = alpha[h] + ssm_dt_bias[h]
+///   alpha_softplus[h] = softplus(alpha_biased[h])   // > 0
+///   gate[h]           = alpha_softplus[h] * ssm_a[h] // < 0 (Mamba convention)
+///   decay[h]          = exp(gate[h])                 // ∈ (0, 1]
+/// ```
+///
+/// Softplus is numerically stable for large |x|:
+/// - `x > 20`: `softplus(x) ≈ x` (avoid exp overflow)
+/// - `x < -20`: `softplus(x) ≈ exp(x)` (asymptotic)
+/// - otherwise: `ln(1 + exp(x))`
+///
+/// # Panics
+///
+/// Panics if `alpha.len()`, `ssm_dt_bias.len()`, and `ssm_a.len()` are not
+/// all equal.
+pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f32]) {
+    assert_eq!(
+        alpha.len(),
+        ssm_dt_bias.len(),
+        "ssm_discretisation_cpu: alpha and ssm_dt_bias must have same length"
+    );
+    assert_eq!(
+        alpha.len(),
+        ssm_a.len(),
+        "ssm_discretisation_cpu: alpha and ssm_a must have same length"
+    );
+    for h in 0..alpha.len() {
+        let a_biased = alpha[h] + ssm_dt_bias[h];
+        // Numerically stable softplus, avoiding exp overflow / ln(1) underflow.
+        let a_softplus = if a_biased > 20.0 {
+            a_biased
+        } else if a_biased < -20.0 {
+            a_biased.exp()
+        } else {
+            (1.0 + a_biased.exp()).ln()
+        };
+        let gate = a_softplus * ssm_a[h];
+        alpha[h] = gate.exp();
     }
 }
 
@@ -205,6 +270,17 @@ pub struct GpuEngine {
     /// — exposed via `GpuPass::silu_gate_apply` for future integration and
     /// standalone parity validation.
     silu_gate_apply_pipeline: wgpu::ComputePipeline,
+    /// Bonsai / Qwen 3.6-27B DeltaNet beta transformation: element-wise
+    /// `beta[i] = sigmoid(beta_raw[i])` in-place on beta buffer. Phase X.3.e.3
+    /// Gap B extra (commit `2d55f2b` CPU implementation reference). Only
+    /// applied when GGUF has `ssm_a` + `ssm_dt_bias` (Bonsai-flavored).
+    beta_sigmoid_pipeline: wgpu::ComputePipeline,
+    /// Bonsai / Qwen 3.6-27B DeltaNet SSM discretisation: per-V-head
+    /// `decay = exp(softplus(alpha + ssm_dt_bias) * ssm_a)`. Phase X.3.e.3
+    /// Gap B (commit `6d43602` CPU reference). Writes decay back into alpha
+    /// buffer in-place. Mamba convention: ssm_a stored ≈ -exp(A_log) < 0
+    /// → gate < 0 → decay ∈ (0, 1].
+    ssm_discretisation_pipeline: wgpu::ComputePipeline,
     residual_add_pipeline: wgpu::ComputePipeline,
     /// Element-wise bias add (Qwen 2 / 2.5 attention QKV biases).
     add_bias_pipeline: wgpu::ComputePipeline,
@@ -398,6 +474,16 @@ impl GpuEngine {
                 SILU_GATE_APPLY_SHADER,
                 "silu_gate_apply",
                 "silu_gate_apply",
+            ),
+            beta_sigmoid_pipeline: make_pipeline(
+                BETA_SIGMOID_SHADER,
+                "beta_sigmoid",
+                "beta_sigmoid",
+            ),
+            ssm_discretisation_pipeline: make_pipeline(
+                SSM_DISCRETISATION_SHADER,
+                "ssm_discretisation",
+                "ssm_discretisation",
             ),
             residual_add_pipeline: make_pipeline(
                 RESIDUAL_ADD_SHADER,
@@ -1173,6 +1259,97 @@ impl<'a> GpuPass<'a> {
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.engine.silu_mul_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, 1, 1);
+        }
+    }
+
+    /// Bonsai DeltaNet beta transformation: `beta[i] = sigmoid(beta_raw[i])`
+    /// in-place on beta buffer.
+    ///
+    /// Phase X.3.e.3 Gap B extra (see commit `2d55f2b` for CPU reference).
+    /// The DeltaNet recurrence's update rate `beta` must be constrained to
+    /// (0, 1) for the delta rule to remain stable. Bonsai / Qwen 3.6-27B
+    /// applies sigmoid to bring raw `beta_proj` output into the valid range.
+    ///
+    /// Not yet wired into `encode_forward_impl` — awaiting Phase 2 Steps
+    /// 1+4 (Bonsai loader + forward path wiring). Exposed publicly for
+    /// standalone parity validation and future integration.
+    pub fn beta_sigmoid(&mut self, beta: &GpuBuffer) {
+        let layout = self.engine.beta_sigmoid_pipeline.get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: beta.buffer.as_entire_binding(),
+                }],
+            });
+        let dispatch_x = ((beta.len as u32) + 255) / 256;
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.beta_sigmoid_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, 1, 1);
+        }
+    }
+
+    /// Bonsai DeltaNet SSM discretisation: writes per-V-head decay factor
+    /// into `alpha` buffer in-place, consuming raw alpha projection +
+    /// `ssm_dt_bias` + `ssm_a`.
+    ///
+    /// Computes `decay[h] = exp(softplus(alpha[h] + ssm_dt_bias[h]) * ssm_a[h])`.
+    /// Phase X.3.e.3 Gap B (see commit `6d43602` for CPU reference).
+    /// Reference: llama.cpp PrismML fork `qwen35.cpp:443-451`.
+    ///
+    /// Mamba convention: `ssm_a` stored ≈ -exp(A_log) < 0 → gate < 0 →
+    /// decay ∈ (0, 1] (real decay factor). Softplus is numerically stable
+    /// for |x| > 20 via closed-form approximation.
+    ///
+    /// Not yet wired into `encode_forward_impl` — awaiting Phase 2 Steps
+    /// 1+4 (Bonsai loader + forward path wiring).
+    pub fn ssm_discretisation(
+        &mut self,
+        alpha: &GpuBuffer,
+        ssm_dt_bias: &GpuBuffer,
+        ssm_a: &GpuBuffer,
+    ) {
+        let layout = self
+            .engine
+            .ssm_discretisation_pipeline
+            .get_bind_group_layout(0);
+        let bg = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: alpha.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ssm_dt_bias.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ssm_a.buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let dispatch_x = ((alpha.len as u32) + 255) / 256;
+        {
+            let mut pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.engine.ssm_discretisation_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(dispatch_x, 1, 1);
         }
@@ -4361,5 +4538,134 @@ mod tests {
         let mut attn_out = vec![1.0f32; 4];
         let gate = vec![1.0f32; 5];
         silu_gate_apply_cpu(&mut attn_out, &gate);
+    }
+
+    /// Verify `beta_sigmoid_cpu` produces standard sigmoid values.
+    #[test]
+    fn beta_sigmoid_cpu_matches_math() {
+        // Key sigmoid values:
+        //   sigmoid(0)      = 0.5
+        //   sigmoid(1)      ≈ 0.7310586
+        //   sigmoid(-1)     ≈ 0.2689414
+        //   sigmoid(large+) ≈ 1.0
+        //   sigmoid(large-) ≈ 0.0
+        let mut beta = vec![0.0f32, 1.0, -1.0, 20.0, -20.0];
+        beta_sigmoid_cpu(&mut beta);
+
+        assert!(
+            (beta[0] - 0.5).abs() < 1e-6,
+            "sigmoid(0) = 0.5, got {}",
+            beta[0]
+        );
+        assert!(
+            (beta[1] - 0.7310586).abs() < 1e-5,
+            "sigmoid(1) ≈ 0.7310586, got {}",
+            beta[1]
+        );
+        assert!(
+            (beta[2] - 0.2689414).abs() < 1e-5,
+            "sigmoid(-1) ≈ 0.2689414, got {}",
+            beta[2]
+        );
+        assert!(
+            (beta[3] - 1.0).abs() < 1e-4,
+            "sigmoid(20) ≈ 1.0, got {}",
+            beta[3]
+        );
+        assert!(beta[4].abs() < 1e-4, "sigmoid(-20) ≈ 0.0, got {}", beta[4]);
+    }
+
+    /// Verify `beta_sigmoid_cpu` output is always in (0, 1) for any input.
+    #[test]
+    fn beta_sigmoid_cpu_range_invariant() {
+        let mut beta = vec![
+            -1000.0f32, -100.0, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0, 1000.0,
+        ];
+        beta_sigmoid_cpu(&mut beta);
+        for (i, &b) in beta.iter().enumerate() {
+            assert!(
+                (0.0..=1.0).contains(&b),
+                "beta_sigmoid_cpu[{i}] out of (0, 1] range: {b}"
+            );
+        }
+    }
+
+    /// Verify `ssm_discretisation_cpu` produces decay values in (0, 1] when
+    /// `ssm_a` is negative (Mamba convention: ssm_a stored ≈ -exp(A_log) < 0).
+    #[test]
+    fn ssm_discretisation_cpu_produces_valid_decay() {
+        // 3 V heads with typical Bonsai / Mamba values:
+        //   ssm_a in [-2, -0.1] (stored as -exp(A_log), A_log in [-2, 0.7])
+        //   ssm_dt_bias in [-1, 1]
+        //   alpha (raw projection) in [-3, 3]
+        let mut alpha = vec![0.0f32, 1.5, -2.0];
+        let ssm_dt_bias = vec![0.5f32, -0.2, 0.1];
+        let ssm_a = vec![-1.0f32, -0.5, -1.5];
+
+        ssm_discretisation_cpu(&mut alpha, &ssm_dt_bias, &ssm_a);
+
+        // Verify each decay ∈ (0, 1]
+        for (h, &d) in alpha.iter().enumerate() {
+            assert!(
+                d > 0.0 && d <= 1.0,
+                "ssm_discretisation_cpu[{h}] decay = {d} not in (0, 1]"
+            );
+        }
+    }
+
+    /// Verify `ssm_discretisation_cpu` hand-computed reference for h=0.
+    ///
+    /// alpha=0.0, ssm_dt_bias=0.0, ssm_a=-1.0:
+    ///   alpha_biased  = 0.0
+    ///   alpha_softplus = ln(1 + exp(0)) = ln(2) ≈ 0.6931472
+    ///   gate          = 0.6931472 * -1.0 = -0.6931472
+    ///   decay         = exp(-0.6931472) = 0.5
+    #[test]
+    fn ssm_discretisation_cpu_hand_computed_anchor() {
+        let mut alpha = vec![0.0f32];
+        let ssm_dt_bias = vec![0.0f32];
+        let ssm_a = vec![-1.0f32];
+
+        ssm_discretisation_cpu(&mut alpha, &ssm_dt_bias, &ssm_a);
+
+        assert!(
+            (alpha[0] - 0.5).abs() < 1e-6,
+            "ssm_discretisation_cpu(0, 0, -1) should give decay ≈ 0.5, got {}",
+            alpha[0]
+        );
+    }
+
+    /// Verify softplus numerical stability for large positive input.
+    ///
+    /// alpha=25.0 (biased): softplus should saturate to ~25 without exp overflow.
+    /// ssm_a=-0.1: gate = 25 * -0.1 = -2.5, decay = exp(-2.5) ≈ 0.0820850
+    #[test]
+    fn ssm_discretisation_cpu_softplus_stable_large_positive() {
+        let mut alpha = vec![25.0f32];
+        let ssm_dt_bias = vec![0.0f32];
+        let ssm_a = vec![-0.1f32];
+
+        ssm_discretisation_cpu(&mut alpha, &ssm_dt_bias, &ssm_a);
+
+        assert!(
+            alpha[0].is_finite(),
+            "softplus overflow: got non-finite decay {}",
+            alpha[0]
+        );
+        assert!(
+            (alpha[0] - 0.0820850).abs() < 1e-4,
+            "expected decay ≈ 0.0820850 for alpha=25, ssm_a=-0.1, got {}",
+            alpha[0]
+        );
+    }
+
+    /// Verify `ssm_discretisation_cpu` panics on mismatched lengths.
+    #[test]
+    #[should_panic(expected = "alpha and ssm_a must have same length")]
+    fn ssm_discretisation_cpu_panics_on_length_mismatch() {
+        let mut alpha = vec![1.0f32; 4];
+        let ssm_dt_bias = vec![1.0f32; 4];
+        let ssm_a = vec![1.0f32; 5];
+        ssm_discretisation_cpu(&mut alpha, &ssm_dt_bias, &ssm_a);
     }
 }
