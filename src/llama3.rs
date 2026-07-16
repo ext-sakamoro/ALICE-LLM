@@ -3843,7 +3843,37 @@ impl<'a> Llama3Model<'a> {
     }
 
     /// Forward pass for a single token. Returns logits [vocab_size].
+    /// Standard single-stream forward. Convenience wrapper for the common
+    /// case with no per-layer hook — equivalent to
+    /// `forward_with_layer_hook(token_id, |_, _| false)`.
     pub fn forward(&mut self, token_id: u32) -> Vec<f32> {
+        self.forward_with_layer_hook(token_id, |_layer_idx, _hidden| false)
+    }
+
+    /// Phase A2 per-layer hybrid support. Runs the standard `forward` path
+    /// but calls `hook(layer_idx, &mut hidden)` before each layer body.
+    ///
+    /// The hook must return `false` for CPU to run the layer as usual, or
+    /// `true` to tell CPU to skip its own compute for that layer. When the
+    /// hook returns `true`, `hidden` is assumed to have been updated in
+    /// place by the caller (typically by delegating the layer to a GPU
+    /// runtime that maintains its own state), and CPU does no attention
+    /// / KV-cache work for that layer.
+    ///
+    /// Per-token bookkeeping (embedding lookup, scratch buffer allocation,
+    /// output norm + projection) still runs on CPU regardless of the hook
+    /// return value. The final `kv_cache.advance()` also always fires so
+    /// the KV cache position tracks the token stream.
+    ///
+    /// This is the primary entry point used by the `run_hybrid_per_layer`
+    /// path in `examples/qwen_gpu.rs`, which orchestrates CPU DeltaNet
+    /// layers + GPU attention layers to bypass Jetson's `wgpu-hal` Vulkan
+    /// weight duplication while keeping DeltaNet math on the CPU where
+    /// the recurrent state and Bonsai Gap-B refinement already work.
+    pub fn forward_with_layer_hook<F>(&mut self, token_id: u32, hook: F) -> Vec<f32>
+    where
+        F: FnMut(usize, &mut Vec<f32>) -> bool,
+    {
         // Gemma 3n: use dedicated forward path (AltUp + Laurel + per-layer
         // input embedding + shared KV are fundamentally different from the
         // standard single-stream flow).
@@ -3955,7 +3985,18 @@ impl<'a> Llama3Model<'a> {
             Vec::new()
         };
 
+        let mut hook = hook;
         for layer_idx in 0..c.num_layers {
+            // Phase A2 hybrid dispatch: give the caller a chance to fully
+            // replace this layer's compute (e.g. delegate to a GPU model
+            // that runs the attention layers). If the hook returns `true`,
+            // it has already mutated `hidden` in place and the CPU-side
+            // layer body must be skipped so KV cache / DeltaNet state on
+            // the CPU side don't get out-of-sync updates for a layer that
+            // the CPU never actually processed.
+            if hook(layer_idx, &mut hidden) {
+                continue;
+            }
             // Hybrid Qwen 3.5 / 3.6: DeltaNet layers take a distinct forward
             // path (linear attention + recurrent state, no KV cache). Any
             // model without `layer_kind_map` populated is treated as

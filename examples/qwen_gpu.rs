@@ -215,6 +215,157 @@ fn run_hybrid_cpu_delegate(
     );
 }
 
+/// Phase A2 per-layer hybrid: CPU processes DeltaNet layers, GPU
+/// processes attention layers. Uses `Llama3Model::forward_with_layer_hook`
+/// on the CPU side and `GpuModel::run_attention_layer_only` on the GPU
+/// side. Intended for Jetson (Cortex-A78AE 6-core + Tegra Orin iGPU)
+/// where full GPU forward OOMs due to `wgpu-hal` Vulkan weight
+/// duplication.
+///
+/// Memory footprint (Bonsai 27B Q1_0 on 8 GB unified Jetson):
+///   - CPU: full model via mmap (kernel page cache), effectively free
+///   - GPU: attention layer weights (~16/64 layers) + KV cache with
+///     `--max-seq-len 512` = ~2 GB with `x2` duplication, fits in ~2.5 GB
+///     available.
+///
+/// The orchestrator layer-kind routing mirrors `Llama3Config::
+/// build_kv_layer_map`: every 4th layer is Attention (interval = 4) for
+/// Qwen 3.5 hybrid schedules; other layers are DeltaNet.
+#[cfg(feature = "gpu")]
+fn run_hybrid_per_layer(
+    model_path: &str,
+    raw_prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    max_seq_len_override: Option<usize>,
+) {
+    println!("Loading model: {model_path} (hybrid-per-layer mode)");
+    let t0 = Instant::now();
+    let data = std::fs::read(model_path).expect("Failed to read GGUF file");
+    let gguf = GgufFile::parse(&data).expect("Failed to parse GGUF");
+    let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
+    println!(
+        "  GGUF parsed: {}ms (vocab={})",
+        t0.elapsed().as_millis(),
+        tokenizer.vocab_size()
+    );
+
+    let config = Llama3Config::from_gguf(&gguf).expect("Failed to load Llama3Config from GGUF");
+    let gpu_cfg = gpu_config_from_llama3(&config);
+    if let Some(override_len) = max_seq_len_override {
+        eprintln!(
+            "  Note: --max-seq-len {} — CPU forward respects GGUF context_length {} (mmap zero-copy),\n         GPU load respects the override for KV cache sizing.",
+            override_len, config.max_seq_len
+        );
+    }
+
+    let t_load = Instant::now();
+    let mut cpu_model = Llama3Model::from_gguf(&gguf).expect("Failed to load Llama3Model");
+    println!("  CPU model loaded: {}ms", t_load.elapsed().as_millis());
+
+    let engine = GpuEngine::new();
+    let mut gpu_cfg = gpu_cfg;
+    if let Some(override_len) = max_seq_len_override {
+        gpu_cfg.max_seq_len = override_len;
+    }
+    let t_gpu = Instant::now();
+    let mut gpu_model = GpuModel::load(engine, &gguf, gpu_cfg);
+    println!("  GPU model loaded: {}ms", t_gpu.elapsed().as_millis());
+
+    // Build the attention-layer bitmap once so the CPU hook can decide
+    // per-layer whether to defer to GPU without probing the model on
+    // every layer step.
+    let interval = config.full_attention_interval();
+    let num_layers = config.num_layers;
+    let is_attention_layer: Vec<bool> = (0..num_layers)
+        .map(|i| match interval {
+            Some(iv) if (i + 1) % iv != 0 => false,
+            _ => true,
+        })
+        .collect();
+
+    let formatted = format!(
+        "<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+    let mut prompt_tokens = tokenizer.encode(&formatted);
+    if tokenizer.add_bos_token && (prompt_tokens.is_empty() || prompt_tokens[0] != tokenizer.bos_id)
+    {
+        prompt_tokens.insert(0, tokenizer.bos_id);
+    }
+    println!("  Prompt: {} tokens", prompt_tokens.len());
+    println!(
+        "  Generating (max {max_tokens} tokens, temp={temperature}, top_k={top_k}) [per-layer hybrid]"
+    );
+    println!("---");
+
+    let step_forward =
+        |cpu_model: &mut Llama3Model, gpu_model: &mut GpuModel, token: u32| -> Vec<f32> {
+            let pos = cpu_model.kv_cache_seq_len() as u32;
+            let is_attention_layer = &is_attention_layer;
+            cpu_model.forward_with_layer_hook(token, |layer_idx, hidden| {
+                if !is_attention_layer[layer_idx] {
+                    return false;
+                }
+                let new_hidden = gpu_model.run_attention_layer_only(layer_idx, hidden, pos);
+                hidden.copy_from_slice(&new_hidden);
+                true
+            })
+        };
+
+    let t_prefill = Instant::now();
+    for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
+        let _ = step_forward(&mut cpu_model, &mut gpu_model, tok);
+    }
+    let last_prompt = *prompt_tokens.last().unwrap();
+    let mut logits = step_forward(&mut cpu_model, &mut gpu_model, last_prompt);
+    let prefill_ms = t_prefill.elapsed().as_millis();
+
+    let t_decode = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::new();
+    let eos_id = tokenizer.eos_id;
+    let im_end_id: u32 = 151645;
+    let endoftext_id: u32 = 151643;
+
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1234;
+    let mut next_rand = || -> f32 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        (rng_state as f32) / (u64::MAX as f32)
+    };
+
+    for _step in 0..max_tokens {
+        let next_token = if temperature < 1e-6 {
+            sample_argmax(&logits) as u32
+        } else {
+            apply_temperature(&mut logits, temperature);
+            top_k_filter(&mut logits, top_k);
+            softmax_inplace(&mut logits);
+            sample_with_random(&logits, next_rand()) as u32
+        };
+
+        if next_token == eos_id || next_token == im_end_id || next_token == endoftext_id {
+            break;
+        }
+        generated_tokens.push(next_token);
+        let text = tokenizer.decode(&[next_token]);
+        print!("{text}");
+        std::io::stdout().flush().ok();
+        logits = step_forward(&mut cpu_model, &mut gpu_model, next_token);
+    }
+    println!();
+    println!("---");
+
+    let decode_ms = t_decode.elapsed().as_millis();
+    let n_tokens = generated_tokens.len();
+    println!(
+        "{n_tokens} tokens generated, {:.1} tok/s ({prefill_ms}ms prefill + {decode_ms}ms decode = {}ms) [per-layer hybrid]",
+        (n_tokens as f64 * 1000.0) / (prefill_ms + decode_ms) as f64,
+        prefill_ms + decode_ms
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -244,10 +395,13 @@ fn main() {
     // Phase X.3.e.3.17 Option C MVP: `--hybrid` skips GPU entirely and falls
     // back to CPU-only `Llama3Model::forward()`. This delivers the Jetson OOM
     // fix (no GPU weight allocation) at the cost of speed (~0.05-0.1 tok/s on
-    // Jetson Cortex-A78AE for Bonsai 27B Q1_0). True per-layer hybrid
-    // (DeltaNet on CPU + Attention on GPU) requires `Llama3Model::
-    // forward_layers_range()` refactor and is next-session work (Phase A2).
+    // Jetson Cortex-A78AE for Bonsai 27B Q1_0).
     let hybrid_mode = args.iter().any(|a| a == "--hybrid");
+    // Phase A2 per-layer hybrid: CPU processes DeltaNet layers, GPU
+    // processes attention layers, hidden state is shuttled between them
+    // via write_f32 / read_f32. Uses `Llama3Model::forward_with_layer_hook`
+    // (CPU) + `GpuModel::run_attention_layer_only` (GPU).
+    let hybrid_per_layer = args.iter().any(|a| a == "--hybrid-per-layer");
 
     #[cfg(feature = "gpu")]
     {
@@ -256,6 +410,17 @@ fn main() {
         // GPU. Delivers Jetson OOM fix (no GPU weight allocation) at speed cost.
         if hybrid_mode {
             run_hybrid_cpu_delegate(
+                &model_path,
+                &raw_prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                max_seq_len_override,
+            );
+            return;
+        }
+        if hybrid_per_layer {
+            run_hybrid_per_layer(
                 &model_path,
                 &raw_prompt,
                 max_tokens,
