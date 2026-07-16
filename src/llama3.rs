@@ -4330,6 +4330,16 @@ impl<'a> Llama3Model<'a> {
                     for i in 0..c.hidden_dim {
                         hidden[i] += down_buf[i];
                     }
+                    // Same `ALICE_LLM_DUMP_LAYERS` dump as the attention path
+                    // below — required because DeltaNet layers hit `continue`
+                    // and would otherwise skip the end-of-loop dump. Without
+                    // this, checkpoints 0/6/13/20 (all DeltaNet in the Qwen
+                    // 3.5 hybrid schedule) never emit CPU reference lines.
+                    if std::env::var_os("ALICE_LLM_DUMP_LAYERS").is_some()
+                        && matches!(layer_idx, 0 | 6 | 13 | 20 | 27)
+                    {
+                        dump_hidden_jsonl_stderr(&format!("cpu_layer_{layer_idx}"), &hidden);
+                    }
                     continue;
                 }
             }
