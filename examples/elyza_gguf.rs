@@ -101,6 +101,10 @@ fn main() {
     // the prompt-end position and first N decoded tokens. When set, forces a
     // plain-argmax manual forward loop (no speculative, no ternary generation).
     let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
+    // Phase X.3.e.3.5 debug: bypass chat template and tokenize prompt as-is.
+    // Used together with ALICE_DUMP_DN0 to compare 1-token-input intermediates
+    // against `llama-eval-callback` reference dumps.
+    let raw_prompt = has_flag(&args, "--raw-prompt");
     // Issue #40 diagnostic: dump post-final-RMSNorm hidden state (pre-output-
     // projection) to stderr as JSONL. Combined with the same flag on
     // `qwen_gpu`, allows offline cos-sim / L2 diff to isolate whether the
@@ -149,7 +153,10 @@ fn main() {
 
     // Detect chat template from GGUF metadata (model architecture).
     let arch_str = gguf.meta_str("general.architecture").unwrap_or("llama");
-    let formatted = match arch_str {
+    let formatted = if raw_prompt {
+        prompt.to_string()
+    } else {
+        match arch_str {
         // Qwen 3 has "thinking mode" default-on which loops <think>...</think>
         // in greedy sampling. Pre-fill empty <think></think> to disable it.
         // Qwen 3.5 (DeltaNet hybrid arch) shares the Qwen 3 chat template.
@@ -165,6 +172,7 @@ fn main() {
         _ => format!(
             "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         ),
+        }
     };
 
     println!("Prompt: {prompt}");
