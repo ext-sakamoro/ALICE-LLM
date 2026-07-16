@@ -3970,7 +3970,10 @@ impl<'a> Llama3Model<'a> {
                     // Phase X.3.e.3.14: dump attn_norm for DeltaNet layers to
                     // track cascade divergence between attention-layer dumps.
                     if std::env::var("ALICE_DUMP_ATTN_ALL").is_ok()
-                        && matches!(layer_idx, 4 | 5 | 6 | 8 | 9 | 10)
+                        && matches!(
+                            layer_idx,
+                            4 | 5 | 6 | 8 | 9 | 10 | 12 | 13 | 14 | 16 | 17 | 18
+                        )
                     {
                         dump_slice(&format!("attn{layer_idx}_norm"), &norm_buf, 3);
                     }
@@ -4494,14 +4497,69 @@ impl<'a> Llama3Model<'a> {
             // applied, but reference qwen35.cpp:401-404 uses ggml_sigmoid
             // (not silu), which caused massive divergence propagating from
             // attention layer 3 onwards (attn_norm-4 sign-flip vs reference).
+            // Phase X.3.e.3.15: dump attn_out (attn_pregate) + gate + attn_gated
+            // for layer 3 to compare with reference qwen35 attn_pregate-3 /
+            // gate_sigmoid-3 / attn_gated-3.
+            let dump_gated_layer3 = std::env::var("ALICE_DUMP_GATED3").is_ok()
+                && layer_idx == 3
+                && layer.gated_output
+                && {
+                    static ONCE_G3: std::sync::Once = std::sync::Once::new();
+                    let mut fire = false;
+                    ONCE_G3.call_once(|| fire = true);
+                    fire
+                };
+            if dump_gated_layer3 {
+                dump_slice("gated3_attn_pregate", &attn_out[..q_dim], 3);
+                dump_slice("gated3_gate_raw", &q_buf[q_dim..2 * q_dim], 3);
+                let gate_sigmoid: Vec<f32> = q_buf[q_dim..2 * q_dim]
+                    .iter()
+                    .map(|&g| sigmoid(g))
+                    .collect();
+                dump_slice("gated3_gate_sigmoid", &gate_sigmoid, 3);
+            }
             if layer.gated_output {
                 for i in 0..q_dim {
                     attn_out[i] *= sigmoid(q_buf[q_dim + i]);
                 }
             }
+            if dump_gated_layer3 {
+                dump_slice("gated3_attn_gated", &attn_out[..q_dim], 3);
+            }
 
             // Output projection
             layer.o_proj.matvec(&attn_out, &mut o_buf);
+            if dump_gated_layer3 {
+                dump_slice("gated3_o_buf", &o_buf, 3);
+                dump_slice("gated3_hidden_pre_residual", &hidden, 3);
+                // Compute what post-residual will be (hidden + o_buf).
+                let post_res: Vec<f32> = hidden
+                    .iter()
+                    .zip(o_buf.iter())
+                    .map(|(&h, &o)| h + o)
+                    .collect();
+                dump_slice("gated3_hidden_post_residual", &post_res, 3);
+                // Phase X.3.e.3.15: compute sum of squares and mean(x²) to
+                // diagnose RMS_NORM scale divergence.
+                let ss: f64 = post_res.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                let mean_sq = ss / post_res.len() as f64;
+                let rms = (mean_sq + 1e-6_f64).sqrt();
+                eprintln!(
+                    "DN0 gated3_hidden_stats: sum_sq={:.4} mean_sq={:.6} rms={:.6} scale=1/rms={:.4}",
+                    ss, mean_sq, rms, 1.0/rms
+                );
+                // Also dump values at middle positions to see where divergence lies.
+                let mid = post_res.len() / 2;
+                eprintln!(
+                    "DN0 gated3_hidden_middle: pos {} = [{:.4},{:.4},{:.4},{:.4},{:.4}]",
+                    mid,
+                    post_res[mid],
+                    post_res[mid + 1],
+                    post_res[mid + 2],
+                    post_res[mid + 3],
+                    post_res[mid + 4]
+                );
+            }
 
             // Gemma-2 post-attention RMSNorm (before residual add; no-op for others)
             if let Some(w) = &layer.post_attn_norm {
@@ -4515,8 +4573,42 @@ impl<'a> Llama3Model<'a> {
                 hidden[i] += o_buf[i];
             }
 
+            // Phase X.3.e.3.15: dump hidden RIGHT BEFORE rms_norm to catch
+            // discrepancy vs computed post_res.
+            if layer_idx == 3 && std::env::var("ALICE_DUMP_GATED3").is_ok() {
+                static ONCE_H3: std::sync::Once = std::sync::Once::new();
+                let mut fire = false;
+                ONCE_H3.call_once(|| fire = true);
+                if fire {
+                    dump_slice("gated3_hidden_pre_ffnnorm", &hidden, 3);
+                    // Manual RMS on this hidden
+                    let ss: f64 = hidden.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                    let mean_sq = ss / hidden.len() as f64;
+                    let scale = 1.0_f64 / (mean_sq + 1e-6_f64).sqrt();
+                    eprintln!(
+                        "DN0 gated3_pre_ffnnorm_rms: mean_sq={:.6} scale={:.4}",
+                        mean_sq, scale
+                    );
+                    // Manual output[0] = hidden[0] * scale * weight[0]
+                    let manual_out_0 = hidden[0] as f64 * scale * layer.ffn_norm[0] as f64;
+                    eprintln!(
+                        "DN0 gated3_manual_out0: hidden[0]={:.4} scale={:.4} weight[0]={:.6} manual_out[0]={:.4}",
+                        hidden[0], scale, layer.ffn_norm[0], manual_out_0
+                    );
+                }
+            }
             // FFN norm
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
+            if layer_idx == 3 && std::env::var("ALICE_DUMP_GATED3").is_ok() {
+                static ONCE_FN3: std::sync::Once = std::sync::Once::new();
+                let mut fire = false;
+                ONCE_FN3.call_once(|| fire = true);
+                if fire {
+                    dump_slice("gated3_ffn_norm_out", &norm_buf, 3);
+                    dump_slice("gated3_ffn_norm_weight", &layer.ffn_norm, 3);
+                    dump_slice("gated3_attn_norm_weight", &layer.attn_norm, 3);
+                }
+            }
 
             // MoE dispatch: layers with `ffn_gate_inp` use expert routing
             // instead of a monolithic SwiGLU FFN. Both paths write their
@@ -4559,6 +4651,16 @@ impl<'a> Llama3Model<'a> {
             // Residual
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
+            }
+            // Phase X.3.e.3.15: layer 3 output (l_out-3 equivalent) dump.
+            if layer_idx == 3 && std::env::var("ALICE_DUMP_GATED3").is_ok() {
+                static ONCE_L3: std::sync::Once = std::sync::Once::new();
+                let mut fire = false;
+                ONCE_L3.call_once(|| fire = true);
+                if fire {
+                    dump_slice("gated3_ffn_out", &down_buf, 3);
+                    dump_slice("gated3_l_out_3", &hidden, 3);
+                }
             }
 
             // Issue #40 diagnostic: dump per-layer post-residual hidden state
@@ -8569,7 +8671,20 @@ fn load_layer_weights<'a>(
     let k_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_k_norm.weight"));
 
     // Gemma-2: sandwich norm (post-attention + post-FFN, before residual add).
-    let post_attn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_attention_norm.weight"));
+    // Phase X.3.e.3.15 fix: Qwen 3.5 uses `post_attention_norm.weight` as the
+    // FFN input norm (loaded via `load_ffn_norm`), NOT as a sandwich norm.
+    // Only load it as `post_attn_norm` when `ffn_norm.weight` exists (i.e.,
+    // Gemma-2 which has both), otherwise the same tensor would double-load
+    // and the Gemma-2 post-attention RMSNorm block would incorrectly fire
+    // on Qwen 3.5, corrupting o_buf before the residual add.
+    let has_ffn_norm_tensor = gguf
+        .tensor_to_f32(&format!("{prefix}.ffn_norm.weight"))
+        .is_some();
+    let post_attn_norm = if has_ffn_norm_tensor {
+        gguf.tensor_to_f32(&format!("{prefix}.post_attention_norm.weight"))
+    } else {
+        None
+    };
     let post_ffn_norm = gguf.tensor_to_f32(&format!("{prefix}.post_ffw_norm.weight"));
 
     // Gemma 3n per-layer tensors (None for other architectures).
