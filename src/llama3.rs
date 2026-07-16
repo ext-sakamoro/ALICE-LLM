@@ -4260,6 +4260,30 @@ impl<'a> Llama3Model<'a> {
                 .as_ref()
                 .expect("v_proj required for non-shared layer")
                 .matvec_preq(&q8_attn, &mut v_buf);
+            // Phase X.3.e.3.5 layer-3 first-forward dump for reference parity.
+            let dump_attn3 = std::env::var("ALICE_DUMP_ATTN3").is_ok() && layer_idx == 3 && {
+                static ONCE_A3: std::sync::Once = std::sync::Once::new();
+                let mut fire = false;
+                ONCE_A3.call_once(|| fire = true);
+                fire
+            };
+            if dump_attn3 {
+                dump_slice("attn3_norm", &norm_buf, 3);
+                dump_slice("attn3_q_buf_full", &q_buf[..q_dim * 2], 3);
+                dump_slice("attn3_q_head0_consec", &q_buf[..c.head_dim], 3);
+                dump_slice(
+                    "attn3_offset_256_gate_if_interleaved",
+                    &q_buf[c.head_dim..c.head_dim * 2],
+                    3,
+                );
+                dump_slice(
+                    "attn3_offset_512_head1_if_interleaved",
+                    &q_buf[c.head_dim * 2..c.head_dim * 3],
+                    3,
+                );
+                dump_slice("attn3_v_head0", &v_buf[..c.head_dim], 3);
+                dump_slice("attn3_k_head0", &k_buf[..c.head_dim], 3);
+            }
             // Qwen 2/2.5 bias (no-op for Llama/Mistral/Gemma/Qwen 3)
             if let Some(b) = layer.q_bias() {
                 for (q, bi) in q_buf.iter_mut().zip(b.iter()) {
