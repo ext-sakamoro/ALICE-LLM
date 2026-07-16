@@ -32,6 +32,7 @@ const ROPE_SHADER: &str = include_str!("shaders/rope.wgsl");
 const ATTENTION_SHADER: &str = include_str!("shaders/attention.wgsl");
 const KV_CACHE_APPEND_SHADER: &str = include_str!("shaders/kv_cache_append.wgsl");
 const SWIGLU_FUSED_Q4K_SHADER: &str = include_str!("shaders/swiglu_fused_q4k.wgsl");
+const SWIGLU_FUSED_Q1_0_SHADER: &str = include_str!("shaders/swiglu_fused_q1_0.wgsl");
 const MATVEC_Q4K_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q4k_batch4.wgsl");
 const MATVEC_Q6K_BATCH4_SHADER: &str = include_str!("shaders/dequant_matvec_q6k_batch4.wgsl");
 const SWIGLU_FUSED_Q4K_BATCH4_SHADER: &str = include_str!("shaders/swiglu_fused_q4k_batch4.wgsl");
@@ -387,6 +388,12 @@ pub struct GpuEngine {
     attention_pipeline: wgpu::ComputePipeline,
     kv_cache_append_pipeline: wgpu::ComputePipeline,
     swiglu_fused_q4k_pipeline: wgpu::ComputePipeline,
+    /// Fused SwiGLU pipeline for Q1_0 weights (Bonsai 27B FFN). Same
+    /// bind-group layout as `swiglu_fused_q4k_pipeline` — only the shader
+    /// differs to handle the 18-byte / 128-element Q1_0 block layout with
+    /// byte-level indexing. Selected by `build_swiglu_bg` via the quant
+    /// type of `dlw.gate_proj` / `dlw.up_proj`.
+    swiglu_fused_q1_0_pipeline: wgpu::ComputePipeline,
     // Batch-4 specialized pipelines (K=4 unrolled scalar accumulators)
     matvec_q4k_batch4_pipeline: wgpu::ComputePipeline,
     matvec_q6k_batch4_pipeline: wgpu::ComputePipeline,
@@ -506,6 +513,11 @@ impl GpuEngine {
             "matvec_q1_0_row8_batch4",
             "matvec_q1_0_row8_batch4",
         );
+        let swiglu_fused_q1_0_pipeline = make_pipeline(
+            SWIGLU_FUSED_Q1_0_SHADER,
+            "swiglu_fused_q1_0",
+            "swiglu_fused_q1_0",
+        );
         let swiglu_fused_q4k_pipeline = make_pipeline(
             SWIGLU_FUSED_Q4K_SHADER,
             "swiglu_fused_q4k",
@@ -611,6 +623,7 @@ impl GpuEngine {
                 "kv_cache_append",
             ),
             swiglu_fused_q4k_pipeline,
+            swiglu_fused_q1_0_pipeline,
             matvec_q4k_batch4_pipeline,
             matvec_q6k_batch4_pipeline,
             swiglu_batch4_pipeline,
@@ -2120,6 +2133,14 @@ struct SwigluBG {
     bg: wgpu::BindGroup,
     dispatch_x: u32,
     dispatch_y: u32,
+    /// Selects the fused SwiGLU pipeline: Q4_K uses `swiglu_fused_q4k`
+    /// (workgroup_size 256, one row per workgroup, 256-elem block), Q1_0
+    /// uses `swiglu_fused_q1_0` (workgroup_size 128, byte-level 18-byte
+    /// block indexing). Q6_K and Q5_K FFN weights fall back to the un-fused
+    /// path — none of the shipping Bonsai / Qwen 3.5 GGUFs use those
+    /// quants for `ffn_gate` / `ffn_up` so the fused path covers the
+    /// production workload.
+    quant: GpuQuantType,
 }
 
 /// Per-layer pre-cached bind groups.
@@ -2685,6 +2706,10 @@ impl GpuModel {
         input: &GpuBuffer,
         output: &GpuBuffer,
     ) -> SwigluBG {
+        assert_eq!(
+            gate_w.quant, up_w.quant,
+            "SwigluBG requires matching quant types for gate and up projections"
+        );
         let (dispatch_x, dispatch_y, grid_x) = matvec_dispatch(gate_w.rows);
         let params_buf = engine.make_persistent_uniform(&MatvecParams {
             rows: gate_w.rows,
@@ -2696,7 +2721,22 @@ impl GpuModel {
             _pad2: 0,
             _pad3: 0,
         });
-        let layout = engine.swiglu_fused_q4k_pipeline.get_bind_group_layout(0);
+        // Select the fused SwiGLU pipeline by quant type — Q4_K uses the
+        // 256-elem block kernel, Q1_0 uses the 18-byte block kernel with
+        // byte-level indexing. Other quants are not supported by the
+        // fused path (would need a new shader per quant); the loader
+        // panics upstream when it sees such a FFN configuration.
+        let pipeline = match gate_w.quant {
+            GpuQuantType::Q4K => &engine.swiglu_fused_q4k_pipeline,
+            GpuQuantType::Q1_0 => &engine.swiglu_fused_q1_0_pipeline,
+            other => panic!(
+                "build_swiglu_bg: unsupported quant type {other:?} for fused \
+                 SwiGLU — only Q4_K and Q1_0 have fused shaders. Add a new \
+                 `swiglu_fused_<quant>.wgsl` or fall back to un-fused \
+                 `gate_proj` + `up_proj` + silu_mul + `down_proj`."
+            ),
+        };
+        let layout = pipeline.get_bind_group_layout(0);
         let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -2728,6 +2768,7 @@ impl GpuModel {
             bg,
             dispatch_x,
             dispatch_y,
+            quant: gate_w.quant,
         }
     }
 
@@ -4600,7 +4641,7 @@ impl GpuModel {
 
             // --- FFN sub-block ---
             // Use the correct source of FFN bind groups based on layer type.
-            let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_down) =
+            let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_swiglu_quant, ffn_down) =
                 match self.layer_types[i] {
                     LayerType::Attention => {
                         let lbg = &self.layer_bgs[i];
@@ -4609,6 +4650,7 @@ impl GpuModel {
                             &lbg.swiglu.bg,
                             lbg.swiglu.dispatch_x,
                             lbg.swiglu.dispatch_y,
+                            lbg.swiglu.quant,
                             &lbg.down_proj,
                         )
                     }
@@ -4619,6 +4661,7 @@ impl GpuModel {
                             &dbg.swiglu.bg,
                             dbg.swiglu.dispatch_x,
                             dbg.swiglu.dispatch_y,
+                            dbg.swiglu.quant,
                             &dbg.down_proj,
                         )
                     }
@@ -4628,7 +4671,21 @@ impl GpuModel {
             cp.set_bind_group(0, ffn_norm, &[]);
             cp.dispatch_workgroups(1, 1, 1);
 
-            cp.set_pipeline(&self.engine.swiglu_fused_q4k_pipeline);
+            // Phase X.3.e.3.27 fix: SwiGLU dispatch selects the fused pipeline
+            // by the FFN weight quant type. Q4_K (Qwen 3.5) uses the 256-elem
+            // block kernel; Q1_0 (Bonsai 27B) uses the 18-byte block kernel.
+            // Bind group layouts are compatible across the two shaders (same
+            // storage buffer / uniform layout), so switching pipelines just
+            // reinterprets the weight bytes.
+            let ffn_swiglu_pipeline = match ffn_swiglu_quant {
+                GpuQuantType::Q4K => &self.engine.swiglu_fused_q4k_pipeline,
+                GpuQuantType::Q1_0 => &self.engine.swiglu_fused_q1_0_pipeline,
+                other => panic!(
+                    "encode_forward: unexpected SwiGLU quant {other:?} — \
+                     build_swiglu_bg should have panicked at load time."
+                ),
+            };
+            cp.set_pipeline(ffn_swiglu_pipeline);
             cp.set_bind_group(0, ffn_swiglu_bg, &[]);
             cp.dispatch_workgroups(ffn_swiglu_dx, ffn_swiglu_dy, 1);
 
@@ -5284,9 +5341,14 @@ impl GpuModel {
             r.rmsnorm_us += timed_dispatch(e, &e.rmsnorm_pipeline, &lbg.ffn_norm_bg, 1, 1, 1);
             r.rmsnorm_n += 1;
 
+            let swiglu_pipeline = match lbg.swiglu.quant {
+                GpuQuantType::Q4K => &e.swiglu_fused_q4k_pipeline,
+                GpuQuantType::Q1_0 => &e.swiglu_fused_q1_0_pipeline,
+                other => panic!("forward_profiled: unexpected SwiGLU quant {other:?}"),
+            };
             r.swiglu_us += timed_dispatch(
                 e,
-                &e.swiglu_fused_q4k_pipeline,
+                swiglu_pipeline,
                 &lbg.swiglu.bg,
                 lbg.swiglu.dispatch_x,
                 lbg.swiglu.dispatch_y,
@@ -5778,8 +5840,13 @@ impl GpuModel {
                 1,
                 0u8
             );
+            let ts_swiglu_pipeline = match lbg.swiglu.quant {
+                GpuQuantType::Q4K => &self.engine.swiglu_fused_q4k_pipeline,
+                GpuQuantType::Q1_0 => &self.engine.swiglu_fused_q1_0_pipeline,
+                other => panic!("forward_timestamped: unexpected SwiGLU quant {other:?}"),
+            };
             ts_dispatch!(
-                &self.engine.swiglu_fused_q4k_pipeline,
+                ts_swiglu_pipeline,
                 &lbg.swiglu.bg,
                 lbg.swiglu.dispatch_x,
                 lbg.swiglu.dispatch_y,
