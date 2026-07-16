@@ -113,6 +113,10 @@ fn main() {
     let max_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(256);
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let top_k: usize = parse_arg(&args, "--top-k").unwrap_or(40);
+    // Override the GGUF-provided `context_length` to shrink the KV cache
+    // allocation. Useful on memory-constrained targets (Jetson 8 GB
+    // unified) where the default 8192 causes OOM at load time.
+    let max_seq_len_override: Option<usize> = parse_arg(&args, "--max-seq-len");
     // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
     // the first N decoded tokens plus the prompt-end position (pos=-1).
     let logits_dump: usize = parse_arg(&args, "--logits-dump").unwrap_or(0);
@@ -161,7 +165,14 @@ fn main() {
             llama_cfg.rope_theta
         );
 
-        let config = gpu_config_from_llama3(&llama_cfg);
+        let mut config = gpu_config_from_llama3(&llama_cfg);
+        if let Some(override_len) = max_seq_len_override {
+            eprintln!(
+                "  Overriding max_seq_len: {} → {} (--max-seq-len)",
+                config.max_seq_len, override_len
+            );
+            config.max_seq_len = override_len;
+        }
 
         // --- GPU init ---
         let t_gpu = Instant::now();
