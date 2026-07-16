@@ -1915,11 +1915,34 @@ struct LayerWeightBufs {
 #[allow(dead_code)]
 struct DeltaNetLayerWeightBufs {
     attn_norm: GpuBuffer,
-    /// Fused in_proj for q, k, v, z: [qk_dim*2 + v_dim + v_dim, hidden_dim]
-    ssm_in: GpuWeightBuffer,
-    /// Causal conv1d kernel: [kernel_size, conv_dim]
+    /// Standard Qwen 3.5 fused in_proj for q, k, v, z: `[qk_dim*2 + v_dim*2, hidden]`.
+    /// `None` on Bonsai / Qwen 3.6-27B (which splits this into `attn_qkv` +
+    /// `attn_gate`); exactly one of `ssm_in` or `attn_qkv` is `Some` per layer.
+    ssm_in: Option<GpuWeightBuffer>,
+    /// Bonsai / Qwen 3.6-27B DeltaNet Q+K+V fused projection:
+    /// `[qk_dim * num_kv_heads * 2 + v_dim * num_v_heads, hidden]`
+    /// (10240 rows for Bonsai 27B). Together with `attn_gate` replaces the
+    /// standard Qwen 3.5 `ssm_in`.
+    attn_qkv: Option<GpuWeightBuffer>,
+    /// Bonsai / Qwen 3.6-27B DeltaNet Z (output-gate) projection:
+    /// `[v_dim * num_v_heads, hidden]` (6144 rows for Bonsai 27B).
+    attn_gate: Option<GpuWeightBuffer>,
+    /// Bonsai / Qwen 3.6 learnable SSM state-transition parameter, `[num_v_heads]` f32,
+    /// stored ≈ `-exp(A_log)` (Mamba convention, negative). Consumed by
+    /// `GpuPass::ssm_discretisation` in the Bonsai DeltaNet forward path.
+    ssm_a: Option<GpuBuffer>,
+    /// Bonsai / Qwen 3.6 SSM discretisation-step bias, `[num_v_heads]` f32.
+    /// Added to raw alpha projection before softplus, together with `ssm_a`.
+    ssm_dt_bias: Option<GpuBuffer>,
+    /// Bonsai / Qwen 3.6 SSM state RMSNorm weight, `[v_dim]` f32. Broadcast
+    /// across V heads and applied to `dn_delta_out` via
+    /// `GpuPass::ssm_norm_per_head` in the Bonsai DeltaNet forward path.
+    ssm_norm: Option<GpuBuffer>,
+    /// Causal conv1d kernel: `[kernel_size, conv_dim]`
     conv1d_weight: GpuBuffer,
-    conv1d_bias: GpuBuffer,
+    /// Causal conv1d bias: `[conv_dim]`. `None` on Bonsai (which omits the
+    /// bias tensor); Standard Qwen 3.5 GGUFs always have it.
+    conv1d_bias: Option<GpuBuffer>,
     /// Alpha (decay gate) projection
     alpha_proj: GpuWeightBuffer,
     /// Beta (update rate) projection
@@ -1936,7 +1959,14 @@ struct DeltaNetLayerWeightBufs {
 #[allow(dead_code)]
 struct DeltaNetLayerBGs {
     attn_norm_bg: wgpu::BindGroup,
-    ssm_in_proj: MatvecBG,
+    /// Standard Qwen 3.5 fused in_proj bind group. `None` on Bonsai / Qwen 3.6-27B.
+    ssm_in_proj: Option<MatvecBG>,
+    /// Bonsai / Qwen 3.6-27B fused Q+K+V projection bind group. `None` on
+    /// standard Qwen 3.5.
+    attn_qkv_proj: Option<MatvecBG>,
+    /// Bonsai / Qwen 3.6-27B Z (output-gate) projection bind group. `None`
+    /// on standard Qwen 3.5.
+    attn_gate_proj: Option<MatvecBG>,
     /// alpha decay-gate projection: `norm_buf → alpha_buf` (`[num_kv_heads]`).
     alpha_proj_mv: MatvecBG,
     /// beta update-rate projection: `norm_buf → beta_buf` (`[num_kv_heads]`).
@@ -2416,33 +2446,63 @@ impl GpuModel {
         // and DeltaNet SSM refinement pipelines (`ssm_a` / `ssm_dt_bias` /
         // `ssm_norm` consumers) that GpuModel does not yet implement.
         //
-        // Rather than panicking at a random `.unwrap()` inside `upload_w(...
-        // "ssm_in.weight" ...)` when `ssm_in` is absent from the Bonsai GGUF,
-        // fail fast here with an actionable error message so the caller
-        // knows to use the CPU forward path (`llama3.rs`) instead.
-        if gguf.tensor_info("blk.0.attn_qkv.weight").is_some()
-            || gguf.tensor_info("blk.0.attn_gate.weight").is_some()
-            || gguf.tensor_info("blk.0.ssm_a.weight").is_some()
-            || gguf.tensor_info("blk.0.ssm_dt_bias.weight").is_some()
-        {
-            panic!(
-                "Bonsai / Qwen 3.6-27B GPU forward is not yet supported.\n\
-                 \n\
-                 This GGUF contains Bonsai-style tensors (`attn_qkv` split, `attn_gate`, \n\
-                 or SSM refinement tensors `ssm_a` / `ssm_dt_bias` / `ssm_norm`) which \n\
-                 require gated attention shader support and DeltaNet SSM refinement \n\
-                 pipelines that GpuModel does not implement.\n\
-                 \n\
-                 Use the CPU forward path via `llama3::Llama3Model` instead:\n\
-                 \n\
-                     let mut model = alice_llm::llama3::Llama3Model::load(&gguf)?;\n\
-                     let logits = model.forward(&token_ids)?;\n\
-                 \n\
-                 CPU forward has full Bonsai support including Phase X.3.e.3 SSM\n\
-                 refinements and Q1_0 / Q2_0 NEON kernels (Bonsai 27B runs on Jetson\n\
-                 8GB at ~10s / token). See `docs/BONSAI_GPU_SUPPORT.md` for the\n\
-                 GPU implementation scope."
+        // Bonsai / Qwen 3.6-27B tensor layout detection.
+        //
+        // Bonsai splits the DeltaNet fused in_proj into `attn_qkv` + `attn_gate`
+        // (unlike standard Qwen 3.5 which uses `ssm_in`), and adds SSM
+        // refinement tensors `ssm_a` / `ssm_dt_bias` / `ssm_norm`. The GPU
+        // loader can now handle this layout — Phase 2 Step 1 (this PR) makes
+        // load succeed by loading Bonsai tensors into `Option<>` fields on
+        // `DeltaNetLayerWeightBufs` / `DeltaNetLayerBGs`.
+        //
+        // Forward path integration (Phase 2 Step 4) is separate work: the
+        // `encode_forward_impl` DeltaNet arm still fails fast when it
+        // encounters a Bonsai layer, pointing to the specific building block
+        // that needs to be wired (see `docs/BONSAI_GPU_SUPPORT.md`).
+        //
+        // The previous PR #77 unconditional fail-fast is removed in favor of
+        // this partial support (load succeeds, forward panics with clear
+        // per-op message).
+        // For Bonsai 27B (full_attention_interval=4) blk.0 is always a
+        // DeltaNet layer, so checking `blk.0.attn_qkv.weight` cleanly
+        // distinguishes the Bonsai layout from standard Qwen 3.5 (which
+        // exports `blk.0.ssm_in.weight` instead).
+        let is_bonsai_deltanet_gguf = gguf.tensor_info("blk.0.attn_qkv.weight").is_some();
+        if is_bonsai_deltanet_gguf {
+            eprintln!(
+                "[GpuModel] Bonsai / Qwen 3.6-27B tensor layout detected \
+                 (attn_qkv + attn_gate + SSM refinement tensors). Load will \
+                 succeed, but forward path is not yet fully wired — expect a \
+                 panic at DeltaNet layer forward with details about the \
+                 remaining Phase 2 Step 4 work. See docs/BONSAI_GPU_SUPPORT.md."
             );
+        }
+        // Full-attention Bonsai layout (attn_q with 2×q_dim rows for Q + swish
+        // gate) is not yet supported at the loader level. Detect and fail fast
+        // with a clear message pointing to Phase 2 Step 1 completion work.
+        // Bonsai full-attn tensors live at layers indicated by
+        // `full_attention_interval`; check the first such layer.
+        if let Some(interval) = config.full_attention_interval {
+            let full_attn_layer = interval - 1;
+            let expected_q_rows = config.num_heads * config.head_dim;
+            if let Some(info) = gguf.tensor_info(&format!("blk.{full_attn_layer}.attn_q.weight")) {
+                if info.dims[1] as u32 == expected_q_rows * 2 {
+                    panic!(
+                        "Bonsai / Qwen 3.6-27B full-attention Q+gate split \
+                         (attn_q with 2×q_dim rows) is not yet supported by \
+                         the GPU loader.\n\
+                         \n\
+                         This is Phase 2 Step 1 completion work — the loader \
+                         needs to split `attn_q [q_dim*2, hidden]` at load \
+                         time into two separate MatvecBGs (Q half and gate \
+                         half). Landed as separate PR.\n\
+                         \n\
+                         Meanwhile use the CPU forward path:\n\
+                         let mut model = alice_llm::llama3::Llama3Model::load(&gguf)?;\n\
+                         See docs/BONSAI_GPU_SUPPORT.md for scope details."
+                    );
+                }
+            }
         }
 
         // OOM prevention: estimate peak memory usage and log warning if projected
@@ -2593,9 +2653,65 @@ impl GpuModel {
                     let conv1d_w = gguf
                         .tensor_to_f32(&format!("blk.{i}.ssm_conv1d.weight"))
                         .unwrap();
-                    let conv1d_b = gguf
+                    // Bonsai / Qwen 3.6-27B GGUFs omit the conv1d bias tensor
+                    // (see PR #62 for the CPU-side treatment). Standard
+                    // Qwen 3.5 GGUFs always ship it. Load as Option and let
+                    // the forward path decide how to handle absence.
+                    let conv1d_b_opt = gguf
                         .tensor_to_f32(&format!("blk.{i}.ssm_conv1d.bias"))
-                        .unwrap();
+                        .map(|v| engine.upload_f32(&v));
+
+                    // Bonsai / Qwen 3.6-27B split the fused `ssm_in` into
+                    // `attn_qkv` + `attn_gate`. Exactly one of these layouts
+                    // is present in the GGUF; the loader picks accordingly.
+                    let has_attn_qkv = gguf
+                        .tensor_info(&format!("blk.{i}.attn_qkv.weight"))
+                        .is_some();
+                    let (ssm_in_opt, attn_qkv_opt, attn_gate_opt) = if has_attn_qkv {
+                        // Bonsai layout: two-tensor split.
+                        // Compute Bonsai-specific row counts:
+                        //   attn_qkv rows = qk_dim*num_kv_heads*2 + v_dim*num_v_heads
+                        //   attn_gate rows = v_dim * num_v_heads
+                        let qkv_rows =
+                            (dn_qk_dim * dn_num_kv_heads) * 2 + dn_v_dim * dn_num_v_heads;
+                        let gate_rows = dn_v_dim * dn_num_v_heads;
+                        (
+                            None,
+                            Some(upload_w(
+                                &format!("blk.{i}.attn_qkv.weight"),
+                                qkv_rows,
+                                config.hidden_dim,
+                            )),
+                            Some(upload_w(
+                                &format!("blk.{i}.attn_gate.weight"),
+                                gate_rows,
+                                config.hidden_dim,
+                            )),
+                        )
+                    } else {
+                        // Standard Qwen 3.5 layout: single fused ssm_in tensor.
+                        (
+                            Some(upload_w(
+                                &format!("blk.{i}.ssm_in.weight"),
+                                dn_in_proj_out,
+                                config.hidden_dim,
+                            )),
+                            None,
+                            None,
+                        )
+                    };
+
+                    // Bonsai SSM refinement tensors — all optional. Standard
+                    // Qwen 3.5 GGUFs omit these; Bonsai GGUFs include them.
+                    let ssm_a_opt = gguf
+                        .tensor_to_f32(&format!("blk.{i}.ssm_a.weight"))
+                        .map(|v| engine.upload_f32(&v));
+                    let ssm_dt_bias_opt = gguf
+                        .tensor_to_f32(&format!("blk.{i}.ssm_dt_bias.weight"))
+                        .map(|v| engine.upload_f32(&v));
+                    let ssm_norm_opt = gguf
+                        .tensor_to_f32(&format!("blk.{i}.ssm_norm.weight"))
+                        .map(|v| engine.upload_f32(&v));
 
                     deltanet_layer_weights.push(DeltaNetLayerWeightBufs {
                         attn_norm: engine.upload_f32(
@@ -2603,13 +2719,14 @@ impl GpuModel {
                                 .tensor_to_f32(&format!("blk.{i}.attn_norm.weight"))
                                 .unwrap(),
                         ),
-                        ssm_in: upload_w(
-                            &format!("blk.{i}.ssm_in.weight"),
-                            dn_in_proj_out,
-                            config.hidden_dim,
-                        ),
+                        ssm_in: ssm_in_opt,
+                        attn_qkv: attn_qkv_opt,
+                        attn_gate: attn_gate_opt,
+                        ssm_a: ssm_a_opt,
+                        ssm_dt_bias: ssm_dt_bias_opt,
+                        ssm_norm: ssm_norm_opt,
                         conv1d_weight: engine.upload_f32(&conv1d_w),
-                        conv1d_bias: engine.upload_f32(&conv1d_b),
+                        conv1d_bias: conv1d_b_opt,
                         alpha_proj: upload_w(
                             &format!("blk.{i}.ssm_alpha.weight"),
                             dn_num_kv_heads,
@@ -2889,6 +3006,10 @@ impl GpuModel {
 
         let mut layer_bgs = Vec::with_capacity(config.num_layers);
         let mut deltanet_bgs: Vec<DeltaNetLayerBGs> = Vec::new();
+        // Bonsai GGUFs omit the conv1d bias tensor; store zero-filled fallback
+        // buffers here so their lifetime extends past bind group creation.
+        // Populated only for Bonsai DeltaNet layers, empty for standard Qwen 3.5.
+        let mut bonsai_conv1d_bias_zero_buffers: Vec<GpuBuffer> = Vec::new();
         let mut dn_idx: usize = 0; // index into deltanet_layer_weights
         let mut attn_kv_idx: usize = 0; // index into k_caches/v_caches
 
@@ -3050,14 +3171,54 @@ impl GpuModel {
                         &norm_buf,
                         &rmsnorm_params_buf,
                     );
-                    let ssm_in_proj =
-                        Self::build_matvec_bg(&engine, &dlw.ssm_in, &norm_buf, &q_buf);
+                    // Standard Qwen 3.5 uses the fused `ssm_in`; Bonsai splits
+                    // it into `attn_qkv` + `attn_gate`. Build the corresponding
+                    // MatvecBGs only for the tensors that are present.
+                    let ssm_in_proj = dlw
+                        .ssm_in
+                        .as_ref()
+                        .map(|w| Self::build_matvec_bg(&engine, w, &norm_buf, &q_buf));
+                    // Bonsai: `attn_qkv` produces Q+K+V into q_buf, `attn_gate`
+                    // produces Z into v_buf. The output-buffer choice for
+                    // `attn_gate` follows the standard forward path's `z` slice
+                    // pattern (v_buf holds z for the deltanet recurrence).
+                    let attn_qkv_proj = dlw
+                        .attn_qkv
+                        .as_ref()
+                        .map(|w| Self::build_matvec_bg(&engine, w, &norm_buf, &q_buf));
+                    let attn_gate_proj = dlw
+                        .attn_gate
+                        .as_ref()
+                        .map(|w| Self::build_matvec_bg(&engine, w, &norm_buf, &v_buf));
+
                     let alpha_proj_mv =
                         Self::build_matvec_bg(&engine, &dlw.alpha_proj, &norm_buf, &alpha_buf);
                     let beta_proj_mv =
                         Self::build_matvec_bg(&engine, &dlw.beta_proj, &norm_buf, &beta_buf);
 
-                    // Conv1d bind group: x=q_buf, state=conv_state, weight/bias, out=k_buf
+                    // Conv1d bind group: x=q_buf, state=conv_state, weight/bias, out=k_buf.
+                    //
+                    // Bonsai GGUFs omit the conv1d bias tensor (dlw.conv1d_bias
+                    // is None). Since the WGSL shader expects a bias buffer at
+                    // binding 3, we allocate a zero-filled fallback of size
+                    // `conv_dim` for those layers. The Bonsai forward path is
+                    // not yet wired anyway (Phase 2 Step 4) — this allocation
+                    // is a no-op cost at load time, and the zero bias produces
+                    // mathematically equivalent output to omitting the bias
+                    // step in the CPU implementation.
+                    // Bonsai GGUFs omit the conv1d bias tensor. Push a
+                    // zero-filled fallback to the persistent Vec first, then
+                    // borrow from the Vec so the buffer outlives the bind
+                    // group creation.
+                    if dlw.conv1d_bias.is_none() {
+                        let zero = vec![0.0f32; dn_conv_dim as usize];
+                        bonsai_conv1d_bias_zero_buffers.push(engine.upload_f32(&zero));
+                    }
+                    let conv1d_bias_buf = dlw
+                        .conv1d_bias
+                        .as_ref()
+                        .unwrap_or_else(|| bonsai_conv1d_bias_zero_buffers.last().unwrap());
+
                     let conv1d_bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &conv1d_layout,
@@ -3076,7 +3237,7 @@ impl GpuModel {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: dlw.conv1d_bias.buffer.as_entire_binding(),
+                                resource: conv1d_bias_buf.buffer.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 4,
@@ -3158,6 +3319,8 @@ impl GpuModel {
                     deltanet_bgs.push(DeltaNetLayerBGs {
                         attn_norm_bg,
                         ssm_in_proj,
+                        attn_qkv_proj,
+                        attn_gate_proj,
                         alpha_proj_mv,
                         beta_proj_mv,
                         conv1d_bg,
@@ -3462,7 +3625,28 @@ impl GpuModel {
                     cp.dispatch_workgroups(1, 1, 1);
 
                     // 2. Fused in_proj: norm_buf → q_buf (contains q, k, v, z packed)
-                    Self::dispatch_mv(&self.engine, &mut cp, &dbg.ssm_in_proj);
+                    //
+                    // Standard Qwen 3.5 has `ssm_in_proj`. Bonsai / Qwen 3.6-27B
+                    // splits this into `attn_qkv_proj` + `attn_gate_proj` (loaded
+                    // at load time; forward wiring for the split path is
+                    // Phase 2 Step 4).
+                    match &dbg.ssm_in_proj {
+                        Some(mv) => Self::dispatch_mv(&self.engine, &mut cp, mv),
+                        None => {
+                            // Bonsai DeltaNet forward is not yet wired end-to-end.
+                            // The building-block shaders exist (see PR #78/#79/#80)
+                            // but the dispatch sequence is Phase 2 Step 4 work.
+                            panic!(
+                                "Bonsai / Qwen 3.6-27B DeltaNet forward path is \
+                                 not yet wired (Phase 2 Step 4 pending). Load \
+                                 succeeded — `attn_qkv` + `attn_gate` + SSM \
+                                 refinement tensors are all uploaded — but the \
+                                 dispatch sequence in `encode_forward_impl` \
+                                 still needs to route through them. Use CPU \
+                                 forward path (`llama3::Llama3Model`) meanwhile."
+                            );
+                        }
+                    }
 
                     // 2a. Alpha decay-gate projection: norm_buf → alpha_buf ([num_kv_heads]).
                     Self::dispatch_mv(&self.engine, &mut cp, &dbg.alpha_proj_mv);
