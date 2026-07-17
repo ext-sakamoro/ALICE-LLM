@@ -188,6 +188,73 @@ per-tensor noise that:
 - Verify `attn_norm.weight` / `kv_a_norm.weight` are stored as F32 in
   the GGUF (not Q6_K) — norm weights are small and shouldn't be quantized
 
+## Q5_K_M cross-check (2026-07-17 update)
+
+Downloaded `DeepSeek-V2-Lite-Chat.Q5_K_M.gguf` (mradermacher, 11.3 GB) and
+re-ran the same dump. Layer-0 attention weights (`attn_q`, `attn_kv_b`,
+`attn_output`) are Q5_K instead of Q4_K, so per-element quant noise
+drops from ~2-4% to ~1-1.5%. Norm weights (`attn_norm`, `ffn_norm`) are
+stored as F32 in both quant files, so any drift there comes from
+compute-side ops, not weight storage.
+
+Per-position `attn_out` sum diff versus HF bf16 oracle:
+
+| Pos | Q4_K_M | Q5_K_M | HF |
+|---:|---:|---:|---:|
+| 0 | +2.225 (Δ 0.011) | +2.294 (Δ 0.057) | +2.236 |
+| 1 | +1.359 (Δ 0.269) | +1.244 (Δ 0.154) | +1.090 |
+| 5 | +1.058 (Δ 1.028) | +1.266 (Δ 0.820) | +2.086 |
+| 11 | −0.740 (Δ 0.678) | −0.839 (Δ 0.777) | −0.062 |
+
+**Q5_K_M does not reduce the position-11 divergence** (Δ 0.777 vs Q4_K_M's
+Δ 0.678 — actually slightly larger). If quant noise were the primary
+driver, Q5_K would have cut the drift roughly in half. Instead it barely
+moves, and at position 0 Q5_K is actually farther from HF than Q4_K,
+suggesting Q4_K's larger noise coincidentally cancelled some structural
+error that Q5_K exposes.
+
+## Root cause (revised, 2026-07-17)
+
+**Structural divergence in the MLA forward path**, not quantization
+noise. The Q4_K → Q5_K test rules out per-element weight drift as the
+primary driver — a structural bug on ALICE-LLM's side is the remaining
+explanation.
+
+Confirmed characteristics:
+- Position 0 (single-position self-attention) matches HF within Q4_K
+  tolerance for pre-attention ops (embedding, RMSNorm, Q proj, KV LoRA)
+- Position 1+ shows monotonically growing `attn_out` divergence
+- Q5_K quant (lower per-element noise) does not close the gap
+
+Candidate root causes (highest likelihood first):
+
+1. **RoPE cache vs on-the-fly asymmetry** — ALICE-LLM stores `k_pe` in
+   the KV cache POST-RoPE (rotated at write time). HF may apply RoPE
+   on-the-fly at each attention forward using `position_ids`. If the
+   rotation angles differ by an offset (e.g. `pos` vs `pos - offset`),
+   historical Q·K dot products drift systematically
+2. **Softmax scale** — `1 / sqrt(qk_nope + qk_rope)` = `1/sqrt(192)`
+   should match HF's `self.softmax_scale`. Verify no mscale multiplier
+   is inadvertently applied for V2-Lite (DeepSeek-V2 uses mscale only
+   with YARN, which V2-Lite doesn't enable)
+3. **KV cache K/V slice extraction from `scratch_kv_up`** — layout is
+   `[head0_qk_nope(128), head0_v(128), head1_qk_nope(128), head1_v(128), ...]`.
+   Off-by-one indexing would produce systematic drift proportional to
+   position count
+4. **`kv_b_proj` matvec direction** — inspect whether `weight.T @ x` vs
+   `weight @ x` is applied consistently between write and read paths
+
+## Follow-up (open issue, updated priority)
+
+1. ✅ Q5_K_M cross-check completed — rules out quant noise as primary cause
+2. Compare ALICE post-RoPE `q_full` vs HF post-RoPE q at pos 1+ — need
+   a new HF hook after `apply_rotary_pos_emb` inside `DeepseekV2Attention`
+3. Compare `scratch_kv_up[head_off .. head_off+256]` per-head at
+   historical positions vs HF's expanded K/V — need dumps of the
+   per-position reconstructed K_nope and V from ALICE
+4. Once divergence is pin-pointed to one op, fix + rerun oracle to
+   verify token-exact match on Tokyo (33132)
+
 **Alternative** (lower confidence): subtle formula divergence in KV cache
 reconstruction. To rule out, need to add a hook that captures HF's
 per-position reconstructed K_nope + V and compare against ALICE's
