@@ -6,7 +6,7 @@ Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependen
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
-**Bonsai 27B Q1_0 (Ternary, 3.8 GB) on Apple M3 Metal: coherent generation at 1.1 tok/s (Phase X.3.e.3.27 Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix).**
+**Bonsai 27B Q1_0 (1.125 bpw binary, 3.6 GB GGUF) on Apple M3 Metal: coherent generation at 1.1 tok/s (Phase X.3.e.3.27 Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix).**
 
 **Qwen 3.5-4B hybrid (DeltaNet + Full Attention) on Apple M3 Metal: coherent generation at 2.9 tok/s (Q4_K_M mixed quant with Q5_K/Q8_0 shader coverage).**
 
