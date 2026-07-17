@@ -909,12 +909,22 @@ impl Llama3Config {
             let kv_lora_rank = gguf
                 .meta_u32(&format!("{prefix}.attention.kv_lora_rank"))
                 .map(|v| v as usize);
-            let qk_nope_head_dim = gguf
+            let key_length = gguf
                 .meta_u32(&format!("{prefix}.attention.key_length"))
                 .map(|v| v as usize);
             let qk_rope_head_dim = gguf
                 .meta_u32(&format!("{prefix}.rope.dimension_count"))
                 .map(|v| v as usize);
+            // V2 / V2-Lite (no q_lora_rank) stores the **full** Q per-head
+            // dim as `attention.key_length` (nope + rope combined), while
+            // V2.5 / V3 / R1 (with q_lora_rank) store only the nope portion
+            // there. Split them apart so `qk_nope + qk_rope` matches the
+            // actual `attn_q.weight` per-head width in both branches.
+            let qk_nope_head_dim = if q_lora_rank.is_none() {
+                key_length.zip(qk_rope_head_dim).map(|(kl, rope)| kl - rope)
+            } else {
+                key_length
+            };
             let v_head_dim = gguf
                 .meta_u32(&format!("{prefix}.attention.value_length"))
                 .map(|v| v as usize);
@@ -2798,12 +2808,9 @@ impl<'a> LayerWeights<'a> {
 /// FFN weights are `Option` because MoE layers omit them entirely.
 struct DeepSeekV3LayerWeights<'a> {
     attn_norm: Vec<f32>,
-    /// Q LoRA down projection: `hidden → q_lora_rank`.
-    q_a_proj: WeightRef<'a>,
-    /// RMSNorm applied to the `q_lora_rank` intermediate before `q_b_proj`.
-    q_a_norm: Vec<f32>,
-    /// Q LoRA up projection: `q_lora_rank → num_heads * (qk_nope + qk_rope)`.
-    q_b_proj: WeightRef<'a>,
+    /// Q projection: dense (V2 / V2-Lite) or LoRA (V2.5 / V3 / R1).
+    /// See [`DeepSeekQProjection`] for the family-specific layout.
+    q: DeepSeekQProjection<'a>,
     /// Fused KV LoRA down + MQA k_pe projection:
     /// `hidden → (kv_lora_rank + qk_rope_head_dim)`.
     kv_a_proj_with_mqa: WeightRef<'a>,
@@ -2826,6 +2833,28 @@ struct DeepSeekV3LayerWeights<'a> {
     // ── MoE (present only for layers ≥ `first_k_dense_replace`) ─────────
     /// DeepSeek-V3 MoE weights (Phase 3). `None` for dense layers.
     moe: Option<DeepSeekMoeWeights<'a>>,
+}
+
+/// Family-specific Q projection layout for DeepSeek variants (Issue #58).
+///
+/// - **`Dense`** — V2 / V2-Lite (16B / 1.6B active): single `attn_q.weight`
+///   matvec `hidden → num_heads * (qk_nope + qk_rope)`, no LoRA compression.
+/// - **`LoRA`** — V2.5 / V3 (671B) / R1: two-stage projection with a
+///   `q_a_proj → q_a_norm → q_b_proj` chain through the `q_lora_rank`
+///   bottleneck (typically 1536).
+///
+/// KV projection stays LoRA across the entire family so it lives outside
+/// this enum. V2-Lite's `deepseek2.attention.q_lora_rank` metadata key is
+/// absent, which the loader keys on to pick the `Dense` variant.
+enum DeepSeekQProjection<'a> {
+    /// V2 / V2-Lite dense Q: `[num_heads * (qk_nope + qk_rope), hidden_dim]`.
+    Dense { q_proj: WeightRef<'a> },
+    /// V2.5 / V3 / R1 LoRA Q: `[q_lora_rank, hidden]` → norm → `[num_heads * (qk_nope + qk_rope), q_lora_rank]`.
+    LoRA {
+        q_a_proj: WeightRef<'a>,
+        q_a_norm: Vec<f32>,
+        q_b_proj: WeightRef<'a>,
+    },
 }
 
 /// DeepSeek-V3 MoE weight bundle for one non-dense layer.
@@ -3573,13 +3602,25 @@ impl<'a> Llama3Model<'a> {
         let mut norm_buf = vec![0.0f32; hidden_dim];
         rms_norm(&hidden, &block.attn_norm, c.norm_eps, &mut norm_buf);
 
-        // Q LoRA chain.
+        // Q LoRA chain. MTP is a V3-only feature (V2 / V2-Lite ship no MTP
+        // head), so we assume LoRA here and treat Dense as unreachable.
         let mut q_a_buf = vec![0.0f32; q_lora_rank];
         let mut q_a_normed = vec![0.0f32; q_lora_rank];
         let mut q_full = vec![0.0f32; num_heads * q_head_total];
-        block.q_a_proj.matvec(&norm_buf, &mut q_a_buf);
-        rms_norm(&q_a_buf, &block.q_a_norm, c.norm_eps, &mut q_a_normed);
-        block.q_b_proj.matvec(&q_a_normed, &mut q_full);
+        match &block.q {
+            DeepSeekQProjection::LoRA {
+                q_a_proj,
+                q_a_norm,
+                q_b_proj,
+            } => {
+                q_a_proj.matvec(&norm_buf, &mut q_a_buf);
+                rms_norm(&q_a_buf, q_a_norm, c.norm_eps, &mut q_a_normed);
+                q_b_proj.matvec(&q_a_normed, &mut q_full);
+            }
+            DeepSeekQProjection::Dense { .. } => {
+                unreachable!("MTP head is V3-only; V2 / V2-Lite never load a dense-Q MTP block")
+            }
+        }
 
         // KV LoRA chain: kv_a plus shared k_pe.
         let mut kv_a_full = vec![0.0f32; kv_lora_rank + qk_rope];
@@ -5407,7 +5448,11 @@ impl<'a> Llama3Model<'a> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
         let num_heads = c.num_heads;
-        let q_lora_rank = c.deepseek_q_lora_rank().expect("q_lora_rank");
+        // q_lora_rank is optional — absent on V2 / V2-Lite where the Q
+        // projection is dense (Issue #58). Use 0 as sentinel when unused so
+        // the per-layer scratch alloc stays simple; the match on
+        // `layer.q` decides whether to touch those buffers at all.
+        let q_lora_rank = c.deepseek_q_lora_rank().unwrap_or(0);
         let kv_lora_rank = c.deepseek_kv_lora_rank().expect("kv_lora_rank");
         let qk_nope = c.deepseek_qk_nope_head_dim().expect("qk_nope_head_dim");
         let qk_rope = c.deepseek_qk_rope_head_dim().expect("qk_rope_head_dim");
@@ -5428,7 +5473,8 @@ impl<'a> Llama3Model<'a> {
         let emb_start = token_id as usize * hidden_dim;
         let mut hidden: Vec<f32> = self.embedding[emb_start..emb_start + hidden_dim].to_vec();
 
-        // Scratch buffers reused across layers.
+        // Scratch buffers reused across layers. `q_a_buf` / `q_a_normed` are
+        // only touched by the LoRA branch; length 0 for V2 / V2-Lite dense.
         let mut norm_buf = vec![0.0f32; hidden_dim];
         let mut q_a_buf = vec![0.0f32; q_lora_rank];
         let mut q_a_normed = vec![0.0f32; q_lora_rank];
@@ -5448,10 +5494,21 @@ impl<'a> Llama3Model<'a> {
             // ── Attention block ───────────────────────────────────────
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
 
-            // Q LoRA chain.
-            layer.q_a_proj.matvec(&norm_buf, &mut q_a_buf);
-            rms_norm(&q_a_buf, &layer.q_a_norm, c.norm_eps, &mut q_a_normed);
-            layer.q_b_proj.matvec(&q_a_normed, &mut q_full);
+            // Q projection: dense (V2 / V2-Lite) or LoRA (V2.5 / V3 / R1).
+            match &layer.q {
+                DeepSeekQProjection::Dense { q_proj } => {
+                    q_proj.matvec(&norm_buf, &mut q_full);
+                }
+                DeepSeekQProjection::LoRA {
+                    q_a_proj,
+                    q_a_norm,
+                    q_b_proj,
+                } => {
+                    q_a_proj.matvec(&norm_buf, &mut q_a_buf);
+                    rms_norm(&q_a_buf, q_a_norm, c.norm_eps, &mut q_a_normed);
+                    q_b_proj.matvec(&q_a_normed, &mut q_full);
+                }
+            }
 
             // KV LoRA chain: single matvec produces the compressed latent
             // `kv_a` plus the shared positional slice `k_pe`.
@@ -9084,8 +9141,9 @@ fn load_deepseek_v3_layer_weights<'a>(
 
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
 
-    // MLA dimensions from the config metadata.
-    let q_lora_rank = config.deepseek_q_lora_rank()?;
+    // MLA dimensions from the config metadata. `q_lora_rank` is optional —
+    // absent on V2 / V2-Lite (Issue #58), which use a dense `attn_q.weight`
+    // matvec instead of the two-stage LoRA chain used by V2.5 / V3 / R1.
     let kv_lora_rank = config.deepseek_kv_lora_rank()?;
     let qk_nope_head_dim = config.deepseek_qk_nope_head_dim()?;
     let qk_rope_head_dim = config.deepseek_qk_rope_head_dim()?;
@@ -9094,19 +9152,34 @@ fn load_deepseek_v3_layer_weights<'a>(
     let q_head_total = qk_nope_head_dim + qk_rope_head_dim;
     let kv_up_head_total = qk_nope_head_dim + v_head_dim;
 
-    let q_a_proj = load_weight_ref(
-        gguf,
-        &format!("{prefix}.attn_q_a.weight"),
-        q_lora_rank,
-        config.hidden_dim,
-    )?;
-    let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
-    let q_b_proj = load_weight_ref(
-        gguf,
-        &format!("{prefix}.attn_q_b.weight"),
-        config.num_heads * q_head_total,
-        q_lora_rank,
-    )?;
+    let q = if let Some(q_lora_rank) = config.deepseek_q_lora_rank() {
+        let q_a_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q_a.weight"),
+            q_lora_rank,
+            config.hidden_dim,
+        )?;
+        let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
+        let q_b_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q_b.weight"),
+            config.num_heads * q_head_total,
+            q_lora_rank,
+        )?;
+        DeepSeekQProjection::LoRA {
+            q_a_proj,
+            q_a_norm,
+            q_b_proj,
+        }
+    } else {
+        let q_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q.weight"),
+            config.num_heads * q_head_total,
+            config.hidden_dim,
+        )?;
+        DeepSeekQProjection::Dense { q_proj }
+    };
     let kv_a_proj_with_mqa = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_kv_a_mqa.weight"),
@@ -9235,9 +9308,7 @@ fn load_deepseek_v3_layer_weights<'a>(
 
     Some(DeepSeekV3LayerWeights {
         attn_norm,
-        q_a_proj,
-        q_a_norm,
-        q_b_proj,
+        q,
         kv_a_proj_with_mqa,
         kv_a_norm,
         kv_b_proj,
@@ -9343,7 +9414,6 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
     // call site. This helper is used by exactly one caller (MTP), so a
     // targeted duplicate keeps the diff surgical.
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
-    let q_lora_rank = config.deepseek_q_lora_rank()?;
     let kv_lora_rank = config.deepseek_kv_lora_rank()?;
     let qk_nope_head_dim = config.deepseek_qk_nope_head_dim()?;
     let qk_rope_head_dim = config.deepseek_qk_rope_head_dim()?;
@@ -9351,19 +9421,34 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
     let q_head_total = qk_nope_head_dim + qk_rope_head_dim;
     let kv_up_head_total = qk_nope_head_dim + v_head_dim;
 
-    let q_a_proj = load_weight_ref(
-        gguf,
-        &format!("{prefix}.attn_q_a.weight"),
-        q_lora_rank,
-        config.hidden_dim,
-    )?;
-    let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
-    let q_b_proj = load_weight_ref(
-        gguf,
-        &format!("{prefix}.attn_q_b.weight"),
-        config.num_heads * q_head_total,
-        q_lora_rank,
-    )?;
+    let q = if let Some(q_lora_rank) = config.deepseek_q_lora_rank() {
+        let q_a_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q_a.weight"),
+            q_lora_rank,
+            config.hidden_dim,
+        )?;
+        let q_a_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_q_a_norm.weight"))?;
+        let q_b_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q_b.weight"),
+            config.num_heads * q_head_total,
+            q_lora_rank,
+        )?;
+        DeepSeekQProjection::LoRA {
+            q_a_proj,
+            q_a_norm,
+            q_b_proj,
+        }
+    } else {
+        let q_proj = load_weight_ref(
+            gguf,
+            &format!("{prefix}.attn_q.weight"),
+            config.num_heads * q_head_total,
+            config.hidden_dim,
+        )?;
+        DeepSeekQProjection::Dense { q_proj }
+    };
     let kv_a_proj_with_mqa = load_weight_ref(
         gguf,
         &format!("{prefix}.attn_kv_a_mqa.weight"),
@@ -9453,9 +9538,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
 
     Some(DeepSeekV3LayerWeights {
         attn_norm,
-        q_a_proj,
-        q_a_norm,
-        q_b_proj,
+        q,
         kv_a_proj_with_mqa,
         kv_a_norm,
         kv_b_proj,
