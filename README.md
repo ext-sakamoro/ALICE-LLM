@@ -2,7 +2,9 @@
 
 **English** | [日本語](README_JP.md)
 
-Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 326 tests.
+Pure Rust LLM inference engine focused on understanding and optimizing every layer of inference—from GGUF parsing to SIMD, GPU kernels, speculative decoding, and hybrid architectures. Built as a research and engineering project rather than a wrapper around existing ML frameworks.
+
+GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
