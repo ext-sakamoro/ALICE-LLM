@@ -18,6 +18,8 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、326 テスト�
 
 **arm64 8 GiB board (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.3 tok/s (CPU-only `--hybrid` の 3.3 倍高速) — `attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
 
+**Ornith-1.0-9B (DeepReinforce 製、MIT、Qwen 3.5 fine-tune で agentic coding 特化): Apple Silicon CPU (1.8 tok/s) / Apple Silicon Metal iGPU (2.1 tok/s) / arm64 8 GiB board CPU (2.3 tok/s) の 3 環境で zero-config load-and-run 確認 — `general.architecture = qwen35` で自動検出、Phase X.3.e.3.14-29 の CPU/GPU fix が fine-tune にも cascade 適用。**
+
 ## クイックスタート
 
 ```bash
@@ -65,7 +67,7 @@ cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
 - **GGUF v3 パーサー** — ゼロコピー mmap 重み読み込み
 - **Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32** 量子化（全GGML K-quant型対応）
 - **llama.cpp互換** — Q2_K–Q6_K×Q8_K 整数内積（`ggml_vec_dot_q*_K_q8_K` と一致、±0.03 logits）
-- **マルチアーキテクチャ** — Llama-3/3.1/3.2、Mistral（スライディングウィンドウ）、Gemma-2（ソフトキャッピング）、**Qwen 2 / 2.5（QKV bias）、Qwen 3（per-head QK RMSNorm）、Qwen 3.5 ハイブリッド（DeltaNet linear attention + full attention）、Gemma 3n（Laurel / AltUp / per-layer embedding）、Gemma 4（SWA half head_dim）、MoE（Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B）** — すべて自動検出
+- **マルチアーキテクチャ** — Llama-3/3.1/3.2、Mistral（スライディングウィンドウ）、Gemma-2（ソフトキャッピング）、**Qwen 2 / 2.5（QKV bias）、Qwen 3（per-head QK RMSNorm）、Qwen 3.5 ハイブリッド（DeltaNet linear attention + full attention、Ornith-1.0 等の downstream fine-tune 検証済）、Gemma 3n（Laurel / AltUp / per-layer embedding）、Gemma 4（SWA half head_dim）、MoE（Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B）** — すべて自動検出
 - **DeltaNet CPU forward** — Qwen 3.5 Gated Linear Attention（causal conv1d + gated delta rule + recurrent state）、WGSL GPU shader と bit-for-bit 一致
 - **Tied embeddings** — Llama-3.2-1B/3B の出力射影を量子化 `token_embd.weight` で実行（Q6_K matvec）
 - **BPE トークナイザ** — GGUFメタデータからGPT-2バイトエンコーディング、GGUF `token_type` と SentencePiece byte-fallback 用の named constants
