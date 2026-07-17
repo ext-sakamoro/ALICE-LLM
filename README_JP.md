@@ -6,7 +6,7 @@ Pure Rust LLM推論エンジン。GGUF量子化モデル、外部MLライブラ�
 
 **GPU (wgpu/Metal): 125ms → 71ms/トークン (1B)、バッチ4投機的デコード: 1Bドラフト + 8B検証 = 5.89倍高速化、受理率90%。**
 
-**Bonsai 27B Q1_0 (Ternary、3.8 GB) が Apple Silicon Metal で coherent 生成 1.1 tok/s (Phase X.3.e.3.27、Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix)。**
+**Bonsai 27B Q1_0 (1.125 bpw binary、3.6 GB GGUF) が Apple Silicon Metal で coherent 生成 1.1 tok/s (Phase X.3.e.3.27、Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix)。**
 
 **Qwen 3.5-4B ハイブリッド (DeltaNet + フルアテンション) が Apple Silicon Metal で coherent 生成 2.9 tok/s (Q4_K_M 混合量子化を Q5_K/Q8_0 shader でカバー)。**
 
@@ -63,17 +63,21 @@ cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
 - **GGUF v3 パーサー** — ゼロコピー mmap 重み読み込み
 - **Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32** 量子化（全GGML K-quant型対応）
 - **llama.cpp互換** — Q2_K–Q6_K×Q8_K 整数内積（`ggml_vec_dot_q*_K_q8_K` と一致、±0.03 logits）
-- **マルチアーキテクチャ** — Llama-3/3.1/3.2、Mistral（スライディングウィンドウ）、Gemma-2（ソフトキャッピング）、自動検出
+- **マルチアーキテクチャ** — Llama-3/3.1/3.2、Mistral（スライディングウィンドウ）、Gemma-2（ソフトキャッピング）、**Qwen 2 / 2.5（QKV bias）、Qwen 3（per-head QK RMSNorm）、Qwen 3.5 ハイブリッド（DeltaNet linear attention + full attention）、Gemma 3n（Laurel / AltUp / per-layer embedding）、Gemma 4（SWA half head_dim）、MoE（Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B）** — すべて自動検出
+- **DeltaNet CPU forward** — Qwen 3.5 Gated Linear Attention（causal conv1d + gated delta rule + recurrent state）、WGSL GPU shader と bit-for-bit 一致
 - **Tied embeddings** — Llama-3.2-1B/3B の出力射影を量子化 `token_embd.weight` で実行（Q6_K matvec）
-- **BPE トークナイザ** — GGUFメタデータからGPT-2バイトエンコーディング
+- **BPE トークナイザ** — GGUFメタデータからGPT-2バイトエンコーディング、GGUF `token_type` と SentencePiece byte-fallback 用の named constants
 - **Contiguous + Paged KVキャッシュ** — ロールバック付きフラットバッファ、または16トークン/ページのオンデマンド確保
 - **Continuous batching** — ラウンドロビンスケジューラ、リクエスト単位のPagedKvCache
 - **投機的デコード** — レイヤースキップドラフト + デュアルモデル（1B→8B） + 確率的サンプリング（Leviathan et al.）
 - **RoPE周波数スケーリング** — `rope_freqs.weight` テンソルによるNTK-awareコンテキスト拡張（Llama-3.1/3.2）
 - **LLVM自動ベクトル化** — `target-cpu=native` でARM SDOT命令生成（Q4_K内積で37個のsdot）
+- **x86_64 SIMD（AVX2 + AVX-512BW/F）** — Q4_K / Q5_K / Q6_K / Q8_0 / Ternary の内積カーネル、runtime CPU-feature dispatch（`is_x86_feature_detected!` を `OnceLock` で cache）、AVX-512 は Ternary bitmask path で `__mmask16` 使用
 - **スパースターナリ** — N:M構造化スパース性、2-bitパック、LUT+SDOT最適化、ブロックパックレイアウト
-- **GPU推論 (wgpu)** — Metal/Vulkan/DX12コンピュートシェーダー、Q4_K/Q6_K脱量子化融合matvec、融合SwiGLU、バッチ4投機的デコード、トークン単位メモリ確保ゼロ、サブグループSIMDリダクション
+- **GPU推論 (wgpu)** — Metal/Vulkan/DX12コンピュートシェーダー、Q4_K / **Q5_K** / Q6_K / **Q8_0** / **Q1_0** 脱量子化融合matvec、**融合 SwiGLU（Q4_K と Q1_0 の 2 variant）**、バッチ4投機的デコード、トークン単位メモリ確保ゼロ、サブグループSIMDリダクション、**DeltaNet SSM path（alpha / beta / conv1d / gated delta rule with Bonsai Gap-B refinement）を Qwen 3.5 / Qwen 3.6 / Bonsai 27B ハイブリッドで動作**
+- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) が DeltaNet 層を CPU、Attention 層を GPU に分割、hidden state を `write_f32` / `read_f32` 経由で per-token 交換。将来の attention-only load path と組合わせれば arm64 board-class の unified-memory 環境で wgpu-hal Vulkan の 2× 重複コピーを回避可能
 - **Ternary QAT** — STE、L1正則化、AdamW、レイヤー単位混合精度
+- **God-object-free config** — `Llama3Config`（38 → 16 fields）と `LayerWeights`（33 → 17 fields）を凝集性の高い sub-struct（`AttentionExtrasConfig`、`SsmDeltaNetConfig`、`MoeConfig`、`Gemma3nConfig`、`Gemma4Config`、`QwenAttentionBiases`、`QwenAttentionNorms`、`Gemma3nLayerAugmentations`、`MoeExpertWeights`）に分割、backward-compat な accessor method 経由でアクセス
 - **フラットキャッシュアラインド `Matrix<T>`** — 単一連続 `Vec<T>` の row-major レイアウトが `Vec<Vec<T>>` を置き換え、`matmul_flat` は FMA `mul_add` を `j` 連続 inner loop で使用しキャッシュラインを coalescing
 - **部分ソートサンプリング** — `top_k_filter` が `select_nth_unstable_by` による O(N) の K 番目選択を採用、10 万規模の大語彙でもコスト維持
 - **オプション SIMD (`--features simd`)** — `wide::f32x8` chunked dot 積 + FMA `mul_add` + scalar tail 処理、ARM NEON と x86_64 AVX2 の両方を `wide` 経由でルーティング
@@ -168,7 +172,7 @@ K=4 (バッチ):   101 ms/4トークン (25.3 ms/トークン, 39.5 tok/s)
 
 ### Bonsai 27B Q1_0 を arm64 8 GiB board で動かす (Vulkan iGPU)
 
-PrismML の Bonsai 27B は 3.6 GB の Q1_0 GGUF (post-training binary g128 ternary quantization) で出荷される。ALICE-LLM の Q1_0 wgpu path は最大レイヤーの matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) を CPU NEON 20 ms から GPU Vulkan sub-ms まで持っていく:
+PrismML の Bonsai 27B は 3.6 GB の Q1_0 GGUF (post-training 1.125 bpw binary quantization、per-block 128 elements、18 bytes/block = 2 byte f16 scale `d` + 16 byte packed 1-bit weights、value = ±d) で出荷される。ALICE-LLM の Q1_0 wgpu path は最大レイヤーの matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) を CPU NEON 20 ms から GPU Vulkan sub-ms まで持っていく:
 
 | Step | カーネル | µs/matvec | vs CPU | 前 step 比 | 帯域利用 |
 |:---:|:---|---:|---:|---:|---:|
