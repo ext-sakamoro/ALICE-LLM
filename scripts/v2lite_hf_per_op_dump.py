@@ -71,6 +71,23 @@ def main():
     input_norm = layer0.input_layernorm
     post_attn_norm = layer0.post_attention_layernorm
 
+    # Monkey-patch apply_rotary_pos_emb to capture post-RoPE q_pe / k_pe.
+    # DeepSeek-V2 modeling file loaded via trust_remote_code; grab module
+    # name from the loaded attention class.
+    import importlib
+    ds_mod = importlib.import_module(type(attn).__module__)
+    orig_apply_rope = ds_mod.apply_rotary_pos_emb
+
+    def apply_rope_capture(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+        caps["q_pe_pre_rope"] = q.detach()
+        caps["k_pe_pre_rope"] = k.detach()
+        q_rot, k_rot = orig_apply_rope(q, k, cos, sin, position_ids, unsqueeze_dim=unsqueeze_dim)
+        caps["q_pe_post_rope"] = q_rot.detach()
+        caps["k_pe_post_rope"] = k_rot.detach()
+        return q_rot, k_rot
+
+    ds_mod.apply_rotary_pos_emb = apply_rope_capture
+
     def hook_hidden_in(module, inputs, outputs):
         # input_layernorm input = the hidden after embedding + optional norm
         # inputs is a tuple; V2-Lite embedding lookup is upstream
@@ -137,12 +154,17 @@ def main():
 
     with open(args.output, "w") as f:
         for op_name, tensor in caps.items():
-            # tensor shape (batch=1, seq=n, ...) — dump every position so
-            # ALICE-LLM's per-pos dumps line up with matching pos values.
-            if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.shape[1] == n:
+            # 3D (batch, seq, hidden): standard linear output
+            if tensor.dim() == 3 and tensor.shape[0] == 1 and tensor.shape[1] == n:
                 for pos in range(n):
-                    line = summary(tensor[0, pos], "hf", pos, 0, op_name)
-                    f.write(line + "\n")
+                    f.write(summary(tensor[0, pos], "hf", pos, 0, op_name) + "\n")
+            # 4D (batch, num_heads, seq, head_dim): post-RoPE q_pe / k_pe
+            elif tensor.dim() == 4 and tensor.shape[0] == 1 and tensor.shape[2] == n:
+                for pos in range(n):
+                    # Flatten across heads for parity with ALICE-LLM's full
+                    # q_full_post_rope (which is num_heads * head_dim concatenated).
+                    per_pos = tensor[0, :, pos, :].contiguous().flatten()
+                    f.write(summary(per_pos, "hf", pos, 0, op_name) + "\n")
             else:
                 # scalar or non-per-position tensor — dump once at pos=-1
                 f.write(summary(tensor, "hf", -1, 0, op_name) + "\n")

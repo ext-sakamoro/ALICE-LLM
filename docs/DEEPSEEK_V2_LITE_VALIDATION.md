@@ -268,6 +268,50 @@ per-position reconstructed K_nope + V and compare against ALICE's
 - If Q8_0 matches: document as a known quant tolerance issue, close #36
   V2-Lite scope
 
+## Post-RoPE + pre-RoPE k_pe capture (2026-07-17 追加)
+
+HF DeepSeek-V2 の `apply_rotary_pos_emb` を monkey-patch して pre/post
+RoPE の q_pe / k_pe を capture する経路を実装。ALICE の `k_pe_pre_rope`
+と HF の `k_pe_pre_rope` を pos 0 (RoPE 恒等) で直接比較:
+
+```
+ALICE k_pe_pre_rope pos 0: head [−0.055, +0.041, −0.058, +0.009, +0.067], l2 16.70, sum +15.34
+HF    k_pe_pre_rope pos 0: head [−0.035, +0.024, +0.075, +0.008, +0.031], l2 11.35, sum −9.62
+```
+
+**k_pe の element-wise が異なる**: l2 47% 差、sum 符号反転。両 engine とも
+`kv_a_proj_with_mqa` 出力の last 64 elements を k_pe として抽出しているが、
+値が根本的に違う (Q4_K quant noise の範疇を大幅超過)
+
+一方、`kv_a_full[0..5]` (element-wise) も divergent:
+
+```
+ALICE kv_a_full[0..5] pos 0: [+0.105, −0.294, +0.038, −0.259, +0.182]
+HF    kv_a_full[0..5] pos 0: [+0.231, −0.037, +0.094, −0.243, +0.191]
+```
+
+要素 3, 4 は 5% 以内で match、要素 0, 1, 2 は 2-8× 差 一方 l2 と sum は
+Q4_K tolerance 内で近い (l2 24.23 vs 24.37、sum 35.76 vs 39.29)
+
+要 element-wise divergent でも `kv_a_normed` (RMSNorm 後) は一致するのは、
+RMSNorm の `x[i] * w[i] / rms(x)` で分母 rms(x) が scale drift を打ち消し
+directional error のみが残るため k_pe は RMSNorm 経由しないので raw
+element-wise error がそのまま attention に流れる
+
+## Root cause 再更新 (2026-07-17)
+
+現在の hypothesis: ALICE-LLM の **Q4_K dequant が `kv_a_proj_with_mqa.weight`
+に対して HF (safetensors bf16 直読み) と異なる element-wise 結果**を生む
+
+- `kv_a_normed` (norm 後 512-dim) は match するので、rows [0..512] は
+  overall direction 一致
+- `k_pe` (raw last 64) は不一致
+- rows [0..512] は match、rows [512..576] は違う → **row-block ごとの
+  Q4_K dequant で block 2 (rows 512-575) が誤解読** の可能性
+
+**次段の verification**: Q8_0 quant (per-element noise ~0.4%) で同じ diff
+実施 Q8_0 で match すれば Q4_K dequant bug 確定、diverge すれば別 root cause
+
 ## Full HF oracle result
 
 Saved at `/notebooks/v2lite_oracle_result.json` on Paperspace instance
