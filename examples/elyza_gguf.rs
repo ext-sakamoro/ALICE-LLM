@@ -169,6 +169,13 @@ fn main() {
         "gemma2" | "gemma3" | "gemma3n" => format!(
             "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
         ),
+        // DeepSeek-V2 / V3 / R1: ChatML-style role-tagged template. Using
+        // the Llama-3 fallback template on deepseek2 GGUF produces ~30
+        // junk tokens for a 2-char prompt because DeepSeek's tokenizer
+        // has no `<|start_header_id|>` etc. and falls back to byte-level.
+        "deepseek2" => format!(
+            "User: {prompt}\n\nAssistant:"
+        ),
         _ => format!(
             "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         ),

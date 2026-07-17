@@ -5553,7 +5553,11 @@ impl<'a> Llama3Model<'a> {
             // slice lines up with `q_pe` at attention time.
             cache_entry[kv_lora_rank..].copy_from_slice(k_pe_shared);
             self.kv_cache.append(layer_idx, &cache_entry, &cache_entry);
-            self.kv_cache.advance();
+            // NB: `KvCache::advance()` bumps the shared `seq_len` counter and
+            // must be called **once** after all layers have appended (see doc
+            // comment on `advance`). Do NOT call it inside the layer loop —
+            // that would grow seq_len by `num_layers` per token and produce
+            // O(N²) KV cache lookups on subsequent forwards.
 
             // Attention: for each history position `t`, dot each head's Q
             // against the reconstructed K, softmax, weighted sum over V.
@@ -5647,6 +5651,12 @@ impl<'a> Llama3Model<'a> {
                 }
             }
         }
+
+        // Bump the shared position exactly once per token forward (Issue #58).
+        // See the doc comment on `KvCache::advance` — this must be called
+        // outside the layer loop, otherwise `seq_len` grows by `num_layers`
+        // per token and the next attention pass fans out to O(N²) matvecs.
+        self.kv_cache.advance();
 
         // Output norm + logits.
         rms_norm(&hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
