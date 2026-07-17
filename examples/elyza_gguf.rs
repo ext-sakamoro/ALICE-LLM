@@ -198,7 +198,15 @@ fn main() {
     // dump to stderr. Bypasses speculative / ternary generate() paths to keep the
     // CPU vs GPU comparison apples-to-apples (temperature=0 argmax on both sides).
     if logits_dump > 0 {
-        let prompt_tokens = tokenizer.encode(&formatted);
+        let mut prompt_tokens = tokenizer.encode(&formatted);
+        // BOS handling: apply the same rule as `Llama3Model::generate` so the
+        // manual-argmax logits dump path stays comparable to the standard
+        // greedy generation path (Issue #36 oracle diff).
+        if tokenizer.add_bos_token
+            && (prompt_tokens.is_empty() || prompt_tokens[0] != tokenizer.bos_id)
+        {
+            prompt_tokens.insert(0, tokenizer.bos_id);
+        }
         let n_prompt = prompt_tokens.len();
         println!("  Prompt tokens: {n_prompt}");
         println!("  logits-dump: N={logits_dump} (stderr JSONL, backend=\"cpu\")");
