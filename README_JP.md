@@ -2,11 +2,19 @@
 
 [English](README.md) | **日本語**
 
-Pure Rust LLM推論エンジン。GGUF量子化モデル、外部MLライブラリ依存ゼロ、156テスト。
+Pure Rust LLM推論エンジン。GGUF量子化モデル、外部MLライブラリ依存ゼロ、326テスト。
 
 **GPU (wgpu/Metal): 125ms → 71ms/トークン (1B)、バッチ4投機的デコード: 1Bドラフト + 8B検証 = 5.89倍高速化、受理率90%。**
 
+**Bonsai 27B Q1_0 (Ternary、3.8 GB) が Apple M3 Metal で coherent 生成 1.1 tok/s (Phase X.3.e.3.27、Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix)。**
+
+**Qwen 3.5-4B ハイブリッド (DeltaNet + フルアテンション) が Apple M3 Metal で coherent 生成 2.9 tok/s (Q4_K_M 混合量子化を Q5_K/Q8_0 shader でカバー)。**
+
 **CPU: 0.16 → 1.76 tok/s (11倍) 70Bスパースターナリ — M1 Proメモリ帯域の45%に到達。**
+
+**Per-layer hybrid (`--hybrid-per-layer`): CPU が DeltaNet 層、GPU が Attention 層を分担、hidden state を per-token でやり取り。フル GPU アロケーションを避けつつ pure GPU と pure CPU の中間速度を実現。**
+
+**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.3 tok/s (CPU-only `--hybrid` の 3.3 倍高速) — `attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
 
 ## クイックスタート
 
@@ -27,6 +35,27 @@ cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
 日本の首都は東京です。
 Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
+```
+
+### Qwen 3.5 / Bonsai 27B ハイブリッド
+
+```bash
+# Qwen 3.5-4B または Bonsai 27B のフル GPU forward
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Qwen3.5-4B-Q4_K_M.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40
+
+# Per-layer hybrid (CPU DeltaNet + GPU Attention) — Phase A2
+# Jetson で GPU 加速化 (attention_only_load 自動 ON)
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 \
+  --hybrid-per-layer --max-seq-len 512
+
+# CPU delegate hybrid (GPU 完全 skip、mmap zero-copy) — Jetson フレンドリー
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 --hybrid
 ```
 
 ## 機能一覧

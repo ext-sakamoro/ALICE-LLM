@@ -1,12 +1,11 @@
 # Bonsai / Qwen 3.6-27B GPU Forward Support Scope
 
-**Status**: **Not yet implemented** (2026-07-16)
-**Current path**: Bonsai runs on CPU forward (`llama3::Llama3Model`) with Q1_0 / Q2_0
-NEON kernels + Phase X.3.e.3 SSM refinements — ~10 s / token on Jetson Orin Nano 8GB.
+**Status**: **Coherent generation on Mac Metal (Phase X.3.e.3.27, 2026-07-17)**; Jetson Orin Nano 8GB still hits the `wgpu-hal` Vulkan 2× duplication ceiling.
+**Current path**:
+- Mac M3 Metal: `GpuModel::load` + `qwen_gpu` example generates coherent English + LaTeX at 1.1 tok/s using the Q1_0 fused SwiGLU shader (`swiglu_fused_q1_0.wgsl`), Q5_K / Q8_0 dequant kernels, and the per-head interleaved `attn_q` de-interleave in `upload_w_bonsai_split` (Phase X.3.e.3.22-3.27).
+- Jetson Orin Nano 8GB: `--hybrid` (CPU delegate MVP, Phase X.3.e.3.17) generates `"The capital of Japan is Tokyo."` at ~0.09 tok/s. Attempts to use `--hybrid-per-layer` with `attention_only_load` (Phase X.3.e.3.29) still exceed the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication = 11+ GB; llama.cpp Vulkan with unified-memory zero-copy is the recommended path until `wgpu-hal` upstream ships zero-copy on Vulkan.
 
-Loading Bonsai GGUF into `gpu::GpuModel::load` panics immediately with an
-actionable error message pointing to `llama3::Llama3Model` (see `src/gpu.rs`
-`load_shared` early-exit block).
+Historical note: earlier versions of `GpuModel::load` panicked on Bonsai GGUFs. That block has been removed as of Phase X.3.e.3.23; the loader now flows through the same DeltaNet + Attention path used by Qwen 3.5-4B and reports layout details up front instead of failing early.
 
 ## Why is CPU-only right now
 

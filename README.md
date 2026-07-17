@@ -16,6 +16,8 @@ Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependen
 
 **Per-layer hybrid (`--hybrid-per-layer`): CPU processes DeltaNet layers + GPU processes Attention layers with per-token hidden-state shuttle. Intermediate speed between pure GPU and pure CPU while bypassing full-model GPU allocation.**
 
+**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.3 tok/s (3.3× faster than CPU-only `--hybrid`) — `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
+
 ## Quick Start
 
 ```bash
@@ -167,11 +169,12 @@ Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Qu
 
 ### Bonsai 27B Q1_0 on Jetson Orin Nano 8GB (Vulkan iGPU)
 
-**End-to-end status (Phase X.3.e.3.22-3.28, 2026-07-17)**
+**End-to-end status (Phase X.3.e.3.22-3.29, 2026-07-17)**
 
 - **Mac M3 Metal**: full GPU forward runs Bonsai 27B Q1_0 end-to-end at 1.1 tok/s, generating coherent English + LaTeX. Fixed by shipping Q1_0 fused SwiGLU (`swiglu_fused_q1_0.wgsl`), the attn_q per-head interleaved layout de-interleave in `upload_w_bonsai_split`, and Q5_K/Q8_0 dequant kernels for Qwen 3.5-4B's mixed-quant weights.
-- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan)**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) generates `"The capital of Japan is **Tokyo**."` at ~0.09 tok/s. Full-GPU load OOMs because `wgpu-hal` on Vulkan unified memory duplicates weights (3.79 GB × 2 = 7.58 GB > 2.55 GB avail at load time).
-- **Per-layer hybrid (`--hybrid-per-layer`)**: CPU runs DeltaNet layers, GPU runs Attention layers, hidden state shuttled per-token. Coherent on Mac M3 at 1.3 tok/s; Jetson requires the pending `attention_only_load` flag to skip DeltaNet weights on GPU (Phase X.3.e.3.29 roadmap).
+- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan) — Qwen 3.5-4B**: **coherent generation at 0.3 tok/s via `--hybrid-per-layer` + `attention_only_load`** (Phase X.3.e.3.29). CPU processes 24 DeltaNet layers, GPU processes 8 Attention layers, DeltaNet weights are skipped from the GPU upload so the total footprint fits under Vulkan's 2×-duplication budget. `"I'm not sure what the user is asking about, and I'm not"` in 50 s / 15 tokens.
+- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan) — Bonsai 27B**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) generates `"The capital of Japan is **Tokyo**."` at ~0.09 tok/s. `--hybrid-per-layer` still exceeds the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication (7.6 GB) leaves nothing for headroom; llama.cpp Vulkan with unified-memory zero-copy is the recommended path for Bonsai 27B on Jetson today, or wait for `wgpu-hal` Vulkan zero-copy upstream.
+- **Per-layer hybrid on Mac M3 Metal**: coherent at 1.2 tok/s. Weight upload cut from 2338 ms to 1059 ms once DeltaNet weights are skipped (Phase X.3.e.3.29).
 
 Micro-benchmark: ALICE-LLM's Q1_0 wgpu path takes the largest layer matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) from CPU NEON 20 ms down to GPU Vulkan sub-ms:
 
