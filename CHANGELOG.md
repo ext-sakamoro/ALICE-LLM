@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Aggregated work since `Cargo.toml` version was set to `1.0.0`. Grouped
-by Phase; the "Phase X.Y.Z" references map back to the roadmap in
-`memory/alice_llm_future_work.md` and the journey entries in
-`memory/alice_llm_phase_x3e3_journey.md`.
+_No entries yet — new work lands here before the next release._
+
+## [1.1.0] - 2026-07-18
+
+Aggregated work since `1.0.0`. Grouped by Phase; the "Phase X.Y.Z"
+references map back to the roadmap in `memory/alice_llm_future_work.md`
+and the journey entries in `memory/alice_llm_phase_x3e3_journey.md`.
 
 ### Added
 
@@ -114,4 +117,6 @@ GPU backend, PEFT / LoRA adapters, integration with ALICE-CodeTracker,
 and the initial round of Phase X.3.e.3 (Phase 5-20) numerical parity
 work.
 
-[Unreleased]: https://github.com/ext-sakamoro/ALICE-LLM/compare/main...HEAD
+[Unreleased]: https://github.com/ext-sakamoro/ALICE-LLM/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ext-sakamoro/ALICE-LLM/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/ext-sakamoro/ALICE-LLM/releases/tag/v1.0.0
