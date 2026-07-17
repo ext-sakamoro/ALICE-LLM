@@ -20,6 +20,8 @@ GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.3 tok/s (3.3× faster than CPU-only `--hybrid`) — `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
 
+**Ornith-1.0-9B (DeepReinforce, MIT, Qwen 3.5 fine-tune for agentic coding): verified load-and-run across Apple M3 CPU (1.8 tok/s), Apple M3 Metal iGPU (2.1 tok/s), and Jetson Orin Nano 8GB CPU (2.3 tok/s) with zero config — arch auto-detected from `general.architecture = qwen35`, all Phase X.3.e.3.14-29 CPU/GPU fixes cascade cleanly to the fine-tune.**
+
 ## Quick Start
 
 ```bash
@@ -46,7 +48,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **GGUF v3 parser** — zero-copy mmap weight loading
 - **Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32** quantization (all GGML K-quant types)
 - **llama.cpp-compatible** — Q2_K–Q6_K×Q8_K integer dot product (matches `ggml_vec_dot_q*_K_q8_K`, ±0.03 logits)
-- **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), **Qwen 2 / 2.5 (QKV bias), Qwen 3 (per-head QK RMSNorm), Qwen 3.5 hybrid (DeltaNet linear attention + full attention), Gemma 3n (Laurel / AltUp / per-layer embedding), Gemma 4 (SWA half head_dim), MoE (Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B)** — all auto-detected
+- **Multi-architecture** — Llama-3/3.1/3.2, Mistral (sliding window), Gemma-2 (softcapping), **Qwen 2 / 2.5 (QKV bias), Qwen 3 (per-head QK RMSNorm), Qwen 3.5 hybrid (DeltaNet linear attention + full attention; downstream fine-tunes like Ornith-1.0 verified), Gemma 3n (Laurel / AltUp / per-layer embedding), Gemma 4 (SWA half head_dim), MoE (Qwen 3 MoE / Mixtral / Gemma 4 26B_A4B)** — all auto-detected
 - **DeltaNet CPU forward** — Qwen 3.5 Gated Linear Attention (causal conv1d + gated delta rule + recurrent state), matches the WGSL GPU shader bit-for-bit
 - **Tied embeddings** — Llama-3.2-1B/3B output projection via quantized `token_embd.weight` (Q6_K matvec)
 - **BPE tokenizer** — GPT-2 byte encoding from GGUF metadata, named constants for GGUF `token_type` and SentencePiece byte-fallback

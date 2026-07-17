@@ -2867,10 +2867,11 @@ impl GpuModel {
         if is_bonsai_deltanet_gguf {
             eprintln!(
                 "[GpuModel] Bonsai / Qwen 3.6-27B tensor layout detected \
-                 (attn_qkv + attn_gate + SSM refinement tensors). Load will \
-                 succeed, but forward path is not yet fully wired — expect a \
-                 panic at DeltaNet layer forward with details about the \
-                 remaining Phase 2 Step 4 work. See docs/BONSAI_GPU_SUPPORT.md."
+                 (attn_qkv + attn_gate + SSM refinement tensors). Forward \
+                 path wired via Phase X.3.e.3.11-18 fixes. Confirmed working: \
+                 Ornith-1.0-9B (qwen35 hybrid). Some models may still exhibit \
+                 numerical issues (e.g. Qwen3.5-4B PAD248319). If output is \
+                 garbage, see docs/BONSAI_GPU_SUPPORT.md."
             );
         }
         // Full-attention Bonsai detection — Bonsai stores Q and the swish gate
@@ -2893,11 +2894,10 @@ impl GpuModel {
         if is_bonsai_full_attn_gguf {
             eprintln!(
                 "[GpuModel] Bonsai / Qwen 3.6-27B full-attention layer layout \
-                 detected (attn_q with 2×q_dim rows). Loader will split into \
-                 q_proj + bonsai_attn_q_gate. Forward path for full-attn \
-                 Bonsai (silu(gate) multiplication into attn_out before \
-                 o_proj) is Phase 2 Step 4b — expect a panic at full-attn \
-                 layer forward if not yet wired."
+                 detected (attn_q with 2×q_dim rows). Loader splits into \
+                 q_proj + bonsai_attn_q_gate; forward applies sigmoid(gate) \
+                 modulation (Phase X.3.e.3.14-16). Confirmed working: \
+                 Ornith-1.0-9B."
             );
         }
 
