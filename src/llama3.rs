@@ -89,6 +89,15 @@ pub enum ModelArch {
     /// streaming / MTP は Phase 2-5 の follow-up Issue で実装予定。
     /// `forward()` は即 panic (fail-fast) で silent garbage を回避。
     DeepSeekV3,
+    /// Kimi K3 / Kimi Delta Attention family (Moonshot AI, 2026-07-27
+    /// planned open weight release, 2.8T params, 1M context, Gated
+    /// DeltaNet variant + "Attention Residuals"). Phase X.4 integration
+    /// target; foundation only until the paper and open weights land.
+    ///
+    /// `forward()` immediately `todo!()` on `KimiK3` — silent garbage
+    /// on a 2.8T model is worse than an explicit panic pointing to
+    /// `docs/KIMI_K3_INTEGRATION.md`.
+    KimiK3,
 }
 
 impl ModelArch {
@@ -116,6 +125,12 @@ impl ModelArch {
             // DeepSeek-V2 / V2.5 / V3 / R1 all share the same architecture
             // family in llama.cpp under the `deepseek2` prefix.
             Some("deepseek2") => Self::DeepSeekV3,
+            // Kimi K3 / Kimi Delta family. Guess of the llama.cpp prefix
+            // until the actual convert_hf_to_gguf.py drop for K3 lands;
+            // covers `"kimi"`, `"kimi3"`, `"kimideltatt"` variants seen
+            // in draft PRs. Refine once the community GGUF conversion
+            // finalizes (see docs/KIMI_K3_INTEGRATION.md §X.4.b).
+            Some(s) if s.starts_with("kimi") => Self::KimiK3,
             _ => Self::Llama,
         }
     }
@@ -131,6 +146,9 @@ impl ModelArch {
             Self::Qwen2 => "qwen2",
             Self::Qwen3 | Self::Qwen3_5 => "qwen3",
             Self::DeepSeekV3 => "deepseek2",
+            // TODO: confirm the actual llama.cpp prefix once conversion
+            // support lands (see docs/KIMI_K3_INTEGRATION.md).
+            Self::KimiK3 => "kimi",
         }
     }
 
@@ -316,6 +334,54 @@ pub struct DeepSeekV3Config {
     pub mtp_layer: Option<usize>,
 }
 
+/// Kimi K3 / Kimi Delta Attention family sub-config.
+///
+/// All fields are `Option` because the paper and open weights are not
+/// available yet (planned 2026-07-27 release). Placeholder fields based
+/// on public gigazine coverage and comparison with existing Gated
+/// DeltaNet families (Bonsai 27B, Qwen 3.5 hybrid). Refine when the
+/// model card / paper / community GGUF conversion lands.
+///
+/// GGUF metadata key prefix (guess): `kimi.*` — confirm at X.4.b.
+/// See `docs/KIMI_K3_INTEGRATION.md` for the full integration plan.
+#[derive(Debug, Clone, Default)]
+pub struct KimiDeltaConfig {
+    /// Ratio of full-attention layers vs Kimi Delta layers in the hybrid
+    /// stack. Bonsai 27B uses 16 full : 48 DeltaNet; Kimi K3 TBD.
+    pub full_attention_interval: Option<usize>,
+    /// Per-head recurrent state dim for the Kimi Delta path.
+    pub delta_state_dim: Option<usize>,
+    /// Attention Residuals scale factor (Moonshot claims ~25% training
+    /// speedup; unclear whether this is a runtime skip-connection
+    /// parameter or a training-only trick).
+    pub attention_residuals_scale: Option<f32>,
+    /// Total routed expert count. Kimi K3 confirmed 2026-07-17: **896**.
+    /// For comparison DeepSeek V3 = 256, Bonsai 27B = 64. Mirrors
+    /// `deepseek_v3.n_routed_experts` semantics.
+    pub n_routed_experts: Option<usize>,
+    /// Shared always-active expert count. Kimi K3: TBD (DeepSeek V3 = 1).
+    pub n_shared_experts: Option<usize>,
+    /// Top-k routed experts per token. Kimi K3 confirmed 2026-07-17:
+    /// **16** (sparsity 16/896 = 1.79% — sparser than V3's 8/256 = 3.13%).
+    /// This drives the expert-streaming feasibility calculation in
+    /// `docs/KIMI_K3_INTEGRATION.md` (~24 GB Q4 active weights per token
+    /// out of ~1.4 TB total, streamable from NVMe on Mac 128 GB).
+    pub num_experts_per_tok: Option<usize>,
+    /// Per-expert FFN intermediate size. Kimi K3: TBD (2.8T ÷ 896 experts
+    /// ≈ 3.1B params/expert, so `moe_intermediate_size` is likely on the
+    /// order of 4096-8192 depending on `hidden_dim`).
+    pub moe_intermediate_size: Option<usize>,
+    /// Long-context RoPE scaling parameters. K3 claims 1M context; may
+    /// use YARN or a Kimi-specific scheme. Placeholder until the config
+    /// JSON is public.
+    pub rope_scaling_type: Option<String>,
+    pub rope_scaling_factor: Option<f32>,
+    /// KV cache compression scheme identifier. K3's 6.3× decode speedup
+    /// implies aggressive compression (fixed-size recurrent state for
+    /// Delta layers + something for full-attn layers).
+    pub kv_compression_scheme: Option<String>,
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
@@ -351,6 +417,9 @@ pub struct Llama3Config {
     /// DeepSeek-V2 / V3 / R1 augmentations (MLA LoRA ranks + DeepSeek MoE
     /// parameters + MTP head layer).
     pub deepseek_v3: Option<DeepSeekV3Config>,
+    /// Kimi K3 / Kimi Delta Attention augmentations. Skeleton only until
+    /// the 2026-07-27 open weight release; see docs/KIMI_K3_INTEGRATION.md.
+    pub kimi_delta: Option<KimiDeltaConfig>,
 }
 
 impl Llama3Config {
@@ -993,6 +1062,9 @@ impl Llama3Config {
             gemma3n,
             gemma4,
             deepseek_v3,
+            // Kimi K3 config population deferred to Phase X.4.b (2026-07-27
+            // open weight release). See docs/KIMI_K3_INTEGRATION.md.
+            kimi_delta: None,
         })
     }
 
@@ -1171,6 +1243,7 @@ impl Llama3Config {
             gemma3n: None,
             gemma4: None,
             deepseek_v3: None,
+            kimi_delta: None,
         }
     }
 
@@ -3936,6 +4009,15 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::DeepSeekV3 {
             return self.forward_deepseek_v3(token_id);
         }
+        // Kimi K3 / Kimi Delta Attention (Moonshot AI). Foundation only —
+        // 2026-07-27 open weight release + paper drop are prerequisites
+        // for the actual forward path. Silent garbage on a 2.8T model is
+        // worse than an explicit panic pointing to the integration doc,
+        // so we `todo!()` here rather than fall through to the standard
+        // path (which would misinterpret Kimi Delta as vanilla attention).
+        if self.config.arch == ModelArch::KimiK3 {
+            return self.forward_kimi_k3(token_id);
+        }
         // Qwen 3.5 / Qwen 3.6 hybrid uses the standard forward path with a
         // per-layer branch (DeltaNet linear-attention vs. full attention).
         // See `layer_kind_map` for the layer-to-kind routing that was set up
@@ -5444,6 +5526,40 @@ impl<'a> Llama3Model<'a> {
     ///
     /// Phase 4 (expert streaming) and Phase 5 (MTP native speculative
     /// decoding) still track separately (Issues #34 / #35).
+    /// Kimi K3 / Kimi Delta Attention forward path (Phase X.4).
+    ///
+    /// **Skeleton only.** The 2026-07-27 open weight release + paper drop
+    /// are prerequisites for the actual forward path. `todo!()` here so a
+    /// user who somehow feeds a Kimi K3 GGUF into ALICE-LLM gets an
+    /// explicit panic pointing to `docs/KIMI_K3_INTEGRATION.md` rather
+    /// than silent garbage from the standard `Llama3Model::forward` path.
+    ///
+    /// Once the paper drops and Kimi K3 GGUF conversion lands upstream,
+    /// this method should reuse `gated_deltanet_step*` for the DeltaNet
+    /// layers, standard attention for the full-attention layers, and
+    /// whatever KV compression scheme K3 ships. See the doc for the phased
+    /// integration plan (X.4.a-X.4.g).
+    ///
+    /// # Panics
+    ///
+    /// Always — this is a fail-fast stub, per CLAUDE.md's
+    /// "仮実装完了偽装の禁止" rule (no silent Ok on unimplemented paths).
+    // `&mut self` is intentional: the real Phase X.4.c implementation will
+    // mutate `self.kv_cache` on every forward, mirroring
+    // `forward_deepseek_v3` and `forward_gemma3n`. Keeping the signature
+    // stable now so the dispatch in `forward_with_layer_hook` doesn't need
+    // to change when the stub gets replaced.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn forward_kimi_k3(&mut self, _token_id: u32) -> Vec<f32> {
+        todo!(
+            "KIMI-K3 forward: waiting for open weight release 2026-07-27 \
+             + paper drop before implementation. See \
+             docs/KIMI_K3_INTEGRATION.md for the phased integration plan \
+             (Phase X.4.a-X.4.g) and the reusable ALICE-LLM components \
+             (`gated_deltanet_step*`, `SsmDeltaNetConfig`, MoE routing)."
+        );
+    }
+
     fn forward_deepseek_v3(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -5550,6 +5666,14 @@ impl<'a> Llama3Model<'a> {
                 pos,
                 &kv_a_full[..64.min(kv_a_full.len())],
             );
+            // Issue #36 diagnostic: dump kv_a_full[kv_lora_rank..]
+            // (elements 512-575) which will become k_pe_pre_rope after
+            // the split. If these differ from k_pe_pre_rope's dump, the
+            // split is buggy; if they match ALICE but differ from HF,
+            // the projection weight rows are permuted vs HF.
+            let kpe_start = kv_lora_rank.min(kv_a_full.len());
+            dump_tensor("kv_a_full_tail64", layer_idx, pos, &kv_a_full[kpe_start..]);
+            dump_tensor("kv_a_full_head512", layer_idx, pos, &kv_a_full[..kpe_start]);
             let (kv_a_slice, k_pe_shared) = kv_a_full.split_at_mut(kv_lora_rank);
             rms_norm(kv_a_slice, &layer.kv_a_norm, c.norm_eps, &mut kv_a_normed);
             dump_tensor("kv_a_normed", layer_idx, pos, &kv_a_normed);
@@ -11895,6 +12019,7 @@ mod tests {
                 noaux_tc: Some(true),
                 mtp_layer: None,
             }),
+            kimi_delta: None,
         }
     }
 
@@ -12033,6 +12158,7 @@ mod tests {
                 noaux_tc: Some(true),
                 mtp_layer: None,
             }),
+            kimi_delta: None,
         };
 
         // Build the two `DeepSeekMoeWeights` variants sharing everything
@@ -12404,6 +12530,7 @@ mod tests {
             gemma3n: None,
             gemma4: None,
             deepseek_v3: None,
+            kimi_delta: None,
         };
         assert!(llama_config.deepseek_mtp_layer().is_none());
     }

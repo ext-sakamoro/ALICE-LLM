@@ -209,6 +209,7 @@ fn main() {
         }
         let n_prompt = prompt_tokens.len();
         println!("  Prompt tokens: {n_prompt}");
+        println!("  Prompt token IDs: {prompt_tokens:?}");
         println!("  logits-dump: N={logits_dump} (stderr JSONL, backend=\"cpu\")");
 
         let t_prefill = Instant::now();
