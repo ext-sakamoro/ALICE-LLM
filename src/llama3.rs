@@ -5540,6 +5540,11 @@ impl<'a> Llama3Model<'a> {
             // `kv_a` plus the shared positional slice `k_pe`.
             layer.kv_a_proj_with_mqa.matvec(&norm_buf, &mut kv_a_full);
             dump_tensor("kv_a_full", layer_idx, pos, &kv_a_full);
+            // Issue #36 diagnostic: also dump the first 64 elements of
+            // kv_a_full to test the row-layout inversion hypothesis
+            // (if HF's k_pe matches ALICE's kv_a_full[0..64] instead of
+            // kv_a_full[512..576], the split is reversed in GGUF vs HF).
+            dump_tensor("kv_a_full_first64", layer_idx, pos, &kv_a_full[..64.min(kv_a_full.len())]);
             let (kv_a_slice, k_pe_shared) = kv_a_full.split_at_mut(kv_lora_rank);
             rms_norm(kv_a_slice, &layer.kv_a_norm, c.norm_eps, &mut kv_a_normed);
             dump_tensor("kv_a_normed", layer_idx, pos, &kv_a_normed);
