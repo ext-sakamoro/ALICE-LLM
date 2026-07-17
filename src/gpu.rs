@@ -2118,6 +2118,19 @@ pub struct GpuModelConfig {
     /// require NEOX; Llama/Mistral/Gemma 4 use LLAMA-style. Mirrors
     /// `Llama3Config::is_neox_rope()` on the CPU side.
     pub neox_rope: bool,
+    /// Phase X.3.e.3.29: when `true`, `GpuModel::load` skips DeltaNet layer
+    /// weight upload / bind group creation / DeltaNet state allocation.
+    /// Used by the per-layer hybrid orchestrator (`--hybrid-per-layer`) so
+    /// only Attention layer weights land on the GPU, cutting the GPU
+    /// memory footprint from ~2.7 GB (Qwen 3.5-4B) or ~3.8 GB (Bonsai 27B)
+    /// down to ~25 %, which fits in Jetson Orin Nano's ~2-3 GB usable
+    /// unified-memory budget after `wgpu-hal` Vulkan 2× duplication.
+    ///
+    /// When enabled, calling any DeltaNet path on the GPU (e.g., a full
+    /// `forward()`) panics because the required weights weren't uploaded.
+    /// The hybrid orchestrator MUST only invoke `run_attention_layer_only`
+    /// for attention-layer indices; DeltaNet layers stay on the CPU.
+    pub attention_only_load: bool,
 }
 
 /// Pre-cached matvec bind group with dispatch dimensions.
@@ -2360,7 +2373,15 @@ pub struct GpuModel {
     layer_types: Vec<LayerType>,
 
     // Pre-cached bind groups (attention layers)
-    layer_bgs: Vec<LayerBGs>,
+    /// Per-layer bind groups. Indexed by *global* layer index so all
+    /// existing per-layer dispatch code can keep using `self.layer_bgs[i]`
+    /// without extra remapping. DeltaNet slots hold `None`, which is fine
+    /// because the standard forward path only ever reads this Vec inside
+    /// the `LayerType::Attention` match arm. Phase X.3.e.3.29 also relies
+    /// on this to skip DeltaNet weight uploads when
+    /// `GpuModelConfig::attention_only_load` is set: DeltaNet slots stay
+    /// `None`, matching the also-`None` deltanet_layer_bgs entries.
+    layer_bgs: Vec<Option<LayerBGs>>,
     rope_q_bg: wgpu::BindGroup,
     rope_k_bg: wgpu::BindGroup,
     residual_attn_bg: wgpu::BindGroup,
@@ -3142,6 +3163,40 @@ impl GpuModel {
                     });
                 }
                 LayerType::DeltaNet => {
+                    // Phase X.3.e.3.29: skip DeltaNet weight upload when the
+                    // caller is running in per-layer hybrid mode. The
+                    // orchestrator processes DeltaNet layers on the CPU, so
+                    // the GPU never touches these weights. This cuts GPU
+                    // memory to ~25% for Qwen 3.5 / Bonsai 27B and fits the
+                    // Jetson unified-memory budget.
+                    //
+                    // The dummy LayerWeightBufs push below still runs so
+                    // `layer_weights[i]` stays aligned with the global
+                    // layer index. Downstream code only reads it when the
+                    // layer is Attention.
+                    if config.attention_only_load {
+                        // Fall through to the dummy `layer_weights.push` at
+                        // the bottom of the DeltaNet branch — we just need
+                        // to jump over the actual DeltaNet tensor uploads.
+                        layer_weights.push(LayerWeightBufs {
+                            attn_norm: engine.alloc_f32(1),
+                            q_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            bonsai_attn_q_gate: None,
+                            k_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            v_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            o_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            q_bias: None,
+                            k_bias: None,
+                            v_bias: None,
+                            q_norm: None,
+                            k_norm: None,
+                            ffn_norm: engine.alloc_f32(1),
+                            gate_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            up_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                            down_proj: engine.upload_weights(&[0u8; 256], 1, 1),
+                        });
+                        continue;
+                    }
                     // Load DeltaNet-specific tensors
                     let conv1d_w = gguf
                         .tensor_to_f32(&format!("blk.{i}.ssm_conv1d.weight"))
@@ -3776,7 +3831,7 @@ impl GpuModel {
                         });
                     attn_kv_idx += 1;
 
-                    layer_bgs.push(LayerBGs {
+                    layer_bgs.push(Some(LayerBGs {
                         attn_norm_bg,
                         q_proj,
                         k_proj,
@@ -3794,9 +3849,20 @@ impl GpuModel {
                         ffn_norm_bg,
                         swiglu,
                         down_proj,
-                    });
+                    }));
                 }
                 LayerType::DeltaNet => {
+                    // DeltaNet slots stay `None` in `layer_bgs` so global
+                    // indexing (`self.layer_bgs[i]`) keeps working; only
+                    // the Attention branch of the encoder reads this Vec.
+                    layer_bgs.push(None);
+                    // Phase X.3.e.3.29: bind group loop must also skip
+                    // DeltaNet layers when weights weren't uploaded. The
+                    // hybrid orchestrator never calls into these layers on
+                    // GPU, so leaving them absent is safe.
+                    if config.attention_only_load {
+                        continue;
+                    }
                     let dlw = &deltanet_layer_weights[dn_idx];
 
                     // DeltaNet attention sub-block bind groups
@@ -4169,7 +4235,7 @@ impl GpuModel {
                     });
 
                     // Push dummy attention LayerBGs (unused but keeps index alignment)
-                    layer_bgs.push(LayerBGs {
+                    layer_bgs.push(Some(LayerBGs {
                         attn_norm_bg: engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: None,
                             layout: &engine.rmsnorm_pipeline.get_bind_group_layout(0),
@@ -4297,7 +4363,7 @@ impl GpuModel {
                             &gate_buf,
                             &down_buf,
                         ),
-                    });
+                    }));
 
                     dn_idx += 1;
                 }
@@ -4451,7 +4517,9 @@ impl GpuModel {
         for i in range {
             match self.layer_types[i] {
                 LayerType::Attention => {
-                    let lbg = &self.layer_bgs[i];
+                    let lbg = self.layer_bgs[i]
+                        .as_ref()
+                        .expect("Attention layer bg missing (Phase X.3.e.3.29 attention_only_load must not reach here for DeltaNet layers)");
 
                     // --- Attention sub-block ---
                     // RMSNorm: hidden → norm_buf
@@ -4695,7 +4763,9 @@ impl GpuModel {
             let (ffn_norm, ffn_swiglu_bg, ffn_swiglu_dx, ffn_swiglu_dy, ffn_swiglu_quant, ffn_down) =
                 match self.layer_types[i] {
                     LayerType::Attention => {
-                        let lbg = &self.layer_bgs[i];
+                        let lbg = self.layer_bgs[i]
+                        .as_ref()
+                        .expect("Attention layer bg missing (Phase X.3.e.3.29 attention_only_load must not reach here for DeltaNet layers)");
                         (
                             &lbg.ffn_norm_bg,
                             &lbg.swiglu.bg,
@@ -5331,7 +5401,9 @@ impl GpuModel {
         let e = &self.engine;
 
         for i in 0..self.config.num_layers {
-            let lbg = &self.layer_bgs[i];
+            let lbg = self.layer_bgs[i]
+                .as_ref()
+                .expect("Attention layer bg missing (Phase X.3.e.3.29 attention_only_load)");
 
             // --- Attention sub-block ---
             r.rmsnorm_us += timed_dispatch(e, &e.rmsnorm_pipeline, &lbg.attn_norm_bg, 1, 1, 1);
@@ -5551,7 +5623,9 @@ impl GpuModel {
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
 
         for i in 0..self.config.num_layers {
-            let lbg = &self.layer_bgs[i];
+            let lbg = self.layer_bgs[i]
+                .as_ref()
+                .expect("Attention layer bg missing (Phase X.3.e.3.29 attention_only_load)");
 
             // RMSNorm: 4 workgroups (1 per token)
             cp.set_pipeline(&self.engine.rmsnorm_pipeline);
@@ -5746,6 +5820,7 @@ impl GpuModel {
         let bias_dispatches: u32 = self
             .layer_bgs
             .iter()
+            .filter_map(|slot| slot.as_ref())
             .map(|lbg| {
                 u32::from(lbg.q_bias_bg.is_some())
                     + u32::from(lbg.k_bias_bg.is_some())
@@ -5755,6 +5830,7 @@ impl GpuModel {
         let qk_norm_dispatches: u32 = self
             .layer_bgs
             .iter()
+            .filter_map(|slot| slot.as_ref())
             .map(|lbg| u32::from(lbg.q_norm_bg.is_some()) + u32::from(lbg.k_norm_bg.is_some()))
             .sum();
         let total_dispatches = ops_per_layer * n_layers + bias_dispatches + qk_norm_dispatches + 2;
@@ -5840,7 +5916,9 @@ impl GpuModel {
         }
 
         for i in 0..self.config.num_layers {
-            let lbg = &self.layer_bgs[i];
+            let lbg = self.layer_bgs[i]
+                .as_ref()
+                .expect("Attention layer bg missing (Phase X.3.e.3.29 attention_only_load)");
 
             // Attention sub-block
             ts_dispatch!(

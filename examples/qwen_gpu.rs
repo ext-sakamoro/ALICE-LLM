@@ -102,6 +102,9 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
         // Qwen 2/2.5/3 require NEOX-style RoPE. Route from Llama3Config
         // (Issue #40 root-cause fix).
         neox_rope: cfg.arch.use_neox_rope(),
+        // Full GPU forward — the per-layer hybrid orchestrator toggles
+        // this to `true` for its own load path (see `run_hybrid_per_layer`).
+        attention_only_load: false,
     }
 }
 
@@ -269,6 +272,11 @@ fn run_hybrid_per_layer(
     if let Some(override_len) = max_seq_len_override {
         gpu_cfg.max_seq_len = override_len;
     }
+    // Phase X.3.e.3.29: per-layer hybrid only ever touches Attention layers
+    // on the GPU, so tell the loader to skip DeltaNet weights entirely.
+    // This is what makes hybrid-per-layer fit under Jetson's ~2-3 GB usable
+    // GPU budget after `wgpu-hal` Vulkan 2× duplication.
+    gpu_cfg.attention_only_load = true;
     let t_gpu = Instant::now();
     let mut gpu_model = GpuModel::load(engine, &gguf, gpu_cfg);
     println!("  GPU model loaded: {}ms", t_gpu.elapsed().as_millis());
