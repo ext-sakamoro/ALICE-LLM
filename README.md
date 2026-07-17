@@ -2,13 +2,19 @@
 
 **English** | [日本語](README_JP.md)
 
-Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 246 tests.
+Pure Rust LLM inference engine. GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
+
+**Bonsai 27B Q1_0 (Ternary, 3.8 GB) on Apple M3 Metal: coherent generation at 1.1 tok/s (Phase X.3.e.3.27 Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix).**
+
+**Qwen 3.5-4B hybrid (DeltaNet + Full Attention) on Apple M3 Metal: coherent generation at 2.9 tok/s (Q4_K_M mixed quant with Q5_K/Q8_0 shader coverage).**
 
 **CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro.**
 
 **x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary all get AVX2 and AVX-512BW/F kernels with runtime dispatch, matching the existing NEON parity on Apple Silicon.**
+
+**Per-layer hybrid (`--hybrid-per-layer`): CPU processes DeltaNet layers + GPU processes Attention layers with per-token hidden-state shuttle. Intermediate speed between pure GPU and pure CPU while bypassing full-model GPU allocation.**
 
 ## Quick Start
 
@@ -47,7 +53,8 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 - **LLVM auto-vectorization** — `target-cpu=native` generates ARM SDOT instructions (37 sdot in Q4_K dot product)
 - **x86_64 SIMD (AVX2 + AVX-512BW/F)** — Q4_K / Q5_K / Q6_K / Q8_0 / Ternary dot products with runtime CPU-feature dispatch (`is_x86_feature_detected!` cached in `OnceLock`); AVX-512 uses `__mmask16` for the Ternary bitmask path
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
-- **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K/Q6_K dequant-fused matvec, fused SwiGLU, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction, **DeltaNet SSM path (alpha / beta / conv1d / gated delta rule) for Qwen 3.5 hybrid**
+- **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K / **Q5_K** / Q6_K / **Q8_0** / **Q1_0** dequant-fused matvec, **fused SwiGLU (Q4_K and Q1_0 variants)**, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction, **DeltaNet SSM path (alpha / beta / conv1d / gated delta rule with Bonsai Gap-B refinement) for Qwen 3.5 / Qwen 3.6 / Bonsai 27B hybrid**
+- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) split DeltaNet layers on CPU and Attention layers on GPU, exchanging hidden state per token via `write_f32` / `read_f32`. Bypasses the wgpu-hal Vulkan weight-duplication penalty on Jetson-class unified-memory targets when combined with a future attention-only load path.
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
 - **God-object–free config** — `Llama3Config` (38 → 16 fields) and `LayerWeights` (33 → 17 fields) split into cohesive sub-structs (`AttentionExtrasConfig`, `SsmDeltaNetConfig`, `MoeConfig`, `Gemma3nConfig`, `Gemma4Config`, `QwenAttentionBiases`, `QwenAttentionNorms`, `Gemma3nLayerAugmentations`, `MoeExpertWeights`) with backward-compat accessor methods
 - **Flat cache-aligned `Matrix<T>`** — single contiguous `Vec<T>` row-major layout replaces `Vec<Vec<T>>`, `matmul_flat` uses FMA `mul_add` on a `j`-contiguous inner loop for cache-line coalescing
@@ -89,6 +96,22 @@ cargo run --example generate_gpu --features gpu,gguf --release -- \
 # Dual-model speculative decoding (1B draft + 8B verify)
 cargo run --example speculative_dual_gpu --features gpu,gguf --release -- \
   --prompt "What is the capital of Japan?" --max-tokens 64
+
+# Qwen 3.5-4B or Bonsai 27B hybrid (DeltaNet + Attention) with full GPU forward
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Qwen3.5-4B-Q4_K_M.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40
+
+# Per-layer hybrid (CPU DeltaNet + GPU Attention) — Phase A2
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 \
+  --hybrid-per-layer --max-seq-len 512
+
+# CPU delegate hybrid (skips GPU entirely, mmap zero-copy) — Jetson-friendly
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 --hybrid
 ```
 
 ### The GPU Optimization Journey (Apple M3 Metal, Llama-3.2-1B Q4_K_M)
@@ -144,7 +167,13 @@ Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Qu
 
 ### Bonsai 27B Q1_0 on Jetson Orin Nano 8GB (Vulkan iGPU)
 
-PrismML's Bonsai 27B ships as a 3.6 GB Q1_0 GGUF (post-training binary g128 ternary quantization). ALICE-LLM's Q1_0 wgpu path takes the largest layer matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) from CPU NEON 20 ms down to GPU Vulkan sub-ms:
+**End-to-end status (Phase X.3.e.3.22-3.28, 2026-07-17)**
+
+- **Mac M3 Metal**: full GPU forward runs Bonsai 27B Q1_0 end-to-end at 1.1 tok/s, generating coherent English + LaTeX. Fixed by shipping Q1_0 fused SwiGLU (`swiglu_fused_q1_0.wgsl`), the attn_q per-head interleaved layout de-interleave in `upload_w_bonsai_split`, and Q5_K/Q8_0 dequant kernels for Qwen 3.5-4B's mixed-quant weights.
+- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan)**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) generates `"The capital of Japan is **Tokyo**."` at ~0.09 tok/s. Full-GPU load OOMs because `wgpu-hal` on Vulkan unified memory duplicates weights (3.79 GB × 2 = 7.58 GB > 2.55 GB avail at load time).
+- **Per-layer hybrid (`--hybrid-per-layer`)**: CPU runs DeltaNet layers, GPU runs Attention layers, hidden state shuttled per-token. Coherent on Mac M3 at 1.3 tok/s; Jetson requires the pending `attention_only_load` flag to skip DeltaNet weights on GPU (Phase X.3.e.3.29 roadmap).
+
+Micro-benchmark: ALICE-LLM's Q1_0 wgpu path takes the largest layer matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) from CPU NEON 20 ms down to GPU Vulkan sub-ms:
 
 | Step | Kernel | µs/matvec | vs CPU | vs prev | Bandwidth util |
 |:---:|:---|---:|---:|---:|---:|
