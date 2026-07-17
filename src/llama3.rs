@@ -5488,11 +5488,36 @@ impl<'a> Llama3Model<'a> {
         let mut up_buf = vec![0.0f32; c.intermediate_dim];
         let mut down_buf = vec![0.0f32; hidden_dim];
 
+        // Issue #36 diagnostic: per-op tensor dump for layer 0. Env-gated so
+        // production builds don't pay the print cost. Emits first 5 elements
+        // + L2 norm + sum for each intermediate tensor, one JSONL line per
+        // (token_pos, layer, op). Compare against the HF oracle dump script
+        // to bisect where the MLA forward diverges.
+        let dump_dsv3 = std::env::var("ALICE_DEEPSEEK_DUMP").is_ok();
+        let dump_tensor = |name: &str, layer_idx: usize, pos: usize, t: &[f32]| {
+            if !dump_dsv3 || layer_idx != 0 {
+                return;
+            }
+            let n = t.len();
+            let head: Vec<f32> = t.iter().take(5).copied().collect();
+            let l2: f32 = t.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let sum: f32 = t.iter().sum();
+            eprintln!(
+                "{{\"engine\":\"alice\",\"pos\":{pos},\"layer\":{layer_idx},\"op\":\"{name}\",\"len\":{n},\"head\":{head:?},\"l2\":{l2:.6},\"sum\":{sum:.6}}}"
+            );
+        };
+        let _ = &dump_tensor; // silence unused when neither branch fires
+
+        if dump_dsv3 {
+            dump_tensor("hidden_in", 0, pos, &hidden);
+        }
+
         for layer_idx in 0..c.num_layers {
             let layer = &deepseek_layers[layer_idx];
 
             // ── Attention block ───────────────────────────────────────
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
+            dump_tensor("attn_norm", layer_idx, pos, &norm_buf);
 
             // Q projection: dense (V2 / V2-Lite) or LoRA (V2.5 / V3 / R1).
             match &layer.q {
@@ -5509,12 +5534,16 @@ impl<'a> Llama3Model<'a> {
                     q_b_proj.matvec(&q_a_normed, &mut q_full);
                 }
             }
+            dump_tensor("q_full", layer_idx, pos, &q_full);
 
             // KV LoRA chain: single matvec produces the compressed latent
             // `kv_a` plus the shared positional slice `k_pe`.
             layer.kv_a_proj_with_mqa.matvec(&norm_buf, &mut kv_a_full);
+            dump_tensor("kv_a_full", layer_idx, pos, &kv_a_full);
             let (kv_a_slice, k_pe_shared) = kv_a_full.split_at_mut(kv_lora_rank);
             rms_norm(kv_a_slice, &layer.kv_a_norm, c.norm_eps, &mut kv_a_normed);
+            dump_tensor("kv_a_normed", layer_idx, pos, &kv_a_normed);
+            dump_tensor("k_pe_pre_rope", layer_idx, pos, k_pe_shared);
             // Persist the compressed latent + shared k_pe in the KV cache
             // (the ~57× compression trick). Reconstructed per-head `k_nope`
             // stays purely on the stack.
@@ -5525,6 +5554,7 @@ impl<'a> Llama3Model<'a> {
             // against future queries; historical positions rebuild theirs on
             // demand from `kv_a`).
             layer.kv_b_proj.matvec(&kv_a_normed, &mut kv_up);
+            dump_tensor("kv_up", layer_idx, pos, &kv_up);
 
             // Split Q per-head into (q_nope, q_pe) and apply NEOX RoPE only
             // to the `qk_rope` slice of each head. The shared `k_pe` gets
@@ -5541,6 +5571,7 @@ impl<'a> Llama3Model<'a> {
                     true, // NEOX
                 );
             }
+            dump_tensor("q_full_post_rope", layer_idx, pos, &q_full);
             apply_rope_auto(
                 k_pe_shared,
                 pos,
@@ -5549,6 +5580,7 @@ impl<'a> Llama3Model<'a> {
                 self.rope_freqs.as_deref(),
                 true,
             );
+            dump_tensor("k_pe_post_rope", layer_idx, pos, k_pe_shared);
             // Persist (post-RoPE) k_pe into the cache entry so the shared
             // slice lines up with `q_pe` at attention time.
             cache_entry[kv_lora_rank..].copy_from_slice(k_pe_shared);
@@ -5618,11 +5650,14 @@ impl<'a> Llama3Model<'a> {
                     }
                 }
             }
+            dump_tensor("attn_out", layer_idx, pos, &attn_out);
 
             layer.o_proj.matvec(&attn_out, &mut o_buf);
+            dump_tensor("o_proj_out", layer_idx, pos, &o_buf);
             for i in 0..hidden_dim {
                 hidden[i] += o_buf[i];
             }
+            dump_tensor("hidden_post_attn", layer_idx, pos, &hidden);
 
             // ── FFN block ─────────────────────────────────────────────
             if layer_idx < first_k_dense {
@@ -5650,6 +5685,7 @@ impl<'a> Llama3Model<'a> {
                     hidden[i] += down_buf[i];
                 }
             }
+            dump_tensor("hidden_post_ffn", layer_idx, pos, &hidden);
         }
 
         // Bump the shared position exactly once per token forward (Issue #58).
