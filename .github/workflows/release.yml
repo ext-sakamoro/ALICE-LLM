@@ -79,7 +79,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          STAGE="alice-llm-server-${{ github.ref_name || inputs.tag }}-${{ matrix.target }}"
+          STAGE="alice-llm-server-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp target/${{ matrix.target }}/release/alice-llm-server "$STAGE/"
           cp README.md LICENSE CHANGELOG.md "$STAGE/"
@@ -90,7 +90,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: bash
         run: |
-          STAGE="alice-llm-server-${{ github.ref_name || inputs.tag }}-${{ matrix.target }}"
+          STAGE="alice-llm-server-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp target/${{ matrix.target }}/release/alice-llm-server.exe "$STAGE/"
           cp README.md LICENSE CHANGELOG.md "$STAGE/"
