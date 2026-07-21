@@ -556,6 +556,19 @@ fn main() {
             return;
         }
 
+        // --- Phase X.3.e.3.36 diagnostic: dump v_buf / k_buf at layer 3 pos 0 ---
+        if args.iter().any(|a| a == "--dump-l3") {
+            model.reset();
+            let tok0 = prompt_tokens[0];
+            let kv_dim = (model.config().num_kv_heads * model.config().head_dim) as usize;
+            let v = model.forward_stop_after_layer_and_read_v_buf(tok0, 3, kv_dim);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu_attn3_v_full", &v);
+            model.reset();
+            let k = model.forward_stop_after_layer_and_read_k_buf(tok0, 3, kv_dim);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu_attn3_k_full", &k);
+            return;
+        }
+
         // --- Issue #40 layer bisection mode ---
         if layer_bisect {
             let checkpoints = [0usize, 6, 13, 20, 27];

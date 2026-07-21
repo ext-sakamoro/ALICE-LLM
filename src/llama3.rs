@@ -4580,6 +4580,10 @@ impl<'a> Llama3Model<'a> {
                 );
                 dump_slice("attn3_v_head0", &v_buf[..c.head_dim], 3);
                 dump_slice("attn3_k_head0", &k_buf[..c.head_dim], 3);
+                // Phase X.3.e.3.36: full v_buf / k_buf dump for GPU comparison
+                let kv_dim = c.num_kv_heads * c.head_dim;
+                dump_hidden_jsonl_stderr("cpu_attn3_v_full", &v_buf[..kv_dim]);
+                dump_hidden_jsonl_stderr("cpu_attn3_k_full", &k_buf[..kv_dim]);
             }
             // Phase X.3.e.3.14: additional attention-layer attn_norm dumps for
             // cascade divergence progression tracking (layers 7/11/15/19/23/27/31).
