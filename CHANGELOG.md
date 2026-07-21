@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No entries yet — new work lands here before the next release._
+### Documentation
+
+- **`docs/ALICE_ROUTER_SPEC.md`** — design specification for the
+  `alice-router` sibling crate (orchestration + verification layer
+  above ALICE-LLM engines and external HTTP APIs). Spec only, no
+  crate yet. 21 sections following `comprehensive-spec-templates`
+  skill: vision / scope / positioning (vs Sakana Fugu / LangChain /
+  LiteLLM / OpenRouter) / architecture / data model / Rust trait API
+  surface / routing strategies / verification / backend integration
+  (Kimi K3 API + AliceLLMBackend) / caching / observability / config
+  TOML / error taxonomy / security / performance targets / testing
+  plan / roadmap (R.0-R.7) / open questions / related ALICE work /
+  glossary.
 
 ## [1.1.0] - 2026-07-18
 
