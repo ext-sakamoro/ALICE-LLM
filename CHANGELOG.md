@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Phase X.3.e.3.37 — `o_proj` weight upload `cols` dimension bug** (0bd5d8e).
+  For Qwen 3.5+ hybrid architectures where `q_dim = num_heads × head_dim`
+  is not equal to `hidden_dim` (e.g. Qwen 3.5-4B has `hidden_dim=2560` and
+  `q_dim=4096`), the GPU attention-layer `o_proj` upload was hardcoded as
+  `upload_w(name, hidden_dim, hidden_dim)`. Only 62.5% of the Q4_K weight
+  bytes were loaded, so 37.5% of the projection matrix was truncated,
+  producing near-orthogonal `o_proj` output (cos 0.118 vs the CPU
+  reference). Every downstream layer then compounded the drift, and the
+  hybrid-per-layer path produced text like "I'm not sure what the user is
+  asking about" instead of the correct Tokyo answer. One-line fix: pass
+  `q_dim_attn = num_heads * head_dim` for `cols` (neutral for standard
+  models where `q_dim == hidden_dim` — Llama, Qwen 2 / 2.5 / 3, Mistral).
+  Result on both Mac Metal and Jetson Vulkan:
+  Qwen 3.5-4B L3 pos 17 hidden cosine `0.7057 → 0.9970` across all
+  positions; end-to-end generation "The capital of Japan is **Tokyo**.
+  It is the country's capital, largest city, ..." Diagnostic journey:
+  Phase X.3.e.3.30-37, 6 hypothesis revisions (DeltaNet layer 6/13 →
+  attention gate → KV cache accumulation → f64/f32 accumulator precision
+  → Metal `pow()` precision → Q4_K dequant → attention-tail projection)
+  all rejected via bit-exact zero-delta ablations (Kahan summation and
+  RoPE precomputed frequencies had zero effect), until direct per-op
+  dumps revealed that V projection was correct (cos 0.9992) but `o_buf`
+  was orthogonal (cos 0.118) — the shape parameter was the root cause.
+  All 326 tests continue to pass on both Apple M3 Metal and Jetson Orin
+  Nano 8GB (Vulkan).
+- **`src/bin/server.rs` stale config API** (c1cfabe). Followed the
+  `Llama3Config` God-object-free refactor: six field accesses
+  (`full_attention_interval`, `linear_num_kv_heads`,
+  `linear_qk_head_dim`, `linear_kv_head_dim`, `linear_num_v_heads`,
+  `linear_conv_kernel_dim`) converted to method calls; `GpuModelConfig`
+  gained two required fields (`neox_rope`,
+  `attention_only_load`) sourced from `llm_config.use_neox_rope()` and
+  `false` respectively. Restored `cargo build --release --features
+  server --bin alice-llm-server` on both Apple Silicon and aarch64
+  Vulkan. Verified end-to-end on Extoria-Jetson (Yahboom Orin Nano
+  8GB): Llama-3.2-1B-Instruct-Q4_K_M loaded via `alice-llm-server
+  --model … --port 8000`, `/v1/chat/completions` returns "Tokyo."
+  at 9.68 tok/s over Tailscale MagicDNS. `attention_only_load: false`
+  means the server bin still requires the full model to fit in unified
+  memory (Qwen 3.5-4B needs 7.82 GB projected peak against 3.28 GB
+  available on Jetson and OOM-kills); routing hybrid architectures
+  through `GpuModel::run_attention_layer_only` inside the server is
+  future work.
+
+### Added
+
+- **Phase X.3.e.3.36-37 — GPU per-op diagnostic infrastructure**
+  (4bb2dfa, 0bd5d8e). Five new public `GpuModel` methods reading a
+  single intermediate buffer after `stop_after` layer via
+  `copy_buffer_to_buffer` + `map_staging`:
+  `forward_stop_after_layer_and_read_v_buf` /
+  `forward_stop_after_layer_and_read_k_buf` /
+  `forward_stop_after_layer_and_read_attn_out` /
+  `forward_stop_after_layer_and_read_o_buf` /
+  `forward_stop_after_layer_and_read_down_buf`. `DiagBuf` enum +
+  private `diag_read_buffer` helper deduplicate the staging-copy
+  pattern. New `GpuModel::config()` public accessor for downstream
+  diagnostic examples. `qwen_gpu` example gains `--dump-l3` and
+  `--dump-l3-ext` flags emitting the JSONL dumps for direct
+  element-wise comparison against CPU reference. On the CPU side,
+  three new full-buffer JSONL dumps (`cpu_attn3_v_full`,
+  `cpu_attn3_k_full`, `cpu_gated3_attn_gated_full`,
+  `cpu_gated3_o_buf_full`, `cpu_gated3_ffn_out_full`) are emitted
+  under the existing `ALICE_DUMP_ATTN3` / `ALICE_DUMP_GATED3`
+  env-gated blocks in `llama3.rs`. These entry points are what
+  narrowed Phase X.3.e.3.37 to a single-op mismatch after six
+  hypothesis revisions had exhausted precision-oriented fixes.
+
 ### Documentation
 
 - **`docs/ALICE_ROUTER_SPEC.md`** — design specification for the
@@ -20,6 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TOML / error taxonomy / security / performance targets / testing
   plan / roadmap (R.0-R.7) / open questions / related ALICE work /
   glossary.
+- **`README.md` + `README_JP.md`** (fc78c12, 5bc4ec8). Added
+  Phase X.3.e.3.37 fix highlight, updated the Jetson Qwen 3.5-4B
+  hybrid-per-layer line from `0.3 tok/s` (pre-fix, incoherent) to
+  `0.4 tok/s` returning the correct "The capital of Japan is Tokyo.
+  It is the country's capital, largest city," output, and added a
+  Jetson multi-model support statement covering the four models
+  verified on Extoria-Jetson (Yahboom Orin Nano 8GB) on 2026-07-21:
+  Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` at 0.4 tok/s, Ornith 9B
+  Q4_K_M `--hybrid` at 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` at
+  0.1 tok/s, and DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64
+  experts / 6 active per token) CPU at 0.1 tok/s.
 
 ## [1.1.0] - 2026-07-18
 
