@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-22
+
+### Added
+
+- **crates.io metadata** (Cargo.toml). Added `repository`, `homepage`,
+  `readme`, `documentation`, `keywords = ["llm", "inference", "gguf",
+  "gpu", "quantization"]`, and `categories = ["science", "algorithms",
+  "wasm"]` for `alice-llm` crate publish readiness. Package verified
+  via `cargo publish --dry-run`: 98 files, 1.8 MiB (429.9 KiB
+  compressed). Description expanded to cover the actual feature set
+  (GGUF v3, K-quants, hybrid CPU/GPU DeltaNet+Attention, wgpu
+  compute shaders, speculative decoding, OpenAI-compatible HTTP
+  server).
+- **`.github/workflows/release.yml`** — multi-platform binary release
+  workflow. Triggers on tag push `v*.*.*` (or `workflow_dispatch` for
+  manual replay). Matrix build over 5 targets:
+  `aarch64-apple-darwin` (macos-14), `x86_64-apple-darwin`
+  (macos-15-intel), `x86_64-unknown-linux-gnu`,
+  `aarch64-unknown-linux-gnu` (cross-compile with `gcc-aarch64-linux-gnu`),
+  and `x86_64-pc-windows-msvc`. Builds `alice-llm-server --features
+  server`, packages as `.tar.gz` (Unix) / `.zip` (Windows) with
+  README + LICENSE + CHANGELOG + SHA256 checksum, uploads to GitHub
+  Release via `softprops/action-gh-release@v2`. Enables single-binary
+  distribution across Mac / Linux / Windows / aarch64 without
+  requiring end-users to install Rust toolchain or ML framework
+  dependencies.
+
 ## [1.2.0] - 2026-07-22
 
 ### Fixed
