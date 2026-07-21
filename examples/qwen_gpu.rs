@@ -569,6 +569,27 @@ fn main() {
             return;
         }
 
+        // --- Phase X.3.e.3.37 diagnostic: dump attn_out / o_buf / down_buf at L3 pos 0 ---
+        if args.iter().any(|a| a == "--dump-l3-ext") {
+            let tok0 = prompt_tokens[0];
+            let q_dim = (model.config().num_heads * model.config().head_dim) as usize;
+            let hidden_dim = model.config().hidden_dim as usize;
+
+            model.reset();
+            let attn_out = model.forward_stop_after_layer_and_read_attn_out(tok0, 3, q_dim);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu_gated3_attn_gated_full", &attn_out);
+
+            model.reset();
+            let o_buf = model.forward_stop_after_layer_and_read_o_buf(tok0, 3, hidden_dim);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu_gated3_o_buf_full", &o_buf);
+
+            model.reset();
+            let ffn_out = model.forward_stop_after_layer_and_read_down_buf(tok0, 3, hidden_dim);
+            alice_llm::llama3::dump_hidden_jsonl_stderr("gpu_gated3_ffn_out_full", &ffn_out);
+
+            return;
+        }
+
         // --- Issue #40 layer bisection mode ---
         if layer_bisect {
             let checkpoints = [0usize, 6, 13, 20, 27];

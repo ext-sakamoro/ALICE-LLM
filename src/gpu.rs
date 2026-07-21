@@ -2312,6 +2312,16 @@ pub enum LayerType {
     DeltaNet,
 }
 
+/// Phase X.3.e.3.37 diagnostic: selects intermediate buffer to read via
+/// `GpuModel::diag_read_buffer`. Not exposed publicly; individual dumps
+/// are wrapped by dedicated `forward_stop_after_layer_and_read_*` methods.
+#[allow(dead_code)]
+enum DiagBuf {
+    AttnOut,
+    OBuf,
+    DownBuf,
+}
+
 /// Pre-compiled GPU model with zero per-token allocations.
 ///
 /// All `wgpu::BindGroup` and uniform buffers are created once at load time.
@@ -3113,10 +3123,20 @@ impl GpuModel {
                             kv_dim,
                             config.hidden_dim,
                         ),
+                        // Phase X.3.e.3.37 fix: o_proj cols = q_dim (input =
+                        // attn_out of q_dim = num_heads * head_dim), NOT
+                        // hidden_dim. For models where q_dim == hidden_dim
+                        // (Llama / Qwen 2/2.5 / Mistral) this is neutral.
+                        // For Qwen 3.5-4B (hidden_dim=2560, q_dim=4096) the
+                        // previous hardcoded hidden_dim loaded only 2560/4096
+                        // = 62.5% of Q4_K bytes = 37.5% weight corruption,
+                        // producing near-orthogonal o_proj output (cos 0.118
+                        // vs 0.999 target) → cascade drift from layer 3
+                        // attention onwards.
                         o_proj: upload_w(
                             &format!("blk.{i}.attn_output.weight"),
                             config.hidden_dim,
-                            config.hidden_dim,
+                            q_dim_attn,
                         ),
                         q_bias: gguf
                             .tensor_to_f32(&format!("blk.{i}.attn_q.bias"))
@@ -5204,6 +5224,83 @@ impl GpuModel {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode_forward_stop_after(&mut encoder, stop_after);
         encoder.copy_buffer_to_buffer(&self._k_buf.buffer, 0, &staging, 0, byte_size);
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+
+        self.engine.map_staging(&staging, n_elements)
+    }
+
+    /// Phase X.3.e.3.37 diagnostic: reads `_attn_out` after `stop_after`
+    /// layer. For attention layers, this is the POST-gate attention output
+    /// (sigmoid_gate_apply modifies attn_out in place). Compare with CPU
+    /// `gated3_attn_gated`.
+    pub fn forward_stop_after_layer_and_read_attn_out(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+    ) -> Vec<f32> {
+        self.diag_read_buffer(token_id, stop_after, n_elements, DiagBuf::AttnOut)
+    }
+
+    /// Phase X.3.e.3.37 diagnostic: reads `_o_buf` after `stop_after` layer
+    /// (post o_proj matvec, pre residual_add). Compare with CPU `gated3_o_buf`.
+    pub fn forward_stop_after_layer_and_read_o_buf(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+    ) -> Vec<f32> {
+        self.diag_read_buffer(token_id, stop_after, n_elements, DiagBuf::OBuf)
+    }
+
+    /// Phase X.3.e.3.37 diagnostic: reads `_down_buf` after `stop_after`
+    /// layer (post FFN down_proj matvec, pre residual_add). Compare with CPU
+    /// `gated3_ffn_out`.
+    pub fn forward_stop_after_layer_and_read_down_buf(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+    ) -> Vec<f32> {
+        self.diag_read_buffer(token_id, stop_after, n_elements, DiagBuf::DownBuf)
+    }
+
+    /// Phase X.3.e.3.37 internal helper: shared staging-copy diagnostic
+    /// pattern for reading a specific intermediate buffer after a stop-at
+    /// layer. Advances seq_len like other stop-after diagnostics.
+    fn diag_read_buffer(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+        which: DiagBuf,
+    ) -> Vec<f32> {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let byte_size = (n_elements * 4) as u64;
+        let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diag_staging"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let src_buf = match which {
+            DiagBuf::AttnOut => &self._attn_out.buffer,
+            DiagBuf::OBuf => &self._o_buf.buffer,
+            DiagBuf::DownBuf => &self._down_buf.buffer,
+        };
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_forward_stop_after(&mut encoder, stop_after);
+        encoder.copy_buffer_to_buffer(src_buf, 0, &staging, 0, byte_size);
         self.engine.queue.submit(Some(encoder.finish()));
         self.seq_len = seq_len;
 
