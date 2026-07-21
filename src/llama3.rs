@@ -4703,12 +4703,15 @@ impl<'a> Llama3Model<'a> {
             }
             if dump_gated_layer3 {
                 dump_slice("gated3_attn_gated", &attn_out[..q_dim], 3);
+                // Phase X.3.e.3.37: full q_dim dump for element-wise GPU compare
+                dump_hidden_jsonl_stderr("cpu_gated3_attn_gated_full", &attn_out[..q_dim]);
             }
 
             // Output projection
             layer.o_proj.matvec(&attn_out, &mut o_buf);
             if dump_gated_layer3 {
                 dump_slice("gated3_o_buf", &o_buf, 3);
+                dump_hidden_jsonl_stderr("cpu_gated3_o_buf_full", &o_buf);
                 dump_slice("gated3_hidden_pre_residual", &hidden, 3);
                 // Compute what post-residual will be (hidden + o_buf).
                 let post_res: Vec<f32> = hidden
@@ -4838,6 +4841,8 @@ impl<'a> Llama3Model<'a> {
                 if fire {
                     dump_slice("gated3_ffn_out", &down_buf, 3);
                     dump_slice("gated3_l_out_3", &hidden, 3);
+                    // Phase X.3.e.3.37: full down_buf dump for GPU compare
+                    dump_hidden_jsonl_stderr("cpu_gated3_ffn_out_full", &down_buf);
                 }
             }
 
