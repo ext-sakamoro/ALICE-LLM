@@ -2793,6 +2793,11 @@ impl GpuModel {
         }
     }
 
+    /// Read-only accessor for model config (needed by external diagnostics).
+    pub fn config(&self) -> &GpuModelConfig {
+        &self.config
+    }
+
     /// Load model from GGUF, upload all weights, pre-create all bind groups.
     /// Load model from GGUF (takes ownership of engine).
     #[cfg(feature = "gguf")]
@@ -5134,6 +5139,75 @@ impl GpuModel {
         self.seq_len = seq_len;
 
         self.engine.map_staging(hidden_staging, hidden_dim)
+    }
+
+    /// Phase X.3.e.3.36 diagnostic: runs forward stopping after `stop_after`
+    /// layer and dumps the current v_buf contents (post-v_proj, since v_buf
+    /// is not modified between v_proj and next-layer's v_proj). Only makes
+    /// sense when `stop_after` is an Attention layer index. Returns the
+    /// first `n_elements` of v_buf. Advances seq_len like other stop-after
+    /// diagnostics.
+    pub fn forward_stop_after_layer_and_read_v_buf(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+    ) -> Vec<f32> {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let byte_size = (n_elements * 4) as u64;
+        let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("v_buf_diag_staging"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_forward_stop_after(&mut encoder, stop_after);
+        encoder.copy_buffer_to_buffer(&self._v_buf.buffer, 0, &staging, 0, byte_size);
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+
+        self.engine.map_staging(&staging, n_elements)
+    }
+
+    /// Phase X.3.e.3.36 diagnostic: same as above but reads k_buf.
+    pub fn forward_stop_after_layer_and_read_k_buf(
+        &mut self,
+        token_id: u32,
+        stop_after: usize,
+        n_elements: usize,
+    ) -> Vec<f32> {
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let byte_size = (n_elements * 4) as u64;
+        let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k_buf_diag_staging"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.encode_forward_stop_after(&mut encoder, stop_after);
+        encoder.copy_buffer_to_buffer(&self._k_buf.buffer, 0, &staging, 0, byte_size);
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+
+        self.engine.map_staging(&staging, n_elements)
     }
 
     /// Issue #40 diagnostic. Executes forward and returns both the
