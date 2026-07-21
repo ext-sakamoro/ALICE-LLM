@@ -12,13 +12,17 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、326 テスト�
 
 **Qwen 3.5-4B ハイブリッド (DeltaNet + フルアテンション) が Apple Silicon Metal で coherent 生成 2.9 tok/s (Q4_K_M 混合量子化を Q5_K/Q8_0 shader でカバー)。**
 
+**Phase X.3.e.3.37 (2026-07-21): Qwen 3.5+ ハイブリッド arch (q_dim = num_heads × head_dim ≠ hidden_dim) 向けの o_proj cols 次元 fix。従来 `upload_w` に hardcode されていた hidden_dim では Qwen 3.5-4B の o_proj 出力が cos 0.118 でほぼ直交していた。1 行 fix で L3 pos 17 hidden cos 0.7057 → 0.9970、全 position で cross-arch coherence 復元。**
+
 **CPU: 0.16 → 1.76 tok/s (11倍) 70Bスパースターナリ — Apple Siliconメモリ帯域の45%に到達。**
 
 **Per-layer hybrid (`--hybrid-per-layer`): CPU が DeltaNet 層、GPU が Attention 層を分担、hidden state を per-token でやり取り。フル GPU アロケーションを避けつつ pure GPU と pure CPU の中間速度を実現。**
 
-**arm64 8 GiB board (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.3 tok/s (CPU-only `--hybrid` の 3.3 倍高速) — `attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
+**arm64 8 GiB board (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.4 tok/s で "The capital of Japan is Tokyo. It is the country's capital, largest city," を回答 — Phase X.3.e.3.37 o_proj weight upload cols 次元 fix により qwen35 ハイブリッド arch の cross-arch 動作が復元 (従来は o_proj を [hidden_dim, hidden_dim] で load していたが、正しくは [hidden_dim, q_dim]、q_dim ≠ hidden_dim なモデルで Q4_K weight bytes の 37.5% が欠損していた)。`attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
 
 **Ornith-1.0-9B (DeepReinforce 製、MIT、Qwen 3.5 fine-tune で agentic coding 特化): Apple Silicon CPU (1.8 tok/s) / Apple Silicon Metal iGPU (2.1 tok/s) / arm64 8 GiB board CPU (2.3 tok/s) の 3 環境で zero-config load-and-run 確認 — `general.architecture = qwen35` で自動検出、Phase X.3.e.3.14-29 の CPU/GPU fix が fine-tune にも cascade 適用。**
+
+**arm64 board マルチモデル対応 (2026-07-21 arm64 arm64 board Nano 8GB で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
 
 ## クイックスタート
 
