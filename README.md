@@ -12,15 +12,19 @@ GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **Qwen 3.5-4B hybrid (DeltaNet + Full Attention) on Apple M3 Metal: coherent generation at 2.9 tok/s (Q4_K_M mixed quant with Q5_K/Q8_0 shader coverage).**
 
+**Phase X.3.e.3.37 (2026-07-21): o_proj cols dimension fix for Qwen 3.5+ hybrid architectures where q_dim = num_heads × head_dim ≠ hidden_dim. Previous hardcoded hidden_dim in `upload_w` produced near-orthogonal o_proj output (cos 0.118) for Qwen 3.5-4B. One-line fix restored cross-arch coherence: L3 pos 17 hidden cos 0.7057 → 0.9970 across all positions.**
+
 **CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro.**
 
 **x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary all get AVX2 and AVX-512BW/F kernels with runtime dispatch, matching the existing NEON parity on Apple Silicon.**
 
 **Per-layer hybrid (`--hybrid-per-layer`): CPU processes DeltaNet layers + GPU processes Attention layers with per-token hidden-state shuttle. Intermediate speed between pure GPU and pure CPU while bypassing full-model GPU allocation.**
 
-**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.3 tok/s (3.3× faster than CPU-only `--hybrid`) — `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
+**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.4 tok/s answering "The capital of Japan is Tokyo. It is the country's capital, largest city," — Phase X.3.e.3.37 o_proj weight upload cols dim fix restored the qwen35 hybrid arch (previously loaded o_proj as [hidden_dim, hidden_dim] instead of [hidden_dim, q_dim], truncating 37.5% of Q4_K weight bytes for models where q_dim ≠ hidden_dim). `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
 
 **Ornith-1.0-9B (DeepReinforce, MIT, Qwen 3.5 fine-tune for agentic coding): verified load-and-run across Apple M3 CPU (1.8 tok/s), Apple M3 Metal iGPU (2.1 tok/s), and Jetson Orin Nano 8GB CPU (2.3 tok/s) with zero config — arch auto-detected from `general.architecture = qwen35`, all Phase X.3.e.3.14-29 CPU/GPU fixes cascade cleanly to the fine-tune.**
+
+**Jetson multi-model support (2026-07-21 verified on Yahboom Orin Nano 8GB)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
 
 ## Quick Start
 
