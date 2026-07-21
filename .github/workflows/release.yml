@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v1.2.1)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross-compile deps (aarch64-linux)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build alice-llm-server (${{ matrix.target }})
+        run: cargo build --release --features server --bin alice-llm-server --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          STAGE="alice-llm-server-${{ github.ref_name || inputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/alice-llm-server "$STAGE/"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          STAGE="alice-llm-server-${{ github.ref_name || inputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/alice-llm-server.exe "$STAGE/"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          7z a "$STAGE.zip" "$STAGE"
+          certutil -hashfile "$STAGE.zip" SHA256 | grep -v ":" | head -1 > "$STAGE.zip.sha256"
+
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            alice-llm-server-*.tar.gz
+            alice-llm-server-*.tar.gz.sha256
+            alice-llm-server-*.zip
+            alice-llm-server-*.zip.sha256
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          fail_on_unmatched_files: false

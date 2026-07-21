@@ -1,10 +1,16 @@
 [package]
 name = "alice-llm"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 license = "AGPL-3.0-or-later"
-description = "ALICE LLM inference engine: tokenizer, KV cache, attention, RoPE, quantization, sampling, batch inference"
+description = "Pure Rust LLM inference engine — GGUF v3 parser, K-quants, hybrid CPU/GPU DeltaNet+Attention, wgpu compute shaders, speculative decoding, OpenAI-compatible HTTP server."
+readme = "README.md"
+repository = "https://github.com/ext-sakamoro/ALICE-LLM"
+homepage = "https://github.com/ext-sakamoro/ALICE-LLM"
+documentation = "https://docs.rs/alice-llm"
+keywords = ["llm", "inference", "gguf", "gpu", "quantization"]
+categories = ["science", "algorithms", "wasm"]
 
 [lib]
 crate-type = ["rlib"]
