@@ -22,7 +22,7 @@ gguf = ["dep:memmap2", "dep:libc"]
 parallel = ["dep:rayon"]
 simd = ["dep:wide"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
-server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "gpu", "gguf"]
+server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:async-stream", "gpu", "gguf"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
@@ -36,6 +36,7 @@ axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+async-stream = { version = "0.3", optional = true }
 
 [[example]]
 name = "elyza_gguf"
