@@ -47,6 +47,21 @@ Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
 
+## Desktop App — ALICE-LLM Studio
+
+[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) is a companion desktop app that wraps this engine in a Tauri GUI: an embedded `alice-llm-server` sidecar, a HuggingFace GGUF browser with per-file streaming download and hardware-fit hints (🟢 comfortable / 🟡 tight / 🟠 hybrid / 🔴 oversized), and an Ollama-style chat pane with `max_tokens` / `temperature` controls. Local models live under `~/.alice-llm-studio/models/`.
+
+**Latest release: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22, embeds ALICE-LLM v1.2.1). Signed installers are not shipped yet, so the first launch may need a Gatekeeper / SmartScreen bypass.
+
+| Platform | Download |
+|---|---|
+| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
+| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
+| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
+| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+
+Chat is non-streaming in this alpha because the embedded sidecar predates the OpenAI SSE surface — the hardware-fit hints are advisory since the shipped `alice-llm-server` doesn't yet accept `--hybrid` / `--hybrid-per-layer` from the GUI. Both gaps are tracked upstream; the CLI examples below expose the full feature surface today.
+
 ## Features
 
 - **GGUF v3 parser** — zero-copy mmap weight loading

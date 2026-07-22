@@ -66,6 +66,21 @@ cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
   --prompt "The capital of Japan is" --max-tokens 40 --hybrid
 ```
 
+## デスクトップアプリ — ALICE-LLM Studio
+
+[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) は本エンジンを Tauri GUI で wrap したコンパニオンアプリ。組み込み `alice-llm-server` サイドカー、HuggingFace GGUF ブラウザ（ファイル単位のストリーミングダウンロード + ハードウェア適合度ヒント: 🟢 余裕 / 🟡 タイト / 🟠 ハイブリッド / 🔴 サイズ超過）、Ollama 風チャット UI (`max_tokens` / `temperature` 制御) を備える。ローカルモデルは `~/.alice-llm-studio/models/` 配下に保存。
+
+**最新リリース: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22、ALICE-LLM v1.2.1 を組み込み)。署名済みインストーラは未提供のため、初回起動時に Gatekeeper / SmartScreen の許可が必要になる場合がある。
+
+| プラットフォーム | ダウンロード |
+|---|---|
+| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
+| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
+| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
+| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+
+本 alpha ではチャットは非ストリーミング (組み込み済みサイドカーが OpenAI SSE サーフェスより前のビルドのため)、ハードウェア適合度ヒントは advisory (`alice-llm-server` 側が GUI からの `--hybrid` / `--hybrid-per-layer` をまだ受け付けないため実行系には反映されない)。両者とも upstream で追従予定。現時点のフル機能面は下記 CLI 例で網羅している。
+
 ## 機能一覧
 
 - **GGUF v3 パーサー** — ゼロコピー mmap 重み読み込み
