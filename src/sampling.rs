@@ -144,7 +144,7 @@ pub trait GrammarTokenizer {
     fn eos_id(&self) -> u32;
 }
 
-#[cfg(all(feature = "grammar", feature = "gguf"))]
+#[cfg(feature = "grammar")]
 impl GrammarTokenizer for crate::gguf::GgufTokenizer {
     fn text_of(&self, id: u32) -> String {
         self.decode(&[id])
