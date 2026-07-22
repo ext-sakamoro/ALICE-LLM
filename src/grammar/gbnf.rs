@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// A character class such as `[a-z]` or `[^abc]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CharClass {
     pub negated: bool,
     pub ranges: Vec<(char, char)>,
@@ -44,7 +44,7 @@ impl CharClass {
 }
 
 /// One grammar symbol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Symbol {
     Terminal(String),
     CharClass(CharClass),
@@ -56,7 +56,7 @@ pub enum Symbol {
 }
 
 /// A sequence of symbols. A rule body is a list of alternatives.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Alternative(pub Vec<Symbol>);
 
 /// A parsed grammar. The rule named `root` is the entry point.
