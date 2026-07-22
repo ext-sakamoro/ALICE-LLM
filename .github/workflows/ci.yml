@@ -105,3 +105,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
         run: cargo build --release --lib
+
+  examples_build:
+    # Phase X.8 B-8: catch example bit-rot for grammar-constrained
+    # decoding demos. GGUF-dependent examples cannot run in CI (no
+    # model shipped) but compile-time verification prevents silent
+    # regressions when the underlying API changes.
+    name: Examples compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --example lol_gen --features "grammar gguf"
+        run: cargo build --example lol_gen --features "grammar gguf"
