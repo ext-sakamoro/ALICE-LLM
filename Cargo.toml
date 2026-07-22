@@ -22,6 +22,7 @@ gguf = ["dep:memmap2", "dep:libc"]
 parallel = ["dep:rayon"]
 simd = ["dep:wide"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+grammar = []
 server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:async-stream", "gpu", "gguf"]
 
 [dependencies]

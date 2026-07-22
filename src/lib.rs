@@ -60,6 +60,8 @@ pub mod deepseek_streaming;
 pub mod gguf;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "grammar")]
+pub mod grammar;
 pub mod kv_cache;
 pub mod linalg;
 pub mod llama3;
