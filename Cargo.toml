@@ -103,6 +103,13 @@ required-features = ["gguf"]
 name = "bench_deepseek_streaming"
 required-features = ["gguf"]
 
+# Phase X.8 B-8: grammar-constrained decoding demo. Points a GGUF model
+# at any GBNF file (LOL / JSON schema / tool-call) and prints the
+# guaranteed-valid output.
+[[example]]
+name = "lol_gen"
+required-features = ["grammar", "gguf"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
