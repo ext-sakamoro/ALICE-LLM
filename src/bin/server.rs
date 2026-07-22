@@ -22,12 +22,18 @@ use alice_llm::{
 use axum::{
     extract::State,
     http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Chat template
@@ -180,7 +186,7 @@ struct ChatCompletionRequest {
     #[serde(default = "default_top_k")]
     top_k: usize,
     #[serde(default)]
-    _stream: bool,
+    stream: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -220,6 +226,34 @@ struct ChatChoice {
     index: usize,
     message: ChatMessage,
     finish_reason: String,
+}
+
+// Streaming chunk shape — mirrors OpenAI's `chat.completion.chunk` so any
+// OpenAI-compatible client (Voicebox, llama.cpp examples, LangChain, etc.)
+// reads the frames without a special code path.
+#[derive(Serialize)]
+struct ChatCompletionChunk {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<ChoiceDelta>,
+}
+
+#[derive(Serialize)]
+struct ChoiceDelta {
+    index: usize,
+    delta: DeltaContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct DeltaContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -411,8 +445,17 @@ async fn completions(
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let prompt = state.chat_template.format_messages(&req.messages);
+
+    if req.stream {
+        // OpenAI-compatible SSE. Bridges the sync generation loop (which
+        // has to hold the GpuModel mutex) to the async response body via a
+        // per-request mpsc channel: `spawn_blocking` drives the model and
+        // pushes deltas, the response body drains the receiver.
+        return Ok(stream_chat_completions(state, prompt, req).into_response());
+    }
+
     let (text, n_prompt, n_gen, decode_ms, finish_reason) =
         generate(&state, &prompt, req.max_tokens, req.temperature, req.top_k)?;
 
@@ -441,7 +484,177 @@ async fn chat_completions(
             tokens_per_sec: tps,
             decode_ms,
         },
-    }))
+    })
+    .into_response())
+}
+
+fn stream_chat_completions(
+    state: Arc<AppState>,
+    prompt: String,
+    req: ChatCompletionRequest,
+) -> impl IntoResponse {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let req_id = make_req_id();
+    let model_name = state.model_name.clone();
+
+    // Emit the leading role delta so OpenAI SDKs that expect it can seed
+    // the assistant message before any content arrives.
+    let initial = ChatCompletionChunk {
+        id: req_id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created: now_secs(),
+        model: model_name.clone(),
+        choices: vec![ChoiceDelta {
+            index: 0,
+            delta: DeltaContent {
+                role: Some("assistant".to_string()),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    let _ = tx.send(Ok(sse_data(&initial)));
+
+    // The tokenizer / GpuModel loop is synchronous, so drive it on a
+    // blocking thread and drip completions back through the channel.
+    let tx_gen = tx.clone();
+    let req_id_gen = req_id.clone();
+    let model_name_gen = model_name.clone();
+    tokio::task::spawn_blocking(move || {
+        run_stream_generation(state, prompt, req, req_id_gen, model_name_gen, tx_gen);
+    });
+
+    Sse::new(async_stream::stream! {
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
+    })
+    .keep_alive(KeepAlive::default())
+}
+
+fn run_stream_generation(
+    state: Arc<AppState>,
+    prompt_text: String,
+    req: ChatCompletionRequest,
+    req_id: String,
+    model_name: String,
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
+) {
+    let prompt_tokens = state.tokenizer.encode(&prompt_text);
+
+    let mut model = match state.model.lock() {
+        Ok(m) => m,
+        Err(_) => {
+            // Poison — end the stream cleanly so the client isn't left hanging.
+            let _ = tx.send(Ok(sse_done()));
+            return;
+        }
+    };
+    model.reset();
+
+    for &tok in &prompt_tokens[..prompt_tokens.len().saturating_sub(1)] {
+        model.forward(tok);
+    }
+    let Some(&last) = prompt_tokens.last() else {
+        let _ = tx.send(Ok(sse_done()));
+        return;
+    };
+    let mut logits = model.forward_and_read(last);
+
+    let mut generated: Vec<u32> = Vec::new();
+    // Running decoded text — we ship the suffix on each token so the client
+    // sees incremental content instead of one big blob at the end. BPE
+    // decode isn't strictly incremental byte-for-byte (multi-token merges
+    // can re-render the tail), so `starts_with` guards the suffix slice.
+    let mut last_decoded = String::new();
+    let mut finish_reason = "length".to_string();
+
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1234;
+    let mut next_rand = || -> f32 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        (rng_state as f32) / (u64::MAX as f32)
+    };
+
+    for _ in 0..req.max_tokens {
+        let next = if req.temperature < 1e-6 {
+            sample_argmax(&logits) as u32
+        } else {
+            apply_temperature(&mut logits, req.temperature);
+            top_k_filter(&mut logits, req.top_k);
+            softmax_inplace(&mut logits);
+            sample_with_random(&logits, next_rand()) as u32
+        };
+
+        if next == state.tokenizer.eos_id || state.stop_token_ids.contains(&next) {
+            finish_reason = "stop".to_string();
+            break;
+        }
+
+        generated.push(next);
+        let full = state.tokenizer.decode(&generated);
+        if full.starts_with(&last_decoded) && full.len() > last_decoded.len() {
+            let delta = &full[last_decoded.len()..];
+            let chunk = ChatCompletionChunk {
+                id: req_id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created: now_secs(),
+                model: model_name.clone(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: DeltaContent {
+                        role: None,
+                        content: Some(delta.to_string()),
+                    },
+                    finish_reason: None,
+                }],
+            };
+            if tx.send(Ok(sse_data(&chunk))).is_err() {
+                // Client disconnected — stop wasting GPU cycles.
+                return;
+            }
+        }
+        last_decoded = full;
+        logits = model.forward_and_read(next);
+    }
+
+    // Terminal chunk carries the finish reason so clients that look for it
+    // (finish_reason: "stop" | "length") don't have to synthesise one.
+    let final_chunk = ChatCompletionChunk {
+        id: req_id,
+        object: "chat.completion.chunk".to_string(),
+        created: now_secs(),
+        model: model_name,
+        choices: vec![ChoiceDelta {
+            index: 0,
+            delta: DeltaContent::default(),
+            finish_reason: Some(finish_reason),
+        }],
+    };
+    let _ = tx.send(Ok(sse_data(&final_chunk)));
+    let _ = tx.send(Ok(sse_done()));
+}
+
+fn sse_data<T: Serialize>(chunk: &T) -> Event {
+    // Fall back to a minimal error payload if serde ever chokes — we've
+    // already committed to a streamed response, so bailing with 500 isn't
+    // an option here.
+    let payload = serde_json::to_string(chunk)
+        .unwrap_or_else(|_| String::from(r#"{"error":"serialization failed"}"#));
+    Event::default().data(payload)
+}
+
+fn sse_done() -> Event {
+    // OpenAI sentinel — literal `data: [DONE]` (not JSON).
+    Event::default().data("[DONE]")
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
