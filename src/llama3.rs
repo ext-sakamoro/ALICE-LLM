@@ -7616,6 +7616,139 @@ impl<'a> Llama3Model<'a> {
             }
         }
     }
+
+    // ─── Grammar-constrained generation (Phase X.8 B-4) ─────────────────────
+
+    /// Generate text with grammar-constrained decoding.
+    ///
+    /// Wraps the standard prefill + decode loop with the grammar mask
+    /// from [`crate::sampling::mask_logits_by_grammar`] and advances the
+    /// FSM ([`crate::grammar::Fsm`]) after every accepted token. The
+    /// mask forbids EOS unless the FSM is in a final state, so the model
+    /// cannot terminate mid-parse; conversely once the grammar admits
+    /// only EOS, the model is forced to stop.
+    ///
+    /// Fails with:
+    /// - [`GrammarGenError::Fsm`] if FSM start or advance fails.
+    /// - [`GrammarGenError::NoValidToken`] if the mask leaves no
+    ///   sample-able token at a given step (grammar unsatisfiable from
+    ///   the current context).
+    ///
+    /// Sampling is greedy (`argmax` within `top_k`); temperature and
+    /// top-k mirror the semantics of [`generate`](Self::generate).
+    /// Repetition penalty is intentionally *not* applied: the grammar
+    /// mask already restricts output space, and mixing the two often
+    /// produces surprising interactions.
+    #[cfg(feature = "grammar")]
+    pub fn generate_grammar(
+        &mut self,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        grammar: &crate::grammar::Grammar,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<GenerateResult, GrammarGenError> {
+        use crate::grammar::Fsm;
+        use crate::sampling::{advance_fsm_on_emit, mask_logits_by_grammar};
+
+        let start = Instant::now();
+        let mut tokens = tokenizer.encode(prompt);
+        if tokenizer.add_bos_token && (tokens.is_empty() || tokens[0] != tokenizer.bos_id) {
+            tokens.insert(0, tokenizer.bos_id);
+        }
+
+        self.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        // Prefill
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        // Init FSM from grammar's root rule.
+        let mut fsm = Fsm::start(grammar)?;
+
+        // Decode
+        let decode_start = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for step in 0..max_new_tokens {
+            // Apply the grammar mask *before* temperature so masking is
+            // preserved through the linear scale.
+            mask_logits_by_grammar(&fsm, tokenizer, &mut logits);
+
+            if !logits.iter().any(|l| l.is_finite()) {
+                return Err(GrammarGenError::NoValidToken { step });
+            }
+
+            // Temperature
+            if temperature > 0.0 && temperature != 1.0 {
+                let inv_t = 1.0 / temperature;
+                for l in &mut logits {
+                    *l *= inv_t;
+                }
+            }
+
+            // Argmax within top-k on the finite subset.
+            let next_token = if top_k > 0 && top_k < logits.len() {
+                let mut indexed: Vec<(usize, f32)> = logits
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, l)| l.is_finite())
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.truncate(top_k);
+                indexed.first().map_or(0u32, |(idx, _)| *idx as u32)
+            } else {
+                logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.is_finite())
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map_or(0u32, |(idx, _)| idx as u32)
+            };
+
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+
+            // Feed the emitted token back to the FSM. If the driver ever
+            // slips (e.g. skipped the mask) the FSM refuses and we bail.
+            advance_fsm_on_emit(&mut fsm, tokenizer, next_token)?;
+
+            tokens.push(next_token);
+            generated.push(next_token);
+
+            logits = self.forward(next_token);
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let output_text = tokenizer.decode(&generated);
+
+        Ok(GenerateResult {
+            text: output_text,
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+            spec_stats: None,
+        })
+    }
 }
 
 // ─── Sampling helpers ────────────────────────────────────────────────────────
@@ -7728,6 +7861,42 @@ pub struct SpecStats {
     pub accepted_tokens: usize,
     pub draft_layers: usize,
     pub spec_k: usize,
+}
+
+/// Errors from grammar-constrained generation (Phase X.8 B-4).
+#[cfg(feature = "grammar")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarGenError {
+    /// FSM construction or transition failure.
+    Fsm(crate::grammar::FsmError),
+    /// After applying the grammar mask, no token remained sample-able at
+    /// `step`. The grammar cannot be satisfied from the current point;
+    /// typically means the model context has diverged from the grammar
+    /// (e.g. prompt already emitted invalid text) or the grammar is
+    /// under-specified for the model's vocabulary.
+    NoValidToken { step: usize },
+}
+
+#[cfg(feature = "grammar")]
+impl std::fmt::Display for GrammarGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fsm(e) => write!(f, "grammar FSM error: {e}"),
+            Self::NoValidToken { step } => {
+                write!(f, "no valid token accepted by grammar at step {step}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "grammar")]
+impl std::error::Error for GrammarGenError {}
+
+#[cfg(feature = "grammar")]
+impl From<crate::grammar::FsmError> for GrammarGenError {
+    fn from(e: crate::grammar::FsmError) -> Self {
+        Self::Fsm(e)
+    }
 }
 
 // ─── Weight loading helpers ─────────────────────────────────────────────────
@@ -12726,5 +12895,36 @@ mod tests {
         assert!(attn_out[4].abs() < 1e-3);
         // gate = 10 → sigmoid(10) ≈ 1 → output ≈ unchanged (0.5 * ~1).
         assert!((attn_out[3] - 0.5).abs() < 1e-3);
+    }
+
+    // ─── generate_grammar (Phase X.8 B-4) ────────────────────────────────
+    // Method-level end-to-end tests need a real GGUF model and are handled
+    // in Phase X.8 B-9 (Mac Metal / Jetson Vulkan smoke run). The unit
+    // tests below cover only the error type surface — enough to guarantee
+    // Display / Debug / From conversion contracts.
+
+    #[cfg(feature = "grammar")]
+    #[test]
+    fn grammar_gen_error_display_no_valid_token() {
+        let e = GrammarGenError::NoValidToken { step: 3 };
+        let s = format!("{e}");
+        assert!(s.contains("step 3"));
+    }
+
+    #[cfg(feature = "grammar")]
+    #[test]
+    fn grammar_gen_error_display_wraps_fsm_error() {
+        let e = GrammarGenError::Fsm(crate::grammar::FsmError::NoTransition { ch: 'x' });
+        let s = format!("{e}");
+        assert!(s.contains("FSM error"));
+        assert!(s.contains("'x'"));
+    }
+
+    #[cfg(feature = "grammar")]
+    #[test]
+    fn grammar_gen_error_from_fsm_error() {
+        let fsm_err = crate::grammar::FsmError::EmptyRoot;
+        let converted: GrammarGenError = fsm_err.clone().into();
+        assert_eq!(converted, GrammarGenError::Fsm(fsm_err));
     }
 }
