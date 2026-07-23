@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Grammar-constrained decoding (Phase X.8, B-1 → B-4, B-8, B-9-C)**
+  behind the new `grammar` feature. Downstream can constrain sampling
+  to any GBNF (LOL DSL, JSON schema, tool-call payloads) with a
+  single feature flag; no new dependencies are pulled in.
+  - `alice_llm::grammar` module:
+    - `parse_gbnf(&str) -> Result<Grammar, GbnfError>` — hand-written
+      llama.cpp-compatible GBNF subset parser (terminal + char class
+      including negation + rule ref + group + `* + ?` quantifiers +
+      `#` comments; unsupported syntax `. / {n,m} / lookahead` fails
+      loud).
+    - `Fsm { start, advance, accepts, accepts_str, is_final, is_dead,
+      allowed_chars, with_max_depth }` — NFA over parse positions,
+      forks eagerly through rule refs / groups / quantifiers,
+      recursion capped by `DEFAULT_MAX_DEPTH = 256` so left-recursion
+      without a base case surfaces as `FsmError::RecursionOverflow`.
+    - `CharSet` for allowed-char introspection.
+  - `alice_llm::sampling` module:
+    - `GrammarTokenizer` trait (blanket impl for `GgufTokenizer`).
+    - `mask_logits_by_grammar(&fsm, tokenizer, &mut logits)` — sets
+      `-inf` on tokens whose decoded text the FSM refuses; skips
+      already-masked logits, forbids EOS unless final.
+    - `advance_fsm_on_emit(&mut fsm, tokenizer, token_id)` — feeds
+      the emitted token's text back to the FSM; drift surfaces as
+      `FsmError::NoTransition`.
+  - `Llama3Model::generate_grammar(tokenizer, prompt, max_new_tokens,
+    grammar, temperature, top_k) -> Result<GenerateResult,
+    GrammarGenError>` — grammar-constrained variant of `generate`.
+    `GrammarGenError { Fsm(FsmError), NoValidToken { step } }` with
+    `Display`, `std::error::Error`, and `From<FsmError>` impls.
+  - `examples/lol_gen.rs` — DSL-agnostic reference: point `--grammar`
+    at any GBNF file and `--model` at any GGUF and dump guaranteed-
+    valid output. `cargo run --example lol_gen --features "grammar
+    gguf" -- --model <path> --grammar <path> --prompt "..."`.
+  - Server (`alice-llm-server`, `--features server`):
+    - `CompletionRequest` / `ChatCompletionRequest` gained
+      `grammar: Option<String>`. When present, the sampler is
+      constrained by the parsed GBNF; when absent, behavior is
+      byte-identical to prior versions.
+    - `POST /v1/completions` and non-streaming
+      `POST /v1/chat/completions` honor the field.
+    - Chat streaming (`stream = true`) with `grammar` returns
+      HTTP 400 explicitly — SSE + mask is future work; a loud error
+      beats silently unconstrained output.
+    - `server` feature now implies `grammar`, so the mask code
+      always ships with the binary.
+- CI: new `Examples & server compile` job compiles the new example
+  and the server binary against the enabling features, protecting
+  the grammar surface from silent bit-rot.
+
+### Fixed
+
+- `impl GrammarTokenizer for GgufTokenizer` was gated on
+  `all(grammar, gguf)`, but `GgufTokenizer` itself is always
+  compiled. Downstream crates enabling only `grammar` (e.g.
+  `alice-lol/tests/lol_gbnf_test.rs`) hit an unresolved bound at
+  `advance_fsm_on_emit`. Loosened to `grammar`-only. (commit
+  `d048270`, follow-up to B-3.)
+
+### Notes
+
+- Phase X.8 B-9-A validated the end-to-end grammar → SdfNode path on
+  Mac Metal with Qwen 3.5-4B Q4_K_M (CPU hybrid, ~1 tok/s): prompt
+  `"generate lol: sphere(1.5)"` produced `SdfNode::Sphere { radius:
+  1.5 }` in ~477s. The grammar mask + `BridgeError::Parse` two-stage
+  safety net fired as designed when `max_new_tokens` capped a
+  partial parse. Fine-tuned LOL emission is future work — the mask
+  guarantees syntactic validity but semantic quality tracks the
+  underlying model.
+- Phase X.8 B-9-B (Jetson Vulkan smoke run) and a version bump to
+  1.3.0 (additive `grammar` feature is SemVer-minor) are follow-up
+  work.
+
 ## [1.2.1] - 2026-07-22
 
 ### Added
