@@ -111,7 +111,12 @@ jobs:
     # decoding demos. GGUF-dependent examples cannot run in CI (no
     # model shipped) but compile-time verification prevents silent
     # regressions when the underlying API changes.
-    name: Examples compile
+    #
+    # Phase X.8 B-9-C: extended to compile the server binary with the
+    # server feature (which now pulls in grammar via
+    # server = [..., "grammar"]) so the optional `grammar` field on
+    # /v1/completions is protected too.
+    name: Examples & server compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,3 +124,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --example lol_gen --features "grammar gguf"
         run: cargo build --example lol_gen --features "grammar gguf"
+      - name: cargo build --bin alice-llm-server --features server
+        run: cargo build --bin alice-llm-server --features server

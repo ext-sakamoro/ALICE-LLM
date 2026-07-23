@@ -5,7 +5,13 @@
 //!
 //! Usage:
 //!   cargo run --bin alice-llm-server --features server --release -- \
-//!     --model path/to/model.gguf --port 8000
+//!     --model path/to/model.gguf --port 8000 [--hybrid]
+//!
+//! `--hybrid` bypasses GPU allocation and runs inference on CPU via
+//! `Llama3Model`. Purpose: Jetson 8GB unified memory has a wgpu-hal Vulkan
+//! weight 2× duplication issue that pushes 27B-class models past 8 GB;
+//! hybrid mode uses ~1× memory. Also useful for Qwen 3.5-4B which shows GPU
+//! numerical drift (PAD248319). Speed on Jetson: ~0.2-0.5 tok/s.
 //!
 //! Endpoints:
 //!   POST /v1/chat/completions — OpenAI chat format
@@ -15,7 +21,7 @@
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
 use alice_llm::gpu::{GpuEngine, GpuModel, GpuModelConfig};
-use alice_llm::llama3::Llama3Config;
+use alice_llm::llama3::{Llama3Config, Llama3Model};
 use alice_llm::{
     apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter,
 };
@@ -166,6 +172,13 @@ struct CompletionRequest {
     temperature: f32,
     #[serde(default = "default_top_k")]
     top_k: usize,
+    /// Optional GBNF grammar (Phase X.8 B-9-C). When present, the
+    /// sampler is constrained to only emit tokens that keep the grammar
+    /// satisfiable; the model MUST also emit EOS via the mask once the
+    /// grammar is complete. DSL-agnostic — send any GBNF (LOL, JSON
+    /// schema, tool-call) as a raw string in this field.
+    #[serde(default)]
+    grammar: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -187,6 +200,11 @@ struct ChatCompletionRequest {
     top_k: usize,
     #[serde(default)]
     stream: bool,
+    /// See [`CompletionRequest::grammar`]. Rejected with HTTP 400 when
+    /// `stream = true` — grammar-constrained SSE decoding is future
+    /// work; the current SSE path bypasses the mask.
+    #[serde(default)]
+    grammar: Option<String>,
 }
 
 fn default_max_tokens() -> usize {
@@ -292,8 +310,49 @@ struct HealthResponse {
 // Application state
 // ---------------------------------------------------------------------------
 
+/// Runtime inference backend — GPU (wgpu) or CPU (Llama3Model).
+///
+/// `--hybrid` flag switches to CPU path, avoiding GPU allocation entirely.
+/// Purpose: Jetson 8GB Vulkan weight 2× duplication makes Bonsai 27B Q1_0
+/// (3.6 GB × 2 = 7.2 GB) tight; CPU path uses 3.6 GB total. Also useful for
+/// Qwen 3.5-4B which exhibits GPU numerical drift (PAD248319).
+enum ModelBackend {
+    Gpu(GpuModel),
+    /// CPU-path model — holds references into the mmap'd GGUF (leaked to
+    /// `'static` in `main()` so the server context can pass it across await
+    /// points; memory reclaim happens at process exit anyway).
+    Cpu(Box<Llama3Model<'static>>),
+}
+
+impl ModelBackend {
+    fn reset(&mut self) {
+        match self {
+            Self::Gpu(m) => m.reset(),
+            Self::Cpu(m) => m.reset(),
+        }
+    }
+
+    /// Prefill call — discard logits (kept for API parity with GpuModel).
+    fn forward(&mut self, token_id: u32) {
+        match self {
+            Self::Gpu(m) => m.forward(token_id),
+            Self::Cpu(m) => {
+                let _ = m.forward(token_id);
+            }
+        }
+    }
+
+    /// Forward + return logits (last-prompt-token and each decode step).
+    fn forward_and_read(&mut self, token_id: u32) -> Vec<f32> {
+        match self {
+            Self::Gpu(m) => m.forward_and_read(token_id),
+            Self::Cpu(m) => m.forward(token_id),
+        }
+    }
+}
+
 struct AppState {
-    model: Mutex<GpuModel>,
+    model: Mutex<ModelBackend>,
     tokenizer: GgufTokenizer,
     model_name: String,
     chat_template: ChatTemplate,
@@ -311,7 +370,31 @@ fn generate(
     max_tokens: usize,
     temperature: f32,
     top_k: usize,
+    grammar_src: Option<&str>,
 ) -> Result<(String, usize, usize, u64, String), StatusCode> {
+    // Parse the grammar up-front so a malformed GBNF fails the request
+    // before we spend any prefill compute. When absent, the decode loop
+    // is byte-identical to the pre-B-9-C path.
+    let grammar = grammar_src
+        .map(alice_llm::grammar::parse_gbnf)
+        .transpose()
+        .map_err(|e| {
+            eprintln!("grammar parse error: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+    // 4096 mirrors the alice-lol bridge default. Small grammars (JSON
+    // schema, tool-call) don't need it, but paying the upper bound once
+    // at start is cheaper than surfacing RecursionOverflow on the LOL
+    // grammar in production.
+    let mut fsm = grammar
+        .as_ref()
+        .map(|g| alice_llm::grammar::Fsm::start(g).map(|f| f.with_max_depth(4096)))
+        .transpose()
+        .map_err(|e| {
+            eprintln!("grammar FSM start error: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+
     let prompt_tokens = state.tokenizer.encode(prompt_text);
 
     let mut model = state
@@ -341,6 +424,12 @@ fn generate(
     };
 
     for _ in 0..max_tokens {
+        // Grammar mask goes first so masked (-inf) logits survive both
+        // temperature scaling and top-k filtering unchanged.
+        if let Some(ref f) = fsm {
+            alice_llm::sampling::mask_logits_by_grammar(f, &state.tokenizer, &mut logits);
+        }
+
         let next = if temperature < 1e-6 {
             sample_argmax(&logits) as u32
         } else {
@@ -354,7 +443,30 @@ fn generate(
             finish_reason = "stop".to_string();
             break;
         }
+
+        // Advance FSM by the emitted token's text. On divergence (the
+        // sampler picked something the mask should have excluded) fail
+        // loud — silently continuing returns text that no longer
+        // satisfies the grammar contract.
+        if let Some(ref mut f) = fsm {
+            alice_llm::sampling::advance_fsm_on_emit(f, &state.tokenizer, next).map_err(|e| {
+                eprintln!("grammar advance error at generated token {next}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+
         generated.push(next);
+
+        // Stop as soon as the grammar is fully satisfied — the mask now
+        // only permits EOS and there's no reason to burn another forward
+        // pass just to reach it.
+        if let Some(ref f) = fsm {
+            if f.is_final() {
+                finish_reason = "stop".to_string();
+                break;
+            }
+        }
+
         logits = model.forward_and_read(next);
     }
 
@@ -415,6 +527,7 @@ async fn completions(
         req.max_tokens,
         req.temperature,
         req.top_k,
+        req.grammar.as_deref(),
     )?;
 
     let tps = if decode_ms > 0 {
@@ -449,6 +562,14 @@ async fn chat_completions(
     let prompt = state.chat_template.format_messages(&req.messages);
 
     if req.stream {
+        // Grammar-constrained decoding is not yet wired through the SSE
+        // path (the streaming generator lives in stream_chat_completions
+        // and bypasses `generate`). Reject explicitly so callers get a
+        // clear error instead of silently unconstrained output.
+        if req.grammar.is_some() {
+            eprintln!("400: grammar-constrained decoding is not supported with stream=true");
+            return Err(StatusCode::BAD_REQUEST);
+        }
         // OpenAI-compatible SSE. Bridges the sync generation loop (which
         // has to hold the GpuModel mutex) to the async response body via a
         // per-request mpsc channel: `spawn_blocking` drives the model and
@@ -456,8 +577,14 @@ async fn chat_completions(
         return Ok(stream_chat_completions(state, prompt, req).into_response());
     }
 
-    let (text, n_prompt, n_gen, decode_ms, finish_reason) =
-        generate(&state, &prompt, req.max_tokens, req.temperature, req.top_k)?;
+    let (text, n_prompt, n_gen, decode_ms, finish_reason) = generate(
+        &state,
+        &prompt,
+        req.max_tokens,
+        req.temperature,
+        req.top_k,
+        req.grammar.as_deref(),
+    )?;
 
     let tps = if decode_ms > 0 {
         n_gen as f64 / (decode_ms as f64 / 1000.0)
@@ -670,7 +797,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            eprintln!("Usage: alice-llm-server --model <path.gguf> [--port 8000]");
+            eprintln!("Usage: alice-llm-server --model <path.gguf> [--port 8000] [--hybrid]");
             std::process::exit(1);
         });
 
@@ -681,17 +808,37 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8000);
 
-    println!("ALICE-LLM Server v1.1");
+    // --hybrid: skip GPU allocation, run inference on CPU via Llama3Model.
+    // Purpose: Jetson 8GB Vulkan weight 2× duplication makes Bonsai 27B tight;
+    // hybrid mode halves memory footprint. Also avoids Qwen 3.5-4B GPU PAD248319.
+    let hybrid = args.iter().any(|a| a == "--hybrid");
+
+    println!(
+        "ALICE-LLM Server v1.1{}",
+        if hybrid {
+            " (--hybrid: CPU forward)"
+        } else {
+            ""
+        }
+    );
     println!("Loading: {model_path}");
 
     let t0 = Instant::now();
-    let data = std::fs::read(&model_path).expect("Failed to read GGUF file");
-    let gguf = GgufFile::parse(&data).expect("Failed to parse GGUF");
-    let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
+    // Leak GGUF bytes to 'static so `Llama3Model<'static>` can hold refs into
+    // the mmap for the server's lifetime (process ends → OS reclaims).
+    let data: &'static [u8] = Box::leak(
+        std::fs::read(&model_path)
+            .expect("Failed to read GGUF file")
+            .into_boxed_slice(),
+    );
+    let gguf: &'static GgufFile<'static> = Box::leak(Box::new(
+        GgufFile::parse(data).expect("Failed to parse GGUF"),
+    ));
+    let tokenizer = GgufTokenizer::from_gguf(gguf).expect("Failed to load tokenizer");
 
     // Auto-detect model config from GGUF metadata
     let llm_config =
-        Llama3Config::from_gguf(&gguf).expect("Failed to detect model config from GGUF");
+        Llama3Config::from_gguf(gguf).expect("Failed to detect model config from GGUF");
     println!(
         "  arch: {:?}, layers: {}, hidden: {}, heads: {}/{}, vocab: {}",
         llm_config.arch,
@@ -751,7 +898,7 @@ fn main() {
     }
 
     // Detect chat template
-    let chat_template = ChatTemplate::detect(&gguf, llm_config.arch);
+    let chat_template = ChatTemplate::detect(gguf, llm_config.arch);
     println!("  chat template: {:?}", chat_template);
 
     // Resolve stop token IDs
@@ -767,10 +914,19 @@ fn main() {
     }
     println!("  stop tokens: {:?}", stop_token_ids);
 
-    // Load GPU model
-    let engine = GpuEngine::new();
-    let model = GpuModel::load(engine, &gguf, config);
-    let vocab_size = model.vocab_size();
+    // Load model — GPU path (default) or CPU path (--hybrid)
+    let (model, vocab_size) = if hybrid {
+        println!("  [hybrid] GPU allocation skipped; weights on CPU only (mmap'd)");
+        let cpu_model =
+            Llama3Model::from_gguf(gguf).expect("Failed to load Llama3Model (CPU path)");
+        let vocab_size = llm_config.vocab_size;
+        (ModelBackend::Cpu(Box::new(cpu_model)), vocab_size)
+    } else {
+        let engine = GpuEngine::new();
+        let gpu_model = GpuModel::load(engine, gguf, config);
+        let vocab_size = gpu_model.vocab_size();
+        (ModelBackend::Gpu(gpu_model), vocab_size)
+    };
     println!(
         "Model ready: {}ms (vocab={vocab_size})",
         t0.elapsed().as_millis()
