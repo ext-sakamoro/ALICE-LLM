@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-23
+
 ### Added
 
 - **Grammar-constrained decoding (Phase X.8, B-1 → B-4, B-8, B-9-C)**
