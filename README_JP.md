@@ -24,6 +24,14 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、326 テスト�
 
 **arm64 board マルチモデル対応 (2026-07-21 arm64 arm64 board Nano 8GB で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
 
+**crates.io に `alice-llm` 1.3.0 公開 (2026-07-23)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めるようになりました。
+
+**Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と arm64 8 GiB board の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。
+
+**Perplexity 測定サンプル (`examples/perplexity.rs`、2026-07-24)** — WikiText-2 test で CPU forward + sliding-window log-probability を用いた PPL 測定、500 トークン: **Qwen 3.5-4B Q4_K_M = 16.38**、**Bonsai 27B Q1_0 = 18.12**。**注意事項**: llama.cpp は同じ Qwen 3.5-4B Q4_K_M を 1 chunk / 512 context 条件で PPL 6.09 ± 1.05 と報告しており、ALICE-LLM の forward path とは **2.68 倍の乖離**があります。BOS 処理が原因ではありません (Qwen 3.5 GGUF に `bos_token_id` が無いため両実装とも BOS 未挿入)。根本原因の調査は **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV レイアウトの instrumentation) として追跡中です。上記数値は llama.cpp との一致が確認できるまで ALICE-LLM 独自のベースラインとして扱ってください。
+
+**診断ツール (Phase X.3.e.3.30+)** — 深さルーティング分析用の新規サンプル 3 つ: `examples/entropy_mod_qwen35.rs` (entropy 駆動 Mixture-of-Depths 観測)、`examples/early_exit_qwen35.rs` (early-exit ablation)、`examples/entropy_ppl_correlation_qwen35.rs` (層ごとの entropy と最終位置 PPL の相関検証)。
+
 ## クイックスタート
 
 ```bash
@@ -44,6 +52,14 @@ cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
 Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
+
+### ライブラリとして利用
+
+```bash
+cargo add alice-llm  # 1.3.0 (crates.io)
+```
+
+公開 API は `src/lib.rs` を参照 (GGUF パーサ、トークナイザ、モデルロード、KV キャッシュ、サンプリング)。具体的な使用例は `examples/` ディレクトリを参照してください。
 
 ### Qwen 3.5 / Bonsai 27B ハイブリッド
 
