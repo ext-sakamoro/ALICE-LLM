@@ -2,4 +2,6 @@
 the project rules
 *.py
 /models/
+/data/*
+!/data/README.md
 .DS_Store
