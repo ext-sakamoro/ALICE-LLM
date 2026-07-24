@@ -2017,6 +2017,13 @@ fn gqa_attention(
         None => 0,
     };
 
+    // Phase X.3.e.3.38 diagnostic: env-gated f64 accumulator variant of
+    // gqa_attention. Tests hypothesis 8 that ALICE-LLM's scalar f32
+    // sequential accumulation (vs llama.cpp's SIMD FLASH_ATTN_EXT
+    // block-wise accumulation) is the source of PPL divergence.
+    // Enable with ALICE_ATTN_F64_ACC=1.
+    let use_f64_acc = std::env::var_os("ALICE_ATTN_F64_ACC").is_some();
+
     attn_out.fill(0.0);
     for h in 0..num_heads {
         let kv_h = h / heads_per_kv;
@@ -2028,11 +2035,19 @@ fn gqa_attention(
         let mut scores = Vec::with_capacity(window_len);
         for t in attn_start..seq_len {
             let k_cached = kv_cache.key_at(layer_idx, t);
-            let mut score = 0.0f32;
-            for d in 0..head_dim {
-                score += q_head[d] * k_cached[k_offset + d];
-            }
-            score *= inv_sqrt_d;
+            let mut score = if use_f64_acc {
+                let mut acc = 0.0f64;
+                for d in 0..head_dim {
+                    acc += q_head[d] as f64 * k_cached[k_offset + d] as f64;
+                }
+                (acc as f32) * inv_sqrt_d
+            } else {
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += q_head[d] * k_cached[k_offset + d];
+                }
+                acc * inv_sqrt_d
+            };
 
             if let Some(cap) = attn_logit_softcap {
                 score = cap * (score / cap).tanh();
@@ -2042,15 +2057,29 @@ fn gqa_attention(
         }
 
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - max_score).exp();
-            sum += *s;
-        }
-        if sum > 0.0 {
-            let inv_sum = 1.0 / sum;
+        if use_f64_acc {
+            let mut sum_f64 = 0.0f64;
             for s in &mut scores {
-                *s *= inv_sum;
+                *s = (*s - max_score).exp();
+                sum_f64 += *s as f64;
+            }
+            if sum_f64 > 0.0 {
+                let inv_sum = (1.0 / sum_f64) as f32;
+                for s in &mut scores {
+                    *s *= inv_sum;
+                }
+            }
+        } else {
+            let mut sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max_score).exp();
+                sum += *s;
+            }
+            if sum > 0.0 {
+                let inv_sum = 1.0 / sum;
+                for s in &mut scores {
+                    *s *= inv_sum;
+                }
             }
         }
 
@@ -2058,8 +2087,16 @@ fn gqa_attention(
             let v_cached = kv_cache.value_at(layer_idx, t);
             let v_offset = kv_h * head_dim;
             let w = scores[si];
-            for d in 0..head_dim {
-                attn_out[q_start + d] += w * v_cached[v_offset + d];
+            if use_f64_acc {
+                for d in 0..head_dim {
+                    let acc =
+                        attn_out[q_start + d] as f64 + w as f64 * v_cached[v_offset + d] as f64;
+                    attn_out[q_start + d] = acc as f32;
+                }
+            } else {
+                for d in 0..head_dim {
+                    attn_out[q_start + d] += w * v_cached[v_offset + d];
+                }
             }
         }
     }
