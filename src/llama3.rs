@@ -4997,6 +4997,38 @@ impl<'a> Llama3Model<'a> {
         logits
     }
 
+    /// Project a hidden state through the model's final `output_norm` +
+    /// `output_proj` (and Gemma-2 logit softcap if configured), producing
+    /// vocab-sized logits without running any layer body or touching the
+    /// KV cache. Read-only on the model.
+    ///
+    /// Used by diagnostic tools that need to compare "would-be" logits from
+    /// an early-layer hidden state to those produced by the full forward
+    /// (e.g. correlating an intermediate-layer confidence signal with
+    /// next-token difficulty). Mirrors the tail of `forward_with_layer_hook`
+    /// exactly so numbers align across the two paths.
+    ///
+    /// # Panics
+    /// Panics if `hidden.len() != config.hidden_dim`.
+    pub fn project_hidden_to_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        let c = &self.config;
+        assert_eq!(
+            hidden.len(),
+            c.hidden_dim,
+            "project_hidden_to_logits: hidden.len() must equal config.hidden_dim"
+        );
+        let mut norm_buf = vec![0.0f32; c.hidden_dim];
+        rms_norm(hidden, &self.output_norm, c.norm_eps, &mut norm_buf);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        self.output_proj.matvec(&norm_buf, &mut logits);
+        if let Some(cap) = c.final_logit_softcap() {
+            for l in &mut logits {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
+        logits
+    }
+
     /// Gemma 3n forward pass. Mirrors llama.cpp
     /// `llama_model_gemma3n::graph::build_arch_graph`.
     ///
