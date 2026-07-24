@@ -74,6 +74,15 @@ pub enum GgmlType {
     /// PrismML fork: 128-element ternary block, {−1, 0, +1} × FP16 scale.
     /// 34 bytes/block (2 FP16 + 32 packed 2-bit slots).
     Q2_0,
+    /// OCP Microscaling FP4 (MX v1.0, September 2023).
+    ///
+    /// 32-element block layout uses 1 byte E8M0 shared exponent (power-of-2
+    /// scale) plus 16 bytes packed E2M1 elements = 17 bytes/block. Effective
+    /// 4.25 bits per weight. Native quantization format for Kimi K3
+    /// (Moonshot AI, 2026-07-27 open weight release), trained with MXFP4 QAT
+    /// from SFT stage onward. Type ID matches upstream llama.cpp
+    /// `GGML_TYPE_MXFP4 = 39`.
+    Mxfp4,
     Other(u32),
 }
 
@@ -93,6 +102,7 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             23 => Self::IQ4_XS,
+            39 => Self::Mxfp4,
             41 => Self::Q1_0,
             42 => Self::Q2_0,
             other => Self::Other(other),
@@ -125,6 +135,8 @@ impl GgmlType {
             Self::Q1_0 => 18,
             // Q2_0 (PrismML g128): d (2) + qs (QK2_0/4 = 32) = 34
             Self::Q2_0 => 34,
+            // MXFP4 (OCP MX v1.0): E8M0 scale (1) + 32 × E2M1 packed (16) = 17
+            Self::Mxfp4 => 17,
             Self::Other(_) => 0,
         }
     }
@@ -137,6 +149,7 @@ impl GgmlType {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => QK8_0,
             Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => QK_K,
             Self::Q1_0 | Self::Q2_0 => QK_G128,
+            Self::Mxfp4 => QK_MXFP4,
             Self::Other(_) => 1,
         }
     }
@@ -144,6 +157,11 @@ impl GgmlType {
 
 /// PrismML fork block size for `Q1_0` / `Q2_0` (Bonsai 27B group-128 layout).
 pub const QK_G128: usize = 128;
+
+/// OCP Microscaling MXFP4 block size (spec v1.0, September 2023).
+///
+/// One block holds 32 E2M1 elements sharing a single E8M0 exponent.
+pub const QK_MXFP4: usize = 32;
 
 // ─── GGUF metadata values ──────────────────────────────────────────────────
 
@@ -569,6 +587,7 @@ impl<'a> GgufFile<'a> {
             GgmlType::Q6_K => dequantize_q6_k(data, &mut out),
             GgmlType::Q1_0 => dequantize_q1_0(data, &mut out),
             GgmlType::Q2_0 => dequantize_q2_0(data, &mut out),
+            GgmlType::Mxfp4 => dequantize_row_mxfp4(data, &mut out),
             GgmlType::Other(_) => return None,
         }
 
@@ -3747,7 +3766,29 @@ pub fn quantized_matvec(
         GgmlType::F32 => f32_matvec(input, data, rows, cols, output),
         GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
+        GgmlType::Mxfp4 => mxfp4_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
+    }
+}
+
+/// Correctness-first MXFP4 matvec fallback: dequantize row to f32 then
+/// call `f32_matvec`.
+///
+/// Used until the fused `mxfp4_matvec` kernel lands in Phase X.4.f. Slow but
+/// correct — allocates a per-row scratch buffer on each call, so hot paths
+/// should switch to the fused kernel once available.
+fn mxfp4_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let blocks_per_row = cols / QK_MXFP4;
+    let row_bytes = blocks_per_row * 17;
+    let mut row_f32 = vec![0.0f32; cols];
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        dequantize_row_mxfp4(row_data, &mut row_f32);
+        let mut acc = 0.0f32;
+        for i in 0..cols {
+            acc += row_f32[i] * input[i];
+        }
+        output[row] = acc;
     }
 }
 
@@ -5429,6 +5470,7 @@ pub fn dequantize_weight_row(data: &[u8], qtype: GgmlType, out: &mut [f32]) {
         GgmlType::Q5_K => dequantize_row_q5k(data, out),
         GgmlType::Q6_K => dequantize_row_q6k(data, out),
         GgmlType::Q8_0 => dequantize_row_q8_0(data, out),
+        GgmlType::Mxfp4 => dequantize_row_mxfp4(data, out),
         GgmlType::F16 => {
             for i in 0..out.len() {
                 let off = i * 2;
@@ -5580,6 +5622,144 @@ fn dequantize_row_f16(data: &[u8], out: &mut [f32]) {
     }
 }
 
+// ─── MXFP4 quantization (OCP Microscaling FP4, MX v1.0) ────────────────────
+
+/// E2M1 element decoding table.
+///
+/// Each 4-bit MXFP4 element is `S EE M` (1 sign + 2 exponent + 1 mantissa).
+/// Per OCP MX v1.0 §Table 1, the 16 patterns decode to the following values
+/// before the block's shared E8M0 scale is applied. E2M1 has no NaN or Inf
+/// representation; both positive and negative zero exist but decode to the
+/// same numeric value.
+///
+/// Ordering: index = 4-bit pattern value (0..16).
+pub const E2M1_DECODE_TABLE: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, // +0 .. +6
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // -0 .. -6
+];
+
+/// Decode an E8M0 shared scale byte to an f32 multiplier.
+///
+/// Per OCP MX v1.0 §5.4, E8M0 encodes an unsigned 8-bit exponent representing
+/// `2^(byte - 127)`. Byte value `0xFF` is reserved for NaN. There is no
+/// mantissa field; all scales are exact powers of two.
+#[must_use]
+pub fn decode_e8m0_scale(byte: u8) -> f32 {
+    if byte == 0xFF {
+        return f32::NAN;
+    }
+    // `2^(byte - 127)` — use `powi` on the biased exponent so both very small
+    // (byte=0 → 2^-127) and very large (byte=254 → 2^127) scales are exact.
+    2.0f32.powi(i32::from(byte) - 127)
+}
+
+/// Dequantize one MXFP4 block (17 bytes → 32 f32 values).
+///
+/// Byte layout per OCP MX v1.0 §5.5:
+/// - Byte 0: E8M0 shared exponent
+/// - Bytes 1..17: 16 bytes packing 32 × E2M1 elements (2 elements per byte,
+///   low nibble = element 2k, high nibble = element 2k+1).
+///
+/// # Panics
+/// Panics if `block` has fewer than 17 bytes.
+pub fn dequantize_mxfp4_block(block: &[u8]) -> [f32; QK_MXFP4] {
+    assert!(
+        block.len() >= 17,
+        "MXFP4 block requires 17 bytes, got {}",
+        block.len()
+    );
+    let scale = decode_e8m0_scale(block[0]);
+    let mut out = [0.0f32; QK_MXFP4];
+    for i in 0..16 {
+        let byte = block[1 + i];
+        let low = usize::from(byte & 0x0F);
+        let high = usize::from(byte >> 4);
+        out[2 * i] = E2M1_DECODE_TABLE[low] * scale;
+        out[2 * i + 1] = E2M1_DECODE_TABLE[high] * scale;
+    }
+    out
+}
+
+/// Dequantize a full MXFP4 row (N × 17 bytes → N × 32 f32 values).
+pub fn dequantize_row_mxfp4(data: &[u8], out: &mut [f32]) {
+    let blocks = out.len() / QK_MXFP4;
+    for blk in 0..blocks {
+        let block = &data[blk * 17..blk * 17 + 17];
+        let dq = dequantize_mxfp4_block(block);
+        out[blk * QK_MXFP4..(blk + 1) * QK_MXFP4].copy_from_slice(&dq);
+    }
+}
+
+/// MXFP4-quantized weight row (one row of a matrix stored as MXFP4 blocks).
+///
+/// Follows the same `Vec<u8>` layout used by `TernaryRow` so downstream matvec
+/// implementations can share the SIMD dispatch pattern once landed. Row length
+/// (number of elements) is stored explicitly because the raw byte length rounds
+/// up to a whole number of 17-byte blocks and the last block may hold padding.
+#[derive(Debug, Clone)]
+pub struct MxfP4Row {
+    /// Packed MXFP4 blocks. Length = `n_blocks * 17`.
+    pub bytes: Vec<u8>,
+    /// Logical element count (blocks × 32 minus any tail padding the loader
+    /// tracks separately).
+    pub n_elements: usize,
+}
+
+impl MxfP4Row {
+    /// Number of 32-element blocks in this row.
+    #[must_use]
+    pub const fn n_blocks(&self) -> usize {
+        self.n_elements.div_ceil(QK_MXFP4)
+    }
+
+    /// Dequantize this row into a caller-provided buffer.
+    ///
+    /// # Panics
+    /// Panics if `out.len() < self.n_elements`.
+    pub fn dequantize(&self, out: &mut [f32]) {
+        assert!(
+            out.len() >= self.n_elements,
+            "output buffer too small: got {}, need {}",
+            out.len(),
+            self.n_elements
+        );
+        let blocks = self.n_blocks();
+        for blk in 0..blocks {
+            let start = blk * 17;
+            let block = &self.bytes[start..start + 17];
+            let dq = dequantize_mxfp4_block(block);
+            let out_start = blk * QK_MXFP4;
+            let take = QK_MXFP4.min(self.n_elements - out_start);
+            out[out_start..out_start + take].copy_from_slice(&dq[..take]);
+        }
+    }
+}
+
+/// MXFP4-quantized weight matrix (rows-major).
+#[derive(Debug, Clone)]
+pub struct MxfP4Matrix {
+    pub rows: Vec<MxfP4Row>,
+    pub n_cols: usize,
+}
+
+/// MXFP4 matrix-vector multiply — NOT YET IMPLEMENTED.
+///
+/// The scalar and SIMD (NEON / AVX2 / AVX-512) matvec kernels land alongside
+/// Phase X.4.b GGUF metadata detection and Phase X.4.c CPU forward path (see
+/// `docs/KIMI_K3_INTEGRATION.md` and `docs/MXFP4_INTEGRATION_PLAN.md`).
+/// Callers hitting this path before those phases land get an explicit panic
+/// pointing to the integration plan, in accordance with the
+/// "仮実装完了偽装の禁止" policy in CLAUDE.md.
+pub fn mxfp4_matvec(_matrix: &MxfP4Matrix, _input: &[f32], _output: &mut [f32]) {
+    todo!(
+        "mxfp4_matvec: not yet implemented (Phase X.4.f matvec kernel). \
+         Block dequant (dequantize_mxfp4_block / dequantize_row_mxfp4 / \
+         MxfP4Row::dequantize) is available for correctness-first dequant-then-\
+         f32-matvec fallback until the fused kernel lands. \
+         See docs/MXFP4_INTEGRATION_PLAN.md §'Files to modify (Phase X.4.f)'."
+    )
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5610,6 +5790,198 @@ mod tests {
         assert!(f16_to_f32(0xFC00) < 0.0);
         // NaN = 0x7C01
         assert!(f16_to_f32(0x7C01).is_nan());
+    }
+
+    // ─── MXFP4 (OCP Microscaling FP4) tests ──────────────────────────────
+
+    #[test]
+    fn test_e2m1_decode_table_bit_exact() {
+        // Per OCP MX v1.0 §Table 1, the 16 E2M1 patterns decode to:
+        //   0000 →  +0.0     0001 →  +0.5     0010 →  +1.0     0011 →  +1.5
+        //   0100 →  +2.0     0101 →  +3.0     0110 →  +4.0     0111 →  +6.0
+        //   1000 →  -0.0     1001 →  -0.5     1010 →  -1.0     1011 →  -1.5
+        //   1100 →  -2.0     1101 →  -3.0     1110 →  -4.0     1111 →  -6.0
+        let expected: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        for (i, &v) in expected.iter().enumerate() {
+            assert_eq!(
+                E2M1_DECODE_TABLE[i].to_bits(),
+                v.to_bits(),
+                "E2M1 pattern {i:04b} expected {v} but got {}",
+                E2M1_DECODE_TABLE[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2m1_no_nan_no_inf() {
+        // E2M1 has no reserved bit pattern for NaN or Inf — every entry is
+        // a finite representable value.
+        for &v in &E2M1_DECODE_TABLE {
+            assert!(v.is_finite(), "E2M1 table contains non-finite value {v}");
+        }
+    }
+
+    #[test]
+    fn test_e8m0_scale_decode_endpoints() {
+        // byte 127 → 2^0 = 1.0 (identity scale, no exponent shift).
+        assert!((decode_e8m0_scale(127) - 1.0).abs() < 1e-12);
+        // byte 128 → 2^1 = 2.0.
+        assert!((decode_e8m0_scale(128) - 2.0).abs() < 1e-12);
+        // byte 126 → 2^-1 = 0.5.
+        assert!((decode_e8m0_scale(126) - 0.5).abs() < 1e-12);
+        // byte 0 → 2^-127, smallest normal-ish scale.
+        assert!(decode_e8m0_scale(0) > 0.0);
+        assert!(decode_e8m0_scale(0) < 1e-30);
+        // byte 254 → 2^127, largest finite scale before NaN.
+        assert!(decode_e8m0_scale(254) > 1e30);
+        assert!(decode_e8m0_scale(254).is_finite());
+    }
+
+    #[test]
+    fn test_e8m0_scale_nan_reserved() {
+        // Byte 0xFF is reserved for NaN per spec §5.4.
+        assert!(decode_e8m0_scale(0xFF).is_nan());
+    }
+
+    #[test]
+    fn test_mxfp4_block_dequant_identity_scale() {
+        // Construct a block with scale = 2^0 = 1.0 (byte 127) and elements
+        // stepping through the 16 E2M1 patterns twice (32 total).
+        // Byte layout: byte 0 = scale, bytes 1..17 = packed E2M1 (low nibble
+        // = element 2k, high nibble = element 2k+1).
+        let mut block = [0u8; 17];
+        block[0] = 127; // scale = 1.0
+                        // Pack elements 0..32 = repeating 0..16, so byte i contains
+                        // (2i+1)<<4 | (2i) but modulo 16. Simpler: byte i = ((2i+1) & 0xF) << 4 | ((2i) & 0xF)
+        for i in 0..16 {
+            let low = (2 * i) & 0xF;
+            let high = (2 * i + 1) & 0xF;
+            block[1 + i] = ((high as u8) << 4) | (low as u8);
+        }
+
+        let out = dequantize_mxfp4_block(&block);
+
+        // With identity scale, the output should match the E2M1 table twice.
+        for i in 0..32 {
+            let expected = E2M1_DECODE_TABLE[i & 0xF];
+            assert_eq!(
+                out[i].to_bits(),
+                expected.to_bits(),
+                "block[{i}] expected {expected} but got {}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_mxfp4_block_dequant_with_scale() {
+        // Scale = 2^2 = 4.0 (byte 129). Element pattern 0111 = +6.0.
+        // Expected output: 6.0 * 4.0 = 24.0 for every element.
+        let mut block = [0u8; 17];
+        block[0] = 129; // scale = 4.0
+        for i in 0..16 {
+            // Both nibbles = 0x7 (pattern +6.0).
+            block[1 + i] = 0x77;
+        }
+        let out = dequantize_mxfp4_block(&block);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(
+                (v - 24.0).abs() < 1e-6,
+                "block[{i}]: expected 24.0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mxfp4_block_dequant_signed_symmetric() {
+        // Scale = 1.0 (byte 127). Alternate patterns 0011 (+1.5) and 1011 (-1.5).
+        // low nibble = 0011 (+1.5), high nibble = 1011 (-1.5).
+        let mut block = [0u8; 17];
+        block[0] = 127;
+        for i in 0..16 {
+            block[1 + i] = (0xB << 4) | 0x3; // high=1011, low=0011
+        }
+        let out = dequantize_mxfp4_block(&block);
+        for i in 0..32 {
+            let expected = if i % 2 == 0 { 1.5 } else { -1.5 };
+            assert!(
+                (out[i] - expected).abs() < 1e-6,
+                "block[{i}]: expected {expected}, got {}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_mxfp4_row_dequant_multi_block() {
+        // Two consecutive blocks: first with scale 1.0 all +1.0, second with
+        // scale 0.5 all +2.0 → output should be all 1.0 for the whole row.
+        let mut data = vec![0u8; 34];
+        // Block 0: scale = 127 (2^0 = 1.0), all elements = 0x22 → +1.0/+1.0
+        data[0] = 127;
+        for i in 0..16 {
+            data[1 + i] = 0x22;
+        }
+        // Block 1: scale = 126 (2^-1 = 0.5), all elements = 0x44 → +2.0/+2.0 * 0.5 = 1.0
+        data[17] = 126;
+        for i in 0..16 {
+            data[18 + i] = 0x44;
+        }
+
+        let mut out = vec![0.0f32; 64];
+        dequantize_row_mxfp4(&data, &mut out);
+
+        for (i, &v) in out.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-6, "out[{i}]: expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_ggml_type_mxfp4_metadata() {
+        let t = GgmlType::from_u32(39);
+        assert_eq!(t, GgmlType::Mxfp4);
+        assert_eq!(t.block_bytes(), 17);
+        assert_eq!(t.elements_per_block(), QK_MXFP4);
+        assert_eq!(QK_MXFP4, 32);
+    }
+
+    #[test]
+    fn test_mxfp4_row_dequantize_via_struct() {
+        // MxfP4Row::dequantize should match the free function when n_elements
+        // is exactly a multiple of QK_MXFP4.
+        let mut bytes = vec![0u8; 17];
+        bytes[0] = 127;
+        for i in 0..16 {
+            bytes[1 + i] = 0x22; // all +1.0 / +1.0
+        }
+        let row = MxfP4Row {
+            bytes,
+            n_elements: 32,
+        };
+        assert_eq!(row.n_blocks(), 1);
+
+        let mut out = vec![0.0f32; 32];
+        row.dequantize(&mut out);
+        for (i, &v) in out.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-6, "out[{i}]: expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "mxfp4_matvec: not yet implemented")]
+    fn test_mxfp4_matvec_fail_fast() {
+        // Verify that the matvec kernel is a fail-fast todo!() rather than
+        // silently returning zeros. Compliance with the
+        // "仮実装完了偽装の禁止" policy in CLAUDE.md.
+        let matrix = MxfP4Matrix {
+            rows: vec![],
+            n_cols: 0,
+        };
+        let input = [0.0f32; 0];
+        let mut output = [0.0f32; 0];
+        mxfp4_matvec(&matrix, &input, &mut output);
     }
 
     #[test]

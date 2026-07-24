@@ -17,6 +17,27 @@
 //! for any GGUF architecture already supported by ALICE-LLM's `forward()`
 //! (Llama 3 / Qwen 2 / 2.5 / 3 / 3.5 / Bonsai 27B via hybrid attention).
 //!
+//! # ⚠ Numerical divergence vs llama.cpp (2026-07-24 finding)
+//!
+//! On Mac M3 Metal, WikiText-2 test first 500 tokens, ctx=512, chunked mode:
+//!   - ALICE-LLM  Qwen 3.5-4B Q4_K_M PPL = 16.38
+//!   - llama.cpp  Qwen 3.5-4B Q4_K_M PPL =  6.09 ± 1.05  (--chunks 1)
+//!   - divergence: 2.68× (ALICE-LLM inflated)
+//!
+//! Cause is NOT BOS handling — Qwen 3.5 GGUF defines no `bos_token_id` and
+//! neither implementation prepends BOS in this configuration. The gap is
+//! attributable to Qwen 3.5 forward path numerical drift in ALICE-LLM
+//! (tracked as Phase X.3.e.3.30-35 in `memory/alice_llm_future_work.md`)
+//! and possibly to Q4_K dequant precision differences.
+//!
+//! Bonsai 27B Q1_0 cannot be validated against llama.cpp: mainline
+//! llama.cpp rejects Bonsai's custom Q1_0 quant type (ggml type 41).
+//!
+//! **Use this example for internal diagnostics only** until the ALICE-LLM
+//! Qwen forward pass matches llama.cpp within ~5%. See
+//! `memory/perplexity_alice_llm_vs_llamacpp_divergence_2026_07_24.md`
+//! for the full validation snapshot + roadmap.
+//!
 //! Usage:
 //!   cargo run --release --features gguf --example perplexity -- \
 //!     --model models/Qwen3.5-4B-Q4_K_M.gguf \
@@ -104,6 +125,7 @@ fn main() {
     let stride: usize = parse_arg(&args, "--stride").unwrap_or(ctx / 4);
     let n_samples: usize = parse_arg(&args, "--n-samples").unwrap_or(0);
     let progress_every: usize = parse_arg(&args, "--progress-every").unwrap_or(200);
+    let prepend_bos: bool = args.iter().any(|a| a == "--prepend-bos");
 
     if mode != "chunked" && mode != "sliding" {
         eprintln!("--mode must be 'chunked' or 'sliding', got '{mode}'");
@@ -176,6 +198,25 @@ fn main() {
     let mut tokens = tokenizer.encode(raw);
     if n_samples > 0 && tokens.len() > n_samples {
         tokens.truncate(n_samples);
+    }
+    if prepend_bos {
+        let decoded = tokenizer.decode(&[tokenizer.bos_id]);
+        tokens.insert(0, tokenizer.bos_id);
+        eprintln!(
+            "  Prepended BOS token id {} (decoded: {:?}) at position 0",
+            tokenizer.bos_id, decoded
+        );
+        if tokenizer.bos_id <= 2 {
+            eprintln!(
+                "  WARNING: bos_id {} looks like the default fallback \
+                 (`gguf.meta_u32(\"tokenizer.ggml.bos_token_id\").unwrap_or(1)`). \
+                 This model's GGUF likely does not define a BOS token \
+                 (Qwen 2/3/3.5 do not use BOS). Prepending a random low-id \
+                 token will inflate PPL, not reduce it. Consider running \
+                 without --prepend-bos for such models.",
+                tokenizer.bos_id
+            );
+        }
     }
     let n_dataset_tokens = tokens.len();
     eprintln!(
