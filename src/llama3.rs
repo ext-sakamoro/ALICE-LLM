@@ -4521,6 +4521,20 @@ impl<'a> Llama3Model<'a> {
             // Attention norm
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
 
+            // Phase X.3.e.3.36 layer 0 op-by-op divergence dump (env-gated,
+            // once-per-process). Compare with llama.cpp `llama-eval-callback`
+            // common_debug_cb_eval output for the same 2-token prompt to
+            // locate the first divergence op within layer 0 forward.
+            let dump_l0 = std::env::var("ALICE_DUMP_LAYER0_OPS").is_ok() && layer_idx == 0 && {
+                static ONCE_L0: std::sync::Once = std::sync::Once::new();
+                let mut fire = false;
+                ONCE_L0.call_once(|| fire = true);
+                fire
+            };
+            if dump_l0 {
+                dump_slice("L0_attn_norm_out", &norm_buf, 3);
+            }
+
             // Q, K, V projections (pre-quantize norm_buf once for all three)
             let q8_attn = quantize_row_q8_k(&norm_buf);
             layer.q_proj.matvec_preq(&q8_attn, &mut q_buf);
@@ -4649,6 +4663,12 @@ impl<'a> Llama3Model<'a> {
             // Store K, V in cache
             self.kv_cache.append(layer_idx, &k_buf, &v_buf);
 
+            if dump_l0 {
+                dump_slice("L0_q_buf", &q_buf[..q_dim], 3);
+                dump_slice("L0_k_buf", &k_buf, 3);
+                dump_slice("L0_v_buf", &v_buf, 3);
+            }
+
             // GQA attention (supports SWA + logit softcapping)
             gqa_attention(
                 &q_buf,
@@ -4667,6 +4687,9 @@ impl<'a> Llama3Model<'a> {
                 },
                 &mut attn_out,
             );
+            if dump_l0 {
+                dump_slice("L0_attn_out", &attn_out, 3);
+            }
 
             // Qwen 3.5 / 3.6 / Bonsai 27B "Gated Attention": when `q_proj`
             // output was `2 * q_dim`, its second half is a per-element
@@ -4709,6 +4732,9 @@ impl<'a> Llama3Model<'a> {
 
             // Output projection
             layer.o_proj.matvec(&attn_out, &mut o_buf);
+            if dump_l0 {
+                dump_slice("L0_o_buf", &o_buf, 3);
+            }
             if dump_gated_layer3 {
                 dump_slice("gated3_o_buf", &o_buf, 3);
                 dump_hidden_jsonl_stderr("cpu_gated3_o_buf_full", &o_buf);
@@ -4753,6 +4779,9 @@ impl<'a> Llama3Model<'a> {
             for i in 0..c.hidden_dim {
                 hidden[i] += o_buf[i];
             }
+            if dump_l0 {
+                dump_slice("L0_ffn_inp", &hidden, 3);
+            }
 
             // Phase X.3.e.3.15: dump hidden RIGHT BEFORE rms_norm to catch
             // discrepancy vs computed post_res.
@@ -4780,6 +4809,9 @@ impl<'a> Llama3Model<'a> {
             }
             // FFN norm
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
+            if dump_l0 {
+                dump_slice("L0_ffn_norm_out", &norm_buf, 3);
+            }
             if layer_idx == 3 && std::env::var("ALICE_DUMP_GATED3").is_ok() {
                 static ONCE_FN3: std::sync::Once = std::sync::Once::new();
                 let mut fire = false;
@@ -4829,9 +4861,16 @@ impl<'a> Llama3Model<'a> {
                 down_buf.copy_from_slice(&tmp);
             }
 
+            if dump_l0 {
+                dump_slice("L0_ffn_out", &down_buf, 3);
+            }
+
             // Residual
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
+            }
+            if dump_l0 {
+                dump_slice("L0_l_out_final", &hidden, 3);
             }
             // Phase X.3.e.3.15: layer 3 output (l_out-3 equivalent) dump.
             if layer_idx == 3 && std::env::var("ALICE_DUMP_GATED3").is_ok() {
