@@ -4678,6 +4678,28 @@ impl<'a> Llama3Model<'a> {
                 dump_slice("L0_q_buf", &q_buf[..q_dim], 3);
                 dump_slice("L0_k_buf", &k_buf, 3);
                 dump_slice("L0_v_buf", &v_buf, 3);
+                // Per-head dump for locating head-boundary layout diffs
+                // against llama-eval-callback per-head values.
+                let head_dim = c.head_dim;
+                for head_idx in [0, 1, 12, 23_usize].iter().copied() {
+                    if head_idx >= c.num_heads {
+                        continue;
+                    }
+                    let start = head_idx * head_dim;
+                    let end = start + head_dim;
+                    if end > q_dim {
+                        continue;
+                    }
+                    let head_slice = &q_buf[start..end];
+                    let sum: f64 = head_slice.iter().map(|&v| v as f64).sum();
+                    eprintln!(
+                        "DN0 L0_q_head{} first3=[{:.6},{:.6},{:.6}] last3=[{:.6},{:.6},{:.6}] sum={:.6}",
+                        head_idx,
+                        head_slice[0], head_slice[1], head_slice[2],
+                        head_slice[head_dim - 3], head_slice[head_dim - 2], head_slice[head_dim - 1],
+                        sum
+                    );
+                }
             }
 
             // GQA attention (supports SWA + logit softcapping)
