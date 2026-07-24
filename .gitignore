@@ -2,4 +2,6 @@
 CLAUDE.md
 *.py
 /models/
+/data/*
+!/data/README.md
 .DS_Store
