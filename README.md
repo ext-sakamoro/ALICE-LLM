@@ -26,6 +26,14 @@ GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **Jetson multi-model support (2026-07-21 verified on Yahboom Orin Nano 8GB)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
 
+**crates.io: `alice-llm` 1.3.0 published (2026-07-23)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps.
+
+**Phase X.8 LOL Bridge (2026-07-23, B-plan 10/10)** — natural-language → SDF: the model emits `Sphere { radius: 1.5 }` etc. under a GBNF-subset grammar for the [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL, then compiles to an `SdfNode`. Verified end-to-end on Mac (M3 Metal) and Jetson Orin Nano 8GB. See `examples/lol_gen.rs`.
+
+**Perplexity example (`examples/perplexity.rs`, 2026-07-24)** — WikiText-2 test PPL via CPU forward + sliding-window log-probability, 500 tokens: **Qwen 3.5-4B Q4_K_M = 16.38**, **Bonsai 27B Q1_0 = 18.12**. Caveat: llama.cpp reports PPL 6.09 ± 1.05 on the same Qwen 3.5-4B Q4_K_M with 1 chunk / 512 context — a **2.68× divergence** with ALICE-LLM's forward path. BOS is not the cause (Qwen 3.5 GGUF has no `bos_token_id`, both implementations omit BOS). Root-cause tracked as **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV-layout instrumentation). Treat these numbers as ALICE-LLM's own baseline until llama.cpp parity is reached.
+
+**Diagnostic tooling (Phase X.3.e.3.30+)** — new examples for depth-routing analysis: `examples/entropy_mod_qwen35.rs` (entropy-driven Mixture-of-Depths observation), `examples/early_exit_qwen35.rs` (early-exit ablation), `examples/entropy_ppl_correlation_qwen35.rs` (correlation validation between per-layer entropy and end-position PPL).
+
 ## Quick Start
 
 ```bash
@@ -46,6 +54,14 @@ cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
 Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
+
+### As a library dependency
+
+```bash
+cargo add alice-llm  # 1.3.0 on crates.io
+```
+
+See `src/lib.rs` for the public API (GGUF parser, tokenizer, model loading, KV cache, sampling) and the `examples/` directory for concrete usage patterns.
 
 ## Desktop App — ALICE-LLM Studio
 
