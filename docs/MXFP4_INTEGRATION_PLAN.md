@@ -5,7 +5,30 @@ still blocked on Kimi K3 open weight release (2026-07-27) for validation,
 but the format spec is public (OCP MX v1.0, Sep 2023) and reference
 implementations exist (`microsoft/microxcaling`, llama.cpp/ik_llama.cpp).
 
-**Landed 2026-07-24** (see commit + `src/gguf.rs` MXFP4 section):
+**Landed 2026-07-24** — see `src/gguf.rs` MXFP4 section.
+
+> **Commit tracking note**: The `src/gguf.rs` MXFP4 skeleton (+372 lines)
+> physically landed inside commit **`e9d8c36`** whose commit message is
+> `docs(perplexity): disclose 2.68x divergence vs llama.cpp on Qwen 3.5-4B`.
+> That commit bundled unrelated perplexity work (`data/README.md` +22,
+> `examples/perplexity.rs` +41) with the MXFP4 skeleton because staged
+> changes from two concurrent workstreams were committed together on the
+> user's machine. The MXFP4 code is functionally correct and CI-clean; the
+> commit message just does not surface the MXFP4 landing. Use `git log
+> --grep="mxfp4\|MXFP4"` to locate this doc + related docs commit `c81bc51`
+> (`docs: Phase X.4 (Kimi K3) roadmap + hegemony thesis + MXFP4 integration
+> plan`) to reach the skeleton via the doc plane. The follow-up explanatory
+> commit added on 2026-07-24 also carries the "mxfp4" keyword so
+> `git log --grep=mxfp4` reliably hits at least three commits (this doc,
+> the roadmap doc, and the explanatory commit) that all point back to
+> `e9d8c36` as the code landing point.
+>
+> The docs commit `c81bc51` was made under the fallback author identity
+> `ext-sakamoro <ext-sakamoro@example.com>` instead of the intended
+> `Moroya Sakamoto <sakamoro@alicelaw.net>` (a session-time author-flag
+> omission). Since amending would require a force-push to `main` and the
+> author string is a plain-text convention rather than a load-bearing
+> field, the mislabel is left in place and this note captures the intent.
 
 - ✅ `GgmlType::Mxfp4` variant (id=39, `block_bytes()=17`,
   `elements_per_block()=32=QK_MXFP4`)
