@@ -68,16 +68,38 @@ fn parse_arg_str<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Compute log P(target | context) = logits[target] - logsumexp(logits),
 /// numerically stable via the max-subtraction trick.
-fn log_prob_at(logits: &[f32], target: u32) -> f32 {
-    let target = target as usize;
-    debug_assert!(target < logits.len(), "target token id out of vocab range");
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+///
+/// If `eog_inf_ids` is non-empty, those token indices have their logit
+/// treated as -inf (excluded from the softmax denominator). This mirrors
+/// llama.cpp's `common_init_result: added <tok> logit bias = -inf` for EOG
+/// tokens, which shifts the denominator down and slightly reduces PPL.
+fn log_prob_at(logits: &[f32], target: u32, eog_inf_ids: &[u32]) -> f32 {
+    let target_us = target as usize;
+    debug_assert!(target_us < logits.len(), "target token id out of vocab range");
+    let mut max = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if eog_inf_ids.contains(&(i as u32)) {
+            continue;
+        }
+        if v > max {
+            max = v;
+        }
+    }
     let mut sum_exp = 0.0_f64;
-    for &v in logits {
+    for (i, &v) in logits.iter().enumerate() {
+        if eog_inf_ids.contains(&(i as u32)) {
+            continue;
+        }
         sum_exp += ((v - max) as f64).exp();
     }
     let logsumexp = max + (sum_exp.ln() as f32);
-    logits[target] - logsumexp
+    // Target is expected to not be in eog_inf_ids for real text scoring;
+    // if it is, log_prob is -inf (which the caller may or may not want).
+    if eog_inf_ids.contains(&target) {
+        f32::NEG_INFINITY
+    } else {
+        logits[target_us] - logsumexp
+    }
 }
 
 /// Escape a JSON string value (minimal — only `\`, `"`, control chars).
@@ -126,6 +148,16 @@ fn main() {
     let n_samples: usize = parse_arg(&args, "--n-samples").unwrap_or(0);
     let progress_every: usize = parse_arg(&args, "--progress-every").unwrap_or(200);
     let prepend_bos: bool = args.iter().any(|a| a == "--prepend-bos");
+    let dump_tokens: usize = parse_arg(&args, "--dump-tokens").unwrap_or(0);
+    let eog_inf_csv: String = parse_arg::<String>(&args, "--eog-inf").unwrap_or_default();
+    let eog_inf_ids: Vec<u32> = if eog_inf_csv.is_empty() {
+        Vec::new()
+    } else {
+        eog_inf_csv
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    };
 
     if mode != "chunked" && mode != "sliding" {
         eprintln!("--mode must be 'chunked' or 'sliding', got '{mode}'");
@@ -232,6 +264,13 @@ fn main() {
         std::process::exit(3);
     }
 
+    if dump_tokens > 0 {
+        for t in tokens.iter().take(dump_tokens) {
+            println!("{}", t);
+        }
+        return;
+    }
+
     let t_ppl = Instant::now();
     let mut sum_nll = 0.0_f64;
     let mut count: usize = 0;
@@ -266,7 +305,7 @@ fn main() {
                 for &tok in chunk {
                     if let Some(logits) = prev_logits.as_ref() {
                         if (tok as usize) < logits.len() {
-                            let log_p = log_prob_at(logits, tok);
+                            let log_p = log_prob_at(logits, tok, &eog_inf_ids);
                             sum_nll += (-log_p) as f64;
                             count += 1;
                         }
@@ -311,7 +350,7 @@ fn main() {
                     if pos >= score_from {
                         if let Some(logits) = prev_logits.as_ref() {
                             if (tok as usize) < logits.len() {
-                                let log_p = log_prob_at(logits, tok);
+                                let log_p = log_prob_at(logits, tok, &eog_inf_ids);
                                 sum_nll += (-log_p) as f64;
                                 count += 1;
                             }
