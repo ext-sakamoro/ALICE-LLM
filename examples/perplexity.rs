@@ -99,7 +99,8 @@ fn main() {
     let model_path = parse_arg_str(&args, "--model").expect("--model required");
     let dataset_path = parse_arg_str(&args, "--dataset").expect("--dataset required");
     let ctx: usize = parse_arg(&args, "--ctx").unwrap_or(2048);
-    let mode: String = parse_arg::<String>(&args, "--mode").unwrap_or_else(|| "chunked".to_string());
+    let mode: String =
+        parse_arg::<String>(&args, "--mode").unwrap_or_else(|| "chunked".to_string());
     let stride: usize = parse_arg(&args, "--stride").unwrap_or(ctx / 4);
     let n_samples: usize = parse_arg(&args, "--n-samples").unwrap_or(0);
     let progress_every: usize = parse_arg(&args, "--progress-every").unwrap_or(200);
@@ -117,9 +118,23 @@ fn main() {
     eprintln!("  model:   {model_path}");
     eprintln!("  dataset: {dataset_path}");
     eprintln!("  ctx:     {ctx}");
-    eprintln!("  stride:  {stride} ({} tokens scored per {ctx}-token window)", if mode == "sliding" { stride } else { ctx.saturating_sub(1) });
+    eprintln!(
+        "  stride:  {stride} ({} tokens scored per {ctx}-token window)",
+        if mode == "sliding" {
+            stride
+        } else {
+            ctx.saturating_sub(1)
+        }
+    );
     eprintln!("  mode:    {mode}");
-    eprintln!("  n_samples: {}", if n_samples == 0 { "all".to_string() } else { n_samples.to_string() });
+    eprintln!(
+        "  n_samples: {}",
+        if n_samples == 0 {
+            "all".to_string()
+        } else {
+            n_samples.to_string()
+        }
+    );
 
     let t_load = Instant::now();
     eprintln!("Loading GGUF...");
@@ -137,7 +152,10 @@ fn main() {
 
     let t_model = Instant::now();
     let mut model = Llama3Model::from_gguf(&gguf).expect("failed to load Llama3Model");
-    eprintln!("  Model loaded: {}ms (CPU forward path)", t_model.elapsed().as_millis());
+    eprintln!(
+        "  Model loaded: {}ms (CPU forward path)",
+        t_model.elapsed().as_millis()
+    );
 
     let t_tok = Instant::now();
     eprintln!("Loading + tokenizing dataset...");
@@ -196,7 +214,7 @@ fn main() {
         "chunked" => {
             eprintln!(
                 "Running chunked mode: {} chunks of {ctx} tokens (last chunk may be shorter)",
-                (n_dataset_tokens + ctx - 1) / ctx
+                n_dataset_tokens.div_ceil(ctx)
             );
             for (chunk_idx, chunk) in tokens.chunks(ctx).enumerate() {
                 if chunk.len() < 2 {
@@ -214,9 +232,7 @@ fn main() {
                     }
                     prev_logits = Some(model.forward(tok));
 
-                    if count > 0
-                        && count.saturating_sub(last_report_count) >= progress_every
-                    {
+                    if count > 0 && count.saturating_sub(last_report_count) >= progress_every {
                         let elapsed = t_ppl.elapsed().as_secs_f64();
                         report(count, sum_nll, elapsed, false);
                         last_report_count = count;
@@ -225,17 +241,16 @@ fn main() {
                     }
                 }
                 if chunk_idx == 0 {
-                    eprintln!(
-                        "  (chunk 0 done, {} tokens scored so far)",
-                        count
-                    );
+                    eprintln!("  (chunk 0 done, {} tokens scored so far)", count);
                 }
                 let _ = last_report_time; // silence unused if progress never fires
             }
         }
         "sliding" => {
             let context_size = ctx - stride;
-            let n_chunks = (n_dataset_tokens.saturating_sub(context_size) + stride - 1) / stride;
+            let n_chunks = n_dataset_tokens
+                .saturating_sub(context_size)
+                .div_ceil(stride);
             eprintln!(
                 "Running sliding mode: ~{n_chunks} chunks of {ctx} tokens, \
                  stride={stride}, score-from={context_size} in each chunk (chunk 0 scores from 1)"
@@ -263,9 +278,7 @@ fn main() {
                     }
                     prev_logits = Some(model.forward(tok));
 
-                    if count > 0
-                        && count.saturating_sub(last_report_count) >= progress_every
-                    {
+                    if count > 0 && count.saturating_sub(last_report_count) >= progress_every {
                         let elapsed = t_ppl.elapsed().as_secs_f64();
                         report(count, sum_nll, elapsed, false);
                         last_report_count = count;
