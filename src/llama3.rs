@@ -4522,14 +4522,25 @@ impl<'a> Llama3Model<'a> {
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
 
             // Phase X.3.e.3.36 layer 0 op-by-op divergence dump (env-gated,
-            // once-per-process). Compare with llama.cpp `llama-eval-callback`
-            // common_debug_cb_eval output for the same 2-token prompt to
+            // fires for first N positions per process where N is capped by
+            // ALICE_DUMP_LAYER0_MAX_POS env var, default 2 = BOS + first
+            // real token). Compare with llama.cpp `llama-eval-callback`
+            // common_debug_cb_eval output for the same N-token prompt to
             // locate the first divergence op within layer 0 forward.
             let dump_l0 = std::env::var("ALICE_DUMP_LAYER0_OPS").is_ok() && layer_idx == 0 && {
-                static ONCE_L0: std::sync::Once = std::sync::Once::new();
-                let mut fire = false;
-                ONCE_L0.call_once(|| fire = true);
-                fire
+                static POS_COUNTER: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let max_pos: usize = std::env::var("ALICE_DUMP_LAYER0_MAX_POS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2);
+                let cur = POS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if cur < max_pos {
+                    eprintln!("DN0 L0_pos_marker pos={}", cur);
+                    true
+                } else {
+                    false
+                }
             };
             if dump_l0 {
                 dump_slice("L0_attn_norm_out", &norm_buf, 3);
