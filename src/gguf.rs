@@ -3308,6 +3308,37 @@ pub fn q4k_matvec_preq(
     let block_bytes = 144;
     let row_bytes = blocks_per_row * block_bytes;
 
+    // Phase X.3.e.3.37 diagnostic: bypass the Q4_K × Q8_K integer dot path
+    // when ALICE_BYPASS_Q8K_ACTIVATION is set — dequantize both operands to
+    // f32 and do a scalar f32 dot product instead. If this changes PPL
+    // significantly, the integer dot kernel is the divergence source.
+    // Not lossless (Q8_K quant of activation happened upstream and is
+    // preserved in the block sums), but avoids any remaining bias inside
+    // the integer accumulator / super-block scale unpacking.
+    if std::env::var_os("ALICE_BYPASS_Q8K_ACTIVATION").is_some() {
+        let mut input_f32 = vec![0.0f32; cols];
+        for (b, block) in q8_blocks.iter().enumerate() {
+            let base = b * QK_K;
+            for i in 0..QK_K {
+                if base + i >= cols {
+                    break;
+                }
+                input_f32[base + i] = block.d * block.qs[i] as f32;
+            }
+        }
+        let mut row_f32 = vec![0.0f32; cols];
+        for row in 0..rows {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            dequantize_q4_k(row_data, &mut row_f32);
+            let mut acc: f64 = 0.0;
+            for i in 0..cols {
+                acc += (row_f32[i] as f64) * (input_f32[i] as f64);
+            }
+            output[row] = acc as f32;
+        }
+        return;
+    }
+
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
