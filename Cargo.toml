@@ -111,6 +111,14 @@ required-features = ["gguf"]
 name = "entropy_mod_qwen35"
 required-features = ["gguf"]
 
+# Correlation validation tool: pairs hidden-state variance (candidate depth-
+# routing signal) with per-token log-loss (ground-truth difficulty). Used to
+# check whether a bimodal signal actually predicts token difficulty before
+# committing to a routing implementation.
+[[example]]
+name = "entropy_ppl_correlation_qwen35"
+required-features = ["gguf"]
+
 # Phase X.8 B-8: grammar-constrained decoding demo. Points a GGUF model
 # at any GBNF file (LOL / JSON schema / tool-call) and prints the
 # guaranteed-valid output.
