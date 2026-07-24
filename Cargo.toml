@@ -103,6 +103,14 @@ required-features = ["gguf"]
 name = "bench_deepseek_streaming"
 required-features = ["gguf"]
 
+# Observation tool for entropy-driven Mixture-of-Depths (MoD) experiments.
+# Emits per-(token, layer) hidden-state statistics as JSONL for post-hoc
+# analysis of natural thresholds for depth routing / early-exit strategies.
+# See Schuster et al. 2022 (CALM) + Raposo et al. 2024 (Mixture-of-Depths).
+[[example]]
+name = "entropy_mod_qwen35"
+required-features = ["gguf"]
+
 # Phase X.8 B-8: grammar-constrained decoding demo. Points a GGUF model
 # at any GBNF file (LOL / JSON schema / tool-call) and prints the
 # guaranteed-valid output.
