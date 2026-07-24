@@ -75,7 +75,10 @@ fn parse_arg_str<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 /// tokens, which shifts the denominator down and slightly reduces PPL.
 fn log_prob_at(logits: &[f32], target: u32, eog_inf_ids: &[u32]) -> f32 {
     let target_us = target as usize;
-    debug_assert!(target_us < logits.len(), "target token id out of vocab range");
+    debug_assert!(
+        target_us < logits.len(),
+        "target token id out of vocab range"
+    );
     let mut max = f32::NEG_INFINITY;
     for (i, &v) in logits.iter().enumerate() {
         if eog_inf_ids.contains(&(i as u32)) {
@@ -149,6 +152,14 @@ fn main() {
     let progress_every: usize = parse_arg(&args, "--progress-every").unwrap_or(200);
     let prepend_bos: bool = args.iter().any(|a| a == "--prepend-bos");
     let dump_tokens: usize = parse_arg(&args, "--dump-tokens").unwrap_or(0);
+    // --dump-layer L: after forwarding the first N tokens (--dump-layer-tokens),
+    // print the hidden state observed at the START of layer L (before its
+    // pre-attention RMSNorm). Format: sum + first 3 + last 3 values,
+    // matching llama-eval-callback's common_debug_cb_eval output format so
+    // we can visually compare. Uses forward_with_layer_hook so it works for
+    // any GGUF architecture ALICE-LLM supports.
+    let dump_layer: i32 = parse_arg(&args, "--dump-layer").unwrap_or(-1);
+    let dump_layer_tokens: usize = parse_arg(&args, "--dump-layer-tokens").unwrap_or(2);
     let eog_inf_csv: String = parse_arg::<String>(&args, "--eog-inf").unwrap_or_default();
     let eog_inf_ids: Vec<u32> = if eog_inf_csv.is_empty() {
         Vec::new()
@@ -267,6 +278,44 @@ fn main() {
     if dump_tokens > 0 {
         for t in tokens.iter().take(dump_tokens) {
             println!("{}", t);
+        }
+        return;
+    }
+
+    if dump_layer >= 0 {
+        let target_layer = dump_layer as usize;
+        model.reset();
+        for (pos, &tok) in tokens.iter().take(dump_layer_tokens).enumerate() {
+            let mut captured: Option<Vec<f32>> = None;
+            let _ = model.forward_with_layer_hook(tok, |lyr, hidden| {
+                if lyr == target_layer && captured.is_none() {
+                    captured = Some(hidden.clone());
+                }
+                false // do not skip CPU layer body
+            });
+            if let Some(h) = captured {
+                let sum: f64 = h.iter().map(|&x| x as f64).sum();
+                let n = h.len();
+                let first3 = if n >= 3 {
+                    format!("{:>10.4}, {:>10.4}, {:>10.4}", h[0], h[1], h[2])
+                } else {
+                    "n<3".to_string()
+                };
+                let last3 = if n >= 3 {
+                    format!("{:>10.4}, {:>10.4}, {:>10.4}", h[n - 3], h[n - 2], h[n - 1])
+                } else {
+                    "n<3".to_string()
+                };
+                println!(
+                    "layer={} pos={} tok={} shape={} sum={:.6} first3=[{}] last3=[{}]",
+                    target_layer, pos, tok, n, sum, first3, last3
+                );
+            } else {
+                println!(
+                    "layer={} pos={} tok={} NOT CAPTURED (hook fired but layer index mismatch)",
+                    target_layer, pos, tok
+                );
+            }
         }
         return;
     }
