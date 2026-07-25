@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-25
+
+### Added
+
+- **`Llama3Model::forward_with_surprise`** — external-signal-driven
+  per-layer routing convenience API. Thin wrapper around
+  `forward_with_layer_hook` that standardises the pattern
+  "an external per-token signal drives per-layer routing decisions"
+  already demonstrated in `examples/early_exit_qwen35.rs` (variance
+  gate) and `examples/entropy_mod_qwen35.rs` (per-layer statistic
+  observation). The caller supplies an optional `SurpriseVec<'_>`
+  slice (per-body, per-region, per-modality, aggregated scalar
+  broadcast, etc.) and a `gate: Fn(usize, Option<SurpriseVec<'_>>) -> bool`
+  closure that returns `true` to skip a layer's CPU compute.
+  - `pub type SurpriseVec<'a> = &'a [f32];` type alias — intentionally
+    unopinionated; the caller owns the slice's shape and meaning.
+  - Backward-compatibility guarantee: `forward_with_surprise(id, None,
+    |_, _| false)` is bit-exact identical to `forward(id)` (both
+    reduce to `forward_with_layer_hook(id, |_, _| false)`).
+  - Determinism: with fixed `surprise` contents and a deterministic
+    `gate` closure, output is bit-exact reproducible across runs on
+    the same hardware.
+  - Additive API only — existing `forward` and
+    `forward_with_layer_hook` are untouched.
+- **`examples/incarnation_forward.rs`** — new example demonstrating
+  the external-signal pattern. Structural variant of
+  `early_exit_qwen35.rs` where the routing signal is a per-token
+  vector produced outside the LLM rather than an internally-computed
+  layer statistic. Includes a startup pass that verifies
+  `forward_with_surprise(id, None, ..)` matches `forward(id)`
+  bit-exact on a real loaded model.
+
 ## [1.3.0] - 2026-07-23
 
 ### Added

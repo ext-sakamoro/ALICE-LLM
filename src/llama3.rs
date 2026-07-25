@@ -52,6 +52,17 @@ pub fn dump_hidden_jsonl_stderr(backend: &str, hidden: &[f32]) {
     eprintln!("{line}");
 }
 
+// ─── External signal type aliases ──────────────────────────────────────────
+
+/// External per-token signal vector passed to [`Llama3Model::forward_with_surprise`].
+///
+/// The shape and meaning of the slice is intentionally unopinionated — the
+/// caller decides whether the elements represent per-body prediction error,
+/// per-region perceptual error, per-modality entropy, an aggregated scalar
+/// broadcast, or any other per-token routing signal. `forward_with_surprise`
+/// only forwards the borrow to the caller-supplied `gate` closure.
+pub type SurpriseVec<'a> = &'a [f32];
+
 // ─── Model architecture ─────────────────────────────────────────────────────
 
 /// Supported model architectures.
@@ -4097,6 +4108,58 @@ impl<'a> Llama3Model<'a> {
     /// `forward_with_layer_hook(token_id, |_, _| false)`.
     pub fn forward(&mut self, token_id: u32) -> Vec<f32> {
         self.forward_with_layer_hook(token_id, |_layer_idx, _hidden| false)
+    }
+
+    /// External-signal-driven per-layer routing convenience API.
+    ///
+    /// Thin wrapper around [`forward_with_layer_hook`] that standardises the
+    /// "an external per-token signal drives per-layer routing decisions"
+    /// pattern already demonstrated in `examples/early_exit_qwen35.rs`
+    /// (variance-gated depth routing) and `examples/entropy_mod_qwen35.rs`
+    /// (per-layer statistic observation).
+    ///
+    /// The caller supplies an optional `surprise` slice (a per-token signal
+    /// of arbitrary shape — per-body, per-region, per-modality, aggregated
+    /// scalar broadcast, etc.) and a `gate` closure that inspects the layer
+    /// index plus the signal and returns `true` to skip that layer's CPU
+    /// compute. When `surprise` is `None`, output is bit-exact identical to
+    /// [`forward`]: the wrapper delegates to `forward_with_layer_hook` with
+    /// a closure that forwards `(layer_idx, None)` to `gate`, and a
+    /// `gate` that always returns `false` reproduces the exact code path
+    /// [`forward`] takes.
+    ///
+    /// Typical use cases:
+    /// - Signal-driven early exit for latency-sensitive inference paths.
+    /// - Mixture-of-Depths style routing with an externally-provided
+    ///   routing key.
+    /// - Adaptive compute where a lightweight upstream model produces a
+    ///   per-token difficulty signal that gates depth on the downstream
+    ///   `Llama3Model`.
+    ///
+    /// # Determinism
+    ///
+    /// With fixed `surprise` slice contents and a deterministic `gate`
+    /// closure, the output is bit-exact reproducible across runs on the
+    /// same hardware. With `surprise: None`, output equals
+    /// `forward(token_id)` bit-exact.
+    ///
+    /// # Backward compatibility
+    ///
+    /// This is an additive API. Existing [`forward`] and
+    /// [`forward_with_layer_hook`] remain untouched.
+    ///
+    /// [`forward`]: Self::forward
+    /// [`forward_with_layer_hook`]: Self::forward_with_layer_hook
+    pub fn forward_with_surprise<F>(
+        &mut self,
+        token_id: u32,
+        surprise: Option<SurpriseVec<'_>>,
+        gate: F,
+    ) -> Vec<f32>
+    where
+        F: Fn(usize, Option<SurpriseVec<'_>>) -> bool,
+    {
+        self.forward_with_layer_hook(token_id, |layer_idx, _hidden| gate(layer_idx, surprise))
     }
 
     /// Phase A2 per-layer hybrid support. Runs the standard `forward` path
