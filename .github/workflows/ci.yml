@@ -126,3 +126,82 @@ jobs:
         run: cargo build --example lol_gen --features "grammar gguf"
       - name: cargo build --bin alice-llm-server --features server
         run: cargo build --bin alice-llm-server --features server
+
+  notify_failure:
+    # Open (or comment on existing) a GitHub Issue automatically when any
+    # upstream CI job fails, so pipeline regressions are surfaced as
+    # trackable issues rather than silently ignored. Dedupe by workflow
+    # name in issue title: multiple failures for the same workflow append
+    # comments to a single open issue instead of spamming new issues.
+    #
+    # Requires `issues: write` because default GITHUB_TOKEN in public
+    # repos is issue read-only. Scoped to this job only.
+    name: Open issue on CI failure
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - actionlint
+      - clippy
+      - test
+      - gpu_pipeline_smoke
+      - build_release
+      - examples_build
+    if: failure()
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Ensure ci-failure and auto-opened labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create ci-failure \
+            --repo "$REPO" \
+            --color d73a4a \
+            --description "CI pipeline failure auto-opened by GitHub Actions" \
+            2>/dev/null || true
+          gh label create auto-opened \
+            --repo "$REPO" \
+            --color 0e8a16 \
+            --description "Automatically opened by a workflow" \
+            2>/dev/null || true
+
+      - name: Create or comment on ci-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list \
+            --repo "$REPO" \
+            --label ci-failure \
+            --state open \
+            --json number,title \
+            --jq ".[] | select(.title | contains(\"$WORKFLOW\")) | .number" \
+            | head -1)
+          short_sha="${SHA:0:7}"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --repo "$REPO" \
+              --body "🔴 New failure — run [$RUN_URL]($RUN_URL) — commit \`$short_sha\` on \`$BRANCH\`"
+          else
+            gh issue create \
+              --repo "$REPO" \
+              --title "CI failure: $WORKFLOW" \
+              --label "ci-failure,auto-opened" \
+              --body-file - <<EOF
+          **Workflow**: $WORKFLOW
+          **Run**: $RUN_URL
+          **Commit**: \`$SHA\`
+          **Branch**: \`$BRANCH\`
+
+          Auto-opened by CI on failure. Investigate the workflow run URL above.
+          Additional failures for the same workflow will append comments to
+          this issue until it is closed manually.
+          EOF
+          fi
