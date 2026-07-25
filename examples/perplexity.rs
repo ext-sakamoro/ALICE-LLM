@@ -160,6 +160,12 @@ fn main() {
     // any GGUF architecture ALICE-LLM supports.
     let dump_layer: i32 = parse_arg(&args, "--dump-layer").unwrap_or(-1);
     let dump_layer_tokens: usize = parse_arg(&args, "--dump-layer-tokens").unwrap_or(2);
+    // --dump-all-layers: dump hidden state at the START of every transformer
+    // layer for the first N tokens (N = --dump-layer-tokens). Emits one line
+    // per (layer, position) with L2 norm + sum + first3/last3, so we can
+    // scan for the first layer where ALICE diverges from llama.cpp's
+    // llama-eval-callback output.
+    let dump_all_layers: bool = args.iter().any(|s| s == "--dump-all-layers");
     let eog_inf_csv: String = parse_arg::<String>(&args, "--eog-inf").unwrap_or_default();
     let eog_inf_ids: Vec<u32> = if eog_inf_csv.is_empty() {
         Vec::new()
@@ -278,6 +284,48 @@ fn main() {
     if dump_tokens > 0 {
         for t in tokens.iter().take(dump_tokens) {
             println!("{}", t);
+        }
+        return;
+    }
+
+    if dump_all_layers {
+        model.reset();
+        // If --prepend-bos was set (or by default for llama models), the
+        // caller expects the same BOS prefix llama.cpp inserts by default.
+        // We construct the local sequence explicitly so this loop matches
+        // llama.cpp's `common_debug_cb_eval` per-position output 1:1.
+        // `tokens` already had BOS prepended above if --prepend-bos was
+        // set, so just take the first N.
+        let seq: Vec<u32> = tokens.iter().take(dump_layer_tokens).copied().collect();
+        for (pos, &tok) in seq.iter().enumerate() {
+            let mut per_layer: Vec<(usize, Vec<f32>)> = Vec::new();
+            let _ = model.forward_with_layer_hook(tok, |lyr, hidden| {
+                per_layer.push((lyr, hidden.clone()));
+                false
+            });
+            for (lyr, h) in &per_layer {
+                let sum: f64 = h.iter().map(|&x| x as f64).sum();
+                let l2: f64 = h
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                let n = h.len();
+                let first3 = if n >= 3 {
+                    format!("{:>10.4}, {:>10.4}, {:>10.4}", h[0], h[1], h[2])
+                } else {
+                    "n<3".to_string()
+                };
+                let last3 = if n >= 3 {
+                    format!("{:>10.4}, {:>10.4}, {:>10.4}", h[n - 3], h[n - 2], h[n - 1])
+                } else {
+                    "n<3".to_string()
+                };
+                println!(
+                    "pos={} tok={} layer={:>3} l2={:.6} sum={:.6} first3=[{}] last3=[{}]",
+                    pos, tok, lyr, l2, sum, first3, last3
+                );
+            }
         }
         return;
     }

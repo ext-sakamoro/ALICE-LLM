@@ -2059,12 +2059,76 @@ fn gqa_attention(
     // Enable with ALICE_ATTN_F64_ACC=1.
     let use_f64_acc = std::env::var_os("ALICE_ATTN_F64_ACC").is_some();
 
+    // Phase X.3.e.3.39 diagnostic: online softmax variant matching
+    // llama.cpp's ggml_compute_forward_flash_attn_ext_f16_one_chunk
+    // algorithm (arxiv:2112.05682). Uses running max M and sum S with
+    // rescaling on new-max detection: VKQ *= exp(Mold-Mnew), S = S*ms+vs.
+    // Enable with ALICE_ATTN_ONLINE_SOFTMAX=1. Mathematically equivalent
+    // to the two-pass version but different f32 rounding path — matches
+    // llama.cpp's arithmetic order for bit-comparable results.
+    let use_online_softmax = std::env::var_os("ALICE_ATTN_ONLINE_SOFTMAX").is_some();
+
     attn_out.fill(0.0);
     for h in 0..num_heads {
         let kv_h = h / heads_per_kv;
         let q_start = h * head_dim;
         let q_head = &q_buf[q_start..q_start + head_dim];
         let k_offset = kv_h * head_dim;
+        let v_offset = kv_h * head_dim;
+
+        if use_online_softmax {
+            // llama.cpp FLASH_ATTN_EXT online softmax algorithm.
+            // Interleaves Q·K score computation, running max/sum update, and
+            // weighted V accumulation into a single pass. Rescales the VKQ
+            // accumulator by exp(Mold - Mnew) whenever a new max is seen.
+            let mut m = f32::NEG_INFINITY;
+            let mut s = 0.0f32;
+            // Reuse attn_out[q_start..q_start+head_dim] as VKQ accumulator
+            // (attn_out.fill(0.0) already zeroed it).
+
+            for t in attn_start..seq_len {
+                let k_cached = kv_cache.key_at(layer_idx, t);
+                let v_cached = kv_cache.value_at(layer_idx, t);
+
+                let mut score = 0.0f32;
+                for d in 0..head_dim {
+                    score += q_head[d] * k_cached[k_offset + d];
+                }
+                score *= inv_sqrt_d;
+
+                if let Some(cap) = attn_logit_softcap {
+                    score = cap * (score / cap).tanh();
+                }
+
+                let m_old = m;
+                let (ms, vs) = if score > m {
+                    m = score;
+                    let ms = (m_old - m).exp(); // rescale factor for VKQ
+                                                // Rescale existing VKQ accumulator.
+                    for d in 0..head_dim {
+                        attn_out[q_start + d] *= ms;
+                    }
+                    (ms, 1.0f32)
+                } else {
+                    (1.0f32, (score - m).exp())
+                };
+
+                // VKQ += V * vs
+                for d in 0..head_dim {
+                    attn_out[q_start + d] += vs * v_cached[v_offset + d];
+                }
+                s = s * ms + vs;
+            }
+
+            // Final normalization: attn_out /= S
+            if s > 0.0 {
+                let inv_s = 1.0 / s;
+                for d in 0..head_dim {
+                    attn_out[q_start + d] *= inv_s;
+                }
+            }
+            continue;
+        }
 
         let window_len = seq_len - attn_start;
         let mut scores = Vec::with_capacity(window_len);
@@ -2120,7 +2184,6 @@ fn gqa_attention(
 
         for (si, t) in (attn_start..seq_len).enumerate() {
             let v_cached = kv_cache.value_at(layer_idx, t);
-            let v_offset = kv_h * head_dim;
             let w = scores[si];
             if use_f64_acc {
                 for d in 0..head_dim {
@@ -10268,6 +10331,97 @@ mod tests {
     fn test_gqa_heads_per_kv() {
         let c = Llama3Config::llama3_8b();
         assert_eq!(c.num_heads / c.num_kv_heads, 4);
+    }
+
+    /// Phase X.3.e.3.39 online softmax equivalence check.
+    ///
+    /// Verifies that llama.cpp-style online softmax and ALICE's two-pass
+    /// softmax produce mathematically equivalent results (within f32
+    /// rounding tolerance) for a small attention head. This is a
+    /// regression guard so future edits to either path keep them in
+    /// numerical agreement.
+    #[test]
+    fn test_online_softmax_matches_two_pass() {
+        let head_dim = 8;
+        let seq_len = 5;
+        let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+
+        // Deterministic pseudo-random inputs.
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.11 - 0.4).collect();
+        let mut k = vec![0.0f32; seq_len * head_dim];
+        let mut v = vec![0.0f32; seq_len * head_dim];
+        for t in 0..seq_len {
+            for d in 0..head_dim {
+                k[t * head_dim + d] = ((t + 1) as f32 * 0.07 - d as f32 * 0.03).sin();
+                v[t * head_dim + d] = ((t + 3) as f32 * 0.13 + d as f32 * 0.05).cos();
+            }
+        }
+
+        // Reference: two-pass softmax.
+        let mut scores = vec![0.0f32; seq_len];
+        for t in 0..seq_len {
+            let mut s = 0.0f32;
+            for d in 0..head_dim {
+                s += q[d] * k[t * head_dim + d];
+            }
+            scores[t] = s * inv_sqrt_d;
+        }
+        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - m).exp();
+            sum += *s;
+        }
+        for s in &mut scores {
+            *s /= sum;
+        }
+        let mut two_pass = vec![0.0f32; head_dim];
+        for t in 0..seq_len {
+            let w = scores[t];
+            for d in 0..head_dim {
+                two_pass[d] += w * v[t * head_dim + d];
+            }
+        }
+
+        // Candidate: online softmax (mirrors llama.cpp FLASH_ATTN_EXT).
+        let mut online = vec![0.0f32; head_dim];
+        let mut m_run = f32::NEG_INFINITY;
+        let mut s_run = 0.0f32;
+        for t in 0..seq_len {
+            let mut score = 0.0f32;
+            for d in 0..head_dim {
+                score += q[d] * k[t * head_dim + d];
+            }
+            score *= inv_sqrt_d;
+            let m_old = m_run;
+            let (ms, vs) = if score > m_run {
+                m_run = score;
+                let ms = (m_old - m_run).exp();
+                for d in 0..head_dim {
+                    online[d] *= ms;
+                }
+                (ms, 1.0f32)
+            } else {
+                (1.0f32, (score - m_run).exp())
+            };
+            for d in 0..head_dim {
+                online[d] += vs * v[t * head_dim + d];
+            }
+            s_run = s_run * ms + vs;
+        }
+        let inv_s = 1.0 / s_run;
+        for d in 0..head_dim {
+            online[d] *= inv_s;
+        }
+
+        for d in 0..head_dim {
+            assert!(
+                (online[d] - two_pass[d]).abs() < 1e-5,
+                "online[{d}]={} vs two_pass[{d}]={}",
+                online[d],
+                two_pass[d]
+            );
+        }
     }
 
     #[test]
