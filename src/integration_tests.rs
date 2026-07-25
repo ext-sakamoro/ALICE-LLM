@@ -1038,7 +1038,7 @@ fn test_kv_cache_seq_len_after_clear() {
 // delegating to `forward_with_layer_hook`. Bit-exact equivalence between
 // `forward_with_surprise(id, None, |_,_| false)` and `forward(id)` therefore
 // holds by construction (both reduce to `forward_with_layer_hook(id, |_,_| false)`);
-// a full-model bit-exact run is covered by `examples/incarnation_forward.rs`.
+// a full-model bit-exact run is covered by `examples/external_signal_routing.rs`.
 
 fn simulate_wrapper<F>(
     num_layers: usize,

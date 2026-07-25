@@ -15,7 +15,7 @@
 //! Two modes evaluated on the same (model, dataset, chunking) configuration:
 //!
 //!   - `baseline` — full forward via `forward(token_id)` (reference PPL).
-//!   - `incarnated` — `forward_with_surprise(token_id, Some(&signal), gate)`
+//!   - `routed`   — `forward_with_surprise(token_id, Some(&signal), gate)`
 //!     where `signal[i]` is a pre-computed per-token score in `[0, 1]` and
 //!     `gate(layer_idx, surprise)` returns `true` for `layer_idx >= gate_layer`
 //!     when the signal's mean falls below `--signal-threshold`. This is the
@@ -31,13 +31,13 @@
 //! would indicate a regression in the wrapper implementation.
 //!
 //! Usage:
-//!   cargo run --release --features gguf --example incarnation_forward -- \
+//!   cargo run --release --features gguf --example external_signal_routing -- \
 //!     --model models/Qwen3.5-4B-Q4_K_M.gguf \
 //!     --dataset data/wikitext-2/wiki.test.raw \
 //!     --n-samples 500 --ctx 512 \
 //!     --gate-layer 7 --signal-threshold 0.5 \
 //!     --signal-seed 42 \
-//!     --mode both --output /tmp/incarnation_forward.jsonl
+//!     --mode both --output /tmp/external_signal_routing.jsonl
 //!
 //! Emits one JSON line per mode on stdout for scripted comparison.
 
@@ -193,7 +193,7 @@ fn run(
                             // external signal and returns `true` for layers
                             // beyond `gate_layer` when mean drops below
                             // `threshold` — a signal-driven early exit.
-                            let s = surprise.expect("surprise present in incarnated mode");
+                            let s = surprise.expect("surprise present in routed mode");
                             let mean = s.iter().copied().sum::<f32>() / s.len() as f32;
                             layer_idx >= gate_layer && mean < threshold
                         },
@@ -270,13 +270,13 @@ fn main() {
 
     if args.len() < 2 || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "Usage: incarnation_forward --model <path.gguf> --dataset <path.txt> \\
-                                       [--n-samples 500] [--ctx 512] \\
-                                       [--gate-layer 7] [--signal-threshold 0.5] \\
-                                       [--signal-seed 42] [--signal-len 4] \\
-                                       [--mode baseline|incarnated|both] \\
-                                       [--output <path.jsonl>] [--progress-every 100] \\
-                                       [--skip-backward-compat]
+            "Usage: external_signal_routing --model <path.gguf> --dataset <path.txt> \\
+                                           [--n-samples 500] [--ctx 512] \\
+                                           [--gate-layer 7] [--signal-threshold 0.5] \\
+                                           [--signal-seed 42] [--signal-len 4] \\
+                                           [--mode baseline|routed|both] \\
+                                           [--output <path.jsonl>] [--progress-every 100] \\
+                                           [--skip-backward-compat]
 
   --model                Path to GGUF model file
   --dataset              Path to raw text dataset (UTF-8)
@@ -290,8 +290,8 @@ fn main() {
   --signal-seed          RNG seed for the deterministic external signal
                          (default: 42).
   --signal-len           Signal vector length (default: 4).
-  --mode                 baseline | incarnated | both (default: both).
-                         `both` runs baseline first, then incarnated —
+  --mode                 baseline | routed | both (default: both).
+                         `both` runs baseline first, then routed —
                          each mode starts from a fresh KV cache.
   --output               Optional per-token JSONL path.
   --progress-every       Emit stderr progress every N scored tokens
@@ -316,12 +316,12 @@ Emits one JSON line per mode on stdout for scripted comparison."
     let progress_every: usize = parse_arg(&args, "--progress-every").unwrap_or(100);
     let skip_backward_compat = args.iter().any(|a| a == "--skip-backward-compat");
 
-    if !matches!(mode.as_str(), "baseline" | "incarnated" | "both") {
-        eprintln!("--mode must be one of: baseline | incarnated | both (got '{mode}')");
+    if !matches!(mode.as_str(), "baseline" | "routed" | "both") {
+        eprintln!("--mode must be one of: baseline | routed | both (got '{mode}')");
         std::process::exit(2);
     }
 
-    eprintln!("=== incarnation_forward ===");
+    eprintln!("=== external_signal_routing ===");
     eprintln!("  model:               {model_path}");
     eprintln!("  dataset:             {dataset_path}");
     eprintln!("  n_samples:           {n_samples}");
@@ -377,7 +377,7 @@ Emits one JSON line per mode on stdout for scripted comparison."
     });
 
     let run_baseline = matches!(mode.as_str(), "baseline" | "both");
-    let run_incarnated = matches!(mode.as_str(), "incarnated" | "both");
+    let run_routed = matches!(mode.as_str(), "routed" | "both");
 
     if run_baseline {
         let summary = run(
@@ -392,12 +392,12 @@ Emits one JSON line per mode on stdout for scripted comparison."
         println!("{}", summary.to_json_line(""));
     }
 
-    if run_incarnated {
+    if run_routed {
         let summary = run(
             &mut model,
             &tokens,
             ctx,
-            "incarnated",
+            "routed",
             Some((gate_layer, signal_threshold, signal_seed, signal_len)),
             per_token_writer.as_mut(),
             progress_every,

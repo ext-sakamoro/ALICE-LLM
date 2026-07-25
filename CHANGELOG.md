@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`examples/external_signal_routing.rs`** — CLI `--mode` now
+  accepts `baseline | routed | both` (previous mode label updated
+  for vocabulary alignment with the example's documented
+  external-signal-driven routing intent). Public API unchanged
+  (`forward_with_surprise` / `SurpriseVec` untouched); no new
+  crates.io release is required.
+
 ## [1.4.0] - 2026-07-25
 
 ### Added
@@ -31,7 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same hardware.
   - Additive API only — existing `forward` and
     `forward_with_layer_hook` are untouched.
-- **`examples/incarnation_forward.rs`** — new example demonstrating
+  - Fits the same adaptive-compute-gate pattern shown in
+    `examples/early_exit_qwen35.rs` (in-hook variance gate) and
+    `examples/entropy_mod_qwen35.rs` (per-layer statistic observation),
+    generalised so the routing signal can originate outside the LLM.
+- **`examples/external_signal_routing.rs`** — new example demonstrating
   the external-signal pattern. Structural variant of
   `early_exit_qwen35.rs` where the routing signal is a per-token
   vector produced outside the LLM rather than an internally-computed
