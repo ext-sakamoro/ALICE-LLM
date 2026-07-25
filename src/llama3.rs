@@ -98,6 +98,29 @@ pub enum ModelArch {
     /// on a 2.8T model is worse than an explicit panic pointing to
     /// `docs/KIMI_K3_INTEGRATION.md`.
     KimiK3,
+    /// Tencent Hy3 (Hunyuan 3) family. Apache 2.0, 295B total / 21B
+    /// active (MoE), 192 experts top-8, 1 MTP layer (3.8B), GQA 8 KV
+    /// heads, 256K context. FP8 (E4M3) native + BF16 fallback via
+    /// AngelSlim quantization toolkit.
+    ///
+    /// Skeleton only until the community `convert_hf_to_gguf.py` /
+    /// llama.cpp support settles and the actual GGUF metadata prefix
+    /// stabilises (best guesses right now are `hunyuan` /
+    /// `hunyuanmoe` / `hy3`, all covered by `from_gguf`). Once weights
+    /// + GGUF land, the CPU forward is expected to inherit ~90% from
+    /// the Bonsai / Qwen 3.6 `gated_deltanet` path (top-K sparse
+    /// routing over 192 experts is the main net-new implementation,
+    /// GQA + MoE scaffolding is already reused across Kimi K3 /
+    /// DeepSeek V3).
+    ///
+    /// `forward()` immediately `todo!()` on `Hy3` — silent garbage on
+    /// a 295B model is worse than an explicit panic pointing to the
+    /// integration doc.
+    ///
+    /// References:
+    /// - GitHub: `Tencent-Hunyuan/Hy3` (weights + inference + RL)
+    /// - HuggingFace: `tencent/Hy3` (BF16) + `tencent/Hy3-FP8`
+    Hy3,
 }
 
 impl ModelArch {
@@ -131,6 +154,13 @@ impl ModelArch {
             // in draft PRs. Refine once the community GGUF conversion
             // finalizes (see docs/KIMI_K3_INTEGRATION.md §X.4.b).
             Some(s) if s.starts_with("kimi") => Self::KimiK3,
+            // Tencent Hy3 (Hunyuan 3). Same "waiting on community
+            // convert_hf_to_gguf.py" caveat as Kimi K3 — the prefix in
+            // the eventual GGUF conversion is not yet fixed, so match
+            // any of the plausible `hunyuan*` / `hy3` variants and
+            // refine once the community lands a canonical prefix.
+            Some("hy3" | "hy3moe" | "hunyuan_moe") => Self::Hy3,
+            Some(s) if s.starts_with("hunyuan") => Self::Hy3,
             _ => Self::Llama,
         }
     }
@@ -149,6 +179,11 @@ impl ModelArch {
             // TODO: confirm the actual llama.cpp prefix once conversion
             // support lands (see docs/KIMI_K3_INTEGRATION.md).
             Self::KimiK3 => "kimi",
+            // Same TODO as KimiK3 — the eventual `general.architecture`
+            // string for Hy3 GGUF is not yet fixed by the community.
+            // `hunyuan` is the working guess based on the HuggingFace
+            // model ids (`tencent/Hy3` under the Hunyuan org).
+            Self::Hy3 => "hunyuan",
         }
     }
 
@@ -4055,6 +4090,14 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::KimiK3 {
             return self.forward_kimi_k3(token_id);
         }
+        // Tencent Hy3 (Hunyuan 3). Skeleton only — the actual GGUF
+        // conversion & the 295B/21B MoE forward path are Phase X.11
+        // follow-up work. Fail fast rather than misinterpret Hy3 as
+        // vanilla attention (its 192-expert top-8 routing + MTP head
+        // are unique).
+        if self.config.arch == ModelArch::Hy3 {
+            return self.forward_hy3(token_id);
+        }
         // Qwen 3.5 / Qwen 3.6 hybrid uses the standard forward path with a
         // per-layer branch (DeltaNet linear-attention vs. full attention).
         // See `layer_kind_map` for the layer-to-kind routing that was set up
@@ -5707,6 +5750,35 @@ impl<'a> Llama3Model<'a> {
              docs/KIMI_K3_INTEGRATION.md for the phased integration plan \
              (Phase X.4.a-X.4.g) and the reusable ALICE-LLM components \
              (`gated_deltanet_step*`, `SsmDeltaNetConfig`, MoE routing)."
+        );
+    }
+
+    /// Fail-fast stub for Tencent Hy3 (Hunyuan 3) forward. Same rationale
+    /// as `forward_kimi_k3`: the target ships as a 295B / 21B-active MoE
+    /// with 192 experts (top-8 routing), 1 MTP layer (3.8B), GQA (8 KV
+    /// heads), 256K context, and native FP8 (E4M3) weights. Enough of that
+    /// scaffolding is unique that pretending it is a standard attention
+    /// model would corrupt the output rather than degrade it gracefully.
+    ///
+    /// Once GGUF conversion for Hy3 lands upstream, this method is
+    /// expected to inherit ~90% from the Bonsai / Qwen 3.6 gated-DeltaNet
+    /// forward path (GQA + MoE scaffolding is already shared across Kimi
+    /// K3 / DeepSeek V3); the net-new pieces are the 192-expert top-8
+    /// sparse routing and the MTP head. See references on `ModelArch::Hy3`.
+    ///
+    /// # Panics
+    ///
+    /// Always — fail-fast stub (CLAUDE.md "仮実装完了偽装の禁止" rule).
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn forward_hy3(&mut self, _token_id: u32) -> Vec<f32> {
+        todo!(
+            "HY3 forward: waiting for community GGUF conversion of \
+             Tencent Hy3 (Hunyuan 3, 295B / 21B active MoE, 192 experts \
+             top-8, MTP head 3.8B, GQA 8 KV, 256K context, FP8 native) \
+             before implementation. Expected to inherit ~90% from the \
+             Bonsai `gated_deltanet_step*` path; net-new pieces are the \
+             192-expert top-8 sparse routing and MTP head. See the \
+             Tencent-Hunyuan/Hy3 GitHub repository for the model spec."
         );
     }
 
