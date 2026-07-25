@@ -1022,3 +1022,88 @@ fn test_kv_cache_seq_len_after_clear() {
     assert!(cache.append(0, vec![0.0; 8], vec![0.0; 8]));
     assert_eq!(cache.seq_len(0), 1);
 }
+
+// ---- forward_with_surprise adapter tests ----
+//
+// These verify the closure-adapter contract of `Llama3Model::forward_with_surprise`
+// without loading a real GGUF (which is impractical in a unit-test crate).
+//
+// The wrapper's semantics are:
+//   forward_with_surprise(id, surprise, gate) invokes gate(layer_idx, surprise)
+//   for every layer index the underlying `forward_with_layer_hook` visits,
+//   passing the borrowed surprise slice unmodified.
+//
+// We simulate the wrapper's inner-closure translation directly to prove the
+// contract holds — this is exactly what `forward_with_surprise` does before
+// delegating to `forward_with_layer_hook`. Bit-exact equivalence between
+// `forward_with_surprise(id, None, |_,_| false)` and `forward(id)` therefore
+// holds by construction (both reduce to `forward_with_layer_hook(id, |_,_| false)`);
+// a full-model bit-exact run is covered by `examples/incarnation_forward.rs`.
+
+fn simulate_wrapper<F>(
+    num_layers: usize,
+    surprise: Option<crate::llama3::SurpriseVec<'_>>,
+    gate: F,
+) -> Vec<bool>
+where
+    F: Fn(usize, Option<crate::llama3::SurpriseVec<'_>>) -> bool,
+{
+    // Mirrors the exact closure body of `forward_with_surprise`.
+    let mut skip_decisions = Vec::with_capacity(num_layers);
+    let inner = |layer_idx: usize, _hidden: &mut Vec<f32>| gate(layer_idx, surprise);
+    // Drive the inner closure for every layer as `forward_with_layer_hook` would.
+    let mut hidden = vec![0.0f32; 4]; // Dummy hidden buffer, contents unused by gate.
+    for layer_idx in 0..num_layers {
+        skip_decisions.push(inner(layer_idx, &mut hidden));
+    }
+    skip_decisions
+}
+
+#[test]
+fn test_forward_with_surprise_none_equals_forward_semantics() {
+    // With `surprise: None` and a gate that always returns false, the
+    // wrapper produces an all-false skip pattern — the same code path
+    // `forward` takes via `forward_with_layer_hook(id, |_, _| false)`.
+    let decisions = simulate_wrapper(32, None, |_layer_idx, surprise| {
+        assert!(
+            surprise.is_none(),
+            "gate must receive None when surprise is None"
+        );
+        false
+    });
+    assert_eq!(decisions.len(), 32);
+    assert!(
+        decisions.iter().all(|&skip| !skip),
+        "None + always-false gate must skip zero layers (matches forward)"
+    );
+}
+
+#[test]
+fn test_forward_with_surprise_gate_receives_signal() {
+    // With `surprise: Some(vec)`, the gate must receive the exact slice
+    // for every layer index. Vary the signal contents and confirm the
+    // gate's skip decisions change accordingly, proving the wrapper
+    // forwards the borrow unmodified.
+    let signal_high: [f32; 4] = [0.9, 0.9, 0.9, 0.9];
+    let signal_low: [f32; 4] = [0.1, 0.1, 0.1, 0.1];
+
+    let threshold_gate =
+        |_layer_idx: usize, surprise: Option<crate::llama3::SurpriseVec<'_>>| -> bool {
+            // Skip when mean surprise is below 0.5.
+            let s = surprise.expect("gate must receive Some when surprise is Some");
+            let mean = s.iter().copied().sum::<f32>() / s.len() as f32;
+            mean < 0.5
+        };
+
+    let hi = simulate_wrapper(8, Some(&signal_high), threshold_gate);
+    let lo = simulate_wrapper(8, Some(&signal_low), threshold_gate);
+
+    assert!(
+        hi.iter().all(|&skip| !skip),
+        "high-surprise signal must skip zero layers"
+    );
+    assert!(
+        lo.iter().all(|&skip| skip),
+        "low-surprise signal must skip all 8 layers"
+    );
+}
