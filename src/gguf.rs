@@ -3308,6 +3308,18 @@ pub fn q4k_matvec_preq(
     let block_bytes = 144;
     let row_bytes = blocks_per_row * block_bytes;
 
+    // Phase X.3.e.3.40 diagnostic: llama.cpp-compatible cross-block
+    // accumulation pattern (matches `ggml_vec_dot_q4_K_q8_K_generic`).
+    // Instead of collapsing each block's 8 sub-block int32 products into
+    // a single f32 per block, this path keeps `sums[8]` f32 accumulators
+    // per row and reduces them at the very end. Enabled with
+    // ALICE_Q4K_LLAMACPP_ACCUM=1. Test target: PPL should approach
+    // llama.cpp CPU 5.75 on Llama 3.2 3B 100 tok wikitext.
+    if std::env::var_os("ALICE_Q4K_LLAMACPP_ACCUM").is_some() {
+        q4k_matvec_preq_llamacpp_accum(data, rows, cols, q8_blocks, output);
+        return;
+    }
+
     // Phase X.3.e.3.37 diagnostic: bypass the Q4_K × Q8_K integer dot path
     // when ALICE_BYPASS_Q8K_ACTIVATION is set — dequantize both operands to
     // f32 and do a scalar f32 dot product instead. If this changes PPL
@@ -3365,6 +3377,123 @@ pub fn q4k_matvec_preq(
                 &row_data[bi * block_bytes..(bi + 1) * block_bytes],
                 &q8_blocks[bi],
             );
+        }
+        output[row] = sumf;
+    }
+}
+
+/// Phase X.3.e.3.40 diagnostic: Q4_K matmul with llama.cpp-compatible
+/// cross-block f32 accumulation. Ports `ggml_vec_dot_q4_K_q8_K_generic`
+/// verbatim: 8-lane `sums[f32; 8]` survives across blocks per row, and
+/// only reduces at the end. This differs from ALICE's default scalar /
+/// NEON paths which collapse the 8-lane int32 accumulator into a single
+/// f32 per block. The two are algebraically equivalent but produce
+/// different f32 rounding paths — this port lets us test whether the
+/// 2.68× PPL divergence vs llama.cpp is explained by the accumulation
+/// order (Phase 4 First-Divergence-Point analysis showed ~1-3e-3 abs
+/// diff at Q_proj which compounds through 28 layers).
+fn q4k_matvec_preq_llamacpp_accum(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    q8_blocks: &[BlockQ8K],
+    output: &mut [f32],
+) {
+    const KMASK1: u32 = 0x3f3f_3f3f;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    const KMASK3: u32 = 0x0303_0303;
+    let blocks_per_row = cols / QK_K;
+    let block_bytes = 144;
+    let row_bytes = blocks_per_row * block_bytes;
+
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+
+        // llama.cpp: float sums[8] = {0}; survives across all blocks in row.
+        let mut sums = [0.0f32; 8];
+        let mut sumf = 0.0f32;
+
+        for bi in 0..blocks_per_row {
+            let block = &row_data[bi * block_bytes..(bi + 1) * block_bytes];
+            let q8k = &q8_blocks[bi];
+
+            // Unpack Q4_K header (matches scalar path exactly).
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let q4 = &block[16..144];
+
+            // Unpack quantized values into aux8[256] (low then high nibbles).
+            let mut aux8 = [0i8; QK_K];
+            let mut a_off = 0usize;
+            let mut q4_off = 0usize;
+            for _ in 0..4 {
+                for l in 0..32 {
+                    aux8[a_off + l] = (q4[q4_off + l] & 0xF) as i8;
+                }
+                a_off += 32;
+                for l in 0..32 {
+                    aux8[a_off + l] = (q4[q4_off + l] >> 4) as i8;
+                }
+                a_off += 32;
+                q4_off += 32;
+            }
+
+            // Unpack scales/mins via kmask bit-packing (matches scalar).
+            let mut utmp = [0u32; 4];
+            let sb = &block[4..16];
+            utmp[0] = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+            utmp[1] = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+            utmp[2] = u32::from_le_bytes([sb[8], sb[9], sb[10], sb[11]]);
+            utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+            let uaux = utmp[1] & KMASK1;
+            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= KMASK1;
+            let s0 = utmp[0].to_le_bytes();
+            let s1 = utmp[1].to_le_bytes();
+            let m0 = utmp[2].to_le_bytes();
+            let m1 = utmp[3].to_le_bytes();
+            let scales = [s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]];
+            let mins = [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3]];
+
+            // Mins correction (matches scalar).
+            let mut sumi = 0i32;
+            for j in 0..16 {
+                sumi += q8k.bsums[j] as i32 * mins[j / 2] as i32;
+            }
+
+            // Per-block 8-lane int32 accumulator (llama.cpp aux32[8]).
+            let mut aux32 = [0i32; 8];
+            let mut a_idx = 0usize;
+            let mut q8_idx = 0usize;
+            for is in 0..8 {
+                let scale = scales[is] as i32;
+                for _ in 0..4 {
+                    for l in 0..8 {
+                        aux32[l] += scale * (q8k.qs[q8_idx + l] as i32 * aux8[a_idx + l] as i32);
+                    }
+                    q8_idx += 8;
+                    a_idx += 8;
+                }
+            }
+
+            // Per-block scale and 8-lane f32 accumulation into sums[].
+            // llama.cpp: for (l=0..8) sums[l] += d * aux32[l];
+            let d_all = d * q8k.d;
+            for l in 0..8 {
+                sums[l] += d_all * aux32[l] as f32;
+            }
+            // Mins contribution accumulates directly into sumf, per block.
+            let dmin_all = dmin * q8k.d;
+            sumf -= dmin_all * sumi as f32;
+        }
+
+        // Final reduction: sumf += Σ sums[l]. This is the key ordering
+        // difference from ALICE's default path — the 8 lanes stay separate
+        // across all blocks and only merge at the very end, matching
+        // llama.cpp's f32 rounding path exactly.
+        for l in 0..8 {
+            sumf += sums[l];
         }
         output[row] = sumf;
     }
