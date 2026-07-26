@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Llama3Model::forward_with_surprise_gpu`** + **`Llama3Model::forward_with_early_exit_gpu`**
+  — signature-only skeletons for the GPU forward variants that
+  preserve the external-signal-driven per-layer routing semantics of
+  `forward_with_surprise`. Both bodies `todo!()` per the 仮実装完了
+  偽装の禁止 rule; landed ahead of the implementation body so the
+  API surface can be validated by downstream planners. See the
+  design + L1/L2/L3 landing plan in the ADR at
+  `docs/adr/alice-llm-gpu-surprise-gate.md` (downstream repo). No
+  behavioural change to any existing API; downstream code that does
+  not call the new methods is unaffected. Implementation body is a
+  follow-up landing.
+
 ### Changed
 
 - **`examples/external_signal_routing.rs`** — CLI `--mode` now

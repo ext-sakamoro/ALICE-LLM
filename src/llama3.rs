@@ -4162,6 +4162,92 @@ impl<'a> Llama3Model<'a> {
         self.forward_with_layer_hook(token_id, |layer_idx, _hidden| gate(layer_idx, surprise))
     }
 
+    /// GPU variant of [`Self::forward_with_surprise`] — matches the CPU
+    /// signature so downstream code can swap in the GPU path without
+    /// signature changes.
+    ///
+    /// Semantic contract: assumes the gate closure is *monotonic in
+    /// `layer_idx`* for a fixed `surprise` — once it returns `true` at
+    /// some layer, it returns `true` for all higher layers. This
+    /// collapses the per-layer gate decisions into a single early-exit
+    /// depth per token, which the GPU forward can encode in one command
+    /// submission via [`Self::forward_with_early_exit_gpu`] with no
+    /// per-layer CPU↔GPU round trip.
+    ///
+    /// Non-monotonic gates would collapse to their first `true` layer
+    /// under this API — usable but semantically distinct from the CPU
+    /// path. Callers with non-monotonic gates should use the CPU path
+    /// or a future `forward_with_layer_hook_gpu` API.
+    ///
+    /// # Status: skeleton
+    ///
+    /// This is a **signature-only skeleton** landed ahead of the
+    /// implementation body so downstream planners can validate the API
+    /// surface. The body panics via `todo!()` — accidental production
+    /// use fails loudly rather than silently returning defaults, per
+    /// the fail-fast rule for placeholder implementations.
+    ///
+    /// Design + landing plan lives in a downstream ADR:
+    /// `alice-llm-gpu-surprise-gate` (L1 skeleton → L2 body → L3
+    /// publish decomposition). Do not call this method in production
+    /// paths until the body lands.
+    ///
+    /// [`Self::forward_with_surprise`]: Self::forward_with_surprise
+    /// [`Self::forward_with_early_exit_gpu`]: Self::forward_with_early_exit_gpu
+    pub fn forward_with_surprise_gpu<F>(
+        &mut self,
+        _token_id: u32,
+        _surprise: Option<SurpriseVec<'_>>,
+        _gate: F,
+    ) -> Vec<f32>
+    where
+        F: Fn(usize, Option<SurpriseVec<'_>>) -> bool,
+    {
+        todo!(
+            "forward_with_surprise_gpu: signature-only skeleton, \
+             implementation body pending — see the downstream \
+             alice-llm-gpu-surprise-gate ADR for design + L1/L2/L3 breakdown"
+        )
+    }
+
+    /// GPU early-exit forward. Runs layers `0..early_exit_layer` on GPU
+    /// followed by the output head reading from the hidden state at
+    /// `early_exit_layer - 1`'s FFN residual add.
+    ///
+    /// - `early_exit_layer == self.config.num_layers` → equivalent to
+    ///   the full GPU forward.
+    /// - `early_exit_layer < num_layers` → the layers
+    ///   `early_exit_layer..num_layers` are entirely skipped; the output
+    ///   head reads the hidden vector as it stands at
+    ///   `early_exit_layer`'s FFN residual add.
+    /// - `early_exit_layer == 0` → degenerate; the output head reads
+    ///   the raw embedding (unlikely to be useful but well-defined).
+    ///
+    /// This is the primary GPU forward primitive for surprise-driven
+    /// per-layer routing patterns where the gate is monotonic in
+    /// `layer_idx` — it preserves the routing semantics at the
+    /// "how deep to go" granularity such gates already imply, without
+    /// paying the per-layer CPU↔GPU round-trip cost of a fully
+    /// general per-layer hook GPU API. Design + effort breakdown in
+    /// the downstream `alice-llm-gpu-surprise-gate` ADR.
+    ///
+    /// # Status: skeleton
+    ///
+    /// Signature-only skeleton — see the sibling
+    /// [`Self::forward_with_surprise_gpu`] doc's *Status: skeleton*
+    /// section for the same lifecycle notes.
+    pub fn forward_with_early_exit_gpu(
+        &mut self,
+        _token_id: u32,
+        _early_exit_layer: usize,
+    ) -> Vec<f32> {
+        todo!(
+            "forward_with_early_exit_gpu: signature-only skeleton, \
+             implementation body pending — see the downstream \
+             alice-llm-gpu-surprise-gate ADR §Implementation approach"
+        )
+    }
+
     /// Phase A2 per-layer hybrid support. Runs the standard `forward` path
     /// but calls `hook(layer_idx, &mut hidden)` before each layer body.
     ///
