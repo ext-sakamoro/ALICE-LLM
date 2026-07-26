@@ -1,6 +1,6 @@
 [package]
 name = "alice-llm"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 license = "AGPL-3.0-or-later"
@@ -65,6 +65,15 @@ required-features = ["gguf"]
 
 [[example]]
 name = "bench_gpu"
+required-features = ["gguf", "gpu"]
+
+# v1.5.0: Metal / Vulkan / DX12 determinism ε-bound bench for the new
+# forward_with_early_exit_and_read / forward_with_surprise_and_read
+# APIs on GpuModel. Runs paired same-seed forwards, reports max
+# |Δlogits|, and asserts early-exit-at-full-depth parity with the
+# existing full-forward path.
+[[example]]
+name = "metal_determinism_check"
 required-features = ["gguf", "gpu"]
 
 [[example]]
