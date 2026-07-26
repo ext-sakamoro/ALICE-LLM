@@ -5172,6 +5172,104 @@ impl GpuModel {
         self.forward_with_early_exit_and_read(token_id, early_exit)
     }
 
+    /// Execute forward with an early-exit depth, advancing KV cache and
+    /// `seq_len`, but WITHOUT computing logits or reading them back.
+    ///
+    /// # When to use
+    ///
+    /// Use this variant when the caller has committed to not needing the
+    /// logits for this token — for example:
+    ///
+    /// - Prefill of an N-token prompt where only token N's logits drive
+    ///   sampling. The first N-1 tokens only need to leave K/V behind for
+    ///   causal attention; their logits are discarded anyway.
+    /// - Downstream consumers that use an external-signal-driven gate to
+    ///   decide which tokens are worth emitting; tokens the gate rejects
+    ///   still need their K/V appended so subsequent tokens see the
+    ///   correct causal context, but their logits are discarded.
+    ///
+    /// # Cost delta vs [`Self::forward_with_early_exit_and_read`]
+    ///
+    /// - Same GPU compute up to `early_exit_layer` — KV cache advance is
+    ///   identical, so a subsequent full-depth forward at the next
+    ///   position sees the same K/V at this position.
+    /// - **Skipped:** output-norm + output-projection compute
+    ///   (proportional to `hidden_dim * vocab_size`).
+    /// - **Skipped:** `vocab_size * 4` bytes of GPU→CPU buffer copy plus
+    ///   the blocking `map_async` wait that dominates end-to-end latency
+    ///   on many discrete-GPU and unified-memory setups.
+    ///
+    /// # KV cache side effect
+    ///
+    /// Identical to [`Self::forward_with_early_exit_and_read`] §KV cache
+    /// side effect: `seq_len` advances by 1 regardless of
+    /// `early_exit_layer`; layers `0..early_exit_layer` append their
+    /// K/V, layers `early_exit_layer..num_layers` do not. Callers who
+    /// mix early-exit and full-depth forwards must either accept the
+    /// resulting sparse K/V or `reset()` between mode switches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `early_exit_layer > self.config.num_layers`.
+    pub fn forward_with_early_exit_no_read(&mut self, token_id: u32, early_exit_layer: usize) {
+        assert!(
+            early_exit_layer <= self.config.num_layers,
+            "forward_with_early_exit_no_read: early_exit_layer {early_exit_layer} \
+             > num_layers {}",
+            self.config.num_layers,
+        );
+
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // Encode only the layer stack up to `early_exit_layer`. Skip the
+        // output head (RMSNorm + output projection) and the logits
+        // readback — both are pure waste when the caller has committed
+        // to discarding this token's logits. KV cache advances
+        // unconditionally because `encode_layers_range` writes K/V into
+        // the per-layer caches as a side effect of the attention
+        // sub-block.
+        self.encode_layers_range(&mut encoder, 0..early_exit_layer, None);
+
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+    }
+
+    /// No-read companion to [`Self::forward_with_surprise_and_read`].
+    ///
+    /// Same monotonic-gate contract as
+    /// [`Self::forward_with_surprise_and_read`] (see §Semantic
+    /// contract): the gate closure is assumed monotonic in `layer_idx`,
+    /// which collapses per-layer gate decisions into a single
+    /// early-exit depth per token. Delegates to
+    /// [`Self::forward_with_early_exit_no_read`] after the CPU-side
+    /// gate scan.
+    ///
+    /// See [`Self::forward_with_early_exit_no_read`] for cost delta vs
+    /// the `_and_read` variant and KV cache semantics.
+    pub fn forward_with_surprise_no_read<F>(
+        &mut self,
+        token_id: u32,
+        surprise: Option<crate::llama3::SurpriseVec<'_>>,
+        gate: F,
+    ) where
+        F: Fn(usize, Option<crate::llama3::SurpriseVec<'_>>) -> bool,
+    {
+        // Mirrors `forward_with_surprise_and_read`'s gate-scan pattern
+        // exactly — only the delegated forward differs.
+        let early_exit = (0..self.config.num_layers)
+            .find(|&i| gate(i, surprise))
+            .unwrap_or(self.config.num_layers);
+        self.forward_with_early_exit_no_read(token_id, early_exit);
+    }
+
     /// Issue #40 layer bisection diagnostic. Executes forward but stops
     /// Phase A2 hybrid entry point. Runs one attention layer on the GPU
     /// given an externally-supplied hidden state and returns the updated

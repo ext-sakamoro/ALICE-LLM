@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-26
+
+### Added
+
+- **`GpuModel::forward_with_early_exit_no_read`** — no-read companion
+  to `forward_with_early_exit_and_read` (added in v1.5.0). Runs the
+  first `early_exit_layer` transformer layers on GPU and advances the
+  KV cache identically to the `_and_read` variant, but skips the
+  output-head compute (RMSNorm + output projection) AND the CPU↔GPU
+  logits readback. Intended for prefill workloads where only the last
+  token's logits matter, or for external-signal-driven decode where a
+  gate has committed to not emitting this token. Downstream callers
+  can now mix `_and_read` (when logits are needed) and `_no_read`
+  (when only KV state advance is needed) to avoid paying the dominant
+  per-token readback cost on latency-bound workloads.
+- **`GpuModel::forward_with_surprise_no_read`** — signature-parity
+  monotonic-gate adapter over `forward_with_early_exit_no_read`,
+  matching the CPU-side `Llama3Model::forward_with_surprise` gate
+  closure signature. Same semantic contract as
+  `forward_with_surprise_and_read` (monotonic gate in `layer_idx`,
+  collapses per-layer gate decisions into a single early-exit depth
+  per token). Delegates to `forward_with_early_exit_no_read` after
+  the CPU-side gate scan.
+
+### Rationale
+
+The v1.5.0 `_and_read` variants always pay the full output-head
+compute + logits readback per invocation. On workloads where the
+caller processes many tokens but only reads logits for a subset —
+prefill of an N-token prompt (only token N's logits drive sampling)
+or a surprise-driven consumer that emits selectively — the readback
+dominates end-to-end latency. The `_no_read` variants let callers
+preserve KV cache correctness without paying the readback cost, and
+compose freely with the `_and_read` variants on a per-token basis.
+
+Additive API only — v1.5.0 `_and_read` variants unchanged.
+Downstream crates can adopt `_no_read` incrementally.
+
 ## [1.5.0] - 2026-07-26
 
 ### Added
