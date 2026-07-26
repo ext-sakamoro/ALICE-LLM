@@ -5035,6 +5035,143 @@ impl GpuModel {
         self.engine.map_staging(&self.staging, self.vocab_size)
     }
 
+    /// Execute forward pass with an early exit after `early_exit_layer`
+    /// transformer layers, then run the output head against the hidden
+    /// state at that depth.
+    ///
+    /// - `early_exit_layer == self.config.num_layers` — equivalent to
+    ///   [`Self::forward_and_read`].
+    /// - `early_exit_layer < num_layers` — layers
+    ///   `early_exit_layer..num_layers` are entirely skipped; the output
+    ///   head reads the hidden vector as it stands after
+    ///   `early_exit_layer - 1`'s FFN residual add.
+    /// - `early_exit_layer == 0` — degenerate but well-defined; the
+    ///   output head reads the raw token embedding directly.
+    ///
+    /// # Purpose
+    ///
+    /// Primary GPU forward primitive for surprise-driven per-layer
+    /// routing patterns where the gate closure is monotonic in
+    /// `layer_idx` (once it returns `true` at some layer, it returns
+    /// `true` for all higher layers). Such gates collapse to a single
+    /// early-exit depth per token, which this API encodes into one
+    /// GPU command submission — no per-layer CPU↔GPU round trip.
+    ///
+    /// The [`Self::forward_with_surprise_and_read`] adapter matches the
+    /// CPU-side [`crate::llama3::Llama3Model::forward_with_surprise`]
+    /// signature and internally scans the gate to compute
+    /// `early_exit_layer`.
+    ///
+    /// # KV cache side effect
+    ///
+    /// This method advances `self.seq_len` by 1 regardless of
+    /// `early_exit_layer`. Layers `0..early_exit_layer` append their
+    /// K/V at the current position; layers `early_exit_layer..num_layers`
+    /// do NOT. If a subsequent token's forward runs *all* layers,
+    /// attention layers at index `>= early_exit_layer` will find no
+    /// K/V at this position and — for the standard causal-attention
+    /// path — treat the position as if the token had never been seen
+    /// at that depth. Callers who mix early-exit and full-depth
+    /// forwards must either accept this or `reset()` the KV cache
+    /// between mode switches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `early_exit_layer > self.config.num_layers`.
+    pub fn forward_with_early_exit_and_read(
+        &mut self,
+        token_id: u32,
+        early_exit_layer: usize,
+    ) -> Vec<f32> {
+        assert!(
+            early_exit_layer <= self.config.num_layers,
+            "forward_with_early_exit_and_read: early_exit_layer {early_exit_layer} \
+             > num_layers {}",
+            self.config.num_layers,
+        );
+
+        let pos = self.seq_len;
+        let seq_len = pos + 1;
+
+        self.update_uniforms(pos, seq_len);
+        self.upload_embedding(token_id);
+
+        let mut encoder = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // Encode the first `early_exit_layer` layers, then the output
+        // head — reads from `self.hidden` (which after layer
+        // `early_exit_layer - 1`'s FFN residual holds the layer's
+        // output; when `early_exit_layer == 0` it holds the raw
+        // embedding from `upload_embedding`).
+        self.encode_layers_range(&mut encoder, 0..early_exit_layer, None);
+        self.encode_output_head(&mut encoder);
+
+        let size = (self.vocab_size * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.logits.buffer, 0, &self.staging, 0, size);
+
+        self.engine.queue.submit(Some(encoder.finish()));
+        self.seq_len = seq_len;
+        self.engine.map_staging(&self.staging, self.vocab_size)
+    }
+
+    /// Execute forward pass with a surprise-driven monotonic gate,
+    /// collapsing per-layer gate decisions into a single early-exit
+    /// depth per token and delegating to
+    /// [`Self::forward_with_early_exit_and_read`].
+    ///
+    /// # Signature parity
+    ///
+    /// Matches the CPU-side
+    /// [`crate::llama3::Llama3Model::forward_with_surprise`] signature
+    /// so downstream code can swap CPU → GPU without changing the
+    /// callsite (aside from the `Llama3Model` → `GpuModel` receiver
+    /// change).
+    ///
+    /// # Semantic contract
+    ///
+    /// The gate closure is assumed *monotonic in `layer_idx`*: once it
+    /// returns `true` at some layer for a fixed `surprise` slice, it
+    /// returns `true` for all higher layers. Under this assumption the
+    /// GPU forward is equivalent to the CPU forward that would call
+    /// `gate` per layer and skip when `true`. Non-monotonic gates
+    /// collapse to their first-`true` layer under this adapter —
+    /// usable but semantically distinct from the CPU per-layer path;
+    /// callers with non-monotonic gates should use the CPU
+    /// [`crate::llama3::Llama3Model::forward_with_surprise`] path.
+    ///
+    /// # Cost
+    ///
+    /// One CPU pre-scan of the gate (`num_layers` closure calls, each
+    /// a cheap CPU predicate) + one GPU command submission. No
+    /// per-layer CPU↔GPU round trip, unlike a hypothetical general
+    /// per-layer hook GPU API which would pay one round trip per
+    /// layer per token.
+    ///
+    /// # KV cache
+    ///
+    /// See [`Self::forward_with_early_exit_and_read`] §KV cache side
+    /// effect for the caveat when mixing early-exit and full-depth
+    /// forwards.
+    pub fn forward_with_surprise_and_read<F>(
+        &mut self,
+        token_id: u32,
+        surprise: Option<crate::llama3::SurpriseVec<'_>>,
+        gate: F,
+    ) -> Vec<f32>
+    where
+        F: Fn(usize, Option<crate::llama3::SurpriseVec<'_>>) -> bool,
+    {
+        // Find the lowest layer index at which the gate returns true
+        // (monotonic gate assumption — see doc). If the gate never
+        // returns true, run the full stack.
+        let early_exit = (0..self.config.num_layers)
+            .find(|&i| gate(i, surprise))
+            .unwrap_or(self.config.num_layers);
+        self.forward_with_early_exit_and_read(token_id, early_exit)
+    }
+
     /// Issue #40 layer bisection diagnostic. Executes forward but stops
     /// Phase A2 hybrid entry point. Runs one attention layer on the GPU
     /// given an externally-supplied hidden state and returns the updated

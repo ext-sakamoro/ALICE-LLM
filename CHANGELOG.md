@@ -9,17 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`Llama3Model::forward_with_surprise_gpu`** + **`Llama3Model::forward_with_early_exit_gpu`**
-  — signature-only skeletons for the GPU forward variants that
-  preserve the external-signal-driven per-layer routing semantics of
-  `forward_with_surprise`. Both bodies `todo!()` per the 仮実装完了
-  偽装の禁止 rule; landed ahead of the implementation body so the
-  API surface can be validated by downstream planners. See the
-  design + L1/L2/L3 landing plan in the ADR at
-  `docs/adr/alice-llm-gpu-surprise-gate.md` (downstream repo). No
-  behavioural change to any existing API; downstream code that does
-  not call the new methods is unaffected. Implementation body is a
-  follow-up landing.
+- **`GpuModel::forward_with_early_exit_and_read`** — GPU forward
+  primitive that runs the first `early_exit_layer` transformer
+  layers on GPU, then dispatches the output head against the
+  hidden state at that depth. Reads logits back and returns them
+  as `Vec<f32>` (same shape as `forward_and_read`). One GPU
+  command submission per token, no per-layer CPU↔GPU round trip.
+  Enables single-early-exit patterns without paying the full
+  N-layer forward cost when the gate closure would have skipped
+  the remaining layers on the CPU path.
+- **`GpuModel::forward_with_surprise_and_read`** — signature-parity
+  adapter over `forward_with_early_exit_and_read` that matches
+  the CPU-side `Llama3Model::forward_with_surprise` signature
+  (accepts a monotonic gate closure and `Option<SurpriseVec<'_>>`).
+  Internally CPU-scans the gate to compute the early-exit depth,
+  then delegates to the primary API.
+- Both APIs enable a GPU forward path that preserves the
+  external-signal-driven per-layer routing semantics of
+  `Llama3Model::forward_with_surprise` (v1.4.0) at the "how deep
+  to go" granularity, without needing a general per-layer hook
+  GPU API that would pay round-trip cost per layer.
+
+### Removed
+
+- **`Llama3Model::forward_with_surprise_gpu`** +
+  **`Llama3Model::forward_with_early_exit_gpu`** signature-only
+  skeletons (added in the same Unreleased window). The GPU
+  forward path lives on `GpuModel` in this crate, not on
+  `Llama3Model`; the earlier skeleton placement on `Llama3Model`
+  was based on an incorrect assumption about where GPU forward
+  lives. Skeletons never released to crates.io — the actual API
+  landed on `GpuModel` in the same Unreleased window (see
+  Added). Downstream callers should use
+  `GpuModel::forward_with_early_exit_and_read` /
+  `GpuModel::forward_with_surprise_and_read` from the outset.
 
 ### Changed
 
