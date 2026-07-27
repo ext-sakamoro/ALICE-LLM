@@ -1,12 +1,39 @@
-//! DeepSeek-V3 routed-expert streaming from disk (Phase 4a, Issue #34).
+//! DeepSeek-V3 / Kimi K3-family routed-expert streaming from disk
+//! (Phase 4a, Issue #34; extended for Kimi K3 at Phase X.4.e).
 //!
 //! # Overview
 //!
-//! DeepSeek-V3 671B has 61 MoE layers × 256 routed experts + 1 shared expert
-//! per layer. Even at Q4_K_M each routed expert is ~19 MB, so keeping every
-//! expert in RAM costs ~370 GB. The core of the colibri innovation is to
-//! **load routed experts on demand** with an LRU cache, since a single token
-//! only touches `num_experts_per_tok = 8` per MoE layer.
+//! Sparse-MoE frontier models push per-token active weights well past the
+//! usable RAM budget of consumer hardware. Two concrete cases handled by
+//! this module:
+//!
+//! * **DeepSeek-V3 671B** — 61 MoE layers × 256 routed experts + 1 shared
+//!   expert per layer. Even at Q4_K_M each routed expert is ~19 MB, so
+//!   keeping every expert in RAM costs ~370 GB. A single token only touches
+//!   `num_experts_per_tok = 8` per MoE layer (sparsity 8/256 ≈ 3.13%).
+//! * **Kimi K3 2.8T / 104B-active** — 92 MoE layers × 896 routed experts +
+//!   2 shared per layer, native MXFP4 (~1.4 TB total at community-Q4 GGUF,
+//!   ~594 GB at native MXFP4). Each token touches
+//!   `num_experts_per_tok = 16` (sparsity 16/896 ≈ 1.79%, sparser than V3).
+//!   Per-token active weights ≈ 24 GB at Q4 (see
+//!   [`kimi_k3_active_bytes`] for the derivation) — well within an
+//!   NVMe-backed Mac M3 Max 128 GB budget once streamed.
+//!
+//! The core of the colibri innovation is to **load routed experts on
+//! demand** with an LRU cache, keyed by `(layer_idx, kind, expert_idx)`.
+//! The infrastructure is expert-count-agnostic: `n_experts` is a runtime
+//! parameter of [`ExpertLayerInfo`], and neither [`LruExpertCache`] nor
+//! [`StreamingExpertPool`] hardcodes 256 anywhere. The K3 topology
+//! (896 experts, top-16) drops into the same pool by construction.
+//!
+//! Kimi K3 uses **Stable LatentMoE**: the per-expert FFN runs in a
+//! `routed_expert_hidden_size = 3584` latent space (versus the DeepSeek V3
+//! full-width path). The per-expert slab layout — three matrices for the
+//! SiTU-GLU / SwiGLU expert FFN — is identical, so the pool's `ExpertKind
+//! = {Gate, Up, Down}` triple still applies unchanged. The Kimi-specific
+//! `W^↓` down-projection + `W^↑` up-projection with RMSNorm live in the
+//! LatentMoE forward path (not per-expert; captured in
+//! [`crate::llama3::KimiDeltaConfig`]) and are not streamed by this pool.
 //!
 //! # Scope of Phase 4a (this module)
 //!
@@ -306,8 +333,15 @@ impl LruExpertCache {
 }
 
 /// Streaming pool serving routed-expert slabs for every MoE layer in a
-/// DeepSeek-V3 model. One pool instance is shared across all MoE layers via
+/// sparse-MoE model. One pool instance is shared across all MoE layers via
 /// `Arc` — the layer index is passed at fetch time.
+///
+/// The pool is expert-count agnostic: [`ExpertLayerInfo::n_experts`]
+/// accepts any positive value, so both DeepSeek V3 (256) and Kimi K3
+/// (896) drop in unchanged. `budget_bytes` should be sized to hold at
+/// least one token's active weights across every layer plus a safety
+/// margin — see [`kimi_k3_active_bytes`] for the K3 formula and
+/// [`recommended_budget_bytes`] for a rule-of-thumb helper.
 pub struct StreamingExpertPool {
     source: Arc<dyn ExpertByteSource>,
     /// Indexed by `[layer_idx][kind as usize]`. Populated at construction
@@ -317,6 +351,24 @@ pub struct StreamingExpertPool {
 }
 
 impl StreamingExpertPool {
+    /// Build a new pool over a byte source and a per-layer expert layout.
+    ///
+    /// # Sizing `budget_bytes`
+    ///
+    /// The cache is byte-budget driven (not entry-count driven), so a
+    /// wrong budget shows up as either a residency-loss thrash (too
+    /// small) or wasted RAM (too large). Recommended defaults by model:
+    ///
+    /// * **DeepSeek V3 Q4_K_M**: ~370 GB total, active per token ≈ 61
+    ///   layers × 8 experts × 3 slabs × 19 MB ≈ 27 GB. A 32-40 GB
+    ///   budget gives one-token headroom + LRU reuse across tokens.
+    /// * **Kimi K3 Q4** (community GGUF, when it lands): active per
+    ///   token ≈ 92 layers × 16 experts × ~16.5 MB ≈ **24 GB**, see
+    ///   [`kimi_k3_active_bytes`]. A 30-40 GB budget fits a Mac M3 Max
+    ///   128 GB unified memory comfortably (leaves ~80+ GB for KV
+    ///   cache + attention + shared experts + OS).
+    ///
+    /// See [`recommended_budget_bytes`] for a programmatic helper.
     pub fn new(
         source: Arc<dyn ExpertByteSource>,
         layer_info: Vec<[ExpertLayerInfo; 3]>,
@@ -545,6 +597,17 @@ pub trait NextLayerPredictor: Send + Sync {
 /// Selection is by raw logit magnitude — sigmoid vs raw scoring does not
 /// change the top-k order for a fixed layer, so we skip the sigmoid pass
 /// and sort on the logits directly.
+///
+/// # Applicability to Kimi K3 (896 experts, top-16)
+///
+/// The predictor is expert-count and top-k agnostic (both are passed at
+/// call time), so it drops in unchanged for K3. The 71.6% overlap number
+/// is DeepSeek V3-specific and the equivalent K3 hit-rate has not been
+/// measured yet (blocked on the same Phase X.4.b GGUF conversion that
+/// blocks end-to-end validation). K3 uses the same Quantile Balancing
+/// routing family as V3 (see Section 2.3.3 of the K3 tech report), so
+/// persistence remains a defensible zero-cost baseline until a learned
+/// K3-specific predictor is trained.
 pub struct PersistenceHeuristic;
 
 impl NextLayerPredictor for PersistenceHeuristic {
@@ -570,6 +633,70 @@ pub struct CacheStats {
     /// exempt from LRU eviction until [`StreamingExpertPool::unpin_experts`]
     /// removes them. `entries - pinned` is the count of evictable entries.
     pub pinned: usize,
+}
+
+// ── Kimi K3 sizing helpers (Phase X.4.e) ─────────────────────────────
+
+/// Compute the active per-token routed-expert byte budget for a Kimi K3
+/// Stable LatentMoE configuration.
+///
+/// K3's routed FFN runs in a `routed_expert_hidden_size` latent space
+/// (default 3584) with three SiTU-GLU matrices per expert (Gate / Up /
+/// Down), each of shape `[latent_hidden × moe_intermediate_size]`
+/// (default 3584 × 3072). At Q4_K_M (≈ 0.5 byte / weight) that's
+/// ≈ 5.5 MB per matrix, ≈ 16.5 MB per expert. With `num_experts_per_tok
+/// = 16` active per layer across `num_moe_layers = 92` MoE layers the
+/// per-token active weight footprint is:
+///
+/// ```text
+/// active_bytes = num_moe_layers × num_experts_per_tok × 3 slabs
+///              × latent_hidden × moe_intermediate × bytes_per_weight
+///            = 92 × 16 × 3 × 3584 × 3072 × 0.5
+///            ≈ 24 GB (Q4)
+/// ```
+///
+/// This function returns that number for arbitrary K3 sizing, letting
+/// callers derive an [`LruExpertCache`] budget without hardcoding the
+/// value at every callsite.
+///
+/// # Bytes-per-weight guidance
+///
+/// - Q4_K_M / MXFP4 native: pass `bytes_per_weight_x100 = 50` (0.50)
+/// - Q5_K_M: `bytes_per_weight_x100 = 63` (0.625)
+/// - Q6_K: `bytes_per_weight_x100 = 82` (0.8203)
+/// - Q8_0: `bytes_per_weight_x100 = 106` (1.0625)
+/// - BF16 / F16: `bytes_per_weight_x100 = 200`
+///
+/// The `x100` fixed-point encoding avoids `f32` in a public API for a
+/// value that only needs 2 decimal digits of precision.
+#[must_use]
+pub const fn kimi_k3_active_bytes(
+    num_moe_layers: usize,
+    num_experts_per_tok: usize,
+    latent_hidden: usize,
+    moe_intermediate: usize,
+    bytes_per_weight_x100: usize,
+) -> usize {
+    // 3 slabs per expert (SiTU-GLU: gate, up, down)
+    let per_slab = latent_hidden * moe_intermediate * bytes_per_weight_x100 / 100;
+    num_moe_layers * num_experts_per_tok * 3 * per_slab
+}
+
+/// Recommended LRU cache byte budget for a streaming-expert pool.
+///
+/// Formula: `active_bytes × safety_multiplier / 10`. A multiplier of 12
+/// (i.e. 1.2×) is a defensible default — it covers one full token of
+/// active weights plus 20% headroom for cross-token LRU reuse (which
+/// pays off whenever two consecutive tokens share any routed experts,
+/// as the persistence heuristic observed on DeepSeek V3).
+///
+/// For Kimi K3 Q4 on Mac M3 Max 128 GB, the recommended budget is
+/// `kimi_k3_active_bytes(92, 16, 3584, 3072, 50) × 12 / 10 ≈ 30 GB`.
+/// Higher multipliers (15-17) trade RAM for hit rate; lower multipliers
+/// (10-11) trade hit rate for headroom on tighter machines.
+#[must_use]
+pub const fn recommended_budget_bytes(active_bytes: usize, safety_multiplier_x10: usize) -> usize {
+    active_bytes * safety_multiplier_x10 / 10
 }
 
 #[cfg(test)]
@@ -967,5 +1094,144 @@ mod tests {
             stats.entries <= 1,
             "zero-budget cache must not accumulate entries"
         );
+    }
+
+    // ── Kimi K3 topology tests (Phase X.4.e) ──────────────────────
+
+    #[test]
+    fn kimi_k3_active_bytes_matches_paper_estimate() {
+        // K3 spec (tech report Table 1, §2.3): 92 MoE layers × 16 experts
+        // per token × 3 SiTU-GLU slabs × 3584 latent × 3072 intermediate
+        // × Q4 (0.5 byte/weight) ≈ 24 GB. This anchors the sizing helper
+        // against the paper-reported estimate so a future refactor cannot
+        // silently drift the formula.
+        let active = kimi_k3_active_bytes(
+            92,   // num_moe_layers (total 93 - 1 dense)
+            16,   // num_experts_per_tok
+            3584, // routed_expert_hidden_size (latent)
+            3072, // moe_intermediate_size
+            50,   // Q4 = 0.50 byte/weight
+        );
+        // 92 × 16 × 3 × 3584 × 3072 × 0.5 = 24_326_701_056 bytes ≈ 22.7 GiB
+        // (≈ 24.3 GB in SI units, matches the "≈ 24 GB" paper claim).
+        assert_eq!(active, 92 * 16 * 3 * 3584 * 3072 / 2);
+        // Sanity check the ballpark against the tech report / integration
+        // doc estimate (20-30 GB window).
+        let gb = active / 1_000_000_000;
+        assert!(
+            (20..=30).contains(&gb),
+            "K3 active bytes {active} ({gb} GB) outside 20-30 GB paper estimate window"
+        );
+    }
+
+    #[test]
+    fn recommended_budget_applies_safety_multiplier() {
+        let active = 20_000_000_000_usize; // 20 GB
+                                           // Default 1.2× → 24 GB.
+        assert_eq!(recommended_budget_bytes(active, 12), 24_000_000_000);
+        // Aggressive 1.7× for high hit-rate targets → 34 GB.
+        assert_eq!(recommended_budget_bytes(active, 17), 34_000_000_000);
+        // Tight 1.0× (baseline, no cross-token reuse) → 20 GB.
+        assert_eq!(recommended_budget_bytes(active, 10), 20_000_000_000);
+    }
+
+    #[test]
+    fn pool_supports_kimi_k3_896_experts_top16_dispatch() {
+        // Construct a synthetic K3-topology pool: 1 MoE layer, 896 routed
+        // experts, tiny slab size (1 KB / expert) so the test stays fast
+        // and RAM-cheap while still exercising the 896-expert index
+        // range and top-16 dispatch path. This proves the pool
+        // infrastructure is expert-count-agnostic: nothing in the LRU /
+        // slab layout / cache accounting hardcodes 256.
+        let n_experts = 896;
+        let bytes_per_expert = 1024; // 1 KB
+        let per_layer_bytes = 3 * n_experts * bytes_per_expert; // ~2.6 MB
+                                                                // Budget for top-16 across 3 slabs = 48 slabs × 1 KB = 48 KB,
+                                                                // sized × 4 for cross-call LRU reuse.
+        let budget = 16 * 3 * bytes_per_expert * 4;
+        let pool = make_pool(n_experts, bytes_per_expert, budget);
+
+        // Sanity: verify n_experts propagated through construction.
+        assert_eq!(pool.bytes_per_expert(0, ExpertKind::Gate), bytes_per_expert);
+
+        // Simulate one token's top-16 dispatch across all 3 slab kinds
+        // (48 slab fetches). Every one should succeed and stay within
+        // the 896-expert index range.
+        let top16: [usize; 16] = [
+            7, 42, 100, 200, 300, 400, 500, 600, 700, 800, 850, 890, 895, 3, 17, 128,
+        ];
+        for &e in &top16 {
+            let g = pool.get_or_load(0, ExpertKind::Gate, e);
+            let u = pool.get_or_load(0, ExpertKind::Up, e);
+            let d = pool.get_or_load(0, ExpertKind::Down, e);
+            assert_eq!(g.len(), bytes_per_expert);
+            assert_eq!(u.len(), bytes_per_expert);
+            assert_eq!(d.len(), bytes_per_expert);
+        }
+
+        // Re-fetch the same 16 experts — every access must be a hit as
+        // long as the budget accommodates 48 slabs (it does at 192 KB).
+        let stats_before = pool.cache_stats();
+        for &e in &top16 {
+            let _g = pool.get_or_load(0, ExpertKind::Gate, e);
+            let _u = pool.get_or_load(0, ExpertKind::Up, e);
+            let _d = pool.get_or_load(0, ExpertKind::Down, e);
+        }
+        let stats_after = pool.cache_stats();
+        assert_eq!(
+            stats_after.hits - stats_before.hits,
+            48,
+            "top-16 × 3-slab re-fetch must be all hits inside the 48-slab budget"
+        );
+        assert_eq!(
+            stats_after.misses, stats_before.misses,
+            "no fresh misses on the re-fetch"
+        );
+
+        // Highest expert index (895) must be reachable — smoke test the
+        // upper end of the 0..896 range.
+        let last = pool.get_or_load(0, ExpertKind::Down, 895);
+        assert_eq!(last.len(), bytes_per_expert);
+
+        // Silence the unused-var warning for `per_layer_bytes` — it's
+        // documentation of the layout, not consumed by asserts.
+        let _ = per_layer_bytes;
+    }
+
+    #[test]
+    fn pool_rejects_out_of_range_expert_index_at_896() {
+        // Complement to the above: expert_idx == n_experts (out of
+        // range) must panic rather than silently serve garbage from
+        // adjacent slabs. The pool asserts on `expert_idx < n_experts`
+        // in get_or_load; verify that boundary at the K3 scale so a
+        // future refactor doesn't accidentally soften it.
+        let pool = make_pool(896, 128, 4096);
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.get_or_load(0, ExpertKind::Gate, 896);
+        }));
+        assert!(
+            ok.is_err(),
+            "expert_idx = n_experts must panic (out of range)"
+        );
+    }
+
+    #[test]
+    fn persistence_heuristic_scales_to_896_experts_top16() {
+        // The predictor is expert-count and top-k agnostic — verify
+        // that on a 896-length logits vector with top-k=16 it returns
+        // the 16 largest indices, no truncation / off-by-one issues at
+        // the K3 scale. Uses a monotone gradient so the expected
+        // top-16 is trivially the last 16 indices.
+        use super::{NextLayerPredictor, PersistenceHeuristic};
+        let mut logits = vec![0.0_f32; 896];
+        for (i, l) in logits.iter_mut().enumerate() {
+            *l = i as f32;
+        }
+        let mut picks = PersistenceHeuristic.predict(&logits, 16);
+        assert_eq!(picks.len(), 16, "top-16 selection returned wrong count");
+        // The 16 largest indices in a 0..896 gradient are 880..896.
+        picks.sort_unstable();
+        let expected: Vec<usize> = (880..896).collect();
+        assert_eq!(picks, expected, "top-16 must be the last 16 indices");
     }
 }

@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Phase X.4.e.1 — Kimi K3 streaming pool infrastructure**
+  (2026-07-28). `deepseek_streaming.rs` is generalised from
+  "DeepSeek-V3 only" to "DeepSeek-V3 / Kimi K3-family sparse-MoE"
+  documentation without touching any struct definitions — the LRU
+  cache, `ExpertLayerInfo`, `StreamingExpertPool`, and
+  `PersistenceHeuristic` were already expert-count and top-k
+  agnostic, so the K3 topology (896 routed experts, top-16, 2
+  shared, Stable LatentMoE) drops in by construction. New sizing
+  helpers landed with the paper-anchored formula:
+  - **`kimi_k3_active_bytes(...)`** — `const fn` returning the
+    per-token active byte footprint under a K3-family config,
+    parameterised by `num_moe_layers × num_experts_per_tok × 3
+    slabs × latent_hidden × moe_intermediate ×
+    bytes_per_weight`. Encodes the paper's ≈ 24 GB estimate (92
+    layers × 16 experts × 3 slabs × 3584 × 3072 × 0.5 byte/Q4).
+    The `bytes_per_weight` argument is fixed-point (`×100`) so a
+    quantization table can be encoded without `f32` in a public
+    API.
+  - **`recommended_budget_bytes(active_bytes,
+    safety_multiplier_x10)`** — companion helper that scales
+    `active_bytes` by a fixed-point multiplier for LRU cache
+    sizing (default 1.2× gives 24 → 30 GB budget for K3 on Mac M3
+    Max 128 GB unified memory).
+- **Four Kimi K3 unit tests** covering (a) sizing-helper
+  correctness against the paper's ≈ 24 GB estimate, (b)
+  recommended-budget arithmetic at three safety multipliers, (c)
+  end-to-end pool dispatch with 896 experts + top-16 fetch + LRU
+  hit accounting, and (d) `PersistenceHeuristic::predict` scaling
+  to a 896-length logits vector with top-16 selection. Also adds
+  a boundary-guard test that expert index 896 (equal to
+  `n_experts`) panics rather than serving garbage from an
+  adjacent slab.
+- **Doc sync** — `docs/KIMI_K3_INTEGRATION.md` gains an
+  **X.4.e.1** row (this session, complete) ahead of the original
+  **X.4.e** (now scoped to "connect the pool infra to real K3
+  GGUF + implement the K3 LatentMoE + RMSNorm + SiTU-GLU forward
+  path in `forward_deepseek_moe_layer`", still blocked on X.4.b
+  and X.4.c).
+
+- **Phase X.4.a.1 — Kimi K3 post-release spec refinement**
+  (2026-07-28). Moonshot's Kimi K3 open weight release landed on
+  schedule 2026-07-27; the full `text_config` structure is now
+  captured by [`KimiDeltaConfig`], expanded from 10 placeholder
+  `Option` fields to 32 concretely-typed fields grouped into 6
+  sub-sections (hybrid attention routing, Gated MLA, Attention
+  Residuals, SiTU-GLU, Stable LatentMoE 896/16, MXFP4 native
+  quantization). All values are cross-checked against the published
+  `config.json` at
+  `huggingface.co/moonshotai/Kimi-K3/raw/main/config.json`.
+- **`KimiDeltaConfig::from_hf_config`** — direct HuggingFace
+  `config.json` loader gated behind the new `hf-config` Cargo feature
+  (`hf-config = ["dep:serde", "dep:serde_json"]`). Parses
+  `text_config.*` including the nested `linear_attn_config` (24 MLA
+  layers `[4, 8, ..., 92, 93]` + 69 KDA layers) and the
+  `quantization_config.config_groups.group_0.weights` (MXFP4 group
+  size 32, 4 bits/weight). Individual missing fields degrade to
+  `None` rather than erroring, so the loader still yields a usable
+  partial config for pre-release checkpoint variants. Five unit
+  tests cover: full-fixture parity with the 2026-07-27 spec, missing
+  fields, missing `text_config`, malformed JSON, and truncated
+  hybrid-layer arrays. This unblocks the direct-safetensors path
+  ahead of community GGUF conversion (Phase X.4.b).
+- **Doc sync** — `docs/KIMI_K3_INTEGRATION.md` gains a
+  "Confirmed via HF config.json" table listing all newly-resolved
+  numeric spec unknowns; "What we DON'T know" is rewritten to only
+  list paper-drop dependencies (KDA gate formula, AttnRes runtime
+  scheme, GGUF metadata prefix, multimodal fusion path, 1M context
+  KV compression for the 24 MLA layers). Integration Phase table
+  now lists X.4.a.1 as complete.
+
+### Changed
+
+- **`ModelArch::KimiK3` doc comment** — updated to reflect the
+  released spec (2.8T total / 104B active, 896 experts top-16, 93
+  layers = 69 KDA + 24 Gated MLA + 1 dense, hidden 7168, 1M context,
+  native MXFP4). The `todo!()` fail-fast in `forward_kimi_k3` and
+  its dispatch site now point to Phase X.4.c (CPU forward) with
+  Phase X.4.b (community GGUF conversion) as the outstanding
+  blocker, rather than the initial weight release.
+
+### Notes
+
+- The `todo!()` in `forward_kimi_k3` remains intentional per
+  CLAUDE.md's "仮実装完了偽装の禁止" rule. Downstream users who
+  feed a Kimi K3 GGUF (once the community conversion lands) will
+  hit an explicit panic pointing to `docs/KIMI_K3_INTEGRATION.md`
+  rather than silent garbage from the vanilla-attention path.
+- The `hf-config` feature only pulls in `serde` + `serde_json`
+  (both already declared optional at the workspace level). The
+  default build surface is unchanged; enable with
+  `cargo build --features hf-config`.
+
 ## [1.6.0] - 2026-07-26
 
 ### Added

@@ -1,9 +1,14 @@
 # Kimi K3 / Kimi Delta Attention Integration Plan (Phase X.4)
 
-**Status**: Skeleton only. `todo!()` fail-fast on `forward_kimi_k3` until
-2026-07-27 open weight release + paper drop. Confirmed spec values from
-2026-07-24 investigation (public sources) are marked ✅; remaining `TODO`
-placeholders are derived from public gigazine coverage (2026-07-17).
+**Status**: Skeleton + full HF-confirmed spec landed
+(Phase X.4.a.1, 2026-07-28). `todo!()` fail-fast on `forward_kimi_k3`
+remains, now blocking on community GGUF conversion (Phase X.4.b,
+mradermacher / bartowski watch) rather than the initial weight release.
+Open weights + `config.json` dropped on schedule 2026-07-27; the entire
+`text_config` structure is now captured by [`KimiDeltaConfig`] and
+parseable via `KimiDeltaConfig::from_hf_config` under the `hf-config`
+Cargo feature. Confirmed spec values are marked ✅ in the tables below;
+paper-only unknowns (KDA gate formula, AttnRes runtime scheme) remain.
 
 **Strategic context**: This integration is not merely "supporting a new
 model". It is the flagship test case of the ALICE-LLM
@@ -48,20 +53,72 @@ points (A: scope, B: edge/cloud, C: MXFP4 GPU shader, D: start timing).
 | Market reaction | Tech + semiconductor stocks dropped on release day | Investing.com |
 | **GPU 逼迫** | **公開 48h で新規 subscription 停止** ✅ | ITmedia 2026-07-21 |
 
-## What we DON'T know yet (blocks implementation)
+## Confirmed via HF config.json (2026-07-28 update)
 
-- Exact hidden dim, num_layers, num_heads (attn), num_kv_heads
-- Kimi Delta specific: DeltaNet chunk size, recurrent state dim per head
-- Hybrid attn : deltanet ratio (Bonsai 27B uses 16:48, unknown for K3)
-- Shared always-active expert count (`n_shared_experts`)
-- Per-expert FFN intermediate size (`moe_intermediate_size`)
-- MoE gating scheme (sigmoid vs softmax, aux-loss vs `noaux_tc`)
-- RoPE style (NEOX vs interleaved), theta, YARN scaling
-- KV cache compression scheme (MLA-style compressed KV? per-position?)
-- GGUF metadata prefix (guess: `"kimi"` / `"kimi3"` / `"kimideltatt"`)
-- GGUF tensor naming (guess: `blk.N.attn_delta_*` or `blk.N.attn_kimi_*`)
-- Multimodal input path (unified with text embed? separate encoder?)
-- Attention Residuals mechanism (skip connection variant? paper drop needed)
+The Kimi K3 `config.json` at
+`huggingface.co/moonshotai/Kimi-K3/raw/main/config.json` resolves all
+of the previously-blocking numeric unknowns. Values below are captured
+in [`KimiDeltaConfig`] fields with matching names and parseable via
+`KimiDeltaConfig::from_hf_config`.
+
+| Item | Value (config.json) | HF field path |
+|---|---|---|
+| `hidden_size` | 7168 ✅ | `text_config.hidden_size` |
+| `num_hidden_layers` | 93 ✅ | `text_config.num_hidden_layers` |
+| `num_attention_heads` | 96 ✅ | `text_config.num_attention_heads` |
+| `num_key_value_heads` | 96 (no GQA) ✅ | `text_config.num_key_value_heads` |
+| Dense-FFN `intermediate_size` | 33792 ✅ | `text_config.intermediate_size` |
+| **Hybrid layer routing** | 24 MLA (`[4,8,...,92,93]`) + 69 KDA + 1 dense ✅ | `text_config.linear_attn_config.{full_attn_layers,kda_layers}` |
+| KDA head_dim / num_heads / conv_k | 128 / 96 / 4 ✅ | `text_config.linear_attn_config.*` |
+| KDA gate `use_full_rank_gate` | `true` ✅ | `linear_attn_config.use_full_rank_gate` |
+| KDA gate `gate_lower_bound` | `-5.0` ✅ | `linear_attn_config.gate_lower_bound` |
+| Gated MLA `q_lora_rank` | 1536 ✅ | `text_config.q_lora_rank` |
+| Gated MLA `kv_lora_rank` | 512 ✅ | `text_config.kv_lora_rank` |
+| MLA `qk_nope_head_dim` | 128 ✅ | `text_config.qk_nope_head_dim` |
+| MLA `qk_rope_head_dim` | 64 (partial RoPE) ✅ | `text_config.qk_rope_head_dim` |
+| MLA `v_head_dim` | 128 ✅ | `text_config.v_head_dim` |
+| MLA `mla_use_nope` | `true` ✅ | `text_config.mla_use_nope` |
+| MLA `mla_use_output_gate` | `true` (Kimi-unique) ✅ | `text_config.mla_use_output_gate` |
+| AttnRes `attn_res_block_size` | 12 ✅ | `text_config.attn_res_block_size` |
+| Activation | SiTU-GLU (β1=4.0, β2=25.0) ✅ | `text_config.hidden_act`, `.activation_situ_*` |
+| MoE `num_experts` | **896** ✅ | `text_config.num_experts` |
+| MoE `num_experts_per_token` | **16** ✅ | `text_config.num_experts_per_token` |
+| MoE `num_shared_experts` | **2** ✅ | `text_config.num_shared_experts` |
+| MoE `moe_intermediate_size` | 3072 ✅ | `text_config.moe_intermediate_size` |
+| MoE `first_k_dense_replace` | 1 (layer 0 dense) ✅ | `text_config.first_k_dense_replace` |
+| MoE `routed_expert_hidden_size` | 3584 (Latent MoE) ✅ | `text_config.routed_expert_hidden_size` |
+| MoE `routed_scaling_factor` | 1.0 (V3 = 2.5) ✅ | `text_config.routed_scaling_factor` |
+| MoE router activation / topk | sigmoid / `noaux_tc` ✅ | `text_config.moe_router_activation_func`, `.topk_method` |
+| MoE `num_nextn_predict_layers` | **0 (no MTP)** ✅ | `text_config.num_nextn_predict_layers` |
+| MXFP4 group size / bits | 32 / 4 ✅ | `text_config.quantization_config.config_groups.group_0.weights.*` |
+| Max position embeddings | 1,048,576 ✅ | `text_config.max_position_embeddings` |
+| Vocab size | 163,840 (bos 163584, eos 163586, pad 163839) ✅ | `text_config.vocab_size` |
+| Vision encoder | MoonViT-V2, 27 layers, hidden 1024, 12 heads, patch 14 ✅ | `vision_config.*` |
+| Tech report | `github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf` | — |
+
+## What we still DON'T know (paper-drop dependencies)
+
+- **Kimi Delta Attention gate formula** — `use_full_rank_gate=true` +
+  `gate_lower_bound=-5.0` are captured, but the exact functional form
+  (sigmoid? tanh? Gated DeltaNet variant?) needs the tech report to
+  confirm the CPU forward path.
+- **Attention Residuals (AttnRes) runtime scheme** — `attn_res_block_size=12`
+  is captured, but whether AttnRes is a per-block skip connection
+  (residual over 12-layer groups), a training-only technique, or a
+  new residual formulation entirely needs the tech report.
+- **GGUF metadata prefix** — guess `"kimi"` still stands until
+  mradermacher / bartowski publish a converted GGUF and llama.cpp
+  finalises `convert_hf_to_gguf.py` for `model_type = "kimi_k3"`.
+- **GGUF tensor naming** — guess `blk.N.attn_delta_*` /
+  `blk.N.attn_kimi_*` still stands, same blocker as above.
+- **Multimodal fusion path** — `mm_projector_type: "patchmergerv2"` and
+  `merge_type: "sd2_tpool"` are captured but the runtime fusion
+  contract (when is the vision encoder invoked, how are image tokens
+  spliced into the text stream) needs the tech report.
+- **1M context KV compression** — no YARN parameters in `config.json`;
+  the 6.3× decode speedup at 1M ctx likely comes from KDA's fixed-size
+  recurrent state (69 of 93 layers), but the exact windowing for the
+  24 MLA layers is not explicit.
 
 ## Existing ALICE-LLM code that can be reused (~80-95%)
 
@@ -83,10 +140,12 @@ Kimi Delta is a Gated DeltaNet family, which ALICE-LLM already ships:
 | Phase | Scope | 工数 | Blocker |
 |---|---|---|---|
 | **X.4.a** ✅ (2026-07-17) | Architecture enum variant + KimiDeltaConfig stub + fail-fast forward + docs | 完了 | — |
-| X.4.b | GGUF metadata detection + weight tensor mapping + config parity | 1-2 日 | 🚧 2026-07-27 open weight release + community GGUF conversion (mradermacher/bartowski) |
+| **X.4.a.1** ✅ (2026-07-28) | Post-release spec refinement: KimiDeltaConfig expanded from 10 → 32 fields with all HF-confirmed values + `KimiDeltaConfig::from_hf_config` JSON loader (`hf-config` feature) + 5 unit tests + doc sync | 完了 | — |
+| X.4.b | GGUF metadata detection + weight tensor mapping + config parity | 1-2 日 | 🚧 community GGUF conversion (mradermacher/bartowski). HF safetensors + config.json are now in hand |
 | X.4.c | CPU forward path (reuse Bonsai gated_deltanet ~90%, swap gating if paper differs) | 3-5 日 | X.4.b + paper drop |
 | X.4.d | Attention Residuals (AttnRes) 実装 (skip connection の runtime scheme) | 3-5 日 | Kimi 論文 or reference impl |
-| **X.4.e ⭐ 最高 ROI** | **Expert streaming from NVMe + LRU cache** (deepseek_streaming.rs を 896 experts 対応化) — enables Mac/Linux consumer targets at 0.5-2 tok/s given the 896/16 sparsity (1.79%) | 5-7 日 | X.4.c CPU baseline, DeepSeek V3 Issue #34 groundwork |
+| **X.4.e.1** ✅ (2026-07-28) | Pool infrastructure K3 対応 — `deepseek_streaming.rs` の module doc / `StreamingExpertPool` doc / `PersistenceHeuristic` doc を K3 (896 experts, top-16, Stable LatentMoE) 対応化 + `kimi_k3_active_bytes` / `recommended_budget_bytes` sizing helper 追加 + 4 unit test (K3 24GB paper estimate 検証 / 896-index top-16 dispatch / out-of-range boundary at 896 / persistence heuristic scaling) 追加。pool の infrastructure 側は既に n_experts agnostic だったため実質的な struct 変更なしで K3 topology を受け付ける | 完了 (半日) | — |
+| **X.4.e ⭐ 最高 ROI** | **Expert streaming from NVMe + LRU cache 実運用** (X.4.e.1 の pool infra を実 K3 GGUF に接続、`forward_deepseek_moe_layer` を K3 の LatentMoE + RMSNorm 挿入 + SiTU-GLU に拡張) — enables Mac/Linux consumer targets at 0.5-2 tok/s given the 896/16 sparsity (1.79%) | 5-7 日 | X.4.c CPU baseline (KDA forward), X.4.b GGUF |
 | **X.4.f (skeleton ✅ 2026-07-24)** | **MXFP4 CPU skeleton landed** (E2M1 table + E8M0 scale + block dequant + `MxfP4Row/Matrix` + correctness-first `mxfp4_matvec_fallback` routing + 11 unit tests、詳細は `docs/MXFP4_INTEGRATION_PLAN.md`) 残: 融合 scalar/SIMD matvec + PyTorch oracle 検証 | ✅ 1 日 (skeleton) / 🚧 2-3 日 (fused kernel + SIMD 残) | Weight release 2026-07-27 (fused kernel validation) |
 | **X.4.g** | **MXFP4/MXFP8 GPU shader** (Metal + wgpu WGSL、新規 quant format の GPU 実装) | 7-10 日 | X.4.f CPU parity |
 | X.4.h | 1M context validation (RoPE YARN, hybrid attn windowing, KV compression) | 5-7 日 | X.4.d GPU throughput baseline |

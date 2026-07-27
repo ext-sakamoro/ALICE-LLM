@@ -100,14 +100,18 @@ pub enum ModelArch {
     /// streaming / MTP は Phase 2-5 の follow-up Issue で実装予定。
     /// `forward()` は即 panic (fail-fast) で silent garbage を回避。
     DeepSeekV3,
-    /// Kimi K3 / Kimi Delta Attention family (Moonshot AI, 2026-07-27
-    /// planned open weight release, 2.8T params, 1M context, Gated
-    /// DeltaNet variant + "Attention Residuals"). Phase X.4 integration
-    /// target; foundation only until the paper and open weights land.
+    /// Kimi K3 / Kimi Delta Attention family (Moonshot AI). Open weight
+    /// release landed 2026-07-27 (2.8T total / 104B active MoE, 896
+    /// experts top-16, 93 layers = 69 KDA + 24 Gated MLA + 1 dense,
+    /// hidden 7168, 1M context, native MXFP4). Phase X.4 integration
+    /// target; foundation only until the CPU forward path lands
+    /// (X.4.c) and community GGUF conversion arrives (X.4.b).
     ///
     /// `forward()` immediately `todo!()` on `KimiK3` — silent garbage
     /// on a 2.8T model is worse than an explicit panic pointing to
-    /// `docs/KIMI_K3_INTEGRATION.md`.
+    /// `docs/KIMI_K3_INTEGRATION.md`. The full HF-confirmed spec is
+    /// captured by [`KimiDeltaConfig`] and parseable from `config.json`
+    /// via [`KimiDeltaConfig::from_hf_config`] (`hf-config` feature).
     KimiK3,
     /// Tencent Hy3 (Hunyuan 3) family. Apache 2.0, 295B total / 21B
     /// active (MoE), 192 experts top-8, 1 MTP layer (3.8B), GQA 8 KV
@@ -382,50 +386,353 @@ pub struct DeepSeekV3Config {
 
 /// Kimi K3 / Kimi Delta Attention family sub-config.
 ///
-/// All fields are `Option` because the paper and open weights are not
-/// available yet (planned 2026-07-27 release). Placeholder fields based
-/// on public gigazine coverage and comparison with existing Gated
-/// DeltaNet families (Bonsai 27B, Qwen 3.5 hybrid). Refine when the
-/// model card / paper / community GGUF conversion lands.
+/// Moonshot AI's Kimi K3 open weight release (2026-07-27) confirmed the full
+/// architectural spec via `huggingface.co/moonshotai/Kimi-K3/config.json`
+/// (`model_type = "kimi_k3"`, `text_config.model_type = "kimi_linear"`,
+/// plus a nested MoonViT-V2 `vision_config`). All values marked "K3:" in the
+/// field docs below are taken directly from that file; individual fields
+/// remain `Option<T>` so the same struct can be populated piecewise by
+/// either the future GGUF loader (Phase X.4.b, blocked on community
+/// `convert_hf_to_gguf.py`) or by [`KimiDeltaConfig::from_hf_config`] for
+/// the direct-safetensors path.
 ///
-/// GGUF metadata key prefix (guess): `kimi.*` — confirm at X.4.b.
-/// See `docs/KIMI_K3_INTEGRATION.md` for the full integration plan.
+/// GGUF metadata key prefix (guess): `kimi.*` — confirm at X.4.b once the
+/// community conversion lands. See `docs/KIMI_K3_INTEGRATION.md` for the
+/// full 10-sub-phase integration plan.
 #[derive(Debug, Clone, Default)]
 pub struct KimiDeltaConfig {
-    /// Ratio of full-attention layers vs Kimi Delta layers in the hybrid
-    /// stack. Bonsai 27B uses 16 full : 48 DeltaNet; Kimi K3 TBD.
-    pub full_attention_interval: Option<usize>,
-    /// Per-head recurrent state dim for the Kimi Delta path.
-    pub delta_state_dim: Option<usize>,
-    /// Attention Residuals scale factor (Moonshot claims ~25% training
-    /// speedup; unclear whether this is a runtime skip-connection
-    /// parameter or a training-only trick).
-    pub attention_residuals_scale: Option<f32>,
-    /// Total routed expert count. Kimi K3 confirmed 2026-07-17: **896**.
-    /// For comparison DeepSeek V3 = 256, Bonsai 27B = 64. Mirrors
-    /// `deepseek_v3.n_routed_experts` semantics.
+    // ── Hybrid attention layer routing (linear_attn_config.*) ─────────
+    /// Explicit list of full-attention (Gated MLA) layer indices, 1-indexed.
+    /// K3: 24 layers = `[4, 8, 12, ..., 88, 92, 93]`.
+    /// Source: HF `text_config.linear_attn_config.full_attn_layers`.
+    pub full_attn_layers: Option<Vec<usize>>,
+    /// Explicit list of Kimi Delta Attention layer indices, 1-indexed.
+    /// K3: 69 layers = `[1, 2, 3, 5, 6, 7, ..., 89, 90, 91]`.
+    /// Source: HF `text_config.linear_attn_config.kda_layers`.
+    pub kda_layers: Option<Vec<usize>>,
+    /// KDA per-head dimension. K3: 128.
+    pub kda_head_dim: Option<usize>,
+    /// KDA number of heads. K3: 96 (matches `num_attention_heads`).
+    pub kda_num_heads: Option<usize>,
+    /// KDA short-conv kernel size. K3: 4.
+    pub kda_short_conv_kernel_size: Option<usize>,
+    /// KDA gate uses a full-rank projection (vs low-rank). K3: `true`.
+    pub kda_use_full_rank_gate: Option<bool>,
+    /// KDA gate lower bound (clamp for numerical stability). K3: `-5.0`.
+    pub kda_gate_lower_bound: Option<f32>,
+
+    // ── Gated MLA config (mirrors DeepSeek V3 MLA + output gate) ─────
+    /// Q LoRA rank. K3: 1536 (identical to DeepSeek V3).
+    pub q_lora_rank: Option<usize>,
+    /// KV LoRA rank. K3: 512 (identical to DeepSeek V3).
+    pub kv_lora_rank: Option<usize>,
+    /// Non-RoPE Q/K head dim. K3: 128.
+    pub qk_nope_head_dim: Option<usize>,
+    /// RoPE Q/K head dim (partial RoPE). K3: 64.
+    pub qk_rope_head_dim: Option<usize>,
+    /// V head dim. K3: 128.
+    pub v_head_dim: Option<usize>,
+    /// Whether the MLA path skips RoPE entirely. K3: `true` (unusual —
+    /// DeepSeek V3 uses partial RoPE; K3's NoPE + AttnRes is a
+    /// Kimi-specific choice).
+    pub mla_use_nope: Option<bool>,
+    /// Whether MLA adds an output gate on top of the attention block.
+    /// K3: `true` (unique to Kimi; DeepSeek V3 has no output gate).
+    pub mla_use_output_gate: Option<bool>,
+
+    // ── Attention Residuals (AttnRes) ─────────────────────────────────
+    /// AttnRes block size — number of consecutive layers grouped under
+    /// one residual skip. Moonshot claims ~25% training speedup.
+    /// K3: 12. Source: HF `text_config.attn_res_block_size`.
+    pub attn_res_block_size: Option<usize>,
+
+    // ── SiTU-GLU activation ──────────────────────────────────────────
+    /// SiTU activation β1 (nonlinear branch). K3: 4.0.
+    pub situ_beta: Option<f32>,
+    /// SiTU activation β2 (linear branch). K3: 25.0.
+    pub situ_linear_beta: Option<f32>,
+
+    // ── Stable LatentMoE (896 experts, top-16) ───────────────────────
+    /// Total routed experts. K3: **896** (sparsity 16/896 ≈ 1.79%).
+    /// Drives the expert-streaming feasibility calculation in
+    /// `docs/KIMI_K3_INTEGRATION.md` (~24 GB Q4 active weights per
+    /// token out of ~1.4 TB total, streamable from NVMe on Mac 128 GB).
     pub n_routed_experts: Option<usize>,
-    /// Shared always-active expert count. Kimi K3: TBD (DeepSeek V3 = 1).
-    pub n_shared_experts: Option<usize>,
-    /// Top-k routed experts per token. Kimi K3 confirmed 2026-07-17:
-    /// **16** (sparsity 16/896 = 1.79% — sparser than V3's 8/256 = 3.13%).
-    /// This drives the expert-streaming feasibility calculation in
-    /// `docs/KIMI_K3_INTEGRATION.md` (~24 GB Q4 active weights per token
-    /// out of ~1.4 TB total, streamable from NVMe on Mac 128 GB).
+    /// Top-k routed experts per token. K3: **16**.
     pub num_experts_per_tok: Option<usize>,
-    /// Per-expert FFN intermediate size. Kimi K3: TBD (2.8T ÷ 896 experts
-    /// ≈ 3.1B params/expert, so `moe_intermediate_size` is likely on the
-    /// order of 4096-8192 depending on `hidden_dim`).
+    /// Shared always-active experts. K3: 2 (DeepSeek V3 = 1).
+    pub n_shared_experts: Option<usize>,
+    /// Expert group count for grouped top-k routing. K3: 1.
+    pub num_expert_group: Option<usize>,
+    /// Top-k expert groups. K3: 1.
+    pub topk_group: Option<usize>,
+    /// Router activation function. K3: `"sigmoid"`.
+    pub moe_router_activation: Option<String>,
+    /// Router scoring method. K3: `"noaux_tc"` (no auxiliary-loss trick,
+    /// same as DeepSeek V3).
+    pub moe_topk_method: Option<String>,
+    /// Per-expert FFN intermediate size. K3: 3072.
     pub moe_intermediate_size: Option<usize>,
-    /// Long-context RoPE scaling parameters. K3 claims 1M context; may
-    /// use YARN or a Kimi-specific scheme. Placeholder until the config
-    /// JSON is public.
-    pub rope_scaling_type: Option<String>,
-    pub rope_scaling_factor: Option<f32>,
-    /// KV cache compression scheme identifier. K3's 6.3× decode speedup
-    /// implies aggressive compression (fixed-size recurrent state for
-    /// Delta layers + something for full-attn layers).
-    pub kv_compression_scheme: Option<String>,
+    /// Leading dense-FFN layer count (before MoE begins). K3: 1
+    /// (layer 0 dense, layers 1..93 MoE + shared experts).
+    pub first_k_dense_replace: Option<usize>,
+    /// Whether the routed expert outputs are renormalized. K3: `true`.
+    pub moe_renormalize: Option<bool>,
+    /// Latent MoE hidden dim (routed-expert latent space). K3: 3584.
+    pub routed_expert_hidden_size: Option<usize>,
+    /// Whether Latent MoE applies RMSNorm inside the routing block.
+    /// K3: `true`.
+    pub latent_moe_use_norm: Option<bool>,
+    /// Routed expert output scale. K3: 1.0 (DeepSeek V3 = 2.5).
+    pub routed_scaling_factor: Option<f32>,
+
+    // ── MTP head (not present in K3) ─────────────────────────────────
+    /// Multi-Token Prediction head layer count. K3: **0** (no MTP head,
+    /// unlike DeepSeek V3 which has 1). Retained for dispatch parity so
+    /// the same code path that gates MTP for V3 can short-circuit here.
+    pub num_nextn_predict_layers: Option<usize>,
+
+    // ── MXFP4 native quantization ────────────────────────────────────
+    /// Native MXFP4 group size for K3 checkpoints. K3: 32.
+    /// See `docs/MXFP4_INTEGRATION_PLAN.md` (Phase X.4.f).
+    pub mxfp4_group_size: Option<usize>,
+    /// MXFP4 bits per weight. K3: 4.
+    pub mxfp4_num_bits: Option<usize>,
+}
+
+#[cfg(feature = "hf-config")]
+impl KimiDeltaConfig {
+    /// Parse a `KimiDeltaConfig` from the HuggingFace Kimi K3 `config.json`
+    /// (`huggingface.co/moonshotai/Kimi-K3/raw/main/config.json`).
+    ///
+    /// The Kimi K3 top-level `config.json` has three nested sub-configs:
+    /// `text_config` (a `KimiLinearConfig`, `model_type = "kimi_linear"`),
+    /// `vision_config` (MoonViT-V2), and a top-level `model_type` of
+    /// `"kimi_k3"`. This function extracts the fields required by the
+    /// forward path (`text_config.*` plus `linear_attn_config.*`).
+    ///
+    /// Vision fields are deliberately not parsed here — the multimodal
+    /// path is scheduled for Phase X.4.i and will need its own
+    /// `KimiK3VisionConfig` sub-config once MoonViT-V2 lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_json::Error`] when the input bytes are not valid
+    /// JSON. Missing individual fields inside `text_config` are permitted
+    /// (stored as `None`) so this loader still yields a usable partial
+    /// config for pre-release checkpoint variants and future field
+    /// additions upstream.
+    pub fn from_hf_config(json_bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let root: serde_json::Value = serde_json::from_slice(json_bytes)?;
+        let tc = &root["text_config"];
+        let la = &tc["linear_attn_config"];
+        let qw = &tc["quantization_config"]["config_groups"]["group_0"]["weights"];
+
+        let opt_usize = |v: &serde_json::Value| v.as_u64().map(|x| x as usize);
+        let opt_f32 = |v: &serde_json::Value| v.as_f64().map(|x| x as f32);
+        let opt_bool = |v: &serde_json::Value| v.as_bool();
+        let opt_str = |v: &serde_json::Value| v.as_str().map(str::to_owned);
+        let opt_vec_usize = |v: &serde_json::Value| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+        };
+
+        Ok(Self {
+            full_attn_layers: opt_vec_usize(&la["full_attn_layers"]),
+            kda_layers: opt_vec_usize(&la["kda_layers"]),
+            kda_head_dim: opt_usize(&la["head_dim"]),
+            kda_num_heads: opt_usize(&la["num_heads"]),
+            kda_short_conv_kernel_size: opt_usize(&la["short_conv_kernel_size"]),
+            kda_use_full_rank_gate: opt_bool(&la["use_full_rank_gate"]),
+            kda_gate_lower_bound: opt_f32(&la["gate_lower_bound"]),
+            q_lora_rank: opt_usize(&tc["q_lora_rank"]),
+            kv_lora_rank: opt_usize(&tc["kv_lora_rank"]),
+            qk_nope_head_dim: opt_usize(&tc["qk_nope_head_dim"]),
+            qk_rope_head_dim: opt_usize(&tc["qk_rope_head_dim"]),
+            v_head_dim: opt_usize(&tc["v_head_dim"]),
+            mla_use_nope: opt_bool(&tc["mla_use_nope"]),
+            mla_use_output_gate: opt_bool(&tc["mla_use_output_gate"]),
+            attn_res_block_size: opt_usize(&tc["attn_res_block_size"]),
+            situ_beta: opt_f32(&tc["activation_situ_beta"]),
+            situ_linear_beta: opt_f32(&tc["activation_situ_linear_beta"]),
+            n_routed_experts: opt_usize(&tc["num_experts"]),
+            num_experts_per_tok: opt_usize(&tc["num_experts_per_token"]),
+            n_shared_experts: opt_usize(&tc["num_shared_experts"]),
+            num_expert_group: opt_usize(&tc["num_expert_group"]),
+            topk_group: opt_usize(&tc["topk_group"]),
+            moe_router_activation: opt_str(&tc["moe_router_activation_func"]),
+            moe_topk_method: opt_str(&tc["topk_method"]),
+            moe_intermediate_size: opt_usize(&tc["moe_intermediate_size"]),
+            first_k_dense_replace: opt_usize(&tc["first_k_dense_replace"]),
+            moe_renormalize: opt_bool(&tc["moe_renormalize"]),
+            routed_expert_hidden_size: opt_usize(&tc["routed_expert_hidden_size"]),
+            latent_moe_use_norm: opt_bool(&tc["latent_moe_use_norm"]),
+            routed_scaling_factor: opt_f32(&tc["routed_scaling_factor"]),
+            num_nextn_predict_layers: opt_usize(&tc["num_nextn_predict_layers"]),
+            mxfp4_group_size: opt_usize(&qw["group_size"]),
+            mxfp4_num_bits: opt_usize(&qw["num_bits"]),
+        })
+    }
+}
+
+#[cfg(all(test, feature = "hf-config"))]
+mod kimi_k3_hf_config_tests {
+    use super::KimiDeltaConfig;
+
+    /// Minimal fixture reproducing the subset of `text_config` needed to
+    /// exercise the parser. Real config lives at
+    /// `huggingface.co/moonshotai/Kimi-K3/raw/main/config.json` — the
+    /// full-length arrays are truncated here to keep the fixture readable
+    /// while still hitting every field path in `from_hf_config`.
+    const KIMI_K3_FIXTURE: &str = r#"{
+      "model_type": "kimi_k3",
+      "text_config": {
+        "model_type": "kimi_linear",
+        "hidden_size": 7168,
+        "num_hidden_layers": 93,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "num_shared_experts": 2,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "moe_router_activation_func": "sigmoid",
+        "moe_intermediate_size": 3072,
+        "moe_renormalize": true,
+        "first_k_dense_replace": 1,
+        "num_nextn_predict_layers": 0,
+        "routed_expert_hidden_size": 3584,
+        "routed_scaling_factor": 1.0,
+        "latent_moe_use_norm": true,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "mla_use_nope": true,
+        "mla_use_output_gate": true,
+        "attn_res_block_size": 12,
+        "activation_situ_beta": 4.0,
+        "activation_situ_linear_beta": 25.0,
+        "linear_attn_config": {
+          "full_attn_layers": [4, 8, 12, 93],
+          "kda_layers": [1, 2, 3, 5, 6, 7],
+          "num_heads": 96,
+          "head_dim": 128,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true,
+          "gate_lower_bound": -5.0
+        },
+        "quantization_config": {
+          "config_groups": {
+            "group_0": {
+              "weights": {
+                "num_bits": 4,
+                "group_size": 32
+              }
+            }
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn parses_kimi_k3_confirmed_spec() {
+        let cfg = KimiDeltaConfig::from_hf_config(KIMI_K3_FIXTURE.as_bytes())
+            .expect("Kimi K3 fixture should parse");
+
+        // Stable LatentMoE (confirmed 2026-07-27 open weight release)
+        assert_eq!(cfg.n_routed_experts, Some(896));
+        assert_eq!(cfg.num_experts_per_tok, Some(16));
+        assert_eq!(cfg.n_shared_experts, Some(2));
+        assert_eq!(cfg.num_expert_group, Some(1));
+        assert_eq!(cfg.topk_group, Some(1));
+        assert_eq!(cfg.moe_intermediate_size, Some(3072));
+        assert_eq!(cfg.first_k_dense_replace, Some(1));
+        assert_eq!(cfg.num_nextn_predict_layers, Some(0));
+        assert_eq!(cfg.routed_expert_hidden_size, Some(3584));
+        assert_eq!(cfg.moe_renormalize, Some(true));
+        assert_eq!(cfg.latent_moe_use_norm, Some(true));
+        assert_eq!(cfg.routed_scaling_factor, Some(1.0));
+        assert_eq!(cfg.moe_router_activation.as_deref(), Some("sigmoid"));
+        assert_eq!(cfg.moe_topk_method.as_deref(), Some("noaux_tc"));
+
+        // Gated MLA (K3 = DeepSeek V3 MLA + output gate + NoPE)
+        assert_eq!(cfg.q_lora_rank, Some(1536));
+        assert_eq!(cfg.kv_lora_rank, Some(512));
+        assert_eq!(cfg.qk_nope_head_dim, Some(128));
+        assert_eq!(cfg.qk_rope_head_dim, Some(64));
+        assert_eq!(cfg.v_head_dim, Some(128));
+        assert_eq!(cfg.mla_use_nope, Some(true));
+        assert_eq!(cfg.mla_use_output_gate, Some(true));
+
+        // Attention Residuals + SiTU-GLU (Kimi-specific)
+        assert_eq!(cfg.attn_res_block_size, Some(12));
+        assert_eq!(cfg.situ_beta, Some(4.0));
+        assert_eq!(cfg.situ_linear_beta, Some(25.0));
+
+        // Kimi Delta Attention (KDA)
+        assert_eq!(cfg.kda_num_heads, Some(96));
+        assert_eq!(cfg.kda_head_dim, Some(128));
+        assert_eq!(cfg.kda_short_conv_kernel_size, Some(4));
+        assert_eq!(cfg.kda_use_full_rank_gate, Some(true));
+        assert_eq!(cfg.kda_gate_lower_bound, Some(-5.0));
+        assert_eq!(
+            cfg.full_attn_layers.as_deref(),
+            Some(&[4usize, 8, 12, 93][..]),
+        );
+        assert_eq!(
+            cfg.kda_layers.as_deref(),
+            Some(&[1usize, 2, 3, 5, 6, 7][..]),
+        );
+
+        // MXFP4 native quantization
+        assert_eq!(cfg.mxfp4_num_bits, Some(4));
+        assert_eq!(cfg.mxfp4_group_size, Some(32));
+    }
+
+    #[test]
+    fn missing_fields_default_to_none() {
+        let minimal = br#"{"text_config": {}}"#;
+        let cfg = KimiDeltaConfig::from_hf_config(minimal).expect("empty text_config still parses");
+        assert!(cfg.n_routed_experts.is_none());
+        assert!(cfg.full_attn_layers.is_none());
+        assert!(cfg.moe_router_activation.is_none());
+        assert!(cfg.mxfp4_num_bits.is_none());
+    }
+
+    #[test]
+    fn missing_text_config_is_all_none() {
+        let bare = b"{}";
+        let cfg = KimiDeltaConfig::from_hf_config(bare).expect("bare root object still parses");
+        assert!(cfg.n_routed_experts.is_none());
+        assert!(cfg.q_lora_rank.is_none());
+    }
+
+    #[test]
+    fn malformed_json_returns_error() {
+        assert!(KimiDeltaConfig::from_hf_config(b"{not valid json").is_err());
+    }
+
+    #[test]
+    fn confirmed_hybrid_layer_totals() {
+        // K3 spec: 69 KDA + 24 Gated MLA = 93 layers total. The fixture
+        // uses truncated arrays, but the length invariant is worth
+        // asserting on the truncated form as a smoke test — the real
+        // parser doesn't need to know the total.
+        let cfg = KimiDeltaConfig::from_hf_config(KIMI_K3_FIXTURE.as_bytes()).unwrap();
+        let full = cfg.full_attn_layers.expect("full_attn_layers present");
+        let kda = cfg.kda_layers.expect("kda_layers present");
+        assert_eq!(full.len(), 4, "fixture uses 4 truncated MLA layers");
+        assert_eq!(kda.len(), 6, "fixture uses 6 truncated KDA layers");
+        // Total layers = num_hidden_layers = 93 (from real config, not
+        // enforced by parser); documenting here for reader clarity.
+    }
 }
 
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
@@ -4223,12 +4530,15 @@ impl<'a> Llama3Model<'a> {
         if self.config.arch == ModelArch::DeepSeekV3 {
             return self.forward_deepseek_v3(token_id);
         }
-        // Kimi K3 / Kimi Delta Attention (Moonshot AI). Foundation only —
-        // 2026-07-27 open weight release + paper drop are prerequisites
-        // for the actual forward path. Silent garbage on a 2.8T model is
-        // worse than an explicit panic pointing to the integration doc,
-        // so we `todo!()` here rather than fall through to the standard
-        // path (which would misinterpret Kimi Delta as vanilla attention).
+        // Kimi K3 / Kimi Delta Attention (Moonshot AI). Weights released
+        // 2026-07-27 and the full spec is now captured by KimiDeltaConfig
+        // via config.json (see KimiDeltaConfig::from_hf_config); the CPU
+        // forward path itself is still Phase X.4.c work (community GGUF
+        // conversion X.4.b is the outstanding blocker). Silent garbage on
+        // a 2.8T model is worse than an explicit panic pointing to the
+        // integration doc, so we `todo!()` here rather than fall through
+        // to the standard path (which would misinterpret Kimi Delta +
+        // Gated MLA + AttnRes as vanilla attention).
         if self.config.arch == ModelArch::KimiK3 {
             return self.forward_kimi_k3(token_id);
         }
@@ -5887,11 +6197,15 @@ impl<'a> Llama3Model<'a> {
     #[allow(clippy::needless_pass_by_ref_mut)]
     fn forward_kimi_k3(&mut self, _token_id: u32) -> Vec<f32> {
         todo!(
-            "KIMI-K3 forward: waiting for open weight release 2026-07-27 \
-             + paper drop before implementation. See \
+            "KIMI-K3 forward: open weights released 2026-07-27, spec is \
+             now captured in KimiDeltaConfig (parseable from HF config.json \
+             via KimiDeltaConfig::from_hf_config under `hf-config` feature). \
+             CPU forward path (Phase X.4.c) is still pending community GGUF \
+             conversion (X.4.b, mradermacher / bartowski watch). See \
              docs/KIMI_K3_INTEGRATION.md for the phased integration plan \
-             (Phase X.4.a-X.4.g) and the reusable ALICE-LLM components \
-             (`gated_deltanet_step*`, `SsmDeltaNetConfig`, MoE routing)."
+             (Phase X.4.a-X.4.j) and the reusable ALICE-LLM components \
+             (`gated_deltanet_step*`, `SsmDeltaNetConfig`, MoE routing, \
+             MLA scaffolding shared with DeepSeek V3)."
         );
     }
 
