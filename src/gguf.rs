@@ -2345,6 +2345,66 @@ mod avx2_dot {
 
         pos_sum - neg_sum
     }
+
+    /// AVX2 MXFP4 dot for one row (Phase X.4.f.2.b, 2026-07-28).
+    ///
+    /// Mirrors the aarch64 NEON kernel design: per block, scalar
+    /// dequantize into a stack-resident `[f32; 32]` scratch, then
+    /// AVX2 8-wide FMA × 4 iterations = 32 elements. Horizontal
+    /// reduction via the standard 128-bit halve-and-sum pattern
+    /// already used by `q1_0_dot_row` above.
+    ///
+    /// # Numerics
+    ///
+    /// The horizontal reduction order (halve-and-sum) differs from
+    /// the scalar kernel's strictly ascending element order, so
+    /// parity with `mxfp4_matvec_fused_scalar` is tolerance-based
+    /// (~1e-4 relative), not bit-exact — same as the NEON kernel.
+    ///
+    /// # Safety
+    ///
+    /// Caller must have verified AVX2 support via
+    /// `is_x86_feature_detected!("avx2")` and must ensure
+    /// `row_data.len() >= n_blocks * 17` and
+    /// `input.len() >= n_blocks * QK_MXFP4`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn mxfp4_dot_row(row_data: &[u8], input: &[f32]) -> f32 {
+        const BLOCK_BYTES: usize = 17;
+        let n_blocks = row_data.len() / BLOCK_BYTES;
+        let mut total = 0.0_f32;
+        for i in 0..n_blocks {
+            let block = &row_data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+            let scale = decode_e8m0_scale(block[0]);
+            // Scalar dequant into stack scratch (128 bytes = L1-resident).
+            let mut dq = [0.0_f32; QK_MXFP4];
+            for j in 0..16 {
+                let byte = block[1 + j];
+                dq[2 * j] = E2M1_DECODE_TABLE[usize::from(byte & 0x0F)] * scale;
+                dq[2 * j + 1] = E2M1_DECODE_TABLE[usize::from(byte >> 4)] * scale;
+            }
+            // AVX2 matvec: 4 × 8-wide FMA.
+            let block_input = &input[i * QK_MXFP4..(i + 1) * QK_MXFP4];
+            let mut acc: __m256 = _mm256_setzero_ps();
+            for k in 0..(QK_MXFP4 / 8) {
+                // SAFETY: dq and block_input are both 32-element buffers,
+                // k ranges 0..4 so k*8+8 <= 32; loadu does not require
+                // alignment.
+                let dq_vec = _mm256_loadu_ps(dq.as_ptr().add(k * 8));
+                let in_vec = _mm256_loadu_ps(block_input.as_ptr().add(k * 8));
+                acc = _mm256_fmadd_ps(dq_vec, in_vec, acc);
+            }
+            // Horizontal sum: 256 → 128 halve-and-add → 128 → scalar.
+            let lo = _mm256_castps256_ps128(acc);
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let s = _mm_add_ps(lo, hi);
+            let sh = _mm_movehl_ps(s, s);
+            let s2 = _mm_add_ps(s, sh);
+            let sh2 = _mm_shuffle_ps(s2, s2, 0x55);
+            let s3 = _mm_add_ss(s2, sh2);
+            total += _mm_cvtss_f32(s3);
+        }
+        total
+    }
 }
 
 // ─── x86_64 AVX-512 SIMD dot products (Issue #13) ───────────────────────────
@@ -4093,17 +4153,24 @@ fn mxfp4_matvec_fused_scalar(
     }
 }
 
-/// Runtime-dispatched MXFP4 matvec (Phase X.4.f.2.a, 2026-07-28).
+/// Runtime-dispatched MXFP4 matvec (Phase X.4.f.2.a-b, 2026-07-28).
 ///
 /// - **aarch64** (Jetson / Apple Silicon / any ARMv8-A): dispatches per
 ///   row to [`neon_dot::mxfp4_dot_row`] which does scalar per-block
 ///   dequant followed by NEON `vfmaq_f32` 4-wide FMA × 8 iterations.
-/// - **other archs**: falls through to [`mxfp4_matvec_fused_scalar`]
-///   (pure scalar, same result semantics).
+/// - **x86_64 with AVX2** (Ryzen / Xeon / any Haswell+): dispatches
+///   per row to [`avx2_dot::mxfp4_dot_row`] which does scalar
+///   per-block dequant followed by AVX2 `_mm256_fmadd_ps` 8-wide
+///   FMA × 4 iterations. Runtime-detected via
+///   `is_x86_feature_detected!("avx2")`; pre-AVX2 x86 machines
+///   (Ivy Bridge and older) fall through to the scalar kernel.
+/// - **other archs / non-AVX2 x86**: falls through to
+///   [`mxfp4_matvec_fused_scalar`] (pure scalar, same semantics).
 ///
-/// The NEON path uses `vaddvq_f32` for horizontal reduction so it is
+/// Both SIMD paths use vector horizontal reduction so they are
 /// **tolerance-parity** with the scalar kernel (~1e-4 relative), not
-/// bit-exact. See `mxfp4_matvec_neon_matches_scalar` in the tests.
+/// bit-exact. See `mxfp4_matvec_neon_matches_scalar` (aarch64) and
+/// `mxfp4_matvec_avx2_matches_scalar` (x86_64) in the tests.
 fn mxfp4_matvec_dispatched(
     input: &[f32],
     data: &[u8],
@@ -4111,38 +4178,61 @@ fn mxfp4_matvec_dispatched(
     cols: usize,
     output: &mut [f32],
 ) {
+    // Shape validation is architecture-independent; keep it out of the
+    // cfg branches so every path shares the same error surface.
+    assert!(
+        cols.is_multiple_of(QK_MXFP4),
+        "cols {cols} must be a multiple of QK_MXFP4 = {QK_MXFP4}"
+    );
+    assert!(
+        input.len() >= cols,
+        "input length {} < cols {cols}",
+        input.len()
+    );
+    assert!(
+        output.len() >= rows,
+        "output length {} < rows {rows}",
+        output.len()
+    );
+    let blocks_per_row = cols / QK_MXFP4;
+    let row_bytes = blocks_per_row * 17;
+    assert!(
+        data.len() >= rows * row_bytes,
+        "data length {} < rows*row_bytes {}",
+        data.len(),
+        rows * row_bytes
+    );
+
     #[cfg(target_arch = "aarch64")]
     {
-        assert!(
-            cols.is_multiple_of(QK_MXFP4),
-            "cols {cols} must be a multiple of QK_MXFP4 = {QK_MXFP4}"
-        );
-        assert!(
-            input.len() >= cols,
-            "input length {} < cols {cols}",
-            input.len()
-        );
-        assert!(
-            output.len() >= rows,
-            "output length {} < rows {rows}",
-            output.len()
-        );
-        let blocks_per_row = cols / QK_MXFP4;
-        let row_bytes = blocks_per_row * 17;
-        assert!(
-            data.len() >= rows * row_bytes,
-            "data length {} < rows*row_bytes {}",
-            data.len(),
-            rows * row_bytes
-        );
         for row in 0..rows {
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             // SAFETY: NEON is baseline on every aarch64 target Rust
             // supports; input length has been validated above.
             output[row] = unsafe { neon_dot::mxfp4_dot_row(row_data, &input[..cols]) };
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for row in 0..rows {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                // SAFETY: AVX2 + FMA feature-detected above; input
+                // length has been validated above.
+                output[row] = unsafe { avx2_dot::mxfp4_dot_row(row_data, &input[..cols]) };
+            }
+            return;
+        }
+    }
+
+    // Fallback: pure scalar. Reached on non-AVX2 x86_64 machines
+    // (Ivy Bridge and older) and on any architecture that is neither
+    // aarch64 nor x86_64. On aarch64 the branch above always returns,
+    // so the compiler flags this as unreachable — same pattern as
+    // `q1_0_matvec_fallback` below.
+    #[allow(unreachable_code)]
     mxfp4_matvec_fused_scalar(input, data, rows, cols, output);
 }
 
@@ -6603,6 +6693,45 @@ mod tests {
                 "row {row}: kernel {} vs oracle sum {}",
                 out[row],
                 expected
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn mxfp4_matvec_avx2_matches_scalar() {
+        // Phase X.4.f.2.b AVX2 parity test. Skips gracefully if the
+        // host CPU lacks AVX2 (very old x86_64: Ivy Bridge and older).
+        // Like NEON, uses horizontal reduce so parity is
+        // tolerance-based (~1e-4 relative), not bit-exact.
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            eprintln!("skipping mxfp4_matvec_avx2_matches_scalar: host CPU lacks AVX2+FMA");
+            return;
+        }
+        let rows = 4;
+        let cols = 128;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x5);
+        let input: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.03).sin()).collect();
+
+        let mut out_scalar = vec![0.0_f32; rows];
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out_scalar);
+
+        let mut out_avx2 = vec![0.0_f32; rows];
+        // Dispatched call routes to AVX2 on x86_64 with the feature bits set.
+        mxfp4_matvec_dispatched(&input, &data, rows, cols, &mut out_avx2);
+
+        for row in 0..rows {
+            let s = out_scalar[row];
+            let a = out_avx2[row];
+            let abs_err = (s - a).abs();
+            let rel_err = if s.abs() > 1e-6 {
+                abs_err / s.abs()
+            } else {
+                abs_err
+            };
+            assert!(
+                rel_err < 1e-4,
+                "row {row}: scalar {s}, avx2 {a}, rel_err {rel_err}"
             );
         }
     }
