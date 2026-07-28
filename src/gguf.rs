@@ -3926,17 +3926,23 @@ pub fn quantized_matvec(
         GgmlType::F32 => f32_matvec(input, data, rows, cols, output),
         GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
-        GgmlType::Mxfp4 => mxfp4_matvec_fallback(input, data, rows, cols, output),
+        GgmlType::Mxfp4 => mxfp4_matvec_fused_scalar(input, data, rows, cols, output),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
     }
 }
 
-/// Correctness-first MXFP4 matvec fallback: dequantize row to f32 then
-/// call `f32_matvec`.
+/// Correctness-first MXFP4 matvec fallback: dequantize whole row to f32
+/// then call an inline `f32_matvec`.
 ///
-/// Used until the fused `mxfp4_matvec` kernel lands in Phase X.4.f. Slow but
-/// correct — allocates a per-row scratch buffer on each call, so hot paths
-/// should switch to the fused kernel once available.
+/// Retained as the parity reference for
+/// [`mxfp4_matvec_fused_scalar`] — the two kernels must agree
+/// bit-exact because both dequantize blocks the same way and
+/// accumulate in `f32` in the same element order. Any future SIMD
+/// kernel (Phase X.4.f.2+) is validated against this fallback.
+///
+/// Not on the hot path since Phase X.4.f.1 (`quantized_matvec`
+/// routing switched to the fused kernel).
+#[cfg(test)]
 fn mxfp4_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
     let blocks_per_row = cols / QK_MXFP4;
     let row_bytes = blocks_per_row * 17;
@@ -3947,6 +3953,84 @@ fn mxfp4_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, o
         let mut acc = 0.0f32;
         for i in 0..cols {
             acc += row_f32[i] * input[i];
+        }
+        output[row] = acc;
+    }
+}
+
+/// Fused scalar MXFP4 matvec kernel (Phase X.4.f.1, 2026-07-28).
+///
+/// Iterates rows and blocks, dequantizes each 32-element block into a
+/// stack-resident `[f32; QK_MXFP4]` buffer via
+/// [`dequantize_mxfp4_block`], and multiply-accumulates against the
+/// input slice in place. Avoids the per-matvec `Vec<f32>` scratch
+/// buffer used by [`mxfp4_matvec_fallback`] — the small `[f32; 32]`
+/// stack array is L1-resident, and only the reduced `f32` accumulator
+/// crosses block iterations.
+///
+/// # Numerical parity with the fallback
+///
+/// Both kernels call [`dequantize_mxfp4_block`] and accumulate in `f32`
+/// in the same element order (block-major, then intra-block index
+/// ascending). They therefore agree **bit-exact** on identical inputs;
+/// the `mxfp4_matvec_fused_scalar_matches_fallback` unit test enforces
+/// this for every future edit.
+///
+/// # Callers
+///
+/// - `quantized_matvec` dispatches `GgmlType::Mxfp4` here (Phase
+///   X.4.f.1 landing switched from fallback → fused_scalar).
+/// - The free function [`mxfp4_matvec`] iterates a [`MxfP4Matrix`] and
+///   calls this per row.
+///
+/// # Panics
+///
+/// Panics if `cols` is not a multiple of `QK_MXFP4 = 32`, if `data.len()
+/// < rows * (cols/32) * 17`, if `input.len() < cols`, or if
+/// `output.len() < rows`.
+fn mxfp4_matvec_fused_scalar(
+    input: &[f32],
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    output: &mut [f32],
+) {
+    assert!(
+        cols.is_multiple_of(QK_MXFP4),
+        "cols {cols} must be a multiple of QK_MXFP4 = {QK_MXFP4}"
+    );
+    assert!(
+        input.len() >= cols,
+        "input length {} < cols {cols}",
+        input.len()
+    );
+    assert!(
+        output.len() >= rows,
+        "output length {} < rows {rows}",
+        output.len()
+    );
+
+    let blocks_per_row = cols / QK_MXFP4;
+    let row_bytes = blocks_per_row * 17;
+    assert!(
+        data.len() >= rows * row_bytes,
+        "data length {} < rows*row_bytes {}",
+        data.len(),
+        rows * row_bytes
+    );
+
+    for row in 0..rows {
+        let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+        let mut acc = 0.0_f32;
+        for blk in 0..blocks_per_row {
+            let block = &row_data[blk * 17..blk * 17 + 17];
+            // Stack-allocated 32-element scratch (128 bytes) — L1-resident.
+            let dq = dequantize_mxfp4_block(block);
+            let inp_off = blk * QK_MXFP4;
+            // Same accumulation order as fallback: block-major, intra-block ascending.
+            for i in 0..QK_MXFP4 {
+                acc += dq[i] * input[inp_off + i];
+            }
         }
         output[row] = acc;
     }
@@ -5902,22 +5986,57 @@ pub struct MxfP4Matrix {
     pub n_cols: usize,
 }
 
-/// MXFP4 matrix-vector multiply — NOT YET IMPLEMENTED.
+/// MXFP4 matrix-vector multiply via the fused scalar kernel
+/// (Phase X.4.f.1 landing, 2026-07-28).
 ///
-/// The scalar and SIMD (NEON / AVX2 / AVX-512) matvec kernels land alongside
-/// Phase X.4.b GGUF metadata detection and Phase X.4.c CPU forward path (see
-/// `docs/KIMI_K3_INTEGRATION.md` and `docs/MXFP4_INTEGRATION_PLAN.md`).
-/// Callers hitting this path before those phases land get an explicit panic
-/// pointing to the integration plan, in accordance with the
-/// "仮実装完了偽装の禁止" policy in CLAUDE.md.
-pub fn mxfp4_matvec(_matrix: &MxfP4Matrix, _input: &[f32], _output: &mut [f32]) {
-    todo!(
-        "mxfp4_matvec: not yet implemented (Phase X.4.f matvec kernel). \
-         Block dequant (dequantize_mxfp4_block / dequantize_row_mxfp4 / \
-         MxfP4Row::dequantize) is available for correctness-first dequant-then-\
-         f32-matvec fallback until the fused kernel lands. \
-         See docs/MXFP4_INTEGRATION_PLAN.md §'Files to modify (Phase X.4.f)'."
-    )
+/// Iterates each row of `matrix` and calls the shared fused scalar
+/// kernel on its packed bytes; the kernel dequantizes MXFP4 blocks
+/// into a stack-resident `[f32; 32]` buffer and multiply-accumulates
+/// against `input` in place, avoiding the per-row `Vec<f32>` scratch
+/// that the correctness-first `mxfp4_matvec_fallback` uses.
+///
+/// # Panics
+///
+/// Panics if any row's byte length is not a multiple of 17
+/// (MXFP4 block size), if `input.len() < n_cols`, or if
+/// `output.len() < matrix.rows.len()`.
+///
+/// # Numerics
+///
+/// Bit-exact parity with [`mxfp4_matvec_fallback`] — both kernels
+/// dequantize blocks the same way (via
+/// [`dequantize_mxfp4_block`]) and accumulate in `f32` in the same
+/// element order. A dedicated unit test enforces the parity so any
+/// future SIMD kernel additions (Phase X.4.f.2+) can be validated
+/// against this reference.
+pub fn mxfp4_matvec(matrix: &MxfP4Matrix, input: &[f32], output: &mut [f32]) {
+    assert!(
+        output.len() >= matrix.rows.len(),
+        "output buffer too small: got {}, need {}",
+        output.len(),
+        matrix.rows.len(),
+    );
+    assert!(
+        input.len() >= matrix.n_cols,
+        "input buffer too small: got {}, need {}",
+        input.len(),
+        matrix.n_cols,
+    );
+    let n_cols = matrix.n_cols;
+    for (row_idx, row) in matrix.rows.iter().enumerate() {
+        // `MxfP4Row` stores whole-block bytes only; padding for a
+        // partial last block is tracked via `n_elements`, so use
+        // `matrix.n_cols` as the number of valid columns.
+        assert!(
+            row.bytes.len() % 17 == 0,
+            "row {row_idx} bytes length {} is not a multiple of 17",
+            row.bytes.len(),
+        );
+        // Fused scalar kernel operates on one row at a time.
+        let mut single_row = [0.0_f32; 1];
+        mxfp4_matvec_fused_scalar(input, &row.bytes, 1, n_cols, &mut single_row);
+        output[row_idx] = single_row[0];
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -6129,19 +6248,159 @@ mod tests {
         }
     }
 
+    // ─── Phase X.4.f.1: fused scalar MXFP4 matvec kernel tests ────────
+
+    /// Build a deterministic MXFP4 tensor byte buffer of shape
+    /// `[rows, cols]` with a synthetic E8M0 scale byte and repeating
+    /// E2M1 nibbles per row. Used to feed the parity tests below.
+    fn mxfp4_synthetic_tensor(rows: usize, cols: usize, scale_byte: u8, nibble: u8) -> Vec<u8> {
+        assert!(cols.is_multiple_of(QK_MXFP4));
+        assert!(nibble < 16, "E2M1 index must fit in 4 bits");
+        let blocks_per_row = cols / QK_MXFP4;
+        let row_bytes = blocks_per_row * 17;
+        let mut data = vec![0u8; rows * row_bytes];
+        // Same nibble in both halves of every packed byte.
+        let packed = (nibble << 4) | nibble;
+        for row in 0..rows {
+            for blk in 0..blocks_per_row {
+                let base = row * row_bytes + blk * 17;
+                data[base] = scale_byte;
+                // Vary per-row so different rows give different matvec outputs.
+                let bump = ((row + blk) & 0xF) as u8;
+                let bumped_nibble = (nibble + bump) & 0xF;
+                let bumped_packed = (bumped_nibble << 4) | bumped_nibble;
+                for byte in &mut data[base + 1..base + 17] {
+                    *byte = bumped_packed;
+                }
+                // Leave block[0] scale, restore uniform packing for first
+                // block of every row so the identity-row test below is
+                // meaningful.
+                if blk == 0 {
+                    for byte in &mut data[base + 1..base + 17] {
+                        *byte = packed;
+                    }
+                }
+            }
+        }
+        data
+    }
+
     #[test]
-    #[should_panic(expected = "mxfp4_matvec: not yet implemented")]
-    fn test_mxfp4_matvec_fail_fast() {
-        // Verify that the matvec kernel is a fail-fast todo!() rather than
-        // silently returning zeros. Compliance with the
-        // "仮実装完了偽装の禁止" policy in CLAUDE.md.
+    fn mxfp4_matvec_fused_scalar_matches_fallback() {
+        // Non-trivial dimensions: 4 rows × 128 cols = 4 blocks per row.
+        // Every block uses scale byte 127 (2^0 = 1.0) and nibble 0x7
+        // (a mid-magnitude positive E2M1 value from the table); the
+        // synthetic tensor helper varies packing per (row, block) to
+        // avoid degenerate identical rows.
+        let rows = 4;
+        let cols = 128;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x7);
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        let mut out_fallback = vec![0.0f32; rows];
+        let mut out_fused = vec![0.0f32; rows];
+        mxfp4_matvec_fallback(&input, &data, rows, cols, &mut out_fallback);
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out_fused);
+        // Both kernels dequantize with the same routine and accumulate
+        // in the same order, so parity must be bit-exact.
+        assert_eq!(
+            out_fallback, out_fused,
+            "fused kernel must be bit-exact vs fallback"
+        );
+    }
+
+    #[test]
+    fn mxfp4_matvec_free_fn_matches_kernel() {
+        // The MxfP4Matrix wrapper (public free function) must produce
+        // identical results to the internal kernel it dispatches to.
+        let rows = 3;
+        let cols = 64;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x5);
+        let row_bytes = (cols / QK_MXFP4) * 17;
         let matrix = MxfP4Matrix {
-            rows: vec![],
-            n_cols: 0,
+            rows: (0..rows)
+                .map(|r| MxfP4Row {
+                    bytes: data[r * row_bytes..(r + 1) * row_bytes].to_vec(),
+                    n_elements: cols,
+                })
+                .collect(),
+            n_cols: cols,
         };
-        let input = [0.0f32; 0];
-        let mut output = [0.0f32; 0];
-        mxfp4_matvec(&matrix, &input, &mut output);
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32).sin()).collect();
+        let mut out_kernel = vec![0.0f32; rows];
+        let mut out_wrapper = vec![0.0f32; rows];
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out_kernel);
+        mxfp4_matvec(&matrix, &input, &mut out_wrapper);
+        assert_eq!(
+            out_kernel, out_wrapper,
+            "wrapper must match kernel bit-exact"
+        );
+    }
+
+    #[test]
+    fn mxfp4_matvec_zero_input_returns_zero() {
+        let rows = 2;
+        let cols = 32;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x9);
+        let input = vec![0.0f32; cols];
+        let mut out = vec![f32::NAN; rows];
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(
+                v, 0.0,
+                "output[{i}] = {v} but zero input must give zero output"
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_matvec_unit_input_recovers_row_sum() {
+        // input = all ones → output[row] = sum of dequantized row values.
+        // Cross-check against the sum of the dequantized bytes.
+        let rows = 2;
+        let cols = 32;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x7);
+        let input = vec![1.0f32; cols];
+        let mut out = vec![0.0f32; rows];
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out);
+
+        // Independent oracle: dequantize each row and sum.
+        for row in 0..rows {
+            let mut row_f32 = vec![0.0f32; cols];
+            let row_bytes = (cols / QK_MXFP4) * 17;
+            dequantize_row_mxfp4(&data[row * row_bytes..(row + 1) * row_bytes], &mut row_f32);
+            let expected: f32 = row_f32.iter().sum();
+            assert!(
+                (out[row] - expected).abs() < 1e-4,
+                "row {row}: kernel {} vs oracle sum {}",
+                out[row],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_matvec_single_block_hand_computed() {
+        // Build one block of 32 elements: scale = 2.0 (E8M0 byte 128),
+        // all nibbles = 0x2 (E2M1 index → 1.0 per the OCP table),
+        // so every element dequantizes to 1.0 · 2.0 = 2.0.
+        // input = [1, 0, 0, ..., 0] → matvec output = 2.0.
+        let cols = QK_MXFP4;
+        // E2M1 index 0x2 corresponds to +1.0 per the OCP decode table.
+        assert_eq!(E2M1_DECODE_TABLE[0x2], 1.0);
+        let scale_byte = 128; // E8M0: exponent 128 - 127 = 1 → 2^1 = 2.0
+        assert!((decode_e8m0_scale(scale_byte) - 2.0).abs() < 1e-6);
+        let mut data = vec![0u8; 17];
+        data[0] = scale_byte;
+        // Nibble 0x2 in both halves → byte = 0x22.
+        for byte in &mut data[1..17] {
+            *byte = 0x22;
+        }
+        let mut input = vec![0.0f32; cols];
+        input[0] = 1.0;
+        let mut out = [0.0f32; 1];
+        mxfp4_matvec_fused_scalar(&input, &data, 1, cols, &mut out);
+        // input[0] · dq[0] = 1.0 · (1.0 · 2.0) = 2.0.
+        assert!((out[0] - 2.0).abs() < 1e-6, "expected 2.0, got {}", out[0]);
     }
 
     #[test]

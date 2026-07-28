@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.f.1 — MXFP4 fused scalar matvec kernel** (2026-07-28).
+  Lands the fused scalar matvec that was left as a `todo!()`
+  fail-fast in the 2026-07-24 MXFP4 skeleton, closing the CPU-side
+  Phase X.4.f milestone one step short of the SIMD variants
+  (X.4.f.2+). Changes:
+  - **`mxfp4_matvec_fused_scalar()`** (private) — iterates rows and
+    32-element blocks, dequantizes each block into a stack-resident
+    `[f32; QK_MXFP4]` buffer via `dequantize_mxfp4_block`, and
+    multiply-accumulates against the input in `f32` in the same
+    element order as the correctness-first fallback. Avoids the
+    per-matvec `Vec<f32>` scratch allocation.
+  - **`mxfp4_matvec()`** (public free function) — `todo!()`
+    replaced with a real implementation that iterates a
+    `MxfP4Matrix` and dispatches per-row to the fused kernel.
+  - **`quantized_matvec` routing** — `GgmlType::Mxfp4` now goes
+    to `mxfp4_matvec_fused_scalar` instead of the fallback; the
+    fallback becomes `#[cfg(test)]`-only, retained as the parity
+    reference.
+- **5 new MXFP4 unit tests** replacing the removed
+  `test_mxfp4_matvec_fail_fast` (`#[should_panic]`) since the free
+  function is no longer a fail-fast:
+  - `mxfp4_matvec_fused_scalar_matches_fallback` — random 4×128
+    matrix, bit-exact parity between fused and fallback.
+  - `mxfp4_matvec_free_fn_matches_kernel` — `MxfP4Matrix` wrapper
+    dispatches identically to the kernel.
+  - `mxfp4_matvec_zero_input_returns_zero` — zero input → zero
+    output, output pre-poisoned with NaN to catch write skips.
+  - `mxfp4_matvec_unit_input_recovers_row_sum` — input of all
+    ones, output equals row sum (independent oracle via
+    `dequantize_row_mxfp4`).
+  - `mxfp4_matvec_single_block_hand_computed` — 1 block × 1 row
+    with E8M0 scale = 2.0 and all nibbles = 0x2 (E2M1 → 1.0),
+    input = [1, 0, ..., 0] → output = 2.0.
+- **`docs/KIMI_K3_INTEGRATION.md` phase table** — X.4.f row split
+  into X.4.f.1 (完了) and X.4.f.2 (SIMD NEON / AVX2 / AVX-512
+  variants, deferred).
+
+### Deferred
+
+- Phase X.4.f.2 (SIMD variants): NEON kernel for aarch64
+  (Jetson / Mac M-series), AVX2 / AVX-512 for x86_64. Follows the
+  Q1_0 / Q2_0 pattern (see `neon_dot::q1_0_dot_row_pos_only` +
+  per-block sum precompute), validated against
+  `mxfp4_matvec_fused_scalar` for bit-exact parity.
+- Phase X.4.f.3 (PyTorch `microxcaling` oracle): blocked on
+  actual K3 GGUF availability (Phase X.4.b, community
+  conversion).
+
 - **Phase X.4.d — Block Attention Residuals runtime scheme**
   (2026-07-28). Ships the paper §2.2 Eq 8-10 runtime primitives as
   a standalone module ahead of the eventual
