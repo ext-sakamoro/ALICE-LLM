@@ -1757,6 +1757,63 @@ mod neon_dot {
 
         total
     }
+
+    /// NEON MXFP4 dot for one row (Phase X.4.f.2.a, 2026-07-28).
+    ///
+    /// Layout: 17 bytes per 32-element block (1 E8M0 shared scale +
+    /// 16 packed E2M1 nibbles). Per block:
+    ///
+    /// 1. Scalar dequantize into a stack-resident `[f32; 32]` buffer
+    ///    (E2M1 table lookup per nibble, then multiply by the E8M0
+    ///    scale). The table has non-integer entries (0.5, 1.5, 3.0,
+    ///    6.0) so a pure NEON table-lookup path is not straightforward;
+    ///    scalar dequant is fast because the table + block fit in L1.
+    /// 2. NEON matvec: 4-wide `vfmaq_f32` × 8 iterations = 32 elements
+    ///    per block, then `vaddvq_f32` for the horizontal reduce and
+    ///    accumulate into the row total.
+    ///
+    /// # Numerics
+    ///
+    /// The horizontal reduce order (`vaddvq_f32`) differs from the
+    /// scalar kernel's strictly ascending element order, so parity
+    /// with [`super::mxfp4_matvec_fused_scalar`] is tolerance-based
+    /// (not bit-exact). Empirically `< 1e-4` relative error on
+    /// random inputs.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `row_data.len() >= n_blocks * 17` and
+    /// `input.len() >= n_blocks * QK_MXFP4`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn mxfp4_dot_row(row_data: &[u8], input: &[f32]) -> f32 {
+        const BLOCK_BYTES: usize = 17;
+        let n_blocks = row_data.len() / BLOCK_BYTES;
+        let mut total = 0.0_f32;
+        for i in 0..n_blocks {
+            let block = &row_data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+            let scale = decode_e8m0_scale(block[0]);
+            // Scalar dequant into stack scratch (128 bytes = L1-resident).
+            let mut dq = [0.0_f32; QK_MXFP4];
+            for j in 0..16 {
+                let byte = block[1 + j];
+                dq[2 * j] = E2M1_DECODE_TABLE[usize::from(byte & 0x0F)] * scale;
+                dq[2 * j + 1] = E2M1_DECODE_TABLE[usize::from(byte >> 4)] * scale;
+            }
+            // NEON matvec: 8 × 4-wide FMA.
+            let block_input = &input[i * QK_MXFP4..(i + 1) * QK_MXFP4];
+            let mut acc: float32x4_t = vdupq_n_f32(0.0);
+            for k in 0..(QK_MXFP4 / 4) {
+                // SAFETY: dq and block_input are both 32-element buffers,
+                // k ranges 0..8 so k*4+4 <= 32; alignment is not required
+                // for vld1q_f32 on aarch64.
+                let dq_vec = vld1q_f32(dq.as_ptr().add(k * 4));
+                let in_vec = vld1q_f32(block_input.as_ptr().add(k * 4));
+                acc = vfmaq_f32(acc, dq_vec, in_vec);
+            }
+            total += vaddvq_f32(acc);
+        }
+        total
+    }
 }
 
 // ─── x86_64 AVX2 SIMD dot products (Issue #13) ──────────────────────────────
@@ -3926,7 +3983,7 @@ pub fn quantized_matvec(
         GgmlType::F32 => f32_matvec(input, data, rows, cols, output),
         GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
-        GgmlType::Mxfp4 => mxfp4_matvec_fused_scalar(input, data, rows, cols, output),
+        GgmlType::Mxfp4 => mxfp4_matvec_dispatched(input, data, rows, cols, output),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
     }
 }
@@ -4034,6 +4091,59 @@ fn mxfp4_matvec_fused_scalar(
         }
         output[row] = acc;
     }
+}
+
+/// Runtime-dispatched MXFP4 matvec (Phase X.4.f.2.a, 2026-07-28).
+///
+/// - **aarch64** (Jetson / Apple Silicon / any ARMv8-A): dispatches per
+///   row to [`neon_dot::mxfp4_dot_row`] which does scalar per-block
+///   dequant followed by NEON `vfmaq_f32` 4-wide FMA × 8 iterations.
+/// - **other archs**: falls through to [`mxfp4_matvec_fused_scalar`]
+///   (pure scalar, same result semantics).
+///
+/// The NEON path uses `vaddvq_f32` for horizontal reduction so it is
+/// **tolerance-parity** with the scalar kernel (~1e-4 relative), not
+/// bit-exact. See `mxfp4_matvec_neon_matches_scalar` in the tests.
+fn mxfp4_matvec_dispatched(
+    input: &[f32],
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    output: &mut [f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            cols.is_multiple_of(QK_MXFP4),
+            "cols {cols} must be a multiple of QK_MXFP4 = {QK_MXFP4}"
+        );
+        assert!(
+            input.len() >= cols,
+            "input length {} < cols {cols}",
+            input.len()
+        );
+        assert!(
+            output.len() >= rows,
+            "output length {} < rows {rows}",
+            output.len()
+        );
+        let blocks_per_row = cols / QK_MXFP4;
+        let row_bytes = blocks_per_row * 17;
+        assert!(
+            data.len() >= rows * row_bytes,
+            "data length {} < rows*row_bytes {}",
+            data.len(),
+            rows * row_bytes
+        );
+        for row in 0..rows {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            // SAFETY: NEON is baseline on every aarch64 target Rust
+            // supports; input length has been validated above.
+            output[row] = unsafe { neon_dot::mxfp4_dot_row(row_data, &input[..cols]) };
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    mxfp4_matvec_fused_scalar(input, data, rows, cols, output);
 }
 
 /// Matvec entry for PrismML `Q1_0` (Bonsai 27B binary g128).
@@ -6375,6 +6485,56 @@ mod tests {
                 out[row],
                 expected
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn mxfp4_matvec_neon_matches_scalar() {
+        // Phase X.4.f.2.a NEON parity test. NEON uses vaddvq_f32
+        // horizontal reduction which differs from the scalar kernel's
+        // strict ascending element order, so parity is tolerance-based
+        // (~1e-4 relative) rather than bit-exact.
+        let rows = 4;
+        let cols = 128;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x5);
+        let input: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.03).sin()).collect();
+
+        let mut out_scalar = vec![0.0_f32; rows];
+        mxfp4_matvec_fused_scalar(&input, &data, rows, cols, &mut out_scalar);
+
+        let mut out_neon = vec![0.0_f32; rows];
+        // Dispatched call routes to NEON on aarch64.
+        mxfp4_matvec_dispatched(&input, &data, rows, cols, &mut out_neon);
+
+        for row in 0..rows {
+            let s = out_scalar[row];
+            let n = out_neon[row];
+            let abs_err = (s - n).abs();
+            let rel_err = if s.abs() > 1e-6 {
+                abs_err / s.abs()
+            } else {
+                abs_err
+            };
+            assert!(
+                rel_err < 1e-4,
+                "row {row}: scalar {s}, neon {n}, rel_err {rel_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_matvec_dispatched_zero_input_returns_zero() {
+        // Cross-arch smoke test: dispatched entry should behave the
+        // same as the scalar kernel on zero input regardless of NEON.
+        let rows = 2;
+        let cols = 32;
+        let data = mxfp4_synthetic_tensor(rows, cols, 127, 0x9);
+        let input = vec![0.0_f32; cols];
+        let mut out = vec![f32::NAN; rows];
+        mxfp4_matvec_dispatched(&input, &data, rows, cols, &mut out);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, 0.0, "dispatched output[{i}] = {v} but expected 0.0");
         }
     }
 
