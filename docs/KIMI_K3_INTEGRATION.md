@@ -96,29 +96,213 @@ in [`KimiDeltaConfig`] fields with matching names and parseable via
 | Vision encoder | MoonViT-V2, 27 layers, hidden 1024, 12 heads, patch 14 ✅ | `vision_config.*` |
 | Tech report | `github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf` | — |
 
-## What we still DON'T know (paper-drop dependencies)
+## Confirmed via tech report (paper 実読 2026-07-28)
 
-- **Kimi Delta Attention gate formula** — `use_full_rank_gate=true` +
-  `gate_lower_bound=-5.0` are captured, but the exact functional form
-  (sigmoid? tanh? Gated DeltaNet variant?) needs the tech report to
-  confirm the CPU forward path.
-- **Attention Residuals (AttnRes) runtime scheme** — `attn_res_block_size=12`
-  is captured, but whether AttnRes is a per-block skip connection
-  (residual over 12-layer groups), a training-only technique, or a
-  new residual formulation entirely needs the tech report.
-- **GGUF metadata prefix** — guess `"kimi"` still stands until
-  mradermacher / bartowski publish a converted GGUF and llama.cpp
-  finalises `convert_hf_to_gguf.py` for `model_type = "kimi_k3"`.
-- **GGUF tensor naming** — guess `blk.N.attn_delta_*` /
-  `blk.N.attn_kimi_*` still stands, same blocker as above.
-- **Multimodal fusion path** — `mm_projector_type: "patchmergerv2"` and
-  `merge_type: "sd2_tpool"` are captured but the runtime fusion
-  contract (when is the vision encoder invoked, how are image tokens
-  spliced into the text stream) needs the tech report.
-- **1M context KV compression** — no YARN parameters in `config.json`;
-  the 6.3× decode speedup at 1M ctx likely comes from KDA's fixed-size
-  recurrent state (69 of 93 layers), but the exact windowing for the
-  24 MLA layers is not explicit.
+The Kimi K3 tech report (`github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf`,
+47 pages) resolves the remaining paper-drop dependencies. Sections
+2.1.1 (KDA), 2.1.2 (Gated MLA), 2.2 (AttnRes), 2.3 (Stable LatentMoE),
+4.1.4 (Deployment-Aware Post-Training), and 5.4 (Inference & Online
+Serving) were the load-bearing sections for the ALICE-LLM integration.
+
+### KDA gate function (§2.1.1, Eq 1-6)
+
+**Recurrence (Eq 1):**
+
+```text
+S_t = (I − β_t · k_t k_tᵀ) · Diag(α_t) · S_{t−1} + β_t · k_t v_tᵀ
+ō_t = Sᵀ_t · q_t                                        ∈ ℝ^{d_v}
+```
+
+- `S_t ∈ ℝ^{d_k × d_v}` fixed-size recurrent state per head
+  (K3: d_k = d_v = 128, so 64 KB / head; sequence-length invariant)
+- `α_t ∈ (0,1)^{d_k}` channel-wise retention (per Eq 5 below)
+- `β_t ∈ (0,1)` scalar delta-rule write strength
+
+**Per-head parameterization (Eq 2):**
+
+```text
+q_t, k_t = L2Norm(Swish(ShortConv(W_{q/k} x_t)))       ∈ ℝ^{d_k}
+v_t      = Swish(ShortConv(W_v x_t))                   ∈ ℝ^{d_v}
+β_t      = Sigmoid(W_β x_t)                            ∈ (0,1)
+z_t      = W_α^↑ W_α^↓ x_t + b_α                      ∈ ℝ^{d_k}   (low-rank pre-gate)
+```
+
+- ShortConv kernel size = 4 (config `short_conv_kernel_size`)
+- L2Norm on q, k (Kimi Linear inheritance)
+
+**Lower-bounded decay (Eq 5) — key departure from Kimi Linear:**
+
+```text
+g_t = g_min · Sigmoid(exp(A_h) · z_t)                  ∈ (g_min, 0)^{d_k}
+α_t = exp(g_t)                                         ∈ (e^{g_min}, 1)^{d_k}
+```
+
+- `A_h` learnable per-head log-scale (init 0)
+- `g_min = -5.0` fixed (config `gate_lower_bound`)
+- Cumulative log-decay over a 16-token tile ∈ (-80, 0) → fits BF16
+  dynamic range → both diagonal and off-diagonal tiles use dense
+  Tensor Core matmul (Kimi Linear's unbounded negative-Softplus
+  mapping required explicit position-pair computations on the
+  diagonal tile)
+
+**Full-rank output gate (Eq 6) — key departure from Kimi Linear:**
+
+```text
+y_t = W_o · [Sigmoid(W_g x_t) ⊙ RMSNorm(ō_t)]
+```
+
+- `W_g` is full-rank (Kimi Linear used low-rank)
+- Head-wise RMSNorm on recurrent output before gating
+
+Landed as `KimiDeltaState` + `kimi_delta_step` + `kimi_delta_read` +
+`kimi_delta_lower_bounded_decay` + `kimi_delta_output_gate` in
+`src/llama3.rs` at Phase X.4.c.1 (2026-07-28, commit 55df1c6), with
+14 unit tests covering the recurrence math on hand-computed inputs.
+
+### Gated MLA (§2.1.2, Eq 7)
+
+- DeepSeek V2 MLA base (low-rank latent `c_t = W_c x_t` compresses KV
+  cache)
+- **NoPE (No Positional Encoding) on all MLA layers** — no RoPE on
+  queries or keys. KDA layers provide the position-sensitive mixing,
+  MLA layers provide content-only global attention. Consequence: no
+  RoPE base retune / YARN needed at 1M context extension.
+- **Input-dependent full-rank output gate (Eq 7)**:
+
+  ```text
+  y_t = W_o · [Sigmoid(W_g x_t) ⊙ ō_t]
+  ```
+
+  Same gate pattern as KDA (Eq 6) but WITHOUT the inner RMSNorm on
+  `ō_t`. `kimi_delta_output_gate(rms_weight=None, ...)` covers this
+  Gated MLA variant.
+- Attention output kept in FP32 during training (corrects flash
+  attention's biased rounding error).
+
+### Block AttnRes (§2.2, Eq 8-10)
+
+Layers `L = 93` partitioned into `N ≈ 8` blocks of `S = L/N ≈ 12`
+layers each (`attn_res_block_size = 12`; the final block is a partial
+9-layer block, giving 9 total representations when counting the
+embedding layer as `b_0`).
+
+**Within-block reduction:**
+
+```text
+b_n^i = Σ_{j ∈ B_n, j ≤ i} f_j(h_j)                    (partial sum over first i layers of block n)
+b_0    = h_1                                            (token embedding always a source)
+```
+
+**Across-block attention:**
+
+```text
+V = { [b_0, b_1, ..., b_{n-1}]                        if i = 1 (first layer of block n)
+    { [b_0, b_1, ..., b_{n-1}, b_n^{i-1}]             if i ≥ 2 (subsequent layers)
+q_l = w_l ∈ ℝ^d                                        (learnable per-layer pseudo-query)
+k_i = v_i (same tensor for both roles)
+φ(q, k) = exp(qᵀ RMSNorm(k))                          (softmax kernel with RMSNorm on keys)
+α_{i→l} = φ(q_l, k_i) / Σ φ(q_l, k_j)
+h_l = Σ α_{i→l} · v_i
+```
+
+Memory / communication overhead: `O(Ld) → O(Nd)` (reduces by ~12× at
+K3 scale). RMSNorm on keys prevents large-magnitude layer outputs
+from dominating the attention weights.
+
+### Stable LatentMoE (§2.3, Eq 11)
+
+**Forward:**
+
+```text
+u = Σ_{i ∈ T_k(x)} p_i · E_i^routed(W^↓ x)             ∈ ℝ^ℓ          (routed in latent space)
+y = Σ_{j=1}^{N_s} E_j^shared(x) + W^↑ RMSNorm(u)       ∈ ℝ^d          (shared in full width)
+```
+
+- `d = 7168` hidden dim, `ℓ = 3584` latent dim (`routed_expert_hidden_size`)
+- `E_i^routed: ℝ^ℓ → ℝ^ℓ` per-expert FFN (`moe_intermediate_size = 3072`)
+- `E_j^shared: ℝ^d → ℝ^d` shared experts (`N_s = 2`)
+- **RMSNorm inserted between routed aggregation `u` and up-projection
+  `W^↑`** (K3-specific stabilization; DeepSeek MoE lacks this norm)
+
+### SiTU-GLU activation (§2.3.2, Eq 12)
+
+```text
+SiTU-GLU(x) = [β_1 tanh(W_g x / β_1) ⊙ Sigmoid(W_g x)] ⊙ [β_2 tanh(W_u x / β_2)]
+```
+
+- `β_1 = 4` (gate softcap), `β_2 = 25` (up softcap)
+- Bounded: `|f(x)| ≤ β_1 · β_2 = 100` — avoids activation outliers
+  that SwiGLU (unbounded) can produce, matters especially in MXFP8
+  activation-quantization scale.
+- Near-origin: `softcap(x, β) = β · tanh(x / β)` approximates the
+  Swish (SiLU) response of SwiGLU.
+
+### Quantile Balancing (§2.3.3, Eq 13-14)
+
+Auxiliary-loss-free routing (`topk_method = "noaux_tc"`, same family
+as DeepSeek V3). Per-expert bias `b_j` added to router scores for
+Top-k selection but omitted from `p_{i,j}` normalization. Bias update
+uses histogram estimation to scale to 896 experts × millions of
+margins per training batch.
+
+### Deployment-aware MXFP4 scope (§4.1.4)
+
+- **MoE expert weights**: MXFP4 (group 32, 4-bit, per-tensor + E8M0
+  scale)
+- **MoE activations**: MXFP8
+- **Non-expert modules**: BF16 / FP32 (attention projections, latent
+  MoE `W^↓`/`W^↑`, shared experts, MoE router, `lm_head`, vision
+  tower, MM projector — the config.json `quantization_config.ignore`
+  regex list captures the exclusion set)
+- QAT applied throughout post-training (SFT + RL + rollout), so
+  train/rollout/inference share the exact same quantization scheme
+  and there is no train-inference mismatch.
+
+### Pretrain-time MTP head (§4.1.4)
+
+- `num_nextn_predict_layers = 0` in `config.json` reflects the
+  **inference-time** config only.
+- Pretrain includes 1 MTP layer that mirrors a backbone block, later
+  fine-tuned into an EAGLE-3 style draft model (7-step unroll, LK
+  loss `L_LK = -log Σ min(p(x), q(x))`).
+- Not required for the initial ALICE-LLM Phase X.4.c CPU forward path
+  but relevant for a future X.4.k speculative-decode integration.
+
+### KDA-aware prefix cache (§5.4.1)
+
+- 6144-token physical block = 12 × 512-token hash blocks
+- KDA recurrent state is fixed size (128 × 128 f32 per head) but its
+  serial dependence forces checkpointing at coarse boundaries
+  (1024-6144 tokens per KDA layer)
+- MLA per-token entries + KDA per-block checkpoints packed into the
+  same unified paged pool. Same page byte size for both types, KDA
+  state stored contiguously per head so byte streams are
+  self-contained.
+- Prefix caching reusable at any 512-token boundary regardless of
+  request length / chunking / scheduling interleaving.
+
+Relevant to Phase X.4.h (1M context validation) and X.4.e (streaming
+pool + KV cache interaction).
+
+## What we still DON'T know (post-paper-read, 2026-07-28)
+
+The tech report resolves every load-bearing unknown for Phase X.4.c
+(CPU forward). Two smaller items remain, none blocking the CPU
+forward path itself:
+
+- **Multimodal fusion timing** — MoonViT-V2 encoder is described in
+  §2.4 (27-layer transformer, RMSNorm, no bias) and pixel-shuffle
+  down-sampling is captured, but the exact runtime insertion contract
+  for how image tokens are spliced into the text stream (before the
+  first backbone block? per-image position ID assignment? re-entry
+  during agent execution?) still needs the model card or an early
+  reference implementation. Not blocking Phase X.4.c/d/e (text-only
+  path). Scheduled at Phase X.4.i.
+- **GGUF metadata prefix + tensor naming** — depends entirely on
+  which prefix mradermacher / bartowski / llama.cpp settle on when
+  `convert_hf_to_gguf.py` lands for `model_type = "kimi_k3"`. Guess
+  `"kimi"` still stands. This is the sole external-dependency
+  blocker for Phase X.4.b.
 
 ## Existing ALICE-LLM code that can be reused (~80-95%)
 
