@@ -6149,6 +6149,125 @@ pub fn mxfp4_matvec(matrix: &MxfP4Matrix, input: &[f32], output: &mut [f32]) {
     }
 }
 
+// ─── MXFP4 GPU upload padding (Phase X.4.g.0) ───────────────────────────────
+//
+// GPU storage buffers require 4-byte (word) alignment per element. The
+// native MXFP4 block is 17 bytes = 1 E8M0 scale + 16 packed E2M1
+// nibbles, which is not word-aligned. Following the existing Q8_0 GPU
+// upload pattern (34 bytes → 36 bytes = 9 u32 words), the MXFP4
+// upload path pads each 17-byte block to 20 bytes = 5 u32 words:
+//
+//   word 0: [scale(u8, low 8 bits) | 0 (padding, high 24 bits)]
+//   words 1..5: 16 bytes of packed E2M1 (4 u32 = 16 bytes total)
+//
+// The WGSL shader (X.4.g.1, deferred) reads `word 0 & 0xFF` for the
+// scale byte, decodes via the E8M0 formula on-GPU, then unpacks each
+// E2M1 nibble via bit ops on words 1..5.
+
+/// Number of `u32` words per MXFP4 block after GPU upload padding.
+/// `5 words × 4 bytes = 20 bytes`, with `bytes 17..20` reserved as
+/// zero-fill padding to keep every following block word-aligned.
+pub const MXFP4_GPU_WORDS_PER_BLOCK: usize = 5;
+
+/// Byte size of one MXFP4 block after GPU upload padding
+/// (`MXFP4_GPU_WORDS_PER_BLOCK * 4 = 20`).
+pub const MXFP4_GPU_BYTES_PER_BLOCK: usize = MXFP4_GPU_WORDS_PER_BLOCK * 4;
+
+/// Pack a row of native MXFP4 blocks (17 bytes each) into the padded
+/// GPU upload layout (20 bytes each) required by the wgpu shader
+/// pipeline scheduled at Phase X.4.g.1.
+///
+/// # Layout
+///
+/// Per block, the padded output looks like:
+///
+/// ```text
+/// bytes  0.. 1  scale byte + 0-fill high byte  (packed as u32 low 8 bits)
+/// bytes  1.. 4  0-fill padding                 (rest of word 0)
+/// bytes  4..20  16 bytes of packed E2M1 nibbles
+/// ```
+///
+/// The shader reads `u32 word0 = data[block_offset + 0]` and extracts
+/// the scale byte via `word0 & 0xFFu`, then reads words 1..5 for the
+/// 32 packed E2M1 elements. Layout matches Q8_0's `9 u32 word` block
+/// (`f16 d + 32 int8 qs`), just with fewer words per block.
+///
+/// # Arguments
+///
+/// - `native_row`: MXFP4 row in native GGUF layout, `n_blocks × 17`
+///   bytes.
+///
+/// # Returns
+///
+/// Padded row: `n_blocks × 20` bytes, ready for direct GPU buffer
+/// upload as a `&[u8]` cast to `&[u32]` on the shader side.
+///
+/// # Panics
+///
+/// Panics if `native_row.len()` is not a multiple of 17.
+#[must_use]
+pub fn pack_mxfp4_for_gpu_upload(native_row: &[u8]) -> Vec<u8> {
+    assert!(
+        native_row.len().is_multiple_of(17),
+        "native MXFP4 row length {} is not a multiple of 17",
+        native_row.len()
+    );
+    let n_blocks = native_row.len() / 17;
+    let mut padded = vec![0u8; n_blocks * MXFP4_GPU_BYTES_PER_BLOCK];
+    for blk in 0..n_blocks {
+        let src = &native_row[blk * 17..blk * 17 + 17];
+        let dst_base = blk * MXFP4_GPU_BYTES_PER_BLOCK;
+        // Byte 0 of the padded block = the E8M0 scale (low byte of word 0).
+        padded[dst_base] = src[0];
+        // Bytes 1..4 stay 0 (word 0 high 24 bits).
+        // Bytes 4..20 = the 16 packed E2M1 bytes (words 1..5).
+        padded[dst_base + 4..dst_base + 20].copy_from_slice(&src[1..17]);
+    }
+    padded
+}
+
+/// Inverse of [`pack_mxfp4_for_gpu_upload`]: unpack a padded GPU
+/// upload byte buffer back into native 17-byte-per-block MXFP4
+/// layout.
+///
+/// Included for GPU → CPU byte-for-byte parity tests. Not on any
+/// production hot path.
+///
+/// # Panics
+///
+/// Panics if `padded_row.len()` is not a multiple of
+/// [`MXFP4_GPU_BYTES_PER_BLOCK`], or if any block's padding bytes
+/// (positions 1..4 of each 20-byte block) are non-zero (indicates
+/// a producer bug rather than valid MXFP4 data).
+#[must_use]
+pub fn unpack_mxfp4_from_gpu_upload(padded_row: &[u8]) -> Vec<u8> {
+    assert!(
+        padded_row.len().is_multiple_of(MXFP4_GPU_BYTES_PER_BLOCK),
+        "padded MXFP4 row length {} is not a multiple of {MXFP4_GPU_BYTES_PER_BLOCK}",
+        padded_row.len()
+    );
+    let n_blocks = padded_row.len() / MXFP4_GPU_BYTES_PER_BLOCK;
+    let mut native = vec![0u8; n_blocks * 17];
+    for blk in 0..n_blocks {
+        let src_base = blk * MXFP4_GPU_BYTES_PER_BLOCK;
+        // Assert padding invariant so a malformed buffer surfaces
+        // during the round-trip rather than silently deserializing.
+        for offset in 1..4 {
+            assert_eq!(
+                padded_row[src_base + offset],
+                0,
+                "block {blk} padding byte at offset {offset} must be 0, got {}",
+                padded_row[src_base + offset]
+            );
+        }
+        let dst_base = blk * 17;
+        native[dst_base] = padded_row[src_base];
+        native[dst_base + 1..dst_base + 17]
+            .copy_from_slice(&padded_row[src_base + 4..src_base + 20]);
+    }
+    native
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -6561,6 +6680,95 @@ mod tests {
         mxfp4_matvec_fused_scalar(&input, &data, 1, cols, &mut out);
         // input[0] · dq[0] = 1.0 · (1.0 · 2.0) = 2.0.
         assert!((out[0] - 2.0).abs() < 1e-6, "expected 2.0, got {}", out[0]);
+    }
+
+    // ─── Phase X.4.g.0: MXFP4 GPU upload padding helper tests ────────
+
+    #[test]
+    fn mxfp4_gpu_pad_constants_are_20_bytes_5_words() {
+        // Sanity: match the Q8_0 GPU pattern (9 u32 words per block).
+        // MXFP4 native = 17 bytes → padded = 20 bytes = 5 u32 words.
+        assert_eq!(MXFP4_GPU_WORDS_PER_BLOCK, 5);
+        assert_eq!(MXFP4_GPU_BYTES_PER_BLOCK, 20);
+    }
+
+    #[test]
+    fn pack_mxfp4_places_scale_in_word0_low_byte() {
+        // One block, scale byte = 42, all packed bytes = 0xAB.
+        let mut native = vec![0u8; 17];
+        native[0] = 42;
+        for byte in &mut native[1..17] {
+            *byte = 0xAB;
+        }
+        let padded = pack_mxfp4_for_gpu_upload(&native);
+        assert_eq!(padded.len(), 20);
+        // Byte 0 of padded = scale.
+        assert_eq!(padded[0], 42);
+        // Bytes 1..4 = zero-fill padding.
+        for offset in 1..4 {
+            assert_eq!(padded[offset], 0, "padding byte at {offset} must be 0");
+        }
+        // Bytes 4..20 = the 16 packed E2M1 bytes.
+        for offset in 4..20 {
+            assert_eq!(padded[offset], 0xAB, "packed byte at {offset} must be 0xAB");
+        }
+    }
+
+    #[test]
+    fn pack_mxfp4_roundtrip_preserves_native_layout() {
+        // Multi-block roundtrip: pack then unpack must recover the
+        // original native bytes exactly.
+        let n_blocks = 4;
+        let mut native = vec![0u8; n_blocks * 17];
+        for blk in 0..n_blocks {
+            let base = blk * 17;
+            native[base] = (blk as u8).wrapping_mul(37).wrapping_add(1);
+            for i in 1..17 {
+                native[base + i] = ((blk * 17 + i) & 0xFF) as u8;
+            }
+        }
+        let padded = pack_mxfp4_for_gpu_upload(&native);
+        assert_eq!(padded.len(), n_blocks * 20);
+        let recovered = unpack_mxfp4_from_gpu_upload(&padded);
+        assert_eq!(recovered, native, "roundtrip must preserve every byte");
+    }
+
+    #[test]
+    fn pack_mxfp4_matches_dequant_end_to_end() {
+        // Roundtrip preserves dequantized output as well: pack → unpack
+        // → dequant should give the same f32 values as the direct
+        // dequant of the original native row.
+        let native = mxfp4_synthetic_tensor(1, 32, 127, 0x5);
+        assert_eq!(native.len(), 17);
+        let padded = pack_mxfp4_for_gpu_upload(&native);
+        let recovered = unpack_mxfp4_from_gpu_upload(&padded);
+        let mut direct = vec![0.0f32; 32];
+        dequantize_row_mxfp4(&native, &mut direct);
+        let mut via_roundtrip = vec![0.0f32; 32];
+        dequantize_row_mxfp4(&recovered, &mut via_roundtrip);
+        assert_eq!(
+            direct, via_roundtrip,
+            "roundtrip must preserve dequant output"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of 17")]
+    fn pack_mxfp4_rejects_malformed_native_length() {
+        let native = vec![0u8; 16]; // 16 is not a multiple of 17
+        let _ = pack_mxfp4_for_gpu_upload(&native);
+    }
+
+    #[test]
+    #[should_panic(expected = "padding byte at offset 1")]
+    fn unpack_mxfp4_rejects_dirty_padding() {
+        // Producer-side bug simulation: padding bytes are non-zero,
+        // so unpacking must panic rather than silently produce
+        // garbage native bytes.
+        let mut padded = vec![0u8; 20];
+        padded[0] = 42; // scale
+        padded[1] = 0xFF; // dirty padding
+        let _ = unpack_mxfp4_from_gpu_upload(&padded);
     }
 
     #[test]
