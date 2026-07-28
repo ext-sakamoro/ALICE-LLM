@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 1 — `speculative_dspark::MarkovBigramBias`** (2026-07-29).
+  RadixArk/Kimi-K3-DSpark 吸収 3 要素 (DFlash 並列 draft + Markov logit-bias +
+  位置別 confidence head) の 1 要素目 Markov bigram bias を実装 各 prev
+  token に対して top-K next の観測頻度を eager truncate で保持し、apply 時に
+  `logits[next] += strength * ln_1p(count)` を加算する vanilla DSpark rank=256
+  設定に対応 API: `MarkovBigramBias::{new, from_sequence, observe,
+  observe_sequence, apply, vocab_size, rank, is_empty, observed_prev_count,
+  bucket_len}` + `DsparkError` (4 variant) 16 unit test 全 pass、clippy
+  pedantic+nursery 0 warn (`imprecise_flops` 修正で `ln_1p` 使用) Phase 2
+  (PositionConfidenceHead) / Phase 3 (DFlashParallelDraft + `generate_speculative_dual`
+  配線) は次 session 以降
+
 - **🎉 Real Kimi K3 (moonshotai/Kimi-K3 2.8T MoE) 1 token forward
   完走達成** (2026-07-28 22:47 JST). Full pipeline demonstrated on
   real GrEarl/Kimi-K3-GGUF-IQ1_S (566GB across 94 shards) via
