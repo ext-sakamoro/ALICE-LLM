@@ -6397,6 +6397,583 @@ fn load_kimi_k3_model_weights<'a>(
     })
 }
 
+// ── Kimi K3 Gated MLA layer forward (Phase X.4.c.3.2, 2026-07-28) ──
+//
+// Implements one MLA-layer forward for a single new token, mirroring
+// DeepSeek V2 MLA math with K3-specific tweaks:
+//
+// - **NoPE**: `mla_use_nope = true` in K3, so the `q_rope` and
+//   `k_rope` head-dim slices are NOT rotated — they are consumed as
+//   regular attention dimensions. KDA layers provide the position-
+//   sensitive mixing; MLA is content-only global attention.
+// - **Full-rank output gate**: `mla_use_output_gate = true` adds an
+//   input-dependent sigmoid gate on top of the attention output
+//   (Eq 7). The gate reuses the same `kimi_delta_output_gate` shape
+//   as KDA but with `rms_gamma = None` to skip the inner RMSNorm.
+// - **`kv_b` split**: K3 conversion splits `kv_b_proj` into
+//   `attn_k_b` (nope portion) + `attn_v_b` (v portion) up front, so
+//   the forward reconstructs full k/v from cached `c_k` via two
+//   independent matvecs.
+
+/// Per-layer MLA KV cache (Phase X.4.c.3.2).
+///
+/// Stores the latent `c_k` (`kv_lora_rank` per position) + `k_rope`
+/// (`qk_rope_head_dim` per position) — NOT the full reconstructed
+/// keys and values. Full k/v are reconstructed from `c_k` via
+/// `attn_k_b` / `attn_v_b` matvec on every attention step. This is
+/// the MLA compression trick: KV cache size grows linearly with
+/// `n_positions × (kv_lora_rank + qk_rope_head_dim) = n × (512 + 64)
+/// = n × 576 f32` for K3, versus `n × num_heads × (qk + v) = n × 96
+/// × 256 ≈ n × 24576` for a naive dense KV cache — a **42× compression**.
+#[allow(dead_code)]
+pub struct KimiK3MlaCache {
+    /// Row-major `[n_positions × kv_lora_rank]`.
+    c_k: Vec<f32>,
+    /// Row-major `[n_positions × qk_rope_head_dim]`.
+    k_rope: Vec<f32>,
+    n_positions: usize,
+    kv_lora_rank: usize,
+    qk_rope_head_dim: usize,
+}
+
+impl KimiK3MlaCache {
+    /// Allocate an empty cache with reserved capacity for
+    /// `capacity` positions to avoid mid-generation reallocation
+    /// on the hot path.
+    #[must_use]
+    pub fn new(kv_lora_rank: usize, qk_rope_head_dim: usize, capacity: usize) -> Self {
+        Self {
+            c_k: Vec::with_capacity(capacity * kv_lora_rank),
+            k_rope: Vec::with_capacity(capacity * qk_rope_head_dim),
+            n_positions: 0,
+            kv_lora_rank,
+            qk_rope_head_dim,
+        }
+    }
+
+    /// Discard every cached position — call at the start of a new
+    /// sequence.
+    pub fn reset(&mut self) {
+        self.c_k.clear();
+        self.k_rope.clear();
+        self.n_positions = 0;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn n_positions(&self) -> usize {
+        self.n_positions
+    }
+
+    fn append(&mut self, c_k: &[f32], k_rope: &[f32]) {
+        assert_eq!(c_k.len(), self.kv_lora_rank);
+        assert_eq!(k_rope.len(), self.qk_rope_head_dim);
+        self.c_k.extend_from_slice(c_k);
+        self.k_rope.extend_from_slice(k_rope);
+        self.n_positions += 1;
+    }
+
+    fn c_k_at(&self, pos: usize) -> &[f32] {
+        let base = pos * self.kv_lora_rank;
+        &self.c_k[base..base + self.kv_lora_rank]
+    }
+
+    fn k_rope_at(&self, pos: usize) -> &[f32] {
+        let base = pos * self.qk_rope_head_dim;
+        &self.k_rope[base..base + self.qk_rope_head_dim]
+    }
+}
+
+/// Dimension bundle for the Gated MLA forward (Phase X.4.c.3.2).
+///
+/// All fields mirror the sub-config populated by
+/// [`KimiDeltaConfig::from_gguf`] plus the shared MLA dims that live
+/// on the root [`Llama3Config`]. Pass one instance per model instead
+/// of re-deriving fields from the config inside every call.
+#[allow(dead_code)]
+pub struct KimiK3MlaConfig {
+    pub d: usize,
+    pub num_heads: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub q_lora_rank: usize,
+    pub kv_lora_rank: usize,
+    pub rms_eps: f32,
+}
+
+/// Multiply a WeightRef `[rows, cols]` by a `[cols]` vector, returning
+/// a fresh `[rows]` result. Thin allocating wrapper over
+/// `WeightRef::matvec` used by the K3 MLA forward for readability.
+#[inline]
+fn kimi_k3_matvec_ref(w: &WeightRef<'_>, x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0_f32; w.rows];
+    w.matvec(x, &mut out);
+    out
+}
+
+/// Apply RMSNorm with a per-channel `γ` scale in-place: mimics the
+/// module-private `rms_norm` helper but returns a fresh `Vec<f32>` so
+/// the MLA step can chain operations without threading scratch
+/// buffers. `x / sqrt(mean(x²) + eps) · γ`.
+fn kimi_k3_rms_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+    debug_assert_eq!(x.len(), gamma.len());
+    let mut out = vec![0.0_f32; x.len()];
+    rms_norm(x, gamma, eps, &mut out);
+    out
+}
+
+/// One-token Gated MLA layer forward (Phase X.4.c.3.2, K3 tech
+/// report §2.1.2 Eq 7).
+///
+/// Given the input hidden state `x ∈ ℝ^d`, the per-layer weight
+/// bundle from [`KimiK3LayerWeights`], and a mutable MLA KV cache,
+/// runs the full attention pipeline and returns the layer's output
+/// `y ∈ ℝ^d` (ready to be added back to the residual stream).
+///
+/// # Pipeline
+///
+/// 1. **Pre-attention RMSNorm** — `x_norm = RMSNorm(x, attn_norm)`.
+/// 2. **Q LoRA down + norm + up** — `q_latent = W_q_a x_norm`
+///    (`[q_lora_rank]`), `q_latent_norm = RMSNorm(q_latent,
+///    q_a_norm)`, `q_full = W_q_b q_latent_norm` (`[num_heads ×
+///    (qk_nope + qk_rope)]`).
+/// 3. **KV LoRA** — `kv_a_out = W_kv_a_mqa x_norm`
+///    (`[kv_lora_rank + qk_rope_head_dim]`), split into
+///    `c_k` (`[kv_lora_rank]`) and `k_rope` (`[qk_rope_head_dim]`);
+///    apply `RMSNorm(c_k, kv_a_norm)`.
+/// 4. **Cache append** — push `c_k_norm` + `k_rope` into
+///    [`KimiK3MlaCache`]. K3 caches only the compressed latent
+///    (~576 f32 per token) rather than the full reconstructed keys
+///    (~24576 f32) — the 42× MLA compression trick.
+/// 5. **Attention** — for every cached position `i`:
+///    - Reconstruct `k_i = W_k_b c_k_i_norm` (`[num_heads × qk_nope]`)
+///      + concat with `k_rope_i` per head → full `k_i` per head.
+///    - Reconstruct `v_i = W_v_b c_k_i_norm` (`[num_heads × v_head_dim]`).
+///    - Score `s_h[i] = q_full[h] · k_i[h] / sqrt(qk_nope + qk_rope)`.
+///    - Softmax over `i`, weighted sum with `v_i[h]`.
+///
+///    Result concatenated across heads: `[num_heads × v_head_dim]`.
+/// 6. **Output projection** — `attn_out = W_o concat`.
+/// 7. **Output gate (K3, Eq 7)** — `y = Sigmoid(W_g x_norm) ⊙
+///    attn_out`. `mla_use_nope = true` in K3 means the `qk_rope`
+///    slice is used as regular attention dimension without any
+///    rotation; the K3 MLA layers rely on the KDA layers to inject
+///    positional information into the residual stream.
+///
+/// # Panics
+///
+/// Panics on any weight-shape or config-dim mismatch via the
+/// underlying `WeightRef::matvec` / `rms_norm` asserts.
+#[allow(dead_code)]
+fn kimi_k3_gated_mla_step(
+    x: &[f32],
+    attn_norm: &[f32],
+    attn_gate: &WeightRef<'_>,
+    attn_output: &WeightRef<'_>,
+    mla: &KimiK3MlaAttn<'_>,
+    cache: &mut KimiK3MlaCache,
+    config: &KimiK3MlaConfig,
+) -> Vec<f32> {
+    let d = config.d;
+    let h = config.num_heads;
+    let qk_nope = config.qk_nope_head_dim;
+    let qk_rope = config.qk_rope_head_dim;
+    let qk_head = qk_nope + qk_rope;
+    let v_head = config.v_head_dim;
+    let kv_lr = config.kv_lora_rank;
+
+    assert_eq!(x.len(), d, "x length must equal hidden dim d");
+    assert_eq!(cache.kv_lora_rank, kv_lr, "cache.kv_lora_rank mismatch");
+    assert_eq!(
+        cache.qk_rope_head_dim, qk_rope,
+        "cache.qk_rope_head_dim mismatch"
+    );
+
+    // Step 1: pre-attention RMSNorm.
+    let x_norm = kimi_k3_rms_norm(x, attn_norm, config.rms_eps);
+
+    // Step 2: Q LoRA chain.
+    let q_latent = kimi_k3_matvec_ref(&mla.q_a, &x_norm);
+    let q_latent_norm = kimi_k3_rms_norm(&q_latent, &mla.q_a_norm, config.rms_eps);
+    let q_full = kimi_k3_matvec_ref(&mla.q_b, &q_latent_norm);
+    debug_assert_eq!(q_full.len(), h * qk_head, "q_full length");
+
+    // Step 3: KV LoRA down + split.
+    let kv_a_out = kimi_k3_matvec_ref(&mla.kv_a_mqa, &x_norm);
+    debug_assert_eq!(kv_a_out.len(), kv_lr + qk_rope);
+    let c_k_slice = &kv_a_out[..kv_lr];
+    let k_rope_slice = &kv_a_out[kv_lr..];
+    let c_k_norm = kimi_k3_rms_norm(c_k_slice, &mla.kv_a_norm, config.rms_eps);
+
+    // Step 4: cache append (K3 stores latent, not reconstructed k/v).
+    cache.append(&c_k_norm, k_rope_slice);
+    let n_pos = cache.n_positions;
+
+    // Step 5: attention. For each cached position i, reconstruct full
+    // k_i and v_i via the split k_b / v_b matvecs, then compute
+    // scaled dot-product attention against q_full per head.
+    let scale = (qk_head as f32).sqrt().recip();
+    let mut concat_out = vec![0.0_f32; h * v_head];
+
+    // Per-position reconstructed k / v, computed once per position
+    // then reused across heads to keep the inner loop tight.
+    let mut k_all = vec![0.0_f32; n_pos * h * qk_head];
+    let mut v_all = vec![0.0_f32; n_pos * h * v_head];
+    for pos in 0..n_pos {
+        let c_k_i = cache.c_k_at(pos);
+        let k_rope_i = cache.k_rope_at(pos);
+        let k_nope_reconstructed = kimi_k3_matvec_ref(&mla.k_b, c_k_i);
+        let v_reconstructed = kimi_k3_matvec_ref(&mla.v_b, c_k_i);
+        debug_assert_eq!(k_nope_reconstructed.len(), h * qk_nope);
+        debug_assert_eq!(v_reconstructed.len(), h * v_head);
+        // Layout k as [num_heads, qk_head] with nope first, rope last.
+        // Per-head slice: [h * qk_head + 0..qk_nope | qk_nope..qk_head].
+        for head in 0..h {
+            let k_dst_base = pos * h * qk_head + head * qk_head;
+            let k_nope_src = head * qk_nope;
+            k_all[k_dst_base..k_dst_base + qk_nope]
+                .copy_from_slice(&k_nope_reconstructed[k_nope_src..k_nope_src + qk_nope]);
+            // K3 NoPE: k_rope stored as-is, no rotation, shared
+            // across all heads (single-slot MQA style).
+            k_all[k_dst_base + qk_nope..k_dst_base + qk_head].copy_from_slice(k_rope_i);
+            let v_dst_base = pos * h * v_head + head * v_head;
+            let v_src = head * v_head;
+            v_all[v_dst_base..v_dst_base + v_head]
+                .copy_from_slice(&v_reconstructed[v_src..v_src + v_head]);
+        }
+    }
+
+    // Per-head attention.
+    let mut logits_buf = vec![0.0_f32; n_pos];
+    for head in 0..h {
+        // q for this head, layout [head * qk_head..(head+1) * qk_head].
+        let q_head_start = head * qk_head;
+        let q_head = &q_full[q_head_start..q_head_start + qk_head];
+
+        // Scores.
+        for pos in 0..n_pos {
+            let k_start = pos * h * qk_head + head * qk_head;
+            let k_head = &k_all[k_start..k_start + qk_head];
+            let mut dot = 0.0_f64;
+            for j in 0..qk_head {
+                dot += f64::from(q_head[j]) * f64::from(k_head[j]);
+            }
+            logits_buf[pos] = (dot as f32) * scale;
+        }
+
+        // Softmax (log-sum-exp stable).
+        let max_logit = logits_buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0_f64;
+        for l in &mut logits_buf {
+            *l = (*l - max_logit).exp();
+            sum_exp += f64::from(*l);
+        }
+        let inv_sum = (sum_exp as f32).recip();
+
+        // Weighted sum of v.
+        let out_start = head * v_head;
+        for j in 0..v_head {
+            concat_out[out_start + j] = 0.0;
+        }
+        for pos in 0..n_pos {
+            let alpha = logits_buf[pos] * inv_sum;
+            let v_start = pos * h * v_head + head * v_head;
+            for j in 0..v_head {
+                concat_out[out_start + j] += alpha * v_all[v_start + j];
+            }
+        }
+    }
+
+    // Step 6: output projection.
+    let attn_out = kimi_k3_matvec_ref(attn_output, &concat_out);
+    debug_assert_eq!(attn_out.len(), d);
+
+    // Step 7: output gate (Eq 7). `y = Sigmoid(W_g x_norm) ⊙ attn_out`.
+    let gate_pre = kimi_k3_matvec_ref(attn_gate, &x_norm);
+    debug_assert_eq!(gate_pre.len(), d);
+    let mut y = vec![0.0_f32; d];
+    for i in 0..d {
+        y[i] = sigmoid(gate_pre[i]) * attn_out[i];
+    }
+    y
+}
+
+#[cfg(test)]
+mod kimi_k3_gated_mla_tests {
+    use super::{
+        kimi_k3_gated_mla_step, GgmlType, KimiK3MlaAttn, KimiK3MlaCache, KimiK3MlaConfig, WeightRef,
+    };
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    fn tiny_config() -> KimiK3MlaConfig {
+        // d=4, num_heads=2, qk_nope=2, qk_rope=1, v_head=2,
+        // q_lora_rank=2, kv_lora_rank=2.
+        KimiK3MlaConfig {
+            d: 4,
+            num_heads: 2,
+            qk_nope_head_dim: 2,
+            qk_rope_head_dim: 1,
+            v_head_dim: 2,
+            q_lora_rank: 2,
+            kv_lora_rank: 2,
+            rms_eps: 1e-6,
+        }
+    }
+
+    /// Build a tiny MLA weight bundle keyed on the caller's byte
+    /// buffers. Shapes match `tiny_config()`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_tiny_mla_attn<'a>(
+        q_a: &'a [u8],
+        q_a_norm: Vec<f32>,
+        q_b: &'a [u8],
+        kv_a_mqa: &'a [u8],
+        kv_a_norm: Vec<f32>,
+        k_b: &'a [u8],
+        v_b: &'a [u8],
+    ) -> KimiK3MlaAttn<'a> {
+        KimiK3MlaAttn {
+            q_a: WeightRef {
+                data: q_a,
+                qtype: GgmlType::F32,
+                rows: 2,
+                cols: 4,
+            },
+            q_a_norm,
+            q_b: WeightRef {
+                data: q_b,
+                qtype: GgmlType::F32,
+                rows: 6,
+                cols: 2,
+            },
+            kv_a_mqa: WeightRef {
+                data: kv_a_mqa,
+                qtype: GgmlType::F32,
+                rows: 3,
+                cols: 4,
+            },
+            kv_a_norm,
+            k_b: WeightRef {
+                data: k_b,
+                qtype: GgmlType::F32,
+                rows: 4,
+                cols: 2,
+            },
+            v_b: WeightRef {
+                data: v_b,
+                qtype: GgmlType::F32,
+                rows: 4,
+                cols: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn mla_cache_new_starts_empty() {
+        let cache = KimiK3MlaCache::new(2, 1, 4);
+        assert_eq!(cache.n_positions(), 0);
+    }
+
+    #[test]
+    fn mla_cache_reset_clears_positions() {
+        let mut cache = KimiK3MlaCache::new(2, 1, 4);
+        cache.append(&[1.0, 2.0], &[3.0]);
+        cache.append(&[4.0, 5.0], &[6.0]);
+        assert_eq!(cache.n_positions(), 2);
+        cache.reset();
+        assert_eq!(cache.n_positions(), 0);
+    }
+
+    #[test]
+    fn gated_mla_step_zero_output_projection_gives_zero() {
+        // All-zero W_o → attn_out = 0 → y = 0 regardless of gate.
+        let q_a = f32_bytes(&[0.1_f32; 8]);
+        let q_b = f32_bytes(&[0.1_f32; 12]);
+        let kv_a_mqa = f32_bytes(&[0.1_f32; 12]);
+        let k_b = f32_bytes(&[0.1_f32; 8]);
+        let v_b = f32_bytes(&[0.1_f32; 8]);
+        let mla = build_tiny_mla_attn(
+            &q_a,
+            vec![1.0; 2],
+            &q_b,
+            &kv_a_mqa,
+            vec![1.0; 2],
+            &k_b,
+            &v_b,
+        );
+        let attn_norm = vec![1.0_f32; 4];
+        let attn_gate_bytes = f32_bytes(&[0.5_f32; 16]);
+        let attn_output_bytes = f32_bytes(&[0.0_f32; 16]);
+        let attn_gate = WeightRef {
+            data: &attn_gate_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+        let attn_output = WeightRef {
+            data: &attn_output_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+        let mut cache = KimiK3MlaCache::new(2, 1, 4);
+        let config = tiny_config();
+        let x = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let y = kimi_k3_gated_mla_step(
+            &x,
+            &attn_norm,
+            &attn_gate,
+            &attn_output,
+            &mla,
+            &mut cache,
+            &config,
+        );
+        for (i, &v) in y.iter().enumerate() {
+            assert_eq!(v, 0.0, "y[{i}] = {v} but zero W_o must give zero output");
+        }
+        assert_eq!(cache.n_positions(), 1, "cache appends one position");
+    }
+
+    #[test]
+    fn gated_mla_step_single_token_produces_finite_bounded_output() {
+        // Non-zero weights end-to-end; verify output is finite and
+        // stays within a reasonable envelope for the tiny scale.
+        let q_a = f32_bytes(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let q_b_vals: Vec<f32> = (0..12).map(|i| 0.05 + 0.01 * i as f32).collect();
+        let q_b = f32_bytes(&q_b_vals);
+        let kv_a_vals: Vec<f32> = (0..12).map(|i| -0.02 * i as f32).collect();
+        let kv_a_mqa = f32_bytes(&kv_a_vals);
+        let k_b = f32_bytes(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let v_b = f32_bytes(&[-0.1, 0.2, -0.3, 0.4, -0.5, 0.6, -0.7, 0.8]);
+        let mla = build_tiny_mla_attn(
+            &q_a,
+            vec![1.0; 2],
+            &q_b,
+            &kv_a_mqa,
+            vec![1.0; 2],
+            &k_b,
+            &v_b,
+        );
+
+        let attn_norm = vec![1.0_f32; 4];
+        // Identity output projection so the attention output is
+        // returned verbatim.
+        let mut ident = vec![0.0_f32; 16];
+        for i in 0..4 {
+            ident[i * 4 + i] = 1.0;
+        }
+        let ident_bytes = f32_bytes(&ident);
+        let attn_gate = WeightRef {
+            data: &ident_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+        let attn_output = WeightRef {
+            data: &ident_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+
+        let mut cache = KimiK3MlaCache::new(2, 1, 4);
+        let config = tiny_config();
+        let x = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let y = kimi_k3_gated_mla_step(
+            &x,
+            &attn_norm,
+            &attn_gate,
+            &attn_output,
+            &mla,
+            &mut cache,
+            &config,
+        );
+        assert_eq!(y.len(), 4);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "y[{i}] = {v} not finite");
+            assert!(v.abs() <= 4.0, "y[{i}] = {v} exceeds reasonable envelope");
+        }
+        assert_eq!(cache.n_positions(), 1);
+    }
+
+    #[test]
+    fn gated_mla_step_two_tokens_grow_cache() {
+        // Two consecutive steps must both succeed and grow the
+        // cache to 2 positions.
+        let q_a = f32_bytes(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let q_b_vals: Vec<f32> = (0..12).map(|i| 0.05 + 0.01 * i as f32).collect();
+        let q_b = f32_bytes(&q_b_vals);
+        let kv_a_vals: Vec<f32> = (0..12).map(|i| -0.02 * i as f32).collect();
+        let kv_a_mqa = f32_bytes(&kv_a_vals);
+        let k_b = f32_bytes(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let v_b = f32_bytes(&[-0.1, 0.2, -0.3, 0.4, -0.5, 0.6, -0.7, 0.8]);
+        let mla = build_tiny_mla_attn(
+            &q_a,
+            vec![1.0; 2],
+            &q_b,
+            &kv_a_mqa,
+            vec![1.0; 2],
+            &k_b,
+            &v_b,
+        );
+
+        let attn_norm = vec![1.0_f32; 4];
+        let mut ident = vec![0.0_f32; 16];
+        for i in 0..4 {
+            ident[i * 4 + i] = 1.0;
+        }
+        let ident_bytes = f32_bytes(&ident);
+        let attn_gate = WeightRef {
+            data: &ident_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+        let attn_output = WeightRef {
+            data: &ident_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 4,
+        };
+
+        let mut cache = KimiK3MlaCache::new(2, 1, 4);
+        let config = tiny_config();
+        let x1 = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let x2 = vec![-0.3_f32, 0.4, -0.1, 0.2];
+        let y1 = kimi_k3_gated_mla_step(
+            &x1,
+            &attn_norm,
+            &attn_gate,
+            &attn_output,
+            &mla,
+            &mut cache,
+            &config,
+        );
+        let y2 = kimi_k3_gated_mla_step(
+            &x2,
+            &attn_norm,
+            &attn_gate,
+            &attn_output,
+            &mla,
+            &mut cache,
+            &config,
+        );
+        for (i, (&a, &b)) in y1.iter().zip(y2.iter()).enumerate() {
+            assert!(a.is_finite(), "y1[{i}] = {a}");
+            assert!(b.is_finite(), "y2[{i}] = {b}");
+        }
+        assert_eq!(cache.n_positions(), 2);
+    }
+}
+
 /// DeepSeek-V3 Multi-Token Prediction (MTP) module weights (Phase 5a, Issue #35).
 ///
 /// # What MTP is
