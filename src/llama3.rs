@@ -1251,6 +1251,712 @@ mod kimi_delta_tests {
     }
 }
 
+// ── Kimi Delta Attention (KDA) per-head composite forward (Phase X.4.c.2) ──
+//
+// Wires the X.4.c.1 primitives (`KimiDeltaState`, `kimi_delta_step`,
+// `kimi_delta_read`, `kimi_delta_lower_bounded_decay`,
+// `kimi_delta_output_gate`) together with the existing generic
+// `causal_conv1d_step` (line ~3185, ShortConv shared with Qwen 3.5
+// DeltaNet) and `silu` (line ~3112) into a full per-token per-head
+// forward matching K3 tech report §2.1.1 Eq 1-6.
+//
+// Layer-level orchestration (Block AttnRes at §2.2 Eq 8-10, KV cache
+// interaction for the 24 Gated MLA layers, GGUF weight lookup) is
+// out of scope for X.4.c.2 and lives in `forward_kimi_k3` (still
+// `todo!()`) at Phase X.4.c.3+ — those are blocked on Phase X.4.b
+// (community `convert_hf_to_gguf.py`) and Phase X.4.d (AttnRes).
+
+/// Per-head runtime cache for one KDA layer.
+///
+/// Bundles the recurrent delta state ([`KimiDeltaState`]) and the
+/// three ShortConv history ring buffers (one each for Q, K, V) into
+/// a single struct so callers do not need to thread four separate
+/// mutable references through [`kimi_delta_forward_head`]. All
+/// buffers are heap-allocated so a full model's caches
+/// (`num_kda_layers × num_heads` instances) are trivially
+/// send-across-threads for prefill parallelism.
+///
+/// Layout (K3 defaults in parentheses):
+///
+/// - `state`: `[d_k × d_v]` (128 × 128 = 64 KB f32 per head)
+/// - `conv_state_q`: `[(kernel_size − 1) × d_k]` (3 × 128 = 1.5 KB)
+/// - `conv_state_k`: `[(kernel_size − 1) × d_k]` (1.5 KB)
+/// - `conv_state_v`: `[(kernel_size − 1) × d_v]` (1.5 KB)
+///
+/// Total per-head KDA cache ≈ 68.5 KB at K3 defaults; a full 96-head
+/// KDA layer ≈ 6.6 MB, and all 69 KDA layers ≈ 454 MB — invariant of
+/// sequence length (unlike an MLA KV cache that grows with tokens).
+#[derive(Debug, Clone)]
+pub struct KimiDeltaHeadCache {
+    /// Recurrent delta state `S ∈ ℝ^{d_k × d_v}` (Eq 1).
+    pub state: KimiDeltaState,
+    /// Q ShortConv history ring buffer (`(kernel_size − 1) × d_k`).
+    conv_state_q: Vec<f32>,
+    /// K ShortConv history ring buffer (`(kernel_size − 1) × d_k`).
+    conv_state_k: Vec<f32>,
+    /// V ShortConv history ring buffer (`(kernel_size − 1) × d_v`).
+    conv_state_v: Vec<f32>,
+    /// Write cursor for `conv_state_q`.
+    ring_pos_q: usize,
+    /// Write cursor for `conv_state_k`.
+    ring_pos_k: usize,
+    /// Write cursor for `conv_state_v`.
+    ring_pos_v: usize,
+    kernel_size: usize,
+    d_k: usize,
+    d_v: usize,
+}
+
+impl KimiDeltaHeadCache {
+    /// Allocate a zeroed per-head cache. `kernel_size` must be at
+    /// least 2 (matches the guard inside `causal_conv1d_step`);
+    /// K3 uses 4.
+    #[must_use]
+    pub fn new(d_k: usize, d_v: usize, kernel_size: usize) -> Self {
+        assert!(kernel_size >= 2, "kernel_size must be at least 2");
+        let hist = kernel_size - 1;
+        Self {
+            state: KimiDeltaState::new(d_k, d_v),
+            conv_state_q: vec![0.0; hist * d_k],
+            conv_state_k: vec![0.0; hist * d_k],
+            conv_state_v: vec![0.0; hist * d_v],
+            ring_pos_q: 0,
+            ring_pos_k: 0,
+            ring_pos_v: 0,
+            kernel_size,
+            d_k,
+            d_v,
+        }
+    }
+
+    /// Zero every buffer and reset all ring cursors (start of a new
+    /// sequence). Equivalent to `*self = Self::new(...)` but avoids
+    /// the reallocation.
+    pub fn reset(&mut self) {
+        self.state.reset();
+        self.conv_state_q.fill(0.0);
+        self.conv_state_k.fill(0.0);
+        self.conv_state_v.fill(0.0);
+        self.ring_pos_q = 0;
+        self.ring_pos_k = 0;
+        self.ring_pos_v = 0;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn d_k(&self) -> usize {
+        self.d_k
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn d_v(&self) -> usize {
+        self.d_v
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn kernel_size(&self) -> usize {
+        self.kernel_size
+    }
+}
+
+/// Borrowed per-head weight references for one KDA forward pass.
+///
+/// All slice fields are `&'a [f32]` so the struct is zero-copy over
+/// GGUF-backed tensor bytes in the production path and equally usable
+/// with owned `Vec<f32>` buffers in tests. Row-major convention
+/// throughout: `w[out × in]` means output rows are contiguous.
+///
+/// Field grouping (K3 tech report §2.1.1):
+///
+/// - **Q / K / V projections + ShortConv + biases**: Eq 2 first two lines.
+/// - **`w_beta`**: Eq 2 scalar β projection.
+/// - **`w_alpha_down` / `w_alpha_up` / `b_alpha` / `a_h`**: Eq 2 low-rank
+///   pre-gate + Eq 5 lower-bounded decay.
+/// - **`w_gate` / `w_out` / `rms_gamma`**: Eq 6 output gate.
+pub struct KimiDeltaHeadParams<'a> {
+    // ── Q / K / V linear projections + ShortConv (Eq 2) ─────────────
+    /// W_q: `[d_k × d]` row-major (Q linear projection).
+    pub w_q: &'a [f32],
+    /// W_k: `[d_k × d]` row-major.
+    pub w_k: &'a [f32],
+    /// W_v: `[d_v × d]` row-major.
+    pub w_v: &'a [f32],
+    /// ShortConv kernel for Q: `[d_k, kernel_size]` in the
+    /// dim-outer × kernel-inner layout matched by `causal_conv1d_step`
+    /// (`weight[c * kernel_size + k]` for channel `c`, timestep `k`).
+    pub conv_kernel_q: &'a [f32],
+    /// ShortConv kernel for K: `[d_k, kernel_size]`.
+    pub conv_kernel_k: &'a [f32],
+    /// ShortConv kernel for V: `[d_v, kernel_size]`.
+    pub conv_kernel_v: &'a [f32],
+    /// ShortConv bias for Q: `[d_k]`.
+    pub conv_bias_q: &'a [f32],
+    /// ShortConv bias for K: `[d_k]`.
+    pub conv_bias_k: &'a [f32],
+    /// ShortConv bias for V: `[d_v]`.
+    pub conv_bias_v: &'a [f32],
+
+    // ── β delta-rule write strength (Eq 2) ──────────────────────────
+    /// W_β: `[d]` (dot product with `x` yields the pre-sigmoid scalar).
+    pub w_beta: &'a [f32],
+
+    // ── α channel-wise decay (Eq 2 low-rank + Eq 5) ─────────────────
+    /// W_α_↓: `[r × d]` (low-rank down projection to intermediate `r`).
+    pub w_alpha_down: &'a [f32],
+    /// W_α_↑: `[d_k × r]` (up projection back to `d_k`).
+    pub w_alpha_up: &'a [f32],
+    /// b_α: `[d_k]` (bias applied after the up projection).
+    pub b_alpha: &'a [f32],
+    /// A_h: per-head learnable log-scale (initialized 0 in K3, Eq 5).
+    pub a_h: f32,
+    /// Low-rank intermediate dimension `r` for the α projection.
+    pub alpha_rank: usize,
+    /// `g_min` lower bound for the decay (K3 uses -5.0, from
+    /// [`KimiDeltaConfig::kda_gate_lower_bound`]).
+    pub g_min: f32,
+
+    // ── Output gate + projection (Eq 6) ─────────────────────────────
+    /// W_g: `[d_v × d]` (pre-sigmoid full-rank gate projection).
+    pub w_gate: &'a [f32],
+    /// W_o: `[d_out × d_v]` (output projection).
+    pub w_out: &'a [f32],
+    /// Output dimension `d_out` (typically the hidden dim `d` for
+    /// residual add into the backbone stream).
+    pub d_out: usize,
+    /// Optional inner RMSNorm scale γ: `[d_v]`. `None` skips the
+    /// normalize (Gated MLA Eq 7 variant); `Some` matches KDA Eq 6.
+    pub rms_gamma: Option<&'a [f32]>,
+    /// Inner RMSNorm epsilon (ignored when `rms_gamma = None`).
+    pub rms_eps: f32,
+}
+
+/// L2-normalize a slice in place: `x ← x / (||x||_2 + eps)`.
+///
+/// The `eps` term is added to the denominator (not to the squared
+/// sum inside the sqrt), which numerically matches the pattern used
+/// throughout llama.cpp / vLLM for L2-normalizing attention Q/K
+/// projections when the input can be exactly zero (matches KDA's Eq 2
+/// `L2Norm(Swish(ShortConv(W_{q/k} x)))` at the first token when the
+/// ShortConv ring buffer is zero and Swish(0) = 0).
+pub fn kimi_delta_l2_norm_in_place(x: &mut [f32], eps: f32) {
+    let sum_sq: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    let norm = sum_sq.sqrt() as f32 + eps;
+    let scale = norm.recip();
+    for v in x.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// Row-major dense f32 matrix-vector product.
+///
+/// `w` is `[out_dim, in_dim]` row-major (`w[i * in_dim + j]` is row
+/// `i`, column `j`). Uses `f64` accumulation for numerical stability
+/// on the large hidden-dim reductions typical of transformer
+/// projections (matches the convention in this module's private
+/// [`rms_norm`] helper).
+fn kimi_delta_matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    debug_assert_eq!(w.len(), out_dim * in_dim, "w shape mismatch");
+    debug_assert_eq!(x.len(), in_dim, "x length mismatch");
+    let mut y = vec![0.0_f32; out_dim];
+    for i in 0..out_dim {
+        let row_start = i * in_dim;
+        let mut acc = 0.0_f64;
+        for j in 0..in_dim {
+            acc += f64::from(w[row_start + j]) * f64::from(x[j]);
+        }
+        y[i] = acc as f32;
+    }
+    y
+}
+
+/// Scalar dot product with `f64` accumulation.
+fn kimi_delta_dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot length mismatch");
+    let mut acc = 0.0_f64;
+    for i in 0..a.len() {
+        acc += f64::from(a[i]) * f64::from(b[i]);
+    }
+    acc as f32
+}
+
+/// One-token per-head KDA forward pass (composes X.4.c.1 primitives
+/// with ShortConv + Swish + L2Norm into the full Eq 1-6 pipeline).
+///
+/// Pipeline (all steps per K3 tech report §2.1.1):
+///
+/// 1. **Projections (Eq 2)** — `q_pre = W_q x`, `k_pre = W_k x`,
+///    `v_pre = W_v x`.
+/// 2. **ShortConv (Eq 2)** — depthwise causal conv1d over each of q/k/v
+///    with the same kernel size (K3: 4), independent ring buffers per
+///    channel per component. Delegates to the shared
+///    `causal_conv1d_step` helper.
+/// 3. **Activation** — Swish (`silu`) applied element-wise to
+///    q_conv, k_conv, v_conv.
+/// 4. **L2Norm** — applied to q, k only (v is left un-normalized per
+///    Eq 2).
+/// 5. **β = Sigmoid(W_β · x)** — scalar delta-rule write strength.
+/// 6. **α (Eq 5)** — `z = W_α_↑ (W_α_↓ x) + b_α`, then
+///    `α = lower_bounded_decay(z, A_h, g_min)`.
+/// 7. **Recurrent step (Eq 1)** — `kimi_delta_step(state, k, v, α, β)`
+///    updates `state` in place.
+/// 8. **Read** — `ō = kimi_delta_read(state, q) ∈ ℝ^{d_v}`.
+/// 9. **Output gate (Eq 6)** —
+///    `y = W_o [Sigmoid(W_g x) ⊙ RMSNorm(ō)]`, returning `ℝ^{d_out}`.
+///
+/// # Arguments
+///
+/// - `x`: hidden state `∈ ℝ^d`.
+/// - `params`: per-head weight references (see [`KimiDeltaHeadParams`]).
+/// - `cache`: per-head mutable state (see [`KimiDeltaHeadCache`]).
+///   The recurrent state `state` and the three ShortConv ring buffers
+///   all advance by one token per call.
+/// - `l2_eps`: epsilon added to the L2Norm denominator on q, k.
+///
+/// # Panics
+///
+/// Panics via the debug asserts in the internal matvec helper and
+/// in the shared `causal_conv1d_step` / [`kimi_delta_step`] /
+/// [`kimi_delta_read`] / [`kimi_delta_output_gate`] primitives if
+/// any weight or cache shape is inconsistent with the head
+/// dimensions in `cache` or the hidden dimension implied by `x`.
+#[must_use]
+pub fn kimi_delta_forward_head(
+    x: &[f32],
+    params: &KimiDeltaHeadParams<'_>,
+    cache: &mut KimiDeltaHeadCache,
+    l2_eps: f32,
+) -> Vec<f32> {
+    let d = x.len();
+    let d_k = cache.d_k;
+    let d_v = cache.d_v;
+    let ks = cache.kernel_size;
+
+    // Step 1: linear projections.
+    let q_pre = kimi_delta_matvec(params.w_q, x, d_k, d);
+    let k_pre = kimi_delta_matvec(params.w_k, x, d_k, d);
+    let v_pre = kimi_delta_matvec(params.w_v, x, d_v, d);
+
+    // Step 2: ShortConv (kernel_size taps, depthwise per channel).
+    let mut q_conv = vec![0.0_f32; d_k];
+    let mut k_conv = vec![0.0_f32; d_k];
+    let mut v_conv = vec![0.0_f32; d_v];
+    causal_conv1d_step(
+        &q_pre,
+        &mut cache.conv_state_q,
+        &mut cache.ring_pos_q,
+        params.conv_kernel_q,
+        params.conv_bias_q,
+        &mut q_conv,
+        d_k,
+        ks,
+    );
+    causal_conv1d_step(
+        &k_pre,
+        &mut cache.conv_state_k,
+        &mut cache.ring_pos_k,
+        params.conv_kernel_k,
+        params.conv_bias_k,
+        &mut k_conv,
+        d_k,
+        ks,
+    );
+    causal_conv1d_step(
+        &v_pre,
+        &mut cache.conv_state_v,
+        &mut cache.ring_pos_v,
+        params.conv_kernel_v,
+        params.conv_bias_v,
+        &mut v_conv,
+        d_v,
+        ks,
+    );
+
+    // Step 3: Swish (silu) activation, element-wise.
+    for v in &mut q_conv {
+        *v = silu(*v);
+    }
+    for v in &mut k_conv {
+        *v = silu(*v);
+    }
+    for v in &mut v_conv {
+        *v = silu(*v);
+    }
+
+    // Step 4: L2Norm on q, k (v is left as-is per Eq 2).
+    kimi_delta_l2_norm_in_place(&mut q_conv, l2_eps);
+    kimi_delta_l2_norm_in_place(&mut k_conv, l2_eps);
+
+    // Step 5: β = Sigmoid(W_β · x).
+    debug_assert_eq!(
+        params.w_beta.len(),
+        d,
+        "w_beta length must equal hidden dim"
+    );
+    let beta = sigmoid(kimi_delta_dot(params.w_beta, x));
+
+    // Step 6: z = W_α_↑ (W_α_↓ x) + b_α, then α = lower_bounded_decay.
+    let z_mid = kimi_delta_matvec(params.w_alpha_down, x, params.alpha_rank, d);
+    let mut z = kimi_delta_matvec(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
+    debug_assert_eq!(params.b_alpha.len(), d_k, "b_alpha length must equal d_k");
+    for i in 0..d_k {
+        z[i] += params.b_alpha[i];
+    }
+    let alpha = kimi_delta_lower_bounded_decay(&z, params.a_h, params.g_min);
+
+    // Step 7: recurrent update (in-place on cache.state).
+    kimi_delta_step(&mut cache.state, &k_conv, &v_conv, &alpha, beta);
+
+    // Step 8: read.
+    let o_bar = kimi_delta_read(&cache.state, &q_conv);
+
+    // Step 9: output gate (Eq 6 / Eq 7 depending on rms_gamma).
+    let gate_pre = kimi_delta_matvec(params.w_gate, x, d_v, d);
+    kimi_delta_output_gate(
+        &o_bar,
+        &gate_pre,
+        params.rms_gamma,
+        params.rms_eps,
+        params.w_out,
+        params.d_out,
+    )
+}
+
+#[cfg(test)]
+mod kimi_delta_forward_tests {
+    use super::{
+        kimi_delta_forward_head, kimi_delta_l2_norm_in_place, KimiDeltaHeadCache,
+        KimiDeltaHeadParams,
+    };
+
+    /// Build a minimal [`KimiDeltaHeadParams`] with the caller's owned
+    /// buffers borrowed in. Convenience for the tests below that all
+    /// use small toy dimensions.
+    #[allow(clippy::too_many_arguments)]
+    fn params_from_bufs<'a>(
+        w_q: &'a [f32],
+        w_k: &'a [f32],
+        w_v: &'a [f32],
+        conv_kernel_q: &'a [f32],
+        conv_kernel_k: &'a [f32],
+        conv_kernel_v: &'a [f32],
+        conv_bias_q: &'a [f32],
+        conv_bias_k: &'a [f32],
+        conv_bias_v: &'a [f32],
+        w_beta: &'a [f32],
+        w_alpha_down: &'a [f32],
+        w_alpha_up: &'a [f32],
+        b_alpha: &'a [f32],
+        a_h: f32,
+        alpha_rank: usize,
+        g_min: f32,
+        w_gate: &'a [f32],
+        w_out: &'a [f32],
+        d_out: usize,
+        rms_gamma: Option<&'a [f32]>,
+        rms_eps: f32,
+    ) -> KimiDeltaHeadParams<'a> {
+        KimiDeltaHeadParams {
+            w_q,
+            w_k,
+            w_v,
+            conv_kernel_q,
+            conv_kernel_k,
+            conv_kernel_v,
+            conv_bias_q,
+            conv_bias_k,
+            conv_bias_v,
+            w_beta,
+            w_alpha_down,
+            w_alpha_up,
+            b_alpha,
+            a_h,
+            alpha_rank,
+            g_min,
+            w_gate,
+            w_out,
+            d_out,
+            rms_gamma,
+            rms_eps,
+        }
+    }
+
+    #[test]
+    fn cache_new_is_zeroed() {
+        let c = KimiDeltaHeadCache::new(4, 4, 4);
+        assert_eq!(c.d_k(), 4);
+        assert_eq!(c.d_v(), 4);
+        assert_eq!(c.kernel_size(), 4);
+        assert!(c.state.as_slice().iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_q.iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_k.iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_v.iter().all(|&x| x == 0.0));
+        assert_eq!(c.ring_pos_q, 0);
+        assert_eq!(c.ring_pos_k, 0);
+        assert_eq!(c.ring_pos_v, 0);
+    }
+
+    #[test]
+    fn cache_reset_zeroes_all_buffers() {
+        let mut c = KimiDeltaHeadCache::new(2, 2, 3);
+        // Muck with every buffer, then reset.
+        c.state.as_mut_slice().fill(9.0);
+        c.conv_state_q.fill(1.0);
+        c.conv_state_k.fill(2.0);
+        c.conv_state_v.fill(3.0);
+        c.ring_pos_q = 1;
+        c.ring_pos_k = 1;
+        c.ring_pos_v = 1;
+        c.reset();
+        assert!(c.state.as_slice().iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_q.iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_k.iter().all(|&x| x == 0.0));
+        assert!(c.conv_state_v.iter().all(|&x| x == 0.0));
+        assert_eq!(c.ring_pos_q, 0);
+        assert_eq!(c.ring_pos_k, 0);
+        assert_eq!(c.ring_pos_v, 0);
+    }
+
+    #[test]
+    fn l2_norm_in_place_gives_unit_length() {
+        let mut x = [3.0_f32, 4.0];
+        kimi_delta_l2_norm_in_place(&mut x, 0.0);
+        // ||[3, 4]|| = 5 → normalized = [0.6, 0.8].
+        assert!((x[0] - 0.6).abs() < 1e-6);
+        assert!((x[1] - 0.8).abs() < 1e-6);
+        // Verify unit length.
+        let magsq: f32 = x.iter().map(|&v| v * v).sum();
+        assert!((magsq - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_norm_in_place_handles_zero_input_with_eps() {
+        let mut x = [0.0_f32, 0.0, 0.0];
+        // Non-zero eps prevents NaN; the numerator is 0 anyway so
+        // the output stays 0.
+        kimi_delta_l2_norm_in_place(&mut x, 1e-6);
+        for &v in &x {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// Build a "pass-through" 2-dim × 2-dim head where every weight is
+    /// a small explicit value: identity Q/K/V projections, identity
+    /// ShortConv (kernel row = [0, 0, 1] so only the current input
+    /// survives), zero biases, zero W_β (β = 0.5), zero W_α (α → e^{-2.5}
+    /// under g_min = -5), identity W_g / W_o, no RMSNorm. Used by the
+    /// smoke tests below.
+    #[allow(clippy::too_many_arguments)]
+    struct PassThroughHead {
+        d: usize,
+        w_q: Vec<f32>,
+        w_k: Vec<f32>,
+        w_v: Vec<f32>,
+        conv_kernel: Vec<f32>, // shared across q/k/v (each channel: [0, 0, 1])
+        conv_bias: Vec<f32>,   // shared across q/k/v
+        w_beta: Vec<f32>,
+        w_alpha_down: Vec<f32>,
+        w_alpha_up: Vec<f32>,
+        b_alpha: Vec<f32>,
+        w_gate: Vec<f32>,
+        w_out: Vec<f32>,
+    }
+
+    impl PassThroughHead {
+        fn new(d: usize) -> Self {
+            let mut identity = vec![0.0_f32; d * d];
+            for i in 0..d {
+                identity[i * d + i] = 1.0;
+            }
+            let kernel_size = 3;
+            // Per-channel kernel = [0, 0, 1] (only "current" tap survives).
+            let mut conv_kernel = vec![0.0_f32; d * kernel_size];
+            for c in 0..d {
+                conv_kernel[c * kernel_size + (kernel_size - 1)] = 1.0;
+            }
+            Self {
+                d,
+                w_q: identity.clone(),
+                w_k: identity.clone(),
+                w_v: identity.clone(),
+                conv_kernel,
+                conv_bias: vec![0.0; d],
+                w_beta: vec![0.0; d],
+                // Low-rank α with rank 1 that always produces z = 0
+                // regardless of x → g = -5·sigmoid(0) = -2.5 → α = e^{-2.5}.
+                // rank = 1, so both projection buffers have length `d`.
+                w_alpha_down: vec![0.0; d],
+                w_alpha_up: vec![0.0; d],
+                b_alpha: vec![0.0; d],
+                w_gate: identity.clone(),
+                w_out: identity,
+            }
+        }
+
+        fn params(&self) -> KimiDeltaHeadParams<'_> {
+            params_from_bufs(
+                &self.w_q,
+                &self.w_k,
+                &self.w_v,
+                &self.conv_kernel,
+                &self.conv_kernel,
+                &self.conv_kernel,
+                &self.conv_bias,
+                &self.conv_bias,
+                &self.conv_bias,
+                &self.w_beta,
+                &self.w_alpha_down,
+                &self.w_alpha_up,
+                &self.b_alpha,
+                0.0,  // A_h
+                1,    // alpha_rank
+                -5.0, // g_min
+                &self.w_gate,
+                &self.w_out,
+                self.d,
+                None, // no inner RMSNorm — tests focus on math, not norm scale
+                1e-6,
+            )
+        }
+    }
+
+    #[test]
+    fn forward_head_zero_input_gives_zero_output() {
+        // x = 0 → all projections are 0 → q, k, v = 0 → recurrent
+        // state stays at 0 (β k v^T = 0), ō = 0 → y = 0 for any gate.
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(2, 2, 3);
+        let y = kimi_delta_forward_head(&[0.0, 0.0], &params, &mut cache, 1e-6);
+        assert_eq!(y, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn forward_head_advances_all_ring_positions_per_call() {
+        // Every call to `causal_conv1d_step` bumps its own ring cursor
+        // by exactly one, so after a single forward pass every buffer
+        // must be at position `(0 + 1) % (kernel_size - 1)`.
+        let head = PassThroughHead::new(3);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(3, 3, 3);
+        let _ = kimi_delta_forward_head(&[1.0, 2.0, -1.0], &params, &mut cache, 1e-6);
+        // kernel_size = 3 → ring size = 2 → after one step, pos = 1.
+        assert_eq!(cache.ring_pos_q, 1);
+        assert_eq!(cache.ring_pos_k, 1);
+        assert_eq!(cache.ring_pos_v, 1);
+    }
+
+    #[test]
+    fn forward_head_two_tokens_progresses_state_and_conv_rings() {
+        // After two consecutive calls the recurrent state must be
+        // non-zero (some delta write happened) and the conv history
+        // buffers must have been touched (ring wraps back to 0 for
+        // kernel_size = 3, ring size = 2).
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(2, 2, 3);
+        let _ = kimi_delta_forward_head(&[0.5, -0.25], &params, &mut cache, 1e-6);
+        let _ = kimi_delta_forward_head(&[1.0, 0.5], &params, &mut cache, 1e-6);
+        // Ring size = 2 → after 2 calls, pos = 0 (wrapped).
+        assert_eq!(cache.ring_pos_q, 0);
+        assert_eq!(cache.ring_pos_k, 0);
+        assert_eq!(cache.ring_pos_v, 0);
+        // State must have picked up some non-zero mass from the two
+        // delta writes (β k v^T for each token).
+        let state_sum: f32 = cache.state.as_slice().iter().map(|&v| v.abs()).sum();
+        assert!(state_sum > 0.0, "state should be non-zero after 2 writes");
+    }
+
+    #[test]
+    fn forward_head_reset_returns_to_fresh_start() {
+        // After running a token then resetting, the next forward must
+        // produce the same output as if it were the very first token.
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache_a = KimiDeltaHeadCache::new(2, 2, 3);
+        let mut cache_b = KimiDeltaHeadCache::new(2, 2, 3);
+
+        let x = [0.7_f32, -0.3];
+        // Drive cache_a with a noise token, reset, then re-forward on x.
+        let _ = kimi_delta_forward_head(&[3.0, -2.5], &params, &mut cache_a, 1e-6);
+        cache_a.reset();
+        let y_a = kimi_delta_forward_head(&x, &params, &mut cache_a, 1e-6);
+
+        // Fresh cache_b, forward on x directly.
+        let y_b = kimi_delta_forward_head(&x, &params, &mut cache_b, 1e-6);
+
+        for i in 0..2 {
+            assert!(
+                (y_a[i] - y_b[i]).abs() < 1e-6,
+                "reset should give parity with fresh cache: y_a[{i}] = {}, y_b[{i}] = {}",
+                y_a[i],
+                y_b[i],
+            );
+        }
+    }
+
+    #[test]
+    fn forward_head_first_token_output_bounded_by_gate_and_alpha() {
+        // Sanity: on the very first token the state was zero, so after
+        // one step S = β k v^T (α scaled term is zero). The output ō =
+        // S^T q = β · (k^T q) · v. Then W_g = I → sigmoid(x) per
+        // channel; RMSNorm skipped (rms_gamma = None); W_o = I. So
+        // each output channel j is:
+        //     y[j] = sigmoid(x[j]) · β · (k^T q) · v[j]
+        // with |sigmoid(x[j])| ≤ 1 and β = sigmoid(0) = 0.5.
+        //
+        // Assert |y| ≤ some finite bound rather than an exact value —
+        // this catches "output blew up to NaN / inf" regressions
+        // without over-specifying the intermediate math.
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(2, 2, 3);
+        let x = [1.0_f32, -1.0];
+        let y = kimi_delta_forward_head(&x, &params, &mut cache, 1e-6);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "y[{i}] = {v} must be finite");
+            assert!(v.abs() <= 2.0, "y[{i}] = {v} exceeded reasonable bound");
+        }
+    }
+
+    #[test]
+    fn forward_head_with_zero_gate_projection_halves_output_magnitude() {
+        // Same PassThroughHead but override w_gate to zeros → gate_pre
+        // = 0 → sigmoid(0) = 0.5 for every channel. Compared to the
+        // baseline PassThrough (identity w_gate), each output channel
+        // must be exactly `0.5 / sigmoid(x[j])` × baseline (per-channel).
+        // For x = 0, both should trivially be 0; use a non-trivial x
+        // and only assert the sign / boundedness stays consistent.
+        let mut head = PassThroughHead::new(2);
+        // Baseline forward.
+        let params_baseline = head.params();
+        let mut cache_a = KimiDeltaHeadCache::new(2, 2, 3);
+        let x = [0.5_f32, -0.5];
+        let y_baseline = kimi_delta_forward_head(&x, &params_baseline, &mut cache_a, 1e-6);
+
+        // Zero the gate.
+        head.w_gate.iter_mut().for_each(|v| *v = 0.0);
+        let params_zero_gate = head.params();
+        let mut cache_b = KimiDeltaHeadCache::new(2, 2, 3);
+        let y_zero_gate = kimi_delta_forward_head(&x, &params_zero_gate, &mut cache_b, 1e-6);
+
+        // Baseline gate: sigmoid(x[0]) = sigmoid(0.5) ≈ 0.622.
+        // Zero gate:     sigmoid(0)   = 0.5.
+        // Ratio (zero / baseline) = 0.5 / sigmoid(x[j]) per channel.
+        for j in 0..2 {
+            let s_x_j = 1.0 / (1.0 + (-x[j]).exp());
+            let expected_ratio = 0.5 / s_x_j;
+            let actual_ratio = y_zero_gate[j] / y_baseline[j];
+            assert!(
+                (actual_ratio - expected_ratio).abs() < 1e-3,
+                "channel {j} ratio {actual_ratio}, expected {expected_ratio} \
+                 (baseline sigmoid {s_x_j})",
+            );
+        }
+    }
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
