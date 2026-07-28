@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.d — Block Attention Residuals runtime scheme**
+  (2026-07-28). Ships the paper §2.2 Eq 8-10 runtime primitives as
+  a standalone module ahead of the eventual
+  `forward_kimi_k3`-level integration. Block AttnRes reduces the
+  `O(Ld)` memory/communication cost of Full AttnRes to `O(Nd)` by
+  summing layer outputs within `N` block groups; K3 partitions its
+  93 layers into 8 blocks of 12 layers each (with the last block a
+  partial 9-layer block). New API:
+  - **`BlockAttnResState`** — carries finalized `block_reps`
+    (starting with `b_0 = h_1` = token embedding), the running
+    `current_partial` for the in-progress block, and the current
+    block index + within-block position. Sized in the K3 default
+    at ~28 KB per finalized rep (`d = 7168 · f32`), so all 9
+    reps + 1 partial ≈ 280 KB per sequence — negligible relative
+    to the ~450 MB KDA head caches.
+  - **`block_attnres_softmax_attention`** — the K3
+    "RMSNorm-on-keys" softmax kernel from Eq 9
+    (`φ(q, k) = exp(qᵀ · RMSNorm(k))`), with the standard
+    subtract-max-logit trick for numerical stability, optional
+    `γ` scale on the normalized keys, and `k_i = v_i` (same
+    tensor for both roles, as K3 specifies).
+  - **`block_attnres_layer_step`** — one-per-layer step function
+    matching Eq 10. Reads the pre-update partial as the last
+    entry in `V` (skipped on the first layer of a block since
+    the partial would be zeros), computes the residual stream
+    `h_l = softmax(Wₗᵀ · RMSNorm(v)) · v`, then adds
+    `layer_output` into `current_partial` so the next step sees
+    `b_n^i` as its `b_n^{(i+1)-1}`. Finalizes the block
+    (pushes `current_partial` into `block_reps`, resets the
+    partial to zeros, wraps `pos_in_block` back to 0) every
+    `block_size` calls.
+- **10 unit tests** covering (a) state init with embedding as
+  `b_0`, (b) softmax with 1 key returning that key, (c)
+  zero-query averaging keys uniformly, (d) dominant-key mass
+  concentration, (e) γ-scaled keys giving the same 1-key
+  answer (softmax normalization washes out uniform scale), (f)
+  first-layer-in-block omitting the partial from V, (g)
+  second-layer-in-block using the pre-update partial snapshot
+  as the last V entry, (h) partial sum equalling the sum of
+  layer outputs within a block, (i) block finalization at
+  `block_size`, and (j) a full 2-block × 2-layer end-to-end
+  walk with hand-computed finalized `block_reps`.
+- **`docs/KIMI_K3_INTEGRATION.md`** phase table now has an
+  X.4.d row (完了 2026-07-28) with a note that final N-block
+  aggregation into logits is deferred to the integration phase
+  since the paper leaves that kernel's parameterization
+  underspecified.
+
+### Deferred
+
+- Final N-block aggregation layer (paper §2.2 "the final output
+  layer aggregates all N block representations"): the exact
+  aggregation formula is not spelled out in the tech report at
+  the level of detail needed for a standalone unit test. Will
+  land alongside `forward_kimi_k3` integration in a follow-up
+  X.4.d.2 once we see the reference implementation.
+- Block AttnRes integration into `forward_kimi_k3` (still
+  `todo!()`): blocked on Phase X.4.b (community GGUF weight
+  loader for the per-layer pseudo-queries `w_l` and the optional
+  key-side RMSNorm `γ`).
+
 - **Phase X.4.c.2 — KDA per-head composite forward** (2026-07-28).
   Wires the Phase X.4.c.1 primitives together with the existing
   shared `causal_conv1d_step` (Qwen 3.5 DeltaNet's ShortConv,
