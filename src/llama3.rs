@@ -9246,16 +9246,31 @@ impl<'a> KimiK3Model<'a> {
             (token_id as usize) < vocab_size,
             "token_id {token_id} out of vocab range 0..{vocab_size}"
         );
-        let embed_row_bytes =
-            self.weights.token_embd.cols * bytes_per_element(self.weights.token_embd.qtype);
-        let row_start = (token_id as usize) * embed_row_bytes;
-        let row_bytes = &self.weights.token_embd.data[row_start..row_start + embed_row_bytes];
+        // Phase X.4.b.6 continued (2026-07-28): block-aware embed lookup
+        // via `kimi_k3_slice_weight_ref_rows` (which handles all K3 quant
+        // types when `cols % elements_per_block == 0` — K3 hidden = 7168
+        // = 28 × 256 = 224 × 32, block-aligned for all K3 quant types).
+        // The sliced 1-row `WeightRef` is then dequantized to a `Vec<f32>`
+        // via `weight_ref_row_dequant` (routes through the same
+        // per-qtype dequantizers as `GgufFile::tensor_to_f32`).
+        let row_start = token_id as usize;
+        let embed_row =
+            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
+                 (qtype {:?}, cols {}, rows {}). Ensure `cols % elements_per_block == 0` \
+                 (K3 hidden = 7168 = 28 × 256 = 224 × 32, block-aligned for all K3 quant \
+                 types). Phase X.4.c.3.3.b.2 upgrade.",
+                        self.weights.token_embd.qtype,
+                        self.weights.token_embd.cols,
+                        self.weights.token_embd.rows,
+                    )
+                });
+        let x_full = weight_ref_row_dequant(&embed_row);
         let mut x = vec![0.0_f32; hidden_dim];
-        dequantize_row_to_f32(
-            row_bytes,
-            self.weights.token_embd.qtype,
-            &mut x[..hidden_dim.min(self.weights.token_embd.cols)],
-        );
+        let take = hidden_dim.min(x_full.len());
+        x[..take].copy_from_slice(&x_full[..take]);
 
         // ── Step 2-3: per-layer dispatch + residual add ──
         //
@@ -9454,6 +9469,17 @@ fn bytes_per_element(qtype: GgmlType) -> usize {
              in KimiK3Model skeleton — Phase X.4.c.3.3 will add block-aware embed lookup"
         ),
     }
+}
+
+/// Dequantize an entire `WeightRef` to a fresh `Vec<f32>` of length
+/// `rows * cols`. Thin wrapper over `WeightRef::dequantize_all` which
+/// already supports the full K3 quant zoo via
+/// `crate::gguf::dequantize_weight_row`. Used by the K3 embedding
+/// lookup path (Phase X.4.b.6) where per-row slicing hands us a
+/// 1-row `WeightRef` that we then materialize to f32.
+#[allow(dead_code)]
+fn weight_ref_row_dequant(w: &WeightRef<'_>) -> Vec<f32> {
+    w.dequantize_all(w.rows, w.cols)
 }
 
 /// Dequantize a raw byte row to f32. Delegates to the existing
