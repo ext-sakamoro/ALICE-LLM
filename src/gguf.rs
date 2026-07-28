@@ -595,6 +595,176 @@ impl<'a> GgufFile<'a> {
     }
 }
 
+// ─── GGUF split multi-file support (Phase X.4.b.6) ─────────────────────────
+//
+// Real K3 GGUF is distributed as 94 shards (`Kimi-K3-IQ1_S-00001-of-00094.gguf`
+// through `...-00094-of-00094.gguf`). Each shard is a self-contained mini
+// GGUF: shard 0 has full model-level metadata + a subset of tensor infos,
+// shards 1..N have minimal metadata (`split.count`, `split.no`,
+// `split.tensors.count`) + their own subset of tensor infos + tensor data.
+// The union of all shards' tensors = the full model.
+//
+// This wrapper virtualises across N `GgufFile`s so downstream loaders
+// (`load_kimi_k3_model_weights` etc.) can query `tensor_data(name)` /
+// `tensor_info(name)` / `meta_u32(key)` uniformly regardless of whether
+// the model comes from a single file or 94 shards.
+
+/// Multi-shard GGUF reader — wraps N `GgufFile`s + provides tensor-name
+/// routing to the correct shard.
+///
+/// Model-level metadata is read from shard 0 (llama.cpp convention:
+/// shard 0 has full metadata, shards 1..N have only `split.*` keys).
+pub struct GgufMultiFile<'a> {
+    shards: Vec<GgufFile<'a>>,
+    /// `tensor_name` → index into `shards` of the shard that owns it.
+    tensor_shard_idx: HashMap<String, usize>,
+}
+
+impl<'a> GgufMultiFile<'a> {
+    /// Construct from `Vec<&[u8]>` of shard file bytes (typically mmap'd).
+    /// Shards must be passed in order (`.gguf` split index 1, 2, ..., N).
+    /// Returns `None` if any shard fails to parse.
+    pub fn parse_shards(shard_bytes: Vec<&'a [u8]>) -> Option<Self> {
+        if shard_bytes.is_empty() {
+            return None;
+        }
+        let mut shards = Vec::with_capacity(shard_bytes.len());
+        for bytes in shard_bytes {
+            shards.push(GgufFile::parse(bytes)?);
+        }
+        let mut tensor_shard_idx: HashMap<String, usize> = HashMap::new();
+        for (idx, shard) in shards.iter().enumerate() {
+            for name in shard.tensors.keys() {
+                // First shard wins on duplicate names (should not happen
+                // in a well-formed split GGUF, but guards against corrupt
+                // data). Duplicates are ignored silently.
+                tensor_shard_idx.entry(name.clone()).or_insert(idx);
+            }
+        }
+        Some(Self {
+            shards,
+            tensor_shard_idx,
+        })
+    }
+
+    /// Number of shards this multi-file spans.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Total number of unique tensors across all shards.
+    #[must_use]
+    pub fn tensor_count(&self) -> usize {
+        self.tensor_shard_idx.len()
+    }
+
+    // Model-level metadata delegates to shard 0.
+    #[must_use]
+    pub fn meta(&self, key: &str) -> Option<&MetaValue> {
+        self.shards.first()?.meta(key)
+    }
+    #[must_use]
+    pub fn meta_str(&self, key: &str) -> Option<&str> {
+        self.meta(key)?.as_str()
+    }
+    #[must_use]
+    pub fn meta_u32(&self, key: &str) -> Option<u32> {
+        self.meta(key)?.as_u32()
+    }
+    #[must_use]
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        self.meta(key)?.as_f32()
+    }
+    #[must_use]
+    pub fn meta_bool(&self, key: &str) -> Option<bool> {
+        self.meta(key)?.as_bool()
+    }
+
+    /// Look up a tensor's raw byte data, routing to whichever shard owns it.
+    #[must_use]
+    pub fn tensor_data(&self, name: &str) -> Option<&'a [u8]> {
+        let idx = *self.tensor_shard_idx.get(name)?;
+        self.shards.get(idx)?.tensor_data(name)
+    }
+
+    /// Look up a tensor's info (shape / qtype / offset), routing to shard.
+    #[must_use]
+    pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        let idx = *self.tensor_shard_idx.get(name)?;
+        self.shards.get(idx)?.tensor_info(name)
+    }
+
+    /// Dequantize a tensor to f32 (allocates). Same semantics as
+    /// [`GgufFile::tensor_to_f32`], just routed to the correct shard.
+    pub fn tensor_to_f32(&self, name: &str) -> Option<Vec<f32>> {
+        let idx = *self.tensor_shard_idx.get(name)?;
+        self.shards.get(idx)?.tensor_to_f32(name)
+    }
+}
+
+/// Small accessor trait so downstream loaders (K3 etc.) can work with
+/// either `GgufFile` (single file) or `GgufMultiFile` (94 shards)
+/// uniformly. Only the subset of methods actually used by the K3 loader.
+pub trait GgufSource<'a> {
+    fn meta(&self, key: &str) -> Option<&MetaValue>;
+    fn meta_str(&self, key: &str) -> Option<&str> {
+        self.meta(key)?.as_str()
+    }
+    fn meta_u32(&self, key: &str) -> Option<u32> {
+        self.meta(key)?.as_u32()
+    }
+    fn meta_f32(&self, key: &str) -> Option<f32> {
+        self.meta(key)?.as_f32()
+    }
+    fn meta_bool(&self, key: &str) -> Option<bool> {
+        self.meta(key)?.as_bool()
+    }
+    fn tensor_data(&self, name: &str) -> Option<&'a [u8]>;
+    fn tensor_info(&self, name: &str) -> Option<&TensorInfo>;
+    fn tensor_to_f32(&self, name: &str) -> Option<Vec<f32>>;
+}
+
+impl<'a> GgufSource<'a> for GgufFile<'a> {
+    fn meta(&self, key: &str) -> Option<&MetaValue> {
+        self.metadata.get(key)
+    }
+    fn tensor_data(&self, name: &str) -> Option<&'a [u8]> {
+        self.tensor_data(name)
+    }
+    fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensor_info(name)
+    }
+    fn tensor_to_f32(&self, name: &str) -> Option<Vec<f32>> {
+        self.tensor_to_f32(name)
+    }
+}
+
+impl<'a> GgufSource<'a> for GgufMultiFile<'a> {
+    fn meta(&self, key: &str) -> Option<&MetaValue> {
+        self.meta(key)
+    }
+    fn tensor_data(&self, name: &str) -> Option<&'a [u8]> {
+        self.tensor_data(name)
+    }
+    fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensor_info(name)
+    }
+    fn tensor_to_f32(&self, name: &str) -> Option<Vec<f32>> {
+        self.tensor_to_f32(name)
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn multi_file_rejects_empty_shard_list() {
+        assert!(GgufMultiFile::parse_shards(vec![]).is_none());
+    }
+}
+
 // ─── Q4_K dequantization ────────────────────────────────────────────────────
 
 #[inline]
