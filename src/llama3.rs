@@ -9427,8 +9427,17 @@ impl<'a> KimiK3Model<'a> {
              invariant broken (should have failed at ::new)",
         );
 
+        // Phase X.4.b.7 debug: per-layer trace when `ALICE_K3_TRACE=1`.
+        // Real K3 has 93 layers × per-layer disk I/O bound (566 GB mmap
+        // on 32 GB RAM), so silent forward can easily look "hung" when
+        // it's actually just paging in expert weights. Trace makes the
+        // progress visible without a rebuild.
+        let trace = std::env::var("ALICE_K3_TRACE").ok().as_deref() == Some("1");
+        let layer_t0 = std::time::Instant::now();
+
         for il in 0..self.config.num_layers {
             let layer = &self.weights.layers[il];
+            let il_t0 = std::time::Instant::now();
 
             // ── AttnRes pre-attention mix (X.4.c.3.4.d) ──────────
             // Follows pwilkin PR #26185 `src/models/kimi-k3.cpp`
@@ -9551,6 +9560,25 @@ impl<'a> KimiK3Model<'a> {
 
             for i in 0..hidden_dim {
                 x[i] += ffn_output[i];
+            }
+
+            if trace {
+                let kind = if matches!(layer.attn, KimiK3Attention::Mla(_)) {
+                    "MLA"
+                } else {
+                    "KDA"
+                };
+                let ffn_kind = if matches!(layer.ffn, KimiK3Ffn::Dense { .. }) {
+                    "Dense"
+                } else {
+                    "MoE"
+                };
+                let ms = il_t0.elapsed().as_millis();
+                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
+                    self.config.num_layers
+                );
             }
         }
 
