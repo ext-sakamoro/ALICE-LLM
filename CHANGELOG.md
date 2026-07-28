@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.c.3.4 (research) — pwilkin PR #26185 精読 + AttnRes wiring
+  semantics docs update** (2026-07-28). Downloaded `src/models/kimi-k3.cpp`
+  (645 行, SHA `2043a6a8...`) + `gguf-py/gguf/constants.py` from the pending
+  llama.cpp PR (`ggml-org/llama.cpp#26185` "model: add Kimi-K3 text model")
+  and reverse-engineered the actual GGUF export shape for the AttnRes
+  mechanism. Key finding vs. our previous assumption based on Kuberwastaken's
+  TENSOR_MAP.md: the paper's separate `_norm` + `_proj` per-layer AttnRes
+  tensors are **fused into a single 1D `_score` vector per site** in the
+  llama.cpp GGUF export. Extracted verbatim `res_mix` / layer-loop / banking
+  logic and captured in `docs/KIMI_K3_INTEGRATION.md` under a new
+  "llama.cpp reference wiring (pwilkin PR #26185)" subsection of the
+  Block AttnRes section (~180 lines with C++ excerpts, semantic call-outs,
+  and derived 6-step ALICE-LLM `X.4.c.3.4.a-f` sub-task list). No production
+  code changed in this phase — documentation only, unblocking the real
+  wiring work planned for Phase X.4.c.3.4.
+  - **Tensor names** (GGUF, per-layer + model): `blk.{N}.attn_res_score`,
+    `blk.{N}.ffn_res_score`, `output_res_score`, all 1D `[n_embd]` with
+    llama.cpp comment `# Kimi K3 (fused res_norm * res_proj, ...)`.
+  - **`res_mix` semantic**: (1) stack banked ckpts → `[n_embd, n_ckpt, T]`;
+    (2) score each via `sum_rows(RMSNorm(x) * score_w)`; (3) softmax over
+    `n_ckpt+1` (banked + current); (4) weighted sum uses **raw
+    non-normalized** `src` + `cur` (RMSNorm only for score computation,
+    mirroring paper §2.2 Eq 8-10 duality).
+  - **Layer wiring**: `res_mix` called 2× per layer (before `attn_norm`
+    via `attn_res_score`, before `ffn_norm` via `ffn_res_score`), plus
+    1× at model output before `output_norm` via `output_res_score`
+    (`2L+1 = 187` calls at K3's `L=93`). Checkpoint layer (`il % res_bs
+    == 0`, `res_bs = 12`) banks the **raw `prefix_sum`** (not the
+    `res_mix`-transformed value) and resets `prefix_sum` to the attention
+    output alone (`prefix_sum = banked ? cur : prefix_sum + cur`).
+  - **Fused kernel**: `ggml_dsv4_hc_pre` (from DeepSeek V4 lineage) does
+    `out[d, t] = Σ_c p_src[c, t] * src[d, c, t]` in one SIMD pass. The
+    corresponding Rust primitive will be an explicit `for c in 0..n_ckpt`
+    weighted-accumulate.
+  - **GGUF metadata keys added by PR #26185** (all in `kimi-k3.*`
+    namespace): `attn_res_block_size` (u32, K3 default 12),
+    `expert_latent_length` (u32, `moe_intermediate_size / 2`),
+    `activation.situ_beta` (f32, default 4.0),
+    `activation.situ_linear_beta` (f32, default 25.0).
+  - **Impact on Phase X.4.c.3.4 (real wiring)**: existing 4-tensor
+    per-layer skeleton (`attn_res_norm/proj` + `ffn_res_norm/proj`) will
+    be collapsed to 2 tensors (`attn_res_score` + `ffn_res_score`, both
+    1D `[n_embd]`) + a new `output_res_score` field on
+    `KimiK3ModelWeights`. `BlockAttnResState::res_mix` primitive will be
+    refactored to accept `score_w: &[f32]` instead of the fuller
+    `q_proj` matrix path currently in `block_attnres_softmax_attention`.
+    Phase table row updated with derived 6-step sub-task list
+    (X.4.c.3.4.a-f).
+
+- **Phase X.4.c.3.3.c — Stable LatentMoE forward SCOPED (router + shared
+  real, routed `todo!()`)** (2026-07-28). Wires the K3 LatentMoE MoE-layer
+  primitive into `KimiK3Model::forward`, replacing the third of the four
+  original `todo!()` fail-fasts. The router (sigmoid gating with `noaux_tc`
+  bias correction + top-k selection + renormalization) and the fused
+  shared-experts SwiGLU branch are real; the per-expert routed dispatch
+  (3-D cube slicing → SiTU-GLU → weight-sum → K3-only `routed_exp_norm`
+  RMSNorm → `routed_exp_up` projection) remains `todo!()` for Phase
+  X.4.c.3.3.c.2. Real K3's 92 MoE layers now execute router + shared
+  experts end-to-end when hit; the panic surfaces cleanly on the routed
+  aggregation with a phase-named message.
+  - **`kimi_k3_moe_router(x, ffn_gate_inp, exp_probs_b, top_k,
+    renormalize)`** — sigmoid gating + top-k selection with `noaux_tc`
+    bias correction. Selection scores use `sigmoid(router @ x) + bias`,
+    but the emitted weights are the **raw** sigmoid scores (bias is
+    omitted from the weight — mirrors paper §2.3.3 Eq 13 "b is omitted
+    from p_{i,j}"). Returns selected `(expert_idx, weight)` pairs sorted
+    by `expert_idx` for deterministic downstream reduce; weights
+    renormalized to sum to 1 when `renormalize = true` (K3 default).
+  - **`kimi_k3_shared_experts_forward(x, gate, up, down)`** — 2 shared
+    experts fused SwiGLU. K3 GGUF exports `num_shared_experts = 2` as a
+    single weight triple (`ffn_gate_shexp / ffn_up_shexp /
+    ffn_down_shexp`) with the two shared experts pre-summed into the
+    intermediate dim, so the forward is a single SwiGLU application.
+  - **`kimi_k3_latent_moe_forward(x, ffn_norm, moe, top_k, renormalize,
+    eps)`** — end-to-end skeleton with router + shared wired; per-expert
+    routed dispatch stops on `todo!()` with a docstring listing the
+    complete 5-step routed-path plan.
+  - **`KimiK3Model::forward` update** — LatentMoE branch delegates to
+    `kimi_k3_latent_moe_forward`, extracting `top_k` and `renormalize`
+    from `Llama3Config` (`num_experts_per_tok`, `norm_topk_prob`).
+  - **4 new unit tests** — `moe_router_selects_top_k_by_score`,
+    `moe_router_bias_shifts_selection_without_affecting_weights` (paper
+    §2.3.3 spec check), `moe_router_returns_sorted_indices` (deterministic
+    reduce), `shared_experts_forward_zero_input_gives_zero`.
+
 - **Phase X.4.c.3.3.a — MLA + Dense FFN wiring into `forward_kimi_k3`**
   (2026-07-28). Wires the X.4.c.3.2 Gated MLA primitive + a new
   Dense-FFN SwiGLU primitive into `KimiK3Model::forward`, replacing

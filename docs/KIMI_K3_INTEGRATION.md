@@ -209,6 +209,187 @@ Memory / communication overhead: `O(Ld) → O(Nd)` (reduces by ~12× at
 K3 scale). RMSNorm on keys prevents large-magnitude layer outputs
 from dominating the attention weights.
 
+#### llama.cpp reference wiring (pwilkin PR #26185, 2026-07-28 実読)
+
+**File**: `src/models/kimi-k3.cpp` (645 行、SHA `2043a6a8...`)
+**Key files**: `constants.py` (§675-677, §1271-1273), `llama-hparams.h`,
+`llama-graph.cpp` (`ggml_dsv4_hc_pre` reuse from DeepSeek V4)
+
+**tensor names (GGUF)**:
+
+- `blk.{N}.attn_res_score` — **shape `[n_embd]` (1D vector)**、per-layer
+- `blk.{N}.ffn_res_score`  — **shape `[n_embd]` (1D vector)**、per-layer
+- `output_res_score`       — **shape `[n_embd]` (1D vector)**、model-level
+
+いずれも `# Kimi K3 (fused res_norm * res_proj, ...)` の comment 付き:
+paper §2.2 の `RMSNorm(k)` (norm) + learnable score projection の 2
+tensor を **単一 1D vector に fusion** した実装 (paper では別々の
+matrix + norm gain だが GGUF export ではまとめて "score" weight として
+export される)
+
+**per-layer wiring (`src/models/kimi-k3.cpp` L300-353 verbatim)**:
+
+```cpp
+for (int il = 0; il < n_layer; ++il) {
+    const auto & layer = model.layers[il];
+
+    // `prefix_sum` is the residual stream. On checkpoint layers it is banked
+    // into res_stack and restarts from the attention output alone.
+    ggml_tensor * prefix_sum = inpL;
+
+    cur = use_attn_res ? res_mix(prefix_sum, layer.attn_res_score, n_embd, n_tokens, il)
+                       : prefix_sum;
+
+    bool banked = false;
+    if (use_attn_res && (uint32_t) il % res_bs == 0) {
+        res_push(prefix_sum, n_embd, n_tokens);  // banks the RAW layer input, not `cur`
+        banked = true;
+    }
+
+    cur = build_norm(cur, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+    cb(cur, "attn_norm", il);
+
+    if (hparams.is_recr(il)) {
+        cur = build_kda_layer(cur, layer, inp_rs, ...);
+    } else {
+        cur = build_mla_layer(cur, layer, inp_attn_k, inp_attn_kv, ...);
+    }
+
+    prefix_sum = banked ? cur : ggml_add(ctx0, prefix_sum, cur);
+
+    cur = use_attn_res ? res_mix(prefix_sum, layer.ffn_res_score, n_embd, n_tokens, il)
+                       : prefix_sum;
+
+    cur = build_norm(cur, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+
+    if ((uint32_t) il < hparams.n_layer_dense_lead) {
+        // dense SiTU-GLU FFN
+        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up,   cur);
+        cur = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+    } else {
+        cur = build_latent_moe(cur, layer, n_embd_latent, il);
+    }
+
+    prefix_sum = ggml_add(ctx0, prefix_sum, cur);
+    inpL = prefix_sum;
+}
+
+cur = inpL;
+
+// final mix, then narrow to the output tokens
+if (use_attn_res) {
+    cur = res_mix(cur, model.output_res_score, n_embd, n_tokens, -1);
+}
+```
+
+**`res_mix` (L218-257 verbatim, weighted convex combination)**:
+
+```cpp
+ggml_tensor * llama_model_kimi_k3::graph::res_mix(
+    ggml_tensor * cur, ggml_tensor * score_w,
+    int64_t n_embd, int64_t n_tokens, int il)
+{
+    const int n_ckpt = (int) ckpts.size();
+    if (n_ckpt == 0) {
+        return cur; // layer 0: nothing banked yet
+    }
+    const float eps = hparams.f_norm_rms_eps;
+    ggml_tensor * src = res_stack(n_embd, n_tokens);   // [n_embd, n_ckpt, n_tokens]
+
+    // Scores for banked ckpts (rms_norm * score_w, then sum_rows over n_embd)
+    ggml_tensor * sc_src = ggml_rms_norm(ctx0, src, eps);
+    sc_src = ggml_mul(ctx0, sc_src, score_w);
+    sc_src = ggml_sum_rows(ctx0, sc_src);              // [1, n_ckpt, n_tokens]
+    sc_src = ggml_reshape_2d(ctx0, sc_src, n_ckpt, n_tokens);
+
+    // Current residual stream scored separately (kept out of stack)
+    ggml_tensor * sc_cur = ggml_rms_norm(ctx0, cur, eps);
+    sc_cur = ggml_mul(ctx0, sc_cur, score_w);
+    sc_cur = ggml_sum_rows(ctx0, sc_cur);              // [1, n_tokens]
+
+    ggml_tensor * scores = ggml_concat(ctx0, sc_src, sc_cur, 0);  // [n_ckpt+1, n_tokens]
+    ggml_tensor * probs  = ggml_soft_max(ctx0, scores);           // softmax over ne0
+
+    // Split convex combination: hc_pre reduces over ne1 for the stacked part,
+    // plain broadcast-multiply handles the current stream
+    ggml_tensor * p_src = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, n_ckpt, n_tokens, ...));
+    ggml_tensor * p_cur = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_tokens, ...));
+
+    ggml_tensor * out = ggml_dsv4_hc_pre(ctx0, src, p_src);       // weighted sum over ne1
+    out = ggml_add(ctx0, out, ggml_mul(ctx0, cur, p_cur));
+
+    return out;
+}
+```
+
+**重要な semantic 要点** (paper §2.2 との差分):
+
+1. **AttnRes は per-layer で 2 回、model 末尾で 1 回、計 `2L+1` 回呼ぶ**
+   - 各 layer で `attn_norm` の前 (`attn_res_score` 使用) と `ffn_norm`
+     の前 (`ffn_res_score` 使用) に `res_mix` を挟む
+   - `output_norm` の前に `output_res_score` で最終 mix
+2. **checkpoint layer (`il % res_bs == 0`) で banking + prefix_sum リセット**
+   - 銀行に入れるのは **RAW `prefix_sum` (= 前 layer 末の inpL)**、
+     `res_mix` 適用後の `cur` ではない
+   - Banked layer では attention 後の `prefix_sum` が **attn 出力単独**に
+     reset (直前 residual を足さない、bank に既に保存されているため)
+3. **`res_mix` は「stacked ckpts + current stream」の softmax 加重和**
+   - scores = `sum_rows(RMSNorm(x) * score_w)` per bank + per current
+     = paper Eq 9 の `φ(q_l, k_i) = exp(q_l^T RMSNorm(k_i))` を 1D 化
+     (learnable pseudo-query が score_w vector 1 本に fusion)
+   - **weighted sum は non-normalized (raw) 値**を使う (paper §2.2 と同じ、
+     norm は score 計算用のみ)
+4. **`ggml_dsv4_hc_pre`** = DeepSeek V4 由来の融合 kernel
+   - `out[d, t] = Σ_c p_src[c, t] * src[d, c, t]` を 1 pass fused (SIMD)
+   - Rust 版で相当なもの: 明示的 loop `for c in 0..n_ckpt { for d in 0..n_embd { out[d] += p_src[c] * src[d, c] } }`
+5. **`hparams.attn_res_block_size = 0` で AttnRes 全体 disable**
+   - K3 config は `attn_res_block_size = 12`、`hparams.n_layer = 93`
+     → checkpoint layer は `il = 0, 12, 24, 36, 48, 60, 72, 84` (計 8 個)
+     + embedding = 9 total sources (最初の checkpoint は raw embedding)
+
+**GGUF metadata keys** (PR #26185 で追加):
+
+| key | type | comment |
+|---|---|---|
+| `kimi-k3.attn_res_block_size` | u32 | `S = 12` (K3 default) |
+| `kimi-k3.expert_latent_length` | u32 | `moe_intermediate_size / 2` (latent MoE hidden) |
+| `kimi-k3.activation.situ_beta` | f32 | SiTU-GLU β_1 (default 4.0) |
+| `kimi-k3.activation.situ_linear_beta` | f32 | SiTU-GLU β_2 (default 25.0) |
+
+**ALICE-LLM 実装 (X.4.c.3.4) への reflection**:
+
+- 現状 `KimiK3LayerWeights::attn_res_norm/attn_res_proj/ffn_res_norm/ffn_res_proj`
+  の 4 tensor を想定していたが、pwilkin PR reference では **`attn_res_score`
+  + `ffn_res_score` の 2 tensor だけ、両方とも 1D vector [n_embd]** に fusion
+- 実装 map の更新: `KimiK3LayerWeights` の 4 field → 2 field に集約
+  (`attn_res_score` + `ffn_res_score`、いずれも `Vec<f32>` or `WeightRef` [n_embd])
+- `KimiK3ModelWeights::output_res_score` (1D [n_embd]) を追加
+- `BlockAttnResState` は `ckpts: Vec<Vec<f32>>` (banked streams) + `stack_cache`
+  の維持責務、`res_mix(cur, score_w, ...) -> Vec<f32>` primitive を提供
+- 現在の `block_attnres_softmax_attention` primitive は概念的に paper §2.2 に忠実
+  だが、pwilkin PR の 1D-fused 実装に合わせて `score_w: &[f32]` を受ける
+  simplified 版に refactor 予定 (X.4.c.3.4.a)
+- 既存 primitive の per-layer pseudo-query `w_l ∈ ℝ^d` は、GGUF の
+  `attn_res_score / ffn_res_score` として import する (import 側で 1D として
+  読む、fusion 前提)
+
+**まだ未実装 (X.4.c.3.4 sub-task)**:
+
+- X.4.c.3.4.a: `BlockAttnResState::res_mix` primitive を pwilkin 版に合わせて
+  refactor (1D score_w + non-normalized raw weighted sum)
+- X.4.c.3.4.b: `KimiK3LayerWeights` を 4 tensor → 2 tensor に集約 +
+  `load_kimi_k3_layer_weights` の tensor 名 update
+- X.4.c.3.4.c: `KimiK3ModelWeights` に `output_res_score` 追加 +
+  `load_kimi_k3_model_weights` update
+- X.4.c.3.4.d: `KimiK3Model::forward` の layer loop に per-layer `res_mix`
+  を 2 回挿入 (attn_norm 前 + ffn_norm 前) + checkpoint banking logic
+- X.4.c.3.4.e: 最終 output mix (`output_norm` 前) 実装
+- X.4.c.3.4.f: unit test — `res_mix` primitive の scoring / weighted-sum
+  correctness (RMSNorm on keys で normalize、weighted sum で raw を使う 2 段の
+  duality 検証)
+
 ### Stable LatentMoE (§2.3, Eq 11)
 
 **Forward:**
@@ -338,7 +519,7 @@ Kimi Delta is a Gated DeltaNet family, which ALICE-LLM already ships:
 | **X.4.c.3.3.a** ✅ (2026-07-28) | MLA + Dense FFN wiring into `forward_kimi_k3` (`kimi_k3_extract_mla_config` helper + `kimi_k3_dense_ffn_forward` SwiGLU + forward MLA branch real delegate + Dense FFN branch real、KDA/LatentMoE 依然 todo) + 5 test | 完了 | — |
 | X.4.c.3.3.b | KDA per-head aggregation into forward (fused `attn_q/k/v` per-head slicing + `kimi_delta_forward_head` × num_heads + aggregate、F32 first、Q4_K per-head slicing 別途) | 1-2 日 | — |
 | X.4.c.3.3.c | Stable LatentMoE forward into forward (router top-16 + shared expert + latent W↓/W↑ + SiTU-GLU) | 2-3 日 | — |
-| X.4.c.3.4 | Block AttnRes wiring (X.4.d.1 primitive を forward に統合、`attn_res_norm/proj` + `ffn_res_norm/proj` semantics 要 pwilkin PR #26185 精読) + X.4.d.2 最終 aggregation via `output_attn_res_norm/proj` | 2-3 日 | — |
+| X.4.c.3.4 | **Block AttnRes wiring (pwilkin PR #26185 精読済 2026-07-28、上 §Block AttnRes llama.cpp reference wiring 節に semantics 集約)**: X.4.c.3.4.a `res_mix` primitive 1D fused refactor + X.4.c.3.4.b `KimiK3LayerWeights` 4 tensor → 2 tensor (`attn_res_score` + `ffn_res_score`、いずれも 1D [n_embd]) + X.4.c.3.4.c `KimiK3ModelWeights::output_res_score` 追加 + X.4.c.3.4.d layer loop 2 回挿入 + banking + X.4.c.3.4.e 最終 output mix + X.4.c.3.4.f unit test | 2-3 日 | — |
 | X.4.d | Attention Residuals (AttnRes) 実装 (skip connection の runtime scheme) | 3-5 日 | Kimi 論文 or reference impl |
 | **X.4.d.1** ✅ (2026-07-28) | Block AttnRes runtime primitives: `BlockAttnResState` + `block_attnres_softmax_attention` (Eq 9 RMSNorm-on-keys softmax + log-sum-exp stable) + `block_attnres_layer_step` (Eq 10 per-layer update with pre-partial snapshot semantics) + 10 unit tests. 最終 N-block aggregation into logits は paper 詳細不足のため X.4.d.2 (forward_kimi_k3 integration 時) に defer | 完了 | — |
 | **X.4.e.1** ✅ (2026-07-28) | Pool infrastructure K3 対応 — `deepseek_streaming.rs` の module doc / `StreamingExpertPool` doc / `PersistenceHeuristic` doc を K3 (896 experts, top-16, Stable LatentMoE) 対応化 + `kimi_k3_active_bytes` / `recommended_budget_bytes` sizing helper 追加 + 4 unit test (K3 24GB paper estimate 検証 / 896-index top-16 dispatch / out-of-range boundary at 896 / persistence heuristic scaling) 追加。pool の infrastructure 側は既に n_experts agnostic だったため実質的な struct 変更なしで K3 topology を受け付ける | 完了 (半日) | — |
