@@ -6156,6 +6156,14 @@ struct KimiK3MlaAttn<'a> {
 /// wherever K3 inherits from Kimi Linear (`ssm_*` prefix); K3-only
 /// additions (`ssm_f_a` / `ssm_f_b` / `ssm_beta`) are the low-rank α
 /// projection + scalar β projection specific to KDA's Eq 2.
+///
+/// **Phase X.4.b.5 additions** (from real GrEarl K3 GGUF inspection):
+/// - `ssm_g` — full-rank per-head gate matrix `[num_heads * v_head_dim,
+///   hidden]` (K3-specific, replaces Kimi-Linear's low-rank
+///   `ssm_g_a` / `ssm_g_b` pair — this is the "full-rank output gate"
+///   from paper §2.1.1).
+/// - `ssm_a` — per-head learnable `A_h` log-scale array `[num_heads]`
+///   (K3-specific, replaces the paper's hardcoded `A_h = 0` init).
 #[allow(dead_code)]
 struct KimiK3KdaAttn<'a> {
     q: WeightRef<'a>,
@@ -6172,6 +6180,15 @@ struct KimiK3KdaAttn<'a> {
     /// (`ssm_dt.bias`), some do not; the forward path treats absence
     /// as an all-zero bias.
     ssm_dt_bias: Option<Vec<f32>>,
+    /// K3-specific full-rank per-head output gate matrix, shape
+    /// `[num_heads * v_head_dim, hidden]`. Optional (skeleton +
+    /// pwilkin-synth fixtures don't ship it; real GrEarl GGUF does).
+    /// When absent, forward falls back to identity per-head gate.
+    ssm_g: Option<WeightRef<'a>>,
+    /// K3-specific per-head A_h log-scale array `[num_heads]`.
+    /// Optional (fixtures may omit); when absent, forward uses
+    /// `A_h = 0.0` per paper init.
+    ssm_a: Option<Vec<f32>>,
 }
 
 /// Attention-side dispatch per layer. Layer `il` is MLA iff `il ∈
@@ -6380,6 +6397,16 @@ fn load_kimi_k3_layer_weights<'a>(
         // Optional `ssm_dt.bias` — some conversions omit this scalar
         // (real GrEarl K3 GGUF DOES include it).
         let ssm_dt_bias = gguf.tensor_to_f32(&format!("{prefix}.ssm_dt.bias"));
+        // K3-specific full-rank output gate matrix (real GrEarl GGUF
+        // has `blk.{il}.ssm_g.weight`, same shape as attn_output —
+        // `[num_heads * v_head_dim, hidden]`). Optional for
+        // backwards-compatibility with skeleton fixtures.
+        let ssm_g = load_weight_ref_any_shape(gguf, &format!("{prefix}.ssm_g.weight"));
+        // K3-specific per-head A_h log-scale array (real GrEarl GGUF
+        // has `blk.{il}.ssm_a` without `.weight` suffix). Optional.
+        let ssm_a = gguf
+            .tensor_to_f32(&format!("{prefix}.ssm_a"))
+            .or_else(|| gguf.tensor_to_f32(&format!("{prefix}.ssm_a.weight")));
         KimiK3Attention::Kda(KimiK3KdaAttn {
             q: load_ref(&format!("{prefix}.attn_q.weight"))?,
             k: load_ref(&format!("{prefix}.attn_k.weight"))?,
@@ -6392,6 +6419,8 @@ fn load_kimi_k3_layer_weights<'a>(
             ssm_beta: load_ref(&format!("{prefix}.ssm_beta.weight"))?,
             ssm_norm: load_norm(&format!("{prefix}.ssm_norm.weight"))?,
             ssm_dt_bias,
+            ssm_g,
+            ssm_a,
         })
     };
     // `attn_gate` for the layer bundle — MLA only (KDA uses ssm_g). For
@@ -6431,15 +6460,45 @@ fn load_kimi_k3_layer_weights<'a>(
         let ffn_gate_inp = load_norm(&format!("{prefix}.ffn_gate_inp.weight"))?;
         // `exp_probs_b.bias` is optional across variants.
         let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
+        // Phase X.4.b.5: MoE tensor name aliases for real GrEarl GGUF.
+        // Kuberwastaken TENSOR_MAP.md uses `routed_exp_*`; pwilkin PR
+        // #26185 uses `ffn_routed_*`. Try both spellings, prefer the
+        // first found (per-tensor basis so mixed GGUFs don't break).
+        let load_ref_any = |names: &[String]| -> Result<WeightRef<'a>, String> {
+            for n in names {
+                if let Some(w) = load_weight_ref_any_shape(gguf, n) {
+                    return Ok(w);
+                }
+            }
+            Err(format!("layer {il}: no tensor found among {names:?}"))
+        };
+        let load_norm_any = |names: &[String]| -> Result<Vec<f32>, String> {
+            for n in names {
+                if let Some(v) = gguf.tensor_to_f32(n) {
+                    return Ok(v);
+                }
+            }
+            Err(format!("layer {il}: no norm tensor found among {names:?}"))
+        };
         KimiK3Ffn::LatentMoe(KimiK3LatentMoe {
             ffn_gate_inp,
             exp_probs_b,
             ffn_gate_shexp: load_ref(&format!("{prefix}.ffn_gate_shexp.weight"))?,
             ffn_up_shexp: load_ref(&format!("{prefix}.ffn_up_shexp.weight"))?,
             ffn_down_shexp: load_ref(&format!("{prefix}.ffn_down_shexp.weight"))?,
-            routed_exp_up: load_ref(&format!("{prefix}.routed_exp_up.weight"))?,
-            routed_exp_down: load_ref(&format!("{prefix}.routed_exp_down.weight"))?,
-            routed_exp_norm: load_norm(&format!("{prefix}.routed_exp_norm.weight"))?,
+            // Routed latent projections + norm: try both name schemes.
+            routed_exp_up: load_ref_any(&[
+                format!("{prefix}.routed_exp_up.weight"),
+                format!("{prefix}.ffn_routed_up.weight"),
+            ])?,
+            routed_exp_down: load_ref_any(&[
+                format!("{prefix}.routed_exp_down.weight"),
+                format!("{prefix}.ffn_routed_down.weight"),
+            ])?,
+            routed_exp_norm: load_norm_any(&[
+                format!("{prefix}.routed_exp_norm.weight"),
+                format!("{prefix}.ffn_routed_norm.weight"),
+            ])?,
             ffn_gate_exps: load_ref(&format!("{prefix}.ffn_gate_exps.weight"))?,
             ffn_up_exps: load_ref(&format!("{prefix}.ffn_up_exps.weight"))?,
             ffn_down_exps: load_ref(&format!("{prefix}.ffn_down_exps.weight"))?,
@@ -7391,6 +7450,30 @@ fn kimi_k3_kda_layer_forward(
         // `tensor_to_f32`). Slice one head's worth for the primitive.
         let ssm_norm_f32: Vec<f32> = kda.ssm_norm[row_start..row_end].to_vec();
 
+        // Phase X.4.b.5: per-head A_h from ssm_a array (real GrEarl
+        // K3 GGUF ships `blk.{il}.ssm_a` as a per-head f32 array of
+        // length num_heads). Falls back to 0.0 (paper init) when
+        // absent (skeleton / pwilkin-synth fixtures).
+        let a_h = kda
+            .ssm_a
+            .as_ref()
+            .and_then(|arr| arr.get(head_idx).copied())
+            .unwrap_or(0.0);
+
+        // Phase X.4.b.5: per-head ssm_g slice for K3's full-rank
+        // output gate. real K3 exports `blk.{il}.ssm_g.weight` with
+        // shape `[num_heads * v_head_dim, hidden]`. Per-head slice
+        // takes rows [head_idx*v_head_dim..(head_idx+1)*v_head_dim].
+        // When absent (skeleton / pwilkin-synth), the identity gate
+        // fallback keeps unit-test behavior unchanged.
+        let ssm_g_slice = kda
+            .ssm_g
+            .as_ref()
+            .and_then(|g| kimi_k3_slice_weight_ref_rows(g, row_start, row_end));
+        let identity_gate = identity_matrix_f32(v_head_dim);
+        let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_as_f32);
+        let w_gate_ref: &[f32] = w_gate_owned.as_deref().unwrap_or(&identity_gate);
+
         let params = KimiDeltaHeadParams {
             w_q: &weight_ref_as_f32(&w_q),
             w_k: &weight_ref_as_f32(&w_k),
@@ -7407,15 +7490,13 @@ fn kimi_k3_kda_layer_forward(
             w_alpha_up: &weight_ref_as_f32(&w_alpha_up),
             // `b_alpha` is not shipped in K3 GGUF — substitute zeros.
             b_alpha: &vec![0.0_f32; head_dim],
-            a_h: 0.0, // A_h is a learnable scalar; K3 GGUF has no per-head A_h
-            // tensor exported, so we default to 0 (paper's init value).
+            a_h,
             alpha_rank,
             g_min,
-            // Per-head output gate + output projection are applied
-            // once at the layer level (attn_output) after concat, so
-            // the per-head primitive gets an identity gate + identity
-            // output projection.
-            w_gate: &identity_matrix_f32(v_head_dim),
+            // Per-head output gate: real K3 uses ssm_g (full-rank),
+            // fallback to identity when absent. Output projection is
+            // applied once at the layer level after concat.
+            w_gate: w_gate_ref,
             w_out: &identity_matrix_f32(v_head_dim),
             d_out: v_head_dim,
             rms_gamma: Some(&ssm_norm_f32),
