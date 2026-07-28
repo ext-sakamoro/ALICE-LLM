@@ -609,9 +609,8 @@ impl<'a> GgufFile<'a> {
             GgmlType::Q1_0 => dequantize_q1_0(data, &mut out),
             GgmlType::Q2_0 => dequantize_q2_0(data, &mut out),
             GgmlType::Mxfp4 => dequantize_row_mxfp4(data, &mut out),
-            // IQ1_S recognized (shape / slicing OK) but dequant not yet
-            // implemented — Phase X.4.b.7. Return None so callers know.
-            GgmlType::IQ1_S => return None,
+            // Phase X.4.b.7: IQ1_S dequant via `iq1_s::dequantize_iq1_s`.
+            GgmlType::IQ1_S => crate::iq1_s::dequantize_iq1_s(data, &mut out),
             GgmlType::Other(_) => return None,
         }
 
@@ -4238,16 +4237,10 @@ pub fn quantized_matvec(
         GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Mxfp4 => mxfp4_matvec_dispatched(input, data, rows, cols, output),
-        // IQ1_S matvec: not yet implemented — dequant + matvec is
-        // Phase X.4.b.7 (~200-300 LOC for K3-quant IQ1_S codebook +
-        // grid interpretation). Panic with a descriptive message so
-        // callers know which phase to await.
-        GgmlType::IQ1_S => panic!(
-            "IQ1_S matvec not yet implemented (Phase X.4.b.7). Real Kimi K3 GGUF-IQ1_S \
-             uses this for expert cubes. rows={rows} cols={cols} data_len={} input_len={}",
-            data.len(),
-            input.len()
-        ),
+        // Phase X.4.b.7: IQ1_S matvec — dequantize each row on the fly
+        // then call the standard f32_matvec pattern (correctness-first,
+        // not optimized for K3 expert cubes).
+        GgmlType::IQ1_S => iq1_s_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
     }
 }
@@ -4511,6 +4504,30 @@ fn q2_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, ou
             }
             output[r] = acc;
         }
+    }
+}
+
+/// IQ1_S matvec fallback (Phase X.4.b.7).
+///
+/// Real Kimi K3 GrEarl GGUF-IQ1_S expert cubes use this quant type.
+/// Simple correctness-first implementation: dequantize each row to f32
+/// via `crate::iq1_s::dequantize_iq1_s`, then dot with the input.
+/// Not optimized (dequantizes 4 KB per row per matvec call); K3 expert
+/// activation is `top_k=16` experts × 2 matvecs per expert (gate + up)
+/// + 1 down matvec per token, so the temp allocation is bounded.
+#[allow(dead_code)]
+fn iq1_s_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    assert!(rows > 0);
+    let row_bytes = data.len() / rows;
+    let mut row_buf = vec![0.0_f32; cols];
+    for r in 0..rows {
+        let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
+        crate::iq1_s::dequantize_iq1_s(row_data, &mut row_buf);
+        let mut acc = 0.0_f32;
+        for i in 0..cols {
+            acc += row_buf[i] * input[i];
+        }
+        output[r] = acc;
     }
 }
 

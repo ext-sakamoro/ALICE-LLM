@@ -62,6 +62,7 @@ pub mod gguf;
 pub mod gpu;
 #[cfg(feature = "grammar")]
 pub mod grammar;
+pub mod iq1_s;
 pub mod kv_cache;
 pub mod linalg;
 pub mod llama3;
