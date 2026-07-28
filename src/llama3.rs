@@ -1025,6 +1025,153 @@ mod kimi_k3_gguf_loader_tests {
         // refactor that drops the hyphen breaks GGUF key lookups.
         assert_eq!(ModelArch::KimiK3.meta_prefix(), "kimi-k3");
     }
+
+    // ── Phase X.4.b.2 tensor loader tests ────────────────────────
+
+    #[test]
+    fn load_weight_ref_any_shape_reads_both_dims_from_gguf() {
+        // Build a tiny GGUF with one 2D f32 tensor (2 rows × 3 cols)
+        // and verify the shape-inferring helper extracts the correct
+        // rows/cols from `tensor_info.dims`.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        write_u32(&mut buf, 3);
+        write_u64(&mut buf, 1); // n_tensors
+        write_u64(&mut buf, 1); // n_kv (alignment only)
+        write_kv_u32(&mut buf, "general.alignment", 32);
+        // Tensor: name, ndims=2, dims=[3, 2], type=F32, offset=0.
+        write_str(&mut buf, "any_shape_test");
+        write_u32(&mut buf, 2); // ndims
+        write_u64(&mut buf, 3); // dims[0] = cols
+        write_u64(&mut buf, 2); // dims[1] = rows
+        write_u32(&mut buf, 0); // ggml_type = F32
+        write_u64(&mut buf, 0); // offset
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        for x in [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            write_f32(&mut buf, x);
+        }
+        let gguf = GgufFile::parse(&buf).expect("parse");
+        let wref = super::load_weight_ref_any_shape(&gguf, "any_shape_test")
+            .expect("shape helper must find the tensor");
+        assert_eq!(wref.cols, 3, "cols must come from dims[0]");
+        assert_eq!(wref.rows, 2, "rows must come from dims[1]");
+    }
+
+    #[test]
+    fn load_weight_ref_any_shape_1d_tensor_gets_rows_1() {
+        // 1D tensor (norm-like): ndims=1, dims=[4]. Helper must
+        // default rows to 1.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        write_u32(&mut buf, 3);
+        write_u64(&mut buf, 1);
+        write_u64(&mut buf, 1);
+        write_kv_u32(&mut buf, "general.alignment", 32);
+        write_str(&mut buf, "norm_1d");
+        write_u32(&mut buf, 1); // ndims = 1
+        write_u64(&mut buf, 4); // dims[0]
+        write_u32(&mut buf, 0); // F32
+        write_u64(&mut buf, 0);
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        for x in [1.0_f32, 2.0, 3.0, 4.0] {
+            write_f32(&mut buf, x);
+        }
+        let gguf = GgufFile::parse(&buf).expect("parse");
+        let wref = super::load_weight_ref_any_shape(&gguf, "norm_1d")
+            .expect("1D helper must find the tensor");
+        assert_eq!(wref.cols, 4);
+        assert_eq!(wref.rows, 1, "1D tensor falls back to rows=1");
+    }
+
+    #[test]
+    fn model_weights_loader_returns_err_on_missing_global_tensors() {
+        // The X.4.b.1 synthetic fixture only ships one dummy
+        // `token_embd.weight` tensor (1 f32 value). All other Global
+        // tensors are absent; the loader must return `Err` naming the
+        // first missing one rather than panic.
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse fixture");
+        let config = crate::gguf::GgufFile::parse(&bytes)
+            .and_then(|g| super::Llama3Config::from_gguf(&g))
+            .expect("kimi-k3 config must load from synthetic fixture");
+        assert_eq!(config.arch, ModelArch::KimiK3);
+
+        let Err(err) = super::load_kimi_k3_model_weights(&gguf, &config) else {
+            panic!("loader must Err on the metadata-only fixture");
+        };
+        // First missing tensor after `token_embd.weight` (which the
+        // fixture has as a 1-elem dummy) is `output_norm.weight`.
+        assert!(
+            err.contains("output_norm.weight") || err.contains("token_embd"),
+            "expected descriptive missing-tensor error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_weights_loader_returns_err_on_missing_attn_norm() {
+        // With no per-layer tensors in the fixture, layer 0 fails at
+        // its first required tensor (`blk.0.attn_norm.weight`).
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse fixture");
+        let config = super::Llama3Config::from_gguf(&gguf).expect("config");
+
+        let Err(err) = super::load_kimi_k3_layer_weights(&gguf, 0, &config) else {
+            panic!("layer loader must Err on empty fixture");
+        };
+        assert!(
+            err.contains("blk.0.attn_norm"),
+            "expected error to name blk.0.attn_norm, got: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_weights_loader_dispatches_mla_vs_kda_by_layer_index() {
+        // Even without weight tensors, the loader must reach the
+        // MLA vs KDA branch matching `is_mla_layer(il)` — which for
+        // the fixture means layers 3 and 7 look for MLA tensors
+        // (`attn_q_a.weight` first missing) while layers 0/1/2/4/5/6
+        // look for KDA tensors (`attn_q.weight` first missing).
+        //
+        // We can only observe the branch by inspecting the error
+        // message, since neither set of tensors exists. Both messages
+        // must contain the layer prefix.
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse fixture");
+        let config = super::Llama3Config::from_gguf(&gguf).expect("config");
+
+        // The common attn_norm still comes first, so we need a fixture
+        // that already has the common tensors to reach the attn branch.
+        // For this minimal smoke test we assert the dispatch predicate
+        // itself matches the config's is_mla_layer.
+        let kd = config.kimi_delta.as_ref().expect("kimi_delta populated");
+        assert_eq!(kd.is_mla_layer(0), Some(false), "layer 0 = KDA");
+        assert_eq!(kd.is_mla_layer(3), Some(true), "layer 3 = MLA");
+        assert_eq!(kd.is_mla_layer(7), Some(true), "layer 7 = MLA");
+        assert_eq!(kd.is_mla_layer(4), Some(false), "layer 4 = KDA");
+    }
+
+    #[test]
+    fn layer_weights_loader_dense_vs_moe_matches_first_k_dense_replace() {
+        // Fixture sets `leading_dense_block_count = 1`, so layer 0
+        // takes the Dense FFN branch and layers ≥ 1 take LatentMoE.
+        // Same observation constraint as above — assert the
+        // dispatch predicate the loader uses.
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let config = super::Llama3Config::from_gguf(&gguf).expect("config");
+        let kd = config.kimi_delta.as_ref().expect("kimi_delta populated");
+        assert_eq!(kd.first_k_dense_replace, Some(1));
+        // The loader body uses `il < first_k_dense_replace` as the
+        // Dense predicate; enforce that at the predicate level so any
+        // future refactor keeps the boundary at layer 0 for K3.
+        let first_k = kd.first_k_dense_replace.unwrap();
+        assert!(0 < first_k, "layer 0 must be Dense");
+        assert!(!(1 < first_k), "layer 1 must be LatentMoE (not Dense)");
+    }
 }
 
 #[cfg(all(test, feature = "hf-config"))]
@@ -5930,6 +6077,324 @@ struct DeepSeekMoeWeights<'a> {
     ffn_gate_shexp: WeightRef<'a>,
     ffn_up_shexp: WeightRef<'a>,
     ffn_down_shexp: WeightRef<'a>,
+}
+
+// ── Kimi K3 tensor reference structs (Phase X.4.b.2, 2026-07-28) ──
+//
+// GGUF tensor names follow `Kuberwastaken/Kimi-K3-GGUF/TENSOR_MAP.md` and
+// upstream llama.cpp PR #26185 (`pwilkin/kimi-k3-text`). Shapes are
+// mostly derived from GGUF `tensor_info.dims` via
+// [`load_weight_ref_any_shape`] rather than hardcoded, since KDA vs MLA
+// vs Latent-MoE layers all use different per-tensor dimensions and
+// per-layer weight tensor width is easier to trust from the file than
+// to recompute from the config.
+//
+// Weight lifetime is `'a`, borrowed from the underlying GGUF file. All
+// structs are private to `llama3.rs` — the `forward_kimi_k3` layer
+// dispatcher (Phase X.4.c.3) reaches them by name from the same
+// module.
+
+/// MLA-specific weight bundle for one Kimi K3 attention layer (24 of
+/// 93 layers). Mirrors the DeepSeek-V3 LoRA MLA layout with K3's
+/// `kv_b` split into two half-tensors (`attn_k_b` + `attn_v_b`) at
+/// conversion time — see TENSOR_MAP.md §"`kv_b_proj` split".
+#[allow(dead_code)]
+struct KimiK3MlaAttn<'a> {
+    q_a: WeightRef<'a>,
+    q_a_norm: Vec<f32>,
+    q_b: WeightRef<'a>,
+    kv_a_mqa: WeightRef<'a>,
+    kv_a_norm: Vec<f32>,
+    k_b: WeightRef<'a>,
+    v_b: WeightRef<'a>,
+}
+
+/// KDA-specific weight bundle for one Kimi K3 attention layer (69 of
+/// 93 layers). Names match the existing Qwen 3.5 DeltaNet convention
+/// wherever K3 inherits from Kimi Linear (`ssm_*` prefix); K3-only
+/// additions (`ssm_f_a` / `ssm_f_b` / `ssm_beta`) are the low-rank α
+/// projection + scalar β projection specific to KDA's Eq 2.
+#[allow(dead_code)]
+struct KimiK3KdaAttn<'a> {
+    q: WeightRef<'a>,
+    k: WeightRef<'a>,
+    v: WeightRef<'a>,
+    ssm_conv1d_q: WeightRef<'a>,
+    ssm_conv1d_k: WeightRef<'a>,
+    ssm_conv1d_v: WeightRef<'a>,
+    ssm_f_a: WeightRef<'a>,
+    ssm_f_b: WeightRef<'a>,
+    ssm_beta: WeightRef<'a>,
+    ssm_norm: Vec<f32>,
+    /// Optional per-head `dt` bias — some K3 conversions ship it
+    /// (`ssm_dt.bias`), some do not; the forward path treats absence
+    /// as an all-zero bias.
+    ssm_dt_bias: Option<Vec<f32>>,
+}
+
+/// Attention-side dispatch per layer. Layer `il` is MLA iff `il ∈
+/// KimiDeltaConfig::full_attn_layers` (see `is_mla_layer`).
+#[allow(dead_code)]
+enum KimiK3Attention<'a> {
+    Mla(KimiK3MlaAttn<'a>),
+    Kda(KimiK3KdaAttn<'a>),
+}
+
+/// Stable LatentMoE weight bundle for one non-dense K3 layer (layers
+/// 1..93 — layer 0 is dense per `first_k_dense_replace = 1`).
+///
+/// Shape overview (K3 defaults):
+///
+/// - `ffn_gate_inp`: `[num_experts=896, hidden=7168]` router logits.
+/// - `exp_probs_b`: `[num_experts]` router bias (noaux_tc correction).
+/// - `ffn_{gate,up,down}_shexp`: shared expert (`num_shared_experts=2`
+///   fanned into a single fused block per K3 spec).
+/// - `routed_exp_{up,down}`: `W↑` (`[hidden, latent_hidden=3584]`) and
+///   `W↓` (`[latent_hidden, hidden]`) latent projections shared by
+///   every routed expert.
+/// - `routed_exp_norm`: `[latent_hidden]` RMSNorm γ inserted between
+///   the aggregated routed sum `u` and the `W↑` up projection
+///   (K3-specific stabilization, see Stable LatentMoE §2.3.1).
+/// - `ffn_{gate,up,down}_exps`: 3-D per-expert FFN weight cubes,
+///   shape `[moe_intermediate=3072, latent_hidden, num_experts]`
+///   (Kuberwastaken's `EXPERTS = [(w1, ffn_gate_exps), (w3,
+///   ffn_up_exps), (w2, ffn_down_exps)]` mapping).
+#[allow(dead_code)]
+struct KimiK3LatentMoe<'a> {
+    ffn_gate_inp: Vec<f32>,
+    exp_probs_b: Option<Vec<f32>>,
+    ffn_gate_shexp: WeightRef<'a>,
+    ffn_up_shexp: WeightRef<'a>,
+    ffn_down_shexp: WeightRef<'a>,
+    routed_exp_up: WeightRef<'a>,
+    routed_exp_down: WeightRef<'a>,
+    routed_exp_norm: Vec<f32>,
+    ffn_gate_exps: WeightRef<'a>,
+    ffn_up_exps: WeightRef<'a>,
+    ffn_down_exps: WeightRef<'a>,
+}
+
+/// FFN-side dispatch per layer. Layer `il` is dense iff
+/// `il < first_k_dense_replace` (K3: only layer 0).
+///
+/// The Dense variant (3 `WeightRef`s ≈ 144 B) is much smaller than
+/// the LatentMoE variant (11 fields including two `Vec<f32>`s ≈
+/// several KB), so clippy would normally suggest boxing LatentMoE.
+/// We suppress that here because a `Vec<KimiK3LayerWeights>` already
+/// pays the heap-allocation cost per layer at construction time and
+/// the enum tag lives inline; boxing the large variant would add a
+/// second heap round-trip on every layer forward without saving any
+/// resident memory.
+#[allow(dead_code, clippy::large_enum_variant)]
+enum KimiK3Ffn<'a> {
+    Dense {
+        gate: WeightRef<'a>,
+        up: WeightRef<'a>,
+        down: WeightRef<'a>,
+    },
+    LatentMoe(KimiK3LatentMoe<'a>),
+}
+
+/// Kimi K3 per-layer weight bundle (Phase X.4.b.2).
+///
+/// Every K3 layer carries the eight COMMON tensors from TENSOR_MAP.md
+/// (`attn_norm`, `ffn_norm`, `attn_output`, `attn_gate`, plus the four
+/// AttnRes tensors `{attn,ffn}_res_{norm,proj}`) plus one of two
+/// attention layouts (MLA or KDA) and one of two FFN layouts (Dense or
+/// LatentMoE). The `KimiK3Attention` and `KimiK3Ffn` enums encode both
+/// dispatches so no `Option` juggling is needed in the forward path.
+#[allow(dead_code)]
+struct KimiK3LayerWeights<'a> {
+    attn_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    attn_output: WeightRef<'a>,
+    /// K3-specific input-dependent full-rank output gate applied on
+    /// every layer (MLA `mla_use_output_gate = true` + KDA
+    /// `use_full_rank_gate = true`).
+    attn_gate: WeightRef<'a>,
+    /// K3-only Attention Residuals: post-attn AttnRes RMSNorm + proj.
+    attn_res_norm: Vec<f32>,
+    attn_res_proj: WeightRef<'a>,
+    /// K3-only Attention Residuals: post-FFN AttnRes RMSNorm + proj.
+    ffn_res_norm: Vec<f32>,
+    ffn_res_proj: WeightRef<'a>,
+    attn: KimiK3Attention<'a>,
+    ffn: KimiK3Ffn<'a>,
+}
+
+/// Kimi K3 full-model weight bundle (Phase X.4.b.2).
+///
+/// Global tensors (5) + a per-layer vector matching
+/// `config.num_layers` (K3: 93). `output_attn_res_norm` +
+/// `output_attn_res_proj` are the K3-only tensors that implement the
+/// final N-block aggregation of AttnRes (paper §2.2, X.4.d.2).
+#[allow(dead_code)]
+struct KimiK3ModelWeights<'a> {
+    token_embd: WeightRef<'a>,
+    output_norm: Vec<f32>,
+    output: WeightRef<'a>,
+    output_attn_res_norm: Vec<f32>,
+    output_attn_res_proj: WeightRef<'a>,
+    layers: Vec<KimiK3LayerWeights<'a>>,
+}
+
+/// Load the K3 per-layer weight bundle from GGUF (Phase X.4.b.2).
+///
+/// Layer type dispatch:
+///
+/// - **MLA vs KDA** — decided by `config.kimi_delta.is_mla_layer(il)`
+///   which reads the 0-indexed `full_attn_layers` array populated by
+///   `k3meta.py`.
+/// - **Dense vs LatentMoE** — decided by `il < first_k_dense_replace`
+///   from the K3 sub-config (K3 default: only layer 0 is dense).
+///
+/// Returns a descriptive `Err` string on the first missing required
+/// tensor, so the top-level loader can surface which layer / tensor
+/// name to look at when the GGUF is malformed or a K3 variant ships
+/// a tensor under a different name than TENSOR_MAP.md documents.
+#[allow(dead_code)]
+fn load_kimi_k3_layer_weights<'a>(
+    gguf: &'a GgufFile<'a>,
+    il: usize,
+    config: &Llama3Config,
+) -> Result<KimiK3LayerWeights<'a>, String> {
+    let prefix = format!("blk.{il}");
+    let kd = config
+        .kimi_delta
+        .as_ref()
+        .ok_or_else(|| format!("layer {il}: kimi_delta sub-config not populated"))?;
+
+    let load_ref = |name: &str| -> Result<WeightRef<'a>, String> {
+        load_weight_ref_any_shape(gguf, name)
+            .ok_or_else(|| format!("layer {il}: missing tensor '{name}'"))
+    };
+    let load_norm = |name: &str| -> Result<Vec<f32>, String> {
+        gguf.tensor_to_f32(name)
+            .ok_or_else(|| format!("layer {il}: missing norm tensor '{name}'"))
+    };
+
+    // ── COMMON (all layers, all layer types) ─────────────────────────
+    let attn_norm = load_norm(&format!("{prefix}.attn_norm.weight"))?;
+    let ffn_norm = load_norm(&format!("{prefix}.ffn_norm.weight"))?;
+    let attn_output = load_ref(&format!("{prefix}.attn_output.weight"))?;
+    let attn_gate = load_ref(&format!("{prefix}.attn_gate.weight"))?;
+    let attn_res_norm = load_norm(&format!("{prefix}.attn_res_norm.weight"))?;
+    let attn_res_proj = load_ref(&format!("{prefix}.attn_res_proj.weight"))?;
+    let ffn_res_norm = load_norm(&format!("{prefix}.ffn_res_norm.weight"))?;
+    let ffn_res_proj = load_ref(&format!("{prefix}.ffn_res_proj.weight"))?;
+
+    // ── Attention (MLA XOR KDA) ──────────────────────────────────────
+    let is_mla = kd
+        .is_mla_layer(il)
+        .ok_or_else(|| format!("layer {il}: full_attn_layers missing from kimi_delta config"))?;
+    let attn = if is_mla {
+        KimiK3Attention::Mla(KimiK3MlaAttn {
+            q_a: load_ref(&format!("{prefix}.attn_q_a.weight"))?,
+            q_a_norm: load_norm(&format!("{prefix}.attn_q_a_norm.weight"))?,
+            q_b: load_ref(&format!("{prefix}.attn_q_b.weight"))?,
+            kv_a_mqa: load_ref(&format!("{prefix}.attn_kv_a_mqa.weight"))?,
+            kv_a_norm: load_norm(&format!("{prefix}.attn_kv_a_norm.weight"))?,
+            k_b: load_ref(&format!("{prefix}.attn_k_b.weight"))?,
+            v_b: load_ref(&format!("{prefix}.attn_v_b.weight"))?,
+        })
+    } else {
+        // Optional `ssm_dt.bias` — some conversions omit this scalar.
+        let ssm_dt_bias = gguf.tensor_to_f32(&format!("{prefix}.ssm_dt.bias"));
+        KimiK3Attention::Kda(KimiK3KdaAttn {
+            q: load_ref(&format!("{prefix}.attn_q.weight"))?,
+            k: load_ref(&format!("{prefix}.attn_k.weight"))?,
+            v: load_ref(&format!("{prefix}.attn_v.weight"))?,
+            ssm_conv1d_q: load_ref(&format!("{prefix}.ssm_conv1d_q.weight"))?,
+            ssm_conv1d_k: load_ref(&format!("{prefix}.ssm_conv1d_k.weight"))?,
+            ssm_conv1d_v: load_ref(&format!("{prefix}.ssm_conv1d_v.weight"))?,
+            ssm_f_a: load_ref(&format!("{prefix}.ssm_f_a.weight"))?,
+            ssm_f_b: load_ref(&format!("{prefix}.ssm_f_b.weight"))?,
+            ssm_beta: load_ref(&format!("{prefix}.ssm_beta.weight"))?,
+            ssm_norm: load_norm(&format!("{prefix}.ssm_norm.weight"))?,
+            ssm_dt_bias,
+        })
+    };
+
+    // ── FFN (Dense XOR LatentMoE) ────────────────────────────────────
+    let first_k_dense = kd.first_k_dense_replace.unwrap_or(0);
+    let ffn = if il < first_k_dense {
+        KimiK3Ffn::Dense {
+            gate: load_ref(&format!("{prefix}.ffn_gate.weight"))?,
+            up: load_ref(&format!("{prefix}.ffn_up.weight"))?,
+            down: load_ref(&format!("{prefix}.ffn_down.weight"))?,
+        }
+    } else {
+        let ffn_gate_inp = load_norm(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        // `exp_probs_b.bias` is optional across variants.
+        let exp_probs_b = gguf.tensor_to_f32(&format!("{prefix}.exp_probs_b.bias"));
+        KimiK3Ffn::LatentMoe(KimiK3LatentMoe {
+            ffn_gate_inp,
+            exp_probs_b,
+            ffn_gate_shexp: load_ref(&format!("{prefix}.ffn_gate_shexp.weight"))?,
+            ffn_up_shexp: load_ref(&format!("{prefix}.ffn_up_shexp.weight"))?,
+            ffn_down_shexp: load_ref(&format!("{prefix}.ffn_down_shexp.weight"))?,
+            routed_exp_up: load_ref(&format!("{prefix}.routed_exp_up.weight"))?,
+            routed_exp_down: load_ref(&format!("{prefix}.routed_exp_down.weight"))?,
+            routed_exp_norm: load_norm(&format!("{prefix}.routed_exp_norm.weight"))?,
+            ffn_gate_exps: load_ref(&format!("{prefix}.ffn_gate_exps.weight"))?,
+            ffn_up_exps: load_ref(&format!("{prefix}.ffn_up_exps.weight"))?,
+            ffn_down_exps: load_ref(&format!("{prefix}.ffn_down_exps.weight"))?,
+        })
+    };
+
+    Ok(KimiK3LayerWeights {
+        attn_norm,
+        ffn_norm,
+        attn_output,
+        attn_gate,
+        attn_res_norm,
+        attn_res_proj,
+        ffn_res_norm,
+        ffn_res_proj,
+        attn,
+        ffn,
+    })
+}
+
+/// Load the K3 full-model weight bundle from GGUF (Phase X.4.b.2).
+///
+/// Walks the 5 Global tensors then delegates to
+/// [`load_kimi_k3_layer_weights`] for each of the `config.num_layers`
+/// per-layer bundles. Returns a descriptive `Err` on the first
+/// missing tensor.
+#[allow(dead_code)]
+fn load_kimi_k3_model_weights<'a>(
+    gguf: &'a GgufFile<'a>,
+    config: &Llama3Config,
+) -> Result<KimiK3ModelWeights<'a>, String> {
+    let load_ref = |name: &str| -> Result<WeightRef<'a>, String> {
+        load_weight_ref_any_shape(gguf, name)
+            .ok_or_else(|| format!("global: missing tensor '{name}'"))
+    };
+    let load_norm = |name: &str| -> Result<Vec<f32>, String> {
+        gguf.tensor_to_f32(name)
+            .ok_or_else(|| format!("global: missing norm tensor '{name}'"))
+    };
+
+    let token_embd = load_ref("token_embd.weight")?;
+    let output_norm = load_norm("output_norm.weight")?;
+    let output = load_ref("output.weight")?;
+    let output_attn_res_norm = load_norm("output_attn_res_norm.weight")?;
+    let output_attn_res_proj = load_ref("output_attn_res_proj.weight")?;
+
+    let mut layers = Vec::with_capacity(config.num_layers);
+    for il in 0..config.num_layers {
+        layers.push(load_kimi_k3_layer_weights(gguf, il, config)?);
+    }
+
+    Ok(KimiK3ModelWeights {
+        token_embd,
+        output_norm,
+        output,
+        output_attn_res_norm,
+        output_attn_res_proj,
+        layers,
+    })
 }
 
 /// DeepSeek-V3 Multi-Token Prediction (MTP) module weights (Phase 5a, Issue #35).
@@ -11119,6 +11584,26 @@ fn load_weight_ref<'a>(
 ) -> Option<WeightRef<'a>> {
     let info = gguf.tensor_info(name)?;
     let data = gguf.tensor_data(name)?;
+    Some(WeightRef {
+        data,
+        qtype: info.qtype,
+        rows,
+        cols,
+    })
+}
+
+/// Load a weight where the shape is fully derived from the GGUF tensor
+/// info — both `rows` (dims[1] or 1 for 1D tensors) and `cols`
+/// (dims[0]) come from the file, so the caller does not need to compute
+/// them from the model config. Used by the Kimi K3 loader
+/// (Phase X.4.b.2) for tensors whose shape varies per layer type
+/// (MLA-split vs KDA vs LatentMoE per-expert) and would be brittle to
+/// hardcode.
+fn load_weight_ref_any_shape<'a>(gguf: &'a GgufFile<'a>, name: &str) -> Option<WeightRef<'a>> {
+    let info = gguf.tensor_info(name)?;
+    let data = gguf.tensor_data(name)?;
+    let cols = *info.dims.first()? as usize;
+    let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
     Some(WeightRef {
         data,
         qtype: info.qtype,

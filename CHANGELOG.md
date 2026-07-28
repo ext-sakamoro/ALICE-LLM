@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.b.2 — Kimi K3 GGUF tensor loader** (2026-07-28).
+  Follows X.4.b.1 (metadata + config) with the tensor reference
+  data structures + walker that turns a K3 GGUF into a fully
+  categorized `KimiK3ModelWeights<'a>` bundle, one step short of
+  the actual forward pass (Phase X.4.c.3). Structs:
+  - **`KimiK3ModelWeights<'a>`** — Global 5-tensor bundle
+    (`token_embd`, `output_norm`, `output`,
+    `output_attn_res_norm`, `output_attn_res_proj`) + a per-layer
+    `Vec<KimiK3LayerWeights>`.
+  - **`KimiK3LayerWeights<'a>`** — 8 COMMON tensors
+    (`attn_norm`, `ffn_norm`, `attn_output`, `attn_gate` +
+    K3-only AttnRes `{attn,ffn}_res_{norm,proj}`) plus dispatched
+    `attn: KimiK3Attention` and `ffn: KimiK3Ffn`.
+  - **`enum KimiK3Attention<'a> { Mla(KimiK3MlaAttn), Kda(KimiK3KdaAttn) }`**
+    — dispatched by `config.kimi_delta.is_mla_layer(il)` (K3: 24
+    MLA layers `[3, 7, 11, ..., 91, 92]`, 69 KDA otherwise).
+  - **`enum KimiK3Ffn<'a> { Dense { … }, LatentMoe(KimiK3LatentMoe) }`**
+    — dispatched by `il < first_k_dense_replace` (K3: only
+    layer 0 is Dense).
+  - **`KimiK3MlaAttn<'a>`** — 7 tensors: `q_a` + `q_a_norm` +
+    `q_b` (LoRA Q), `kv_a_mqa` + `kv_a_norm` (LoRA KV), split
+    `k_b` + `v_b` (K3's `kv_b` is written as two half-tensors
+    at conversion per TENSOR_MAP.md §"`kv_b_proj` split").
+  - **`KimiK3KdaAttn<'a>`** — 11 tensors: `q` + `k` + `v` (dense
+    projections), `ssm_conv1d_{q,k,v}` (ShortConv per Q/K/V),
+    `ssm_f_a` + `ssm_f_b` (low-rank α path Eq 2), `ssm_beta`
+    (β delta-rule strength), `ssm_norm` (RMSNorm on `ō`), and
+    an optional `ssm_dt.bias` (present in some conversions).
+  - **`KimiK3LatentMoe<'a>`** — 11 fields covering router
+    (`ffn_gate_inp` + optional `exp_probs_b`), shared experts
+    (`ffn_{gate,up,down}_shexp`), latent projections
+    (`routed_exp_{up,down,norm}` — K3-only RMSNorm before `W↑`),
+    and the 3-D per-expert cubes
+    (`ffn_{gate,up,down}_exps`).
+- **`load_kimi_k3_layer_weights(gguf, il, config)`** + wrapper
+  **`load_kimi_k3_model_weights(gguf, config)`** — walk GGUF
+  tensors following `Kuberwastaken/Kimi-K3-GGUF/TENSOR_MAP.md`,
+  dispatching per layer type (MLA/KDA + Dense/LatentMoE),
+  returning descriptive `Err(String)` on the first missing
+  tensor. Uses the new **`load_weight_ref_any_shape`** helper
+  which reads both `rows` and `cols` from `tensor_info.dims`,
+  avoiding the fragile per-tensor shape-computation-from-config
+  that MLA/KDA/LatentMoE variance would otherwise require.
+- **6 new loader tests** on top of the 6 metadata tests from
+  X.4.b.1: shape-helper 2D + 1D coverage, model-loader Err on
+  missing globals, layer-loader Err on missing attn_norm with
+  layer-prefix in the error message, MLA-vs-KDA dispatch
+  predicate correctness at layers 0/3/4/7, and Dense-vs-MoE
+  boundary at `first_k_dense_replace = 1`.
+
+### Deferred (X.4.c.3, next session — makes K3 actually run)
+
+- **`forward_kimi_k3` real implementation**: wire X.4.b.2 tensor
+  refs into a 93-layer forward using the X.4.c.1 KDA primitives,
+  a new Gated MLA layer forward (`q_a → q_a_norm → q_b` LoRA Q +
+  NoPE + full-rank output gate), the X.4.d.1 Block AttnRes state,
+  and the X.4.d.2 final aggregation (`output_attn_res_norm` +
+  `output_attn_res_proj`). Landing this + real GGUF (the GrEarl
+  IQ1_S upload weighs 527 GB) is what turns "K3 loads" into "K3
+  runs".
+- **Stable LatentMoE forward** (part of X.4.c.3): router top-16
+  from 896 + shared experts + latent `W↓` / RMSNorm / `W↑` +
+  SiTU-GLU per routed expert. The 3-D per-expert cube tensors
+  need per-expert byte-slice indexing that plugs into the Phase
+  X.4.e.1 streaming pool.
+
 - **Phase X.4.b.1 — Kimi K3 GGUF metadata loader** (2026-07-28).
   The community `Kuberwastaken/Kimi-K3-GGUF/convert_kimi_k3.py`
   + upstream llama.cpp PR #26185 (`pwilkin/kimi-k3-text`) settled
