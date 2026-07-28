@@ -8142,6 +8142,27 @@ fn kimi_k3_latent_moe_forward(
         "ffn_down_exps per-expert rows must equal n_embd_latent"
     );
 
+    // Phase X.4.b.9 perf: MADV_WILLNEED prefetch hints for selected
+    // expert cube byte ranges. Right after the router picks top-k,
+    // we tell the OS to start paging in the 3 × top_k byte ranges
+    // (gate, up, down for each selected expert). On K3 with USB SSD
+    // this overlaps ~50 MB of disk I/O with the ~100 ms it takes to
+    // run the shared-experts SwiGLU + routed_exp_down matvec below.
+    // No-op on non-Unix; hint-only under Unix (OS may ignore under
+    // memory pressure). Gated on ALICE_K3_MADV env so we can
+    // A/B measure.
+    let madv_on = std::env::var("ALICE_K3_MADV").ok().as_deref() == Some("1");
+    if madv_on {
+        for (expert_idx, _weight) in &selected {
+            for cube in [&moe.ffn_gate_exps, &moe.ffn_up_exps, &moe.ffn_down_exps] {
+                if let Some(plane) = kimi_k3_expert_plane_weight_ref(cube, *expert_idx, num_experts)
+                {
+                    let _ = crate::deepseek_streaming::advise_willneed(plane.data);
+                }
+            }
+        }
+    }
+
     // Step 4: down-project x_norm to latent space.
     let mut routed_in = vec![0.0_f32; n_embd_latent];
     moe.routed_exp_down.matvec(&x_norm, &mut routed_in);

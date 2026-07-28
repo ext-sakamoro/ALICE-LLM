@@ -182,6 +182,43 @@ pub fn advise_random(_mmap_bytes: &[u8]) -> bool {
     false
 }
 
+/// Hint the OS to prefetch a byte range into page cache (POSIX
+/// `madvise(MADV_WILLNEED)`). Kimi K3 MoE forward uses this to
+/// overlap disk I/O with compute: right after the router picks the
+/// top-k experts for a layer, we call this on each of the 16 expert
+/// cube byte ranges so the OS starts paging them in while we're
+/// still finishing the previous layer's shared-experts matvec.
+///
+/// This is a **hint** — safe under any circumstances, but the OS
+/// may ignore it under memory pressure. Return value: `true` iff
+/// the syscall returned 0.
+///
+/// # Safety
+///
+/// Same as [`advise_random`]: the byte slice must have come from a
+/// live `memmap2::Mmap` region.
+#[cfg(all(unix, feature = "gguf"))]
+pub fn advise_willneed(mmap_bytes: &[u8]) -> bool {
+    if mmap_bytes.is_empty() {
+        return true;
+    }
+    // SAFETY: caller-supplied slice must be a valid mmap'd region;
+    // see docstring.
+    let ret = unsafe {
+        libc::madvise(
+            mmap_bytes.as_ptr() as *mut libc::c_void,
+            mmap_bytes.len(),
+            libc::MADV_WILLNEED,
+        )
+    };
+    ret == 0
+}
+
+#[cfg(not(all(unix, feature = "gguf")))]
+pub fn advise_willneed(_mmap_bytes: &[u8]) -> bool {
+    false
+}
+
 /// Byte offset + length of one layer's expert-0 slab, plus per-expert
 /// stride and quant type. Sufficient to locate any expert `e` for that
 /// layer via `base_offset + e * bytes_per_expert`.
