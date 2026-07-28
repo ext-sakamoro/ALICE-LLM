@@ -1957,6 +1957,492 @@ mod kimi_delta_forward_tests {
     }
 }
 
+// ── Block Attention Residuals (Phase X.4.d) ─────────────────────────
+//
+// Implements K3 tech report §2.2 Eq 8-10 runtime scheme. Full AttnRes
+// (Eq 8-9) has each layer selectively retrieve representations from
+// the token embedding + every preceding layer output via softmax
+// attention with a learnable per-layer pseudo-query. Block AttnRes
+// (Eq 10) reduces the `O(Ld)` memory / communication overhead to
+// `O(Nd)` by summing layer outputs within `N` block groups of size
+// `S = L/N` layers each.
+//
+// K3 partitions its `L = 93` layers into `N = 8` blocks of `S = 12`
+// layers each (the last block is a partial 9-layer block since
+// 8 × 12 = 96 ≠ 93; specifically 7 full 12-layer blocks + 1
+// 9-layer block = 84 + 9 = 93). Counting the token embedding as
+// `b_0`, that gives 9 total representations for the cross-block
+// attention V matrix.
+//
+// This module ships the *runtime primitives*: state struct + softmax
+// attention with RMSNorm-on-keys kernel + per-layer step. The
+// final aggregation of the N block representations into logits
+// (paper §2.2 "final output layer aggregates all N block
+// representations") is deferred to X.4.d.2 alongside the concrete
+// forward_kimi_k3 integration, since the paper does not specify the
+// aggregation kernel precisely enough for a standalone unit test.
+
+/// Runtime state for Block Attention Residuals over one sequence.
+///
+/// Grows one entry in `block_reps` every `block_size` layers and
+/// resets `current_partial` at the same cadence. All buffers are
+/// heap-allocated so callers can freely clone the state for
+/// beam-search / speculative-decoding fan-out.
+///
+/// Invariants:
+/// - `block_reps[0]` is always the token embedding (`b_0 = h_1`
+///   per Eq 8), populated by [`BlockAttnResState::new`].
+/// - `block_reps.len() >= 1` at all times.
+/// - `current_partial.len() == d`.
+/// - `pos_in_block ∈ 0..block_size` (advances per
+///   [`block_attnres_layer_step`], wraps at `block_size`).
+///
+/// K3 defaults: `d = 7168`, `block_size = 12`, so each
+/// `Vec<f32>` in `block_reps` ≈ 28 KB and a full model
+/// carries 9 finalized reps + 1 partial ≈ 280 KB — negligible
+/// compared to the KDA head caches (~450 MB).
+#[derive(Debug, Clone)]
+pub struct BlockAttnResState {
+    /// Finalized block representations `[b_0, b_1, ..., b_{n-1}]`.
+    /// `b_0` is always the token embedding.
+    pub block_reps: Vec<Vec<f32>>,
+    /// Running partial sum `b_n^i = Σ_{j ≤ i, j ∈ B_n} v_j` for
+    /// the current block. Reset to zeros when a block finalizes.
+    pub current_partial: Vec<f32>,
+    /// Current block index (0-indexed; block 0 already contains
+    /// `b_0` = embedding, so the first *layer* writes into block 1).
+    current_block: usize,
+    /// Zero-indexed position within the current block (0 =
+    /// "no layers yet processed in this block").
+    pos_in_block: usize,
+    /// Hidden dimension `d`.
+    d: usize,
+    /// Layers per block (K3 uses 12).
+    block_size: usize,
+}
+
+impl BlockAttnResState {
+    /// Initialize with the token embedding as `b_0 = h_1` (Eq 8).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `embedding.len() == 0` or `block_size == 0`.
+    #[must_use]
+    pub fn new(embedding: &[f32], block_size: usize) -> Self {
+        assert!(!embedding.is_empty(), "embedding must be non-empty");
+        assert!(block_size > 0, "block_size must be at least 1");
+        let d = embedding.len();
+        Self {
+            block_reps: vec![embedding.to_vec()],
+            current_partial: vec![0.0; d],
+            current_block: 1, // b_0 already finalized as embedding
+            pos_in_block: 0,
+            d,
+            block_size,
+        }
+    }
+
+    /// Number of finalized block representations, including `b_0`.
+    #[inline]
+    #[must_use]
+    pub fn num_block_reps(&self) -> usize {
+        self.block_reps.len()
+    }
+
+    /// Current in-progress block index (0-based). Callers can use
+    /// this to decide when to inject a per-block operation such as
+    /// pipeline-parallel communication.
+    #[inline]
+    #[must_use]
+    pub const fn current_block_idx(&self) -> usize {
+        self.current_block
+    }
+
+    /// Position of the next layer within the current block.
+    #[inline]
+    #[must_use]
+    pub const fn pos_in_block(&self) -> usize {
+        self.pos_in_block
+    }
+}
+
+/// Softmax attention with the K3 "RMSNorm-on-keys" kernel from
+/// §2.2 Eq 9:
+///
+/// ```text
+/// φ(q, k) = exp(qᵀ · RMSNorm(k))
+/// α_i = φ(q, k_i) / Σ_j φ(q, k_j)
+/// h = Σ_i α_i · v_i
+/// ```
+///
+/// K3 sets `k_i = v_i` (same tensor plays both roles), so this
+/// helper takes a single slice of keys-and-values.
+///
+/// Numerical stability: uses the standard "subtract max logit
+/// before exp" (log-sum-exp trick) so extreme `q^T RMSNorm(k)`
+/// magnitudes do not blow up to `+inf`. The optional RMSNorm
+/// scale `γ` is applied per-channel after normalization; pass
+/// `None` to run un-γ-scaled normalization.
+///
+/// # Panics
+///
+/// Panics if `keys_values` is empty, or if any key length differs
+/// from `query.len()`, or if `rms_gamma` (when `Some`) has a
+/// different length from `query`.
+#[must_use]
+pub fn block_attnres_softmax_attention(
+    query: &[f32],
+    keys_values: &[&[f32]],
+    rms_gamma: Option<&[f32]>,
+    rms_eps: f32,
+) -> Vec<f32> {
+    assert!(!keys_values.is_empty(), "keys_values must be non-empty");
+    let d = query.len();
+    if let Some(gamma) = rms_gamma {
+        assert_eq!(gamma.len(), d, "rms_gamma length must equal query length");
+    }
+    for (i, k) in keys_values.iter().enumerate() {
+        assert_eq!(
+            k.len(),
+            d,
+            "keys_values[{i}] length {} != query length {d}",
+            k.len()
+        );
+    }
+
+    // 1. Compute logits ℓ_i = qᵀ · RMSNorm(k_i) for each key.
+    let mut logits = Vec::with_capacity(keys_values.len());
+    for k in keys_values {
+        // RMSNorm(k) = γ · k / sqrt(mean(k²) + eps).
+        let ss: f64 = k.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        let mean = (ss / d as f64) as f32;
+        let scale = (mean + rms_eps).sqrt().recip();
+        // Fused dot product with the RMSNorm scale and optional γ.
+        let mut logit = 0.0_f64;
+        if let Some(gamma) = rms_gamma {
+            for j in 0..d {
+                logit += f64::from(query[j]) * f64::from(k[j] * scale * gamma[j]);
+            }
+        } else {
+            for j in 0..d {
+                logit += f64::from(query[j]) * f64::from(k[j] * scale);
+            }
+        }
+        logits.push(logit as f32);
+    }
+
+    // 2. Softmax with log-sum-exp stability.
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_logits = Vec::with_capacity(logits.len());
+    let mut sum_exp = 0.0_f64;
+    for &l in &logits {
+        let e = (l - max_logit).exp();
+        exp_logits.push(e);
+        sum_exp += f64::from(e);
+    }
+    let inv_sum = (sum_exp as f32).recip();
+
+    // 3. Weighted sum h = Σ α_i · v_i. K3 uses k_i = v_i, so the
+    //    same slice.
+    let mut h = vec![0.0_f32; d];
+    for (i, v) in keys_values.iter().enumerate() {
+        let alpha = exp_logits[i] * inv_sum;
+        for j in 0..d {
+            h[j] += alpha * v[j];
+        }
+    }
+    h
+}
+
+/// One per-layer step of Block Attention Residuals (K3 §2.2 Eq 10).
+///
+/// Semantics per layer `l` at position `i` in block `n`:
+///
+/// 1. Read the current-partial snapshot `b_n^{i-1}` (the partial
+///    sum through position `i-1`, *before* this layer's output is
+///    added).
+/// 2. Assemble the value matrix `V`:
+///    - If `i = 0` (first layer of block `n`): `V = [b_0, ..., b_{n-1}]`.
+///    - Otherwise: `V = [b_0, ..., b_{n-1}, b_n^{i-1}]`.
+/// 3. Compute `h_l = Σ softmax(qᵀ RMSNorm(v)) · v` with the
+///    per-layer learnable pseudo-query `w_l`.
+/// 4. Accumulate `layer_output` into `current_partial` so the *next*
+///    step sees `b_n^i` as its `b_n^{(i+1)-1}`.
+/// 5. Advance `pos_in_block`. If we hit `block_size`, finalize:
+///    push `current_partial` into `block_reps`, reset the partial
+///    to zeros, increment `current_block`, and wrap
+///    `pos_in_block` back to 0.
+///
+/// Returns `h_l ∈ ℝ^d`, the residual stream state that feeds the
+/// next layer.
+///
+/// # Panics
+///
+/// Panics if `layer_output.len() != state.d`, `w_l.len() != state.d`,
+/// or (when `Some`) `rms_gamma_k.len() != state.d`.
+pub fn block_attnres_layer_step(
+    state: &mut BlockAttnResState,
+    layer_output: &[f32],
+    w_l: &[f32],
+    rms_gamma_k: Option<&[f32]>,
+    rms_eps: f32,
+) -> Vec<f32> {
+    let d = state.d;
+    assert_eq!(layer_output.len(), d, "layer_output length must equal d");
+    assert_eq!(w_l.len(), d, "w_l length must equal d");
+
+    // Step 1-2: assemble V from finalized block reps + (partial before this layer).
+    let mut kv_slices: Vec<&[f32]> = state.block_reps.iter().map(Vec::as_slice).collect();
+    // `pos_in_block > 0` means at least one layer has already contributed
+    // to `current_partial` earlier in this block, so include it as the
+    // last entry in V. On the first layer of a block (pos == 0), the
+    // partial is exactly zeros and would degrade the attention weights
+    // toward a spurious near-zero key; per Eq 10 we omit it entirely.
+    if state.pos_in_block > 0 {
+        kv_slices.push(state.current_partial.as_slice());
+    }
+
+    // Step 3: cross-block softmax attention with RMSNorm-on-keys.
+    let h_l = block_attnres_softmax_attention(w_l, &kv_slices, rms_gamma_k, rms_eps);
+
+    // Step 4: accumulate this layer's output into the current partial.
+    for j in 0..d {
+        state.current_partial[j] += layer_output[j];
+    }
+
+    // Step 5: advance position, finalize the block when we've hit block_size.
+    state.pos_in_block += 1;
+    if state.pos_in_block == state.block_size {
+        // Move current_partial into block_reps (owning), reset with fresh zeros.
+        let finalized = std::mem::replace(&mut state.current_partial, vec![0.0_f32; d]);
+        state.block_reps.push(finalized);
+        state.current_block += 1;
+        state.pos_in_block = 0;
+    }
+
+    h_l
+}
+
+#[cfg(test)]
+mod block_attnres_tests {
+    use super::{block_attnres_layer_step, block_attnres_softmax_attention, BlockAttnResState};
+
+    #[test]
+    fn state_new_stores_embedding_as_b0() {
+        let embedding = [1.0_f32, 2.0, 3.0, 4.0];
+        let s = BlockAttnResState::new(&embedding, 12);
+        assert_eq!(s.num_block_reps(), 1);
+        assert_eq!(s.block_reps[0], embedding);
+        assert!(s.current_partial.iter().all(|&x| x == 0.0));
+        assert_eq!(s.current_block_idx(), 1);
+        assert_eq!(s.pos_in_block(), 0);
+    }
+
+    #[test]
+    fn softmax_attention_single_key_returns_that_key() {
+        // Only one entry in V → softmax collapses to weight 1.0 → h = v_0.
+        let q = [0.5_f32, -0.5, 1.0];
+        let v0 = [7.0_f32, -3.0, 2.0];
+        let vs: Vec<&[f32]> = vec![&v0];
+        let h = block_attnres_softmax_attention(&q, &vs, None, 1e-6);
+        for i in 0..3 {
+            assert!((h[i] - v0[i]).abs() < 1e-4, "h[{i}] = {}", h[i]);
+        }
+    }
+
+    #[test]
+    fn softmax_attention_zero_query_averages_keys() {
+        // query = 0 → every logit = 0 → softmax uniform → h = mean of v_i.
+        let q = [0.0_f32, 0.0, 0.0];
+        let v0 = [1.0_f32, 2.0, 3.0];
+        let v1 = [4.0_f32, 5.0, 6.0];
+        let v2 = [7.0_f32, 8.0, 9.0];
+        let vs: Vec<&[f32]> = vec![&v0, &v1, &v2];
+        let h = block_attnres_softmax_attention(&q, &vs, None, 1e-6);
+        let expected = [
+            (1.0 + 4.0 + 7.0) / 3.0,
+            (2.0 + 5.0 + 8.0) / 3.0,
+            (3.0 + 6.0 + 9.0) / 3.0,
+        ];
+        for i in 0..3 {
+            assert!(
+                (h[i] - expected[i]).abs() < 1e-4,
+                "h[{i}] = {}, expected {}",
+                h[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_attention_dominant_key_wins() {
+        // One key aligned with the query has a much larger logit
+        // → softmax concentrates on that key → h ≈ that v.
+        // Use q = [1, 0, 0] and vs = [ [10, 0, 0], [0, 0.01, 0], [0, 0, 0.01] ].
+        // Logit_0 = q^T RMSNorm(v_0) = 1 · (10 / sqrt(100/3 + eps)) ≈ 1.732
+        // Logit_1, Logit_2 ≈ 0 → softmax puts >0.85 mass on v_0.
+        let q = [1.0_f32, 0.0, 0.0];
+        let v0 = [10.0_f32, 0.0, 0.0];
+        let v1 = [0.0_f32, 0.01, 0.0];
+        let v2 = [0.0_f32, 0.0, 0.01];
+        let vs: Vec<&[f32]> = vec![&v0, &v1, &v2];
+        let h = block_attnres_softmax_attention(&q, &vs, None, 1e-6);
+        // Dominant key contributes most of the first channel.
+        assert!(h[0] > 5.0, "dominant channel got h[0]={}", h[0]);
+        assert!(h[1].abs() < 0.01, "off-axis channel h[1]={}", h[1]);
+        assert!(h[2].abs() < 0.01, "off-axis channel h[2]={}", h[2]);
+    }
+
+    #[test]
+    fn softmax_attention_with_gamma_scales_keys() {
+        // rms_gamma = 2 · [1, 1, 1] doubles the effective RMSNorm output,
+        // which doubles the logit → in a 1-key scenario the softmax
+        // output is still equal to v (since softmax normalization
+        // washes out any single-key scale), so h == v regardless of γ.
+        let q = [0.5_f32, 0.3, -0.2];
+        let v0 = [1.0_f32, -1.0, 2.0];
+        let gamma = [2.0_f32, 2.0, 2.0];
+        let vs: Vec<&[f32]> = vec![&v0];
+        let h = block_attnres_softmax_attention(&q, &vs, Some(&gamma), 1e-6);
+        for i in 0..3 {
+            assert!((h[i] - v0[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn layer_step_first_layer_in_block_omits_partial_from_v() {
+        // Fresh state (pos_in_block = 0) → V = [b_0] only. Confirm
+        // the returned h_l equals softmax_attention(w_l, &[b_0]).
+        let embedding = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut s = BlockAttnResState::new(&embedding, 12);
+        let layer_output = [0.5_f32, -0.5, 0.5, -0.5];
+        let w_l = [1.0_f32, 0.0, 0.0, 0.0];
+
+        let h = block_attnres_layer_step(&mut s, &layer_output, &w_l, None, 1e-6);
+
+        // Independent oracle: V = [b_0] only.
+        let vs: Vec<&[f32]> = vec![&embedding];
+        let expected = block_attnres_softmax_attention(&w_l, &vs, None, 1e-6);
+        for i in 0..4 {
+            assert!(
+                (h[i] - expected[i]).abs() < 1e-5,
+                "h[{i}] = {}, expected {}",
+                h[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn layer_step_second_layer_includes_prior_partial_snapshot() {
+        // After one layer step: current_partial == first layer_output.
+        // The SECOND layer step should attend over V = [b_0, current_partial]
+        // where current_partial is the SNAPSHOT before the second layer's
+        // output is added (i.e., just the first layer's output).
+        let embedding = [1.0_f32, 0.0, 0.0, 0.0];
+        let mut s = BlockAttnResState::new(&embedding, 12);
+        let layer_output_1 = [0.0_f32, 1.0, 0.0, 0.0];
+        let w_l = [0.5_f32, 0.5, 0.5, 0.5];
+        let _ = block_attnres_layer_step(&mut s, &layer_output_1, &w_l, None, 1e-6);
+
+        // Snapshot partial BEFORE the second layer's step, then run step 2.
+        let partial_before_step_2 = s.current_partial.clone();
+        assert_eq!(partial_before_step_2, layer_output_1);
+
+        let layer_output_2 = [0.0_f32, 0.0, 1.0, 0.0];
+        let h = block_attnres_layer_step(&mut s, &layer_output_2, &w_l, None, 1e-6);
+
+        // Independent oracle: V = [b_0, partial_before_step_2].
+        let vs: Vec<&[f32]> = vec![&embedding, &partial_before_step_2];
+        let expected = block_attnres_softmax_attention(&w_l, &vs, None, 1e-6);
+        for i in 0..4 {
+            assert!(
+                (h[i] - expected[i]).abs() < 1e-5,
+                "h[{i}] = {}, expected {}",
+                h[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn partial_sum_equals_sum_of_layer_outputs_within_block() {
+        // Fire 3 layer steps into a block of size 4, verify the
+        // running partial is exactly the sum of those 3 outputs.
+        let embedding = [0.0_f32; 3];
+        let mut s = BlockAttnResState::new(&embedding, 4);
+        let w_l = [0.0_f32; 3];
+        let outs = [
+            [1.0_f32, 2.0, 3.0],
+            [0.5_f32, -1.0, 4.0],
+            [-2.0_f32, 0.25, 1.5],
+        ];
+        for out in &outs {
+            let _ = block_attnres_layer_step(&mut s, out, &w_l, None, 1e-6);
+        }
+        for j in 0..3 {
+            let expected: f32 = outs.iter().map(|o| o[j]).sum();
+            assert!(
+                (s.current_partial[j] - expected).abs() < 1e-4,
+                "channel {j}: partial = {}, expected {}",
+                s.current_partial[j],
+                expected
+            );
+        }
+        // Block hasn't finalized yet (3 layers < block_size 4).
+        assert_eq!(s.num_block_reps(), 1);
+        assert_eq!(s.pos_in_block(), 3);
+    }
+
+    #[test]
+    fn block_finalizes_after_block_size_steps() {
+        // block_size = 2: after 2 layer steps the block finalizes,
+        // block_reps grows to 2 entries, current_partial resets to 0,
+        // pos_in_block wraps to 0, current_block increments.
+        let embedding = [1.0_f32, 2.0];
+        let mut s = BlockAttnResState::new(&embedding, 2);
+        let w_l = [0.0_f32, 0.0];
+        let out1 = [1.0_f32, 1.0];
+        let out2 = [2.0_f32, 3.0];
+        let _ = block_attnres_layer_step(&mut s, &out1, &w_l, None, 1e-6);
+        assert_eq!(s.num_block_reps(), 1);
+        assert_eq!(s.pos_in_block(), 1);
+        let _ = block_attnres_layer_step(&mut s, &out2, &w_l, None, 1e-6);
+        assert_eq!(s.num_block_reps(), 2, "block should have finalized");
+        assert_eq!(s.pos_in_block(), 0, "pos should wrap back to 0");
+        assert_eq!(s.current_block_idx(), 2, "current_block should advance");
+        // Finalized b_1 = out1 + out2 = [3.0, 4.0].
+        assert_eq!(s.block_reps[1], vec![3.0_f32, 4.0]);
+        // current_partial reset to zeros.
+        assert!(s.current_partial.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn full_workflow_two_blocks_end_to_end() {
+        // 2 blocks × 2 layers = 4 layer steps. Confirm state
+        // trajectory matches a hand-computed table.
+        let embedding = [1.0_f32, 0.0];
+        let mut s = BlockAttnResState::new(&embedding, 2);
+        let w_l = [0.0_f32, 0.0]; // zero query → uniform softmax
+        let outs = [
+            [1.0_f32, 1.0], // block 1, layer 1
+            [2.0_f32, 2.0], // block 1, layer 2 → finalize b_1 = [3, 3]
+            [4.0_f32, 4.0], // block 2, layer 1
+            [8.0_f32, 8.0], // block 2, layer 2 → finalize b_2 = [12, 12]
+        ];
+        for out in &outs {
+            let _ = block_attnres_layer_step(&mut s, out, &w_l, None, 1e-6);
+        }
+        // Two blocks finalized on top of the embedding.
+        assert_eq!(s.num_block_reps(), 3);
+        assert_eq!(s.block_reps[0], vec![1.0_f32, 0.0]); // b_0 = embedding
+        assert_eq!(s.block_reps[1], vec![3.0_f32, 3.0]); // b_1
+        assert_eq!(s.block_reps[2], vec![12.0_f32, 12.0]); // b_2
+        assert_eq!(s.pos_in_block(), 0);
+        assert!(s.current_partial.iter().all(|&x| x == 0.0));
+    }
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
