@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.c.1 — KDA CPU forward primitives scaffold**
+  (2026-07-28). Ships the Kimi K3 Kimi Delta Attention math
+  primitives from the tech report §2.1.1 as standalone,
+  unit-testable Rust functions ahead of the block-level integration
+  (X.4.c.2). New public API:
+  - **`KimiDeltaState`** — per-head recurrent state
+    `S ∈ ℝ^{d_k × d_v}` as a row-major flat `Vec<f32>`. Sequence-
+    length invariant (K3 default 128 × 128 = 64 KB / head; 96 heads
+    × 69 KDA layers ≈ 421 MB total across a full model regardless
+    of context length).
+  - **`kimi_delta_step`** (Eq 1) — in-place recurrence
+    `S_t = (I − β k kᵀ) Diag(α) S_{t−1} + β k vᵀ`. Fused 3-pass
+    implementation (row-scale by α → aggregate `w = kᵀ S` →
+    `S += β k (v − w)ᵀ`) with minor short-circuits when `k[i] == 0`
+    or `coef == 0`.
+  - **`kimi_delta_read`** — `ō_t = Sᵀ q_t ∈ ℝ^{d_v}` read-out.
+  - **`kimi_delta_lower_bounded_decay`** (Eq 5) —
+    `g = g_min · Sigmoid(exp(A_h) · z), α = exp(g) ∈
+    (exp(g_min), 1)^{d_k}`. K3 fixes `g_min = -5` to keep the
+    cumulative log-decay over a 16-token tile inside `(-80, 0)`, so
+    KDA's diagonal and off-diagonal tiles can both use dense
+    Tensor Core matmul — the key departure from Kimi Linear's
+    unbounded negative-Softplus mapping.
+  - **`kimi_delta_output_gate`** (Eq 6/7) —
+    `y = W_o [Sigmoid(W_g x) ⊙ RMSNorm(ō)]`. Covers both the KDA
+    variant (`rms_weight = Some(γ)`) and the Gated MLA variant
+    (`rms_weight = None`, Eq 7 which omits the inner RMSNorm on
+    `ō_t`).
+- **14 unit tests** covering state init/reset (2), recurrence with
+  β=0 / α=0 / α=β=1 from zero / two orthogonal writes (4), read
+  from zero + read after single write (2), decay saturation at
+  z=0 / z→+∞ / z→−∞ (3), and output gate for zero-gate / zero-ō /
+  no-RMSNorm variant (3). All tolerances are 1e-4 or exact bit
+  equality; the recurrence tests hand-compute the expected 2×2 and
+  4×4 state matrices.
+- **`docs/KIMI_K3_INTEGRATION.md`** gains a "Confirmed via tech
+  report" section that transcribes every equation the ALICE-LLM
+  Phase X.4.c/d/e/h implementation needs — KDA (Eq 1-6), Gated MLA
+  (Eq 7), Block AttnRes (Eq 8-10), Stable LatentMoE (Eq 11), SiTU-
+  GLU (Eq 12), Quantile Balancing (Eq 13-14), the MXFP4 QAT
+  scope, the pretrain-time MTP head, and the KDA-aware unified
+  prefix cache from §5.4.1. "What we still DON'T know" is rewritten
+  to reflect that the only remaining blockers post-paper-read are
+  (a) the multimodal fusion timing (scheduled at X.4.i) and (b)
+  the community GGUF metadata prefix (external dependency, X.4.b).
+
+### Deferred
+
+- Phase X.4.c.2 (block-level integration): wiring the primitives
+  above into `forward_kimi_k3`, including per-head projection with
+  ShortConv (kernel 4) history buffers, chunkwise parallel form
+  (Eq 3-4, 16-token tiles) for prefill, and interaction with the
+  KV cache for the 24 Gated MLA layers. Blocked on Phase X.4.b
+  (GGUF metadata + weight tensor mapping, community-conversion
+  dependent) and the ShortConv primitive lift from the existing
+  Bonsai `gated_deltanet_step*` codepath.
+
 - **Phase X.4.e.1 — Kimi K3 streaming pool infrastructure**
   (2026-07-28). `deepseek_streaming.rs` is generalised from
   "DeepSeek-V3 only" to "DeepSeek-V3 / Kimi K3-family sparse-MoE"
