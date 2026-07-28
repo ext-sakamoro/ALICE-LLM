@@ -83,6 +83,17 @@ pub enum GgmlType {
     /// from SFT stage onward. Type ID matches upstream llama.cpp
     /// `GGML_TYPE_MXFP4 = 39`.
     Mxfp4,
+    /// llama.cpp IQ1_S: 1.5625 bits per weight (256-element K-block).
+    /// Layout: `d (2) + qs (QK_K/8 = 32) + qh (QK_K/32 * 2 = 16)` = 50 bytes.
+    /// Real K3 GrEarl GGUF-IQ1_S variant uses this for expert cubes
+    /// (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`).
+    ///
+    /// Dequantization is NOT yet implemented in this crate — recognizing
+    /// the type lets the K3 loader's shape derivation work (block-aligned
+    /// per-expert slicing succeeds) but forward will panic at matvec
+    /// time with an "IQ1_S dequant not implemented" message. Full
+    /// dequant is scheduled for Phase X.4.b.7.
+    IQ1_S,
     Other(u32),
 }
 
@@ -101,6 +112,7 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            19 => Self::IQ1_S,
             23 => Self::IQ4_XS,
             39 => Self::Mxfp4,
             41 => Self::Q1_0,
@@ -137,6 +149,9 @@ impl GgmlType {
             Self::Q2_0 => 34,
             // MXFP4 (OCP MX v1.0): E8M0 scale (1) + 32 × E2M1 packed (16) = 17
             Self::Mxfp4 => 17,
+            // IQ1_S (K-block, 256 elements, ~1.5625 bits/elem):
+            //   d (ggml_half = 2) + qs (QK_K/8 = 32) + qh (QK_K/32 × 2 = 16) = 50
+            Self::IQ1_S => 50,
             Self::Other(_) => 0,
         }
     }
@@ -147,7 +162,13 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => QK8_0,
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => QK_K,
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::IQ4_XS
+            | Self::IQ1_S => QK_K,
             Self::Q1_0 | Self::Q2_0 => QK_G128,
             Self::Mxfp4 => QK_MXFP4,
             Self::Other(_) => 1,
@@ -588,6 +609,9 @@ impl<'a> GgufFile<'a> {
             GgmlType::Q1_0 => dequantize_q1_0(data, &mut out),
             GgmlType::Q2_0 => dequantize_q2_0(data, &mut out),
             GgmlType::Mxfp4 => dequantize_row_mxfp4(data, &mut out),
+            // IQ1_S recognized (shape / slicing OK) but dequant not yet
+            // implemented — Phase X.4.b.7. Return None so callers know.
+            GgmlType::IQ1_S => return None,
             GgmlType::Other(_) => return None,
         }
 
@@ -4214,6 +4238,16 @@ pub fn quantized_matvec(
         GgmlType::Q1_0 => q1_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Q2_0 => q2_0_matvec_fallback(input, data, rows, cols, output),
         GgmlType::Mxfp4 => mxfp4_matvec_dispatched(input, data, rows, cols, output),
+        // IQ1_S matvec: not yet implemented — dequant + matvec is
+        // Phase X.4.b.7 (~200-300 LOC for K3-quant IQ1_S codebook +
+        // grid interpretation). Panic with a descriptive message so
+        // callers know which phase to await.
+        GgmlType::IQ1_S => panic!(
+            "IQ1_S matvec not yet implemented (Phase X.4.b.7). Real Kimi K3 GGUF-IQ1_S \
+             uses this for expert cubes. rows={rows} cols={cols} data_len={} input_len={}",
+            data.len(),
+            input.len()
+        ),
         GgmlType::Other(_) => panic!("unsupported quantization type: {qtype:?}"),
     }
 }
