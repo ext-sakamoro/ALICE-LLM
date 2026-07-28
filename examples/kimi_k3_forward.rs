@@ -200,27 +200,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("model constructed in {:?}", t4.elapsed());
     println!("num_layers: {}", model.num_layers());
 
-    println!("=== Forward pass (token_id = {token_id}) ===");
-    let t5 = Instant::now();
-    let logits = model.forward(token_id);
-    println!("forward in {:?}", t5.elapsed());
-    println!("logits.len() = {}", logits.len());
-
-    // Argmax + top-5.
-    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    println!("\nTop-5 (token_id, logit):");
-    for (i, (idx, logit)) in indexed.iter().take(5).enumerate() {
-        println!("  #{i}: token_id={idx:>6} logit={logit:>10.4}");
+    // ── Load tokenizer (K3 vocab_size=163840, GPT-2 BPE from tiktoken) ──
+    // Tokenizer metadata lives in shard 0. For split GGUF, re-parse
+    // shard 0 as a standalone GgufFile purely for tokenizer extraction
+    // (GgufTokenizer owns its data — Vec<Vec<u8>> — so the source
+    // GgufFile can be dropped immediately after construction).
+    println!("=== Loading tokenizer ===");
+    let t_tok = Instant::now();
+    let tokenizer: Option<alice_llm::gguf::GgufTokenizer> = match &gguf {
+        GgufKind::Single(g) => alice_llm::gguf::GgufTokenizer::from_gguf(g),
+        GgufKind::Split(_) => {
+            let g0 = alice_llm::gguf::GgufFile::parse(mmaps[0].as_ref())
+                .ok_or("shard 0 reparse for tokenizer failed")?;
+            alice_llm::gguf::GgufTokenizer::from_gguf(&g0)
+        }
+    };
+    match &tokenizer {
+        Some(t) => println!(
+            "tokenizer loaded in {:?} (some vocab entries, e.g. id 0 = {:?})",
+            t_tok.elapsed(),
+            t.decode(&[0])
+        ),
+        None => println!("tokenizer load returned None (still proceeding)"),
     }
-    println!("\nargmax token_id = {}", indexed[0].0);
 
-    let finite = logits.iter().filter(|v| v.is_finite()).count();
-    println!(
-        "\nsanity: {finite}/{total} logits finite, nan/inf count = {}",
-        logits.len() - finite,
-        total = logits.len()
-    );
+    // ── Two forward passes: 1st cold, 2nd warm-cache. ──
+    for pass in 0..2 {
+        let phase = if pass == 0 { "COLD" } else { "WARM" };
+        println!("\n=== Forward pass #{pass} ({phase}, token_id = {token_id}) ===");
+        let t5 = Instant::now();
+        let logits = model.forward(token_id);
+        let elapsed = t5.elapsed();
+        println!(
+            "forward in {:?} ({:.2} min)",
+            elapsed,
+            elapsed.as_secs_f64() / 60.0
+        );
+        println!("logits.len() = {}", logits.len());
+
+        // Argmax + top-5.
+        let mut indexed: Vec<(usize, f32)> =
+            logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        println!("\nTop-5 (token_id, logit, decoded):");
+        for (i, (idx, logit)) in indexed.iter().take(5).enumerate() {
+            let decoded = tokenizer
+                .as_ref()
+                .map(|t| t.decode(&[*idx as u32]))
+                .unwrap_or_else(|| "<no tokenizer>".to_string());
+            println!("  #{i}: token_id={idx:>6} logit={logit:>10.4} decoded={decoded:?}");
+        }
+        let argmax_id = indexed[0].0 as u32;
+        let argmax_decoded = tokenizer
+            .as_ref()
+            .map(|t| t.decode(&[argmax_id]))
+            .unwrap_or_else(|| "<no tokenizer>".to_string());
+        println!("\nargmax token_id = {argmax_id}, decoded = {argmax_decoded:?}");
+
+        let finite = logits.iter().filter(|v| v.is_finite()).count();
+        println!(
+            "sanity: {finite}/{total} logits finite, nan/inf count = {}",
+            logits.len() - finite,
+            total = logits.len()
+        );
+    }
 
     Ok(())
 }
