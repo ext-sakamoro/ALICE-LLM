@@ -9,6 +9,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.c.3.3.b.2 — quantized per-row + per-expert slicing
+  (Q4_K/Q8_0/MXFP4/etc.)** (2026-07-28). Extends
+  `kimi_k3_slice_weight_ref_rows` and `kimi_k3_expert_plane_weight_ref`
+  from F32-only to full quant zoo (F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
+  Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/Q1_0/Q2_0/MXFP4). Key insight:
+  GGUF row-major storage has quant blocks along the COLUMN axis, not
+  spanning rows. As long as `cols % elements_per_block == 0` (which
+  holds for K3 tensors since `hidden = 7168` divides both 256 and
+  32), per-row byte offsets ARE block-aligned. The earlier
+  "kda_head_dim = 128 is half a block" concern applied only to per-
+  column splits, not per-row (= per-head) splits. This closes the
+  last "F32-only scoping" limitation in K3's forward path: real K3
+  GGUF (Q2_K / IQ1_S / MXFP4 native) can now be loaded and forward
+  passes through KDA per-head aggregation + LatentMoE per-expert
+  dispatch without hitting the previous `panic!("F32 fixtures only")`
+  paths.
+  - **`kimi_k3_slice_weight_ref_rows` extension** — replaces the
+    `F32-only` gate with `cols % elements_per_block == 0` check + per-
+    row byte offset math via `blocks_per_row × block_bytes`.
+    Row_start / row_end must land on row boundaries (always true when
+    the caller passes head indices).
+  - **`kimi_k3_expert_plane_weight_ref` extension** — replaces the
+    `F32-only` gate with `(rows × cols) % elements_per_block == 0`
+    check + per-expert byte offset via `plane_blocks × block_bytes`.
+    Real K3's `ffn_gate_exps` (shape `[n_embd_latent, moe_intermediate,
+    num_experts]` = `[1024, 2048, 896]` typically) has per-expert
+    plane = 2M elements = block-aligned for all K3 quant types.
+  - **5 new unit tests** — `slice_weight_ref_rows_supports_q4_k_when_aligned`,
+    `slice_weight_ref_rows_supports_mxfp4_when_aligned`,
+    `slice_weight_ref_rows_supports_q8_0_when_aligned`,
+    `expert_plane_weight_ref_supports_quantized_cube_when_aligned`,
+    `expert_plane_weight_ref_supports_mxfp4_when_aligned`.
+  - **2 existing misalignment tests preserved** as defensive checks
+    (`_rejects_misaligned_quantized_cols`,
+    `_rejects_quantized_cube_when_misaligned`).
+  - **LatentMoE routed dispatch panic diagnostic upgrade** — replaces
+    the "F32 fixtures only" scoping message with a plane-alignment-
+    focused diagnostic that reports qtype, elements_per_block, plane
+    bytes, and cube data length. Users hitting the panic get an
+    actionable "check `n_embd_latent * n_ff_exp` divisibility"
+    hint.
+  - **439 tests pass (hf-config, +5)** / **434 tests pass (default)**
+    / fmt clean / doc clean / clippy K3 region warning 0.
+
+- **Phase X.4.c.3.4.a-f — AttnRes tensor refactor + res_mix wiring
+  into forward + tests** (2026-07-28). Implements the actual K3
+  Block Attention Residuals wiring following the pwilkin PR #26185
+  spec (which was documented in the Phase X.4.c.3.4 research
+  landing earlier the same day). Six sub-tasks:
+  - **X.4.c.3.4.a: `kimi_k3_res_mix` primitive** (pwilkin
+    `src/models/kimi-k3.cpp` L218-257 verbatim math) — softmax-
+    weighted mixture of banked checkpoints + current residual
+    stream using a fused 1D score vector. `KimiK3AttnResState`
+    struct manages the banked-checkpoint list + block_size +
+    hidden_dim, with `bank()` / `reset()` / `is_checkpoint_layer()`
+    methods.
+  - **X.4.c.3.4.b: `KimiK3LayerWeights` refactor** — collapses the
+    paper-derived 4 tensor layout (`attn_res_norm`/`_proj` +
+    `ffn_res_norm`/`_proj`) to the actual GGUF export 2 tensor
+    layout (`attn_res_score`, `ffn_res_score`, both 1D
+    `[n_embd]`). Loader updated to `blk.{N}.attn_res_score.weight`
+    + `blk.{N}.ffn_res_score.weight`.
+  - **X.4.c.3.4.c: `KimiK3ModelWeights::output_res_score`** —
+    replaces `output_attn_res_norm/proj` with a single 1D
+    `output_res_score` field. Loader updated to
+    `output_res_score.weight`.
+  - **X.4.c.3.4.d: `KimiK3Model::forward` per-layer wiring** —
+    inserts `res_mix` twice per layer (before `attn_norm` +
+    before `ffn_norm`) with checkpoint layer banking (bank raw
+    `prefix_sum` on `il % block_size == 0`) + prefix_sum reset
+    (banked layer's post-attn `prefix_sum = attn_output` alone,
+    non-banked layer's post-attn `prefix_sum += attn_output`).
+    The attention and FFN forwards now receive `cur = res_mix(...)`
+    instead of raw `x`.
+  - **X.4.c.3.4.e: final output mix** — inserts `res_mix(x,
+    output_res_score)` before `output_norm` (pwilkin L358-360).
+  - **X.4.c.3.4.f: 8 new unit tests** — state creation,
+    checkpoint predicate, bank/reset, `res_mix` identity when
+    no banked, convex combination correctness, score bias effect
+    on prob distribution, deterministic across repeated calls.
+    Plus updated `model_reset_clears_all_caches_and_block_attnres`
+    to use the new `attn_res_state` field.
+  - **Model field change** — `block_attnres: Option<BlockAttnResState>`
+    replaced by `attn_res_state: KimiK3AttnResState` (eager init
+    from `hidden_dim` + `block_size` at construction). `reset()`
+    now calls `attn_res_state.reset()`. The paper-conformant
+    `BlockAttnResState` primitive is preserved for reference but
+    no longer referenced by `KimiK3Model`.
+
 - **Phase X.4.c.3.4 (research) — pwilkin PR #26185 精読 + AttnRes wiring
   semantics docs update** (2026-07-28). Downloaded `src/models/kimi-k3.cpp`
   (645 行, SHA `2043a6a8...`) + `gguf-py/gguf/constants.py` from the pending
