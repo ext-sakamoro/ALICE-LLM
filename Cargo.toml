@@ -136,6 +136,13 @@ required-features = ["gguf"]
 name = "lol_gen"
 required-features = ["grammar", "gguf"]
 
+# Phase X.4.b + X.4.c.3.3.d: Kimi K3 GGUF end-to-end forward test.
+# Loads a merged K3 GGUF (single file, use `llama-gguf-split --merge`
+# on split shards first), runs one forward pass, prints top-5 logits.
+[[example]]
+name = "kimi_k3_forward"
+required-features = ["gguf", "hf-config"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
