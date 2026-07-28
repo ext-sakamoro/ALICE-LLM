@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.c.2 — KDA per-head composite forward** (2026-07-28).
+  Wires the Phase X.4.c.1 primitives together with the existing
+  shared `causal_conv1d_step` (Qwen 3.5 DeltaNet's ShortConv,
+  reused unchanged) and `silu` (Swish) into a full per-token
+  per-head KDA forward matching K3 tech report §2.1.1 Eq 1-6:
+  - **`KimiDeltaHeadCache`** — bundles the recurrent
+    [`KimiDeltaState`] and three ShortConv history ring buffers
+    (Q, K, V, each `(kernel_size − 1) × dim`) into one struct so
+    callers thread one mutable reference through the forward
+    call. Total per-head KDA cache ≈ 68.5 KB at K3 defaults
+    (state 64 KB + three conv rings 1.5 KB each); a full 96-head
+    KDA layer ≈ 6.6 MB; all 69 KDA layers ≈ 454 MB —
+    sequence-length invariant.
+  - **`KimiDeltaHeadParams<'a>`** — borrowed per-head weight
+    reference struct with 20 fields grouped by K3 tech report
+    subsection (Q/K/V projections + biases + ShortConv kernels,
+    β projection, α low-rank decay path, A_h, g_min, output
+    gate, output projection, optional inner RMSNorm γ + eps).
+    Zero-copy over GGUF-backed tensors in the production path,
+    equally usable with owned `Vec<f32>` in tests.
+  - **`kimi_delta_l2_norm_in_place`** — L2 normalize a slice
+    in-place with `x ← x / (||x||_2 + eps)`, matching the
+    llama.cpp / vLLM style that adds eps to the denominator so
+    zero inputs stay zero without NaN.
+  - **`kimi_delta_forward_head`** — one-token composite fn.
+    Nine-step pipeline: (1) linear projections, (2) ShortConv,
+    (3) Swish, (4) L2Norm on q/k, (5) β = Sigmoid(W_β · x),
+    (6) α via `kimi_delta_lower_bounded_decay`, (7) recurrent
+    step, (8) read `ō = Sᵀ q`, (9) output gate (Eq 6 / Eq 7).
+- **10 unit tests** covering cache init/reset (2), L2Norm
+  unit-length + zero-input (2), forward zero-input → zero-output,
+  ring cursor advance per call, two-token state + conv ring
+  progression, reset parity with fresh cache, first-token output
+  boundedness (`|y| ≤ 2, finite`), and zero-gate output
+  proportional to the sigmoid ratio vs baseline. All tolerances
+  are 1e-3 to 1e-6.
+
+### Deferred
+
+- Phase X.4.c.3 (block-level integration): wiring
+  `kimi_delta_forward_head` into the eventual `forward_kimi_k3`
+  layer dispatcher, which requires (a) per-layer weight lookup
+  from a GGUF tensor table (blocked on Phase X.4.b, community
+  `convert_hf_to_gguf.py`), (b) the Block Attention Residuals
+  Eq 8-10 wiring (Phase X.4.d), and (c) an MLA-specific KV
+  cache + NoPE + output-gate variant for the 24 Gated MLA
+  layers.
+- Chunkwise parallel form for prefill (Eq 3-4, 16-token tiles):
+  decode-only path is what X.4.c.2 provides; prefill throughput
+  is a post-integration optimization.
+- SIMD / GPU kernel for `kimi_delta_forward_head`: the CPU
+  reference is what the WGSL / Metal shader will be
+  bit-for-bit validated against once the numerics settle.
+
 - **Phase X.4.c.1 — KDA CPU forward primitives scaffold**
   (2026-07-28). Ships the Kimi K3 Kimi Delta Attention math
   primitives from the tech report §2.1.1 as standalone,
