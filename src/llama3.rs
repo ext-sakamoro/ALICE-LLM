@@ -6336,7 +6336,6 @@ fn load_kimi_k3_layer_weights<'a>(
     let attn_norm = load_norm(&format!("{prefix}.attn_norm.weight"))?;
     let ffn_norm = load_norm(&format!("{prefix}.ffn_norm.weight"))?;
     let attn_output = load_ref(&format!("{prefix}.attn_output.weight"))?;
-    let attn_gate = load_ref(&format!("{prefix}.attn_gate.weight"))?;
     // AttnRes fused 1D score vectors (pwilkin PR #26185 GGUF export
     // convention: `blk.{N}.attn_res_score` + `blk.{N}.ffn_res_score`,
     // each `[n_embd]`). Paper §2.2 originally splits these as
@@ -6345,10 +6344,29 @@ fn load_kimi_k3_layer_weights<'a>(
     let ffn_res_score = load_norm(&format!("{prefix}.ffn_res_score.weight"))?;
 
     // ── Attention (MLA XOR KDA) ──────────────────────────────────────
-    let is_mla = kd
-        .is_mla_layer(il)
-        .ok_or_else(|| format!("layer {il}: full_attn_layers missing from kimi_delta config"))?;
+    // Layer type resolution ladder (Phase X.4.b.4):
+    //
+    // 1. **Metadata path** — `config.kimi_delta.is_mla_layer(il)` reads
+    //    the 0-indexed `full_attn_layers` array from the K3 sub-config
+    //    (present in synthetic k3meta.py GGUFs, pwilkin PR fixture,
+    //    unit-test fixtures).
+    // 2. **Tensor-presence fallback** — real GrEarl K3 GGUF export
+    //    does NOT ship the `full_attn_layers` / `kda_layers` arrays,
+    //    so we detect by probing `blk.{il}.attn_q_a.weight` (MLA-only
+    //    LoRA-A projection): if it exists the layer is MLA, otherwise
+    //    KDA. Only reached when path 1 returns `None`.
+    let is_mla = match kd.is_mla_layer(il) {
+        Some(v) => v,
+        None => gguf
+            .tensor_info(&format!("{prefix}.attn_q_a.weight"))
+            .is_some(),
+    };
     let attn = if is_mla {
+        // MLA-only tensors. `attn_gate` in real K3 GGUF is exported for
+        // MLA layers only (the input-dependent output gate before o_proj);
+        // KDA layers use the full-rank `ssm_g` instead (Phase X.4.b.5).
+        let _attn_gate_mla: Option<WeightRef<'a>> =
+            load_weight_ref_any_shape(gguf, &format!("{prefix}.attn_gate.weight"));
         KimiK3Attention::Mla(KimiK3MlaAttn {
             q_a: load_ref(&format!("{prefix}.attn_q_a.weight"))?,
             q_a_norm: load_norm(&format!("{prefix}.attn_q_a_norm.weight"))?,
@@ -6359,7 +6377,8 @@ fn load_kimi_k3_layer_weights<'a>(
             v_b: load_ref(&format!("{prefix}.attn_v_b.weight"))?,
         })
     } else {
-        // Optional `ssm_dt.bias` — some conversions omit this scalar.
+        // Optional `ssm_dt.bias` — some conversions omit this scalar
+        // (real GrEarl K3 GGUF DOES include it).
         let ssm_dt_bias = gguf.tensor_to_f32(&format!("{prefix}.ssm_dt.bias"));
         KimiK3Attention::Kda(KimiK3KdaAttn {
             q: load_ref(&format!("{prefix}.attn_q.weight"))?,
@@ -6375,6 +6394,30 @@ fn load_kimi_k3_layer_weights<'a>(
             ssm_dt_bias,
         })
     };
+    // `attn_gate` for the layer bundle — MLA only (KDA uses ssm_g). For
+    // KDA layers we substitute an "empty" WeightRef that the forward
+    // path already knows not to touch (KDA layer forward ignores
+    // `layer.attn_gate` — it goes through the KDA-specific `ssm_g`
+    // gate implemented in the KDA layer primitive). Attempt to load
+    // `attn_gate` first; if absent fall back to a synthetic empty ref
+    // pointing at the token_embd bytes (any valid mmap slice works;
+    // the ref is never matvec'd on KDA layers). For MLA layers, real
+    // GGUF exports this tensor with shape `[hidden, num_heads *
+    // v_head_dim]`.
+    let attn_gate = load_weight_ref_any_shape(gguf, &format!("{prefix}.attn_gate.weight"))
+        .unwrap_or_else(|| {
+            // Placeholder pointing at attn_norm bytes — 1x1 F32,
+            // unreachable in the KDA layer forward path.
+            let tok_bytes = gguf
+                .tensor_data(&format!("{prefix}.attn_norm.weight"))
+                .unwrap_or(&[0u8; 4]);
+            WeightRef {
+                data: &tok_bytes[..4.min(tok_bytes.len())],
+                qtype: GgmlType::F32,
+                rows: 1,
+                cols: 1,
+            }
+        });
 
     // ── FFN (Dense XOR LatentMoE) ────────────────────────────────────
     let first_k_dense = kd.first_k_dense_replace.unwrap_or(0);
