@@ -6229,7 +6229,7 @@ struct KimiK3LayerWeights<'a> {
 /// `output_attn_res_proj` are the K3-only tensors that implement the
 /// final N-block aggregation of AttnRes (paper §2.2, X.4.d.2).
 #[allow(dead_code)]
-struct KimiK3ModelWeights<'a> {
+pub(crate) struct KimiK3ModelWeights<'a> {
     token_embd: WeightRef<'a>,
     output_norm: Vec<f32>,
     output: WeightRef<'a>,
@@ -6971,6 +6971,524 @@ mod kimi_k3_gated_mla_tests {
             assert!(b.is_finite(), "y2[{i}] = {b}");
         }
         assert_eq!(cache.n_positions(), 2);
+    }
+}
+
+// ── Kimi K3 model struct + skeleton forward (Phase X.4.c.3.1) ─────
+//
+// Bundles the X.4.b.2 weight refs + per-layer runtime caches (KDA
+// per-head + MLA per-layer + Block AttnRes state) into a single
+// stateful struct, plus a skeleton `forward` that plumbs embedding
+// lookup → per-layer dispatch → output projection.
+//
+// The per-layer body (real KDA all-head aggregation, real MLA layer,
+// real LatentMoE FFN, real AttnRes wiring) lives in X.4.c.3.3+ — the
+// skeleton here calls `todo!()` inside the layer loop so callers who
+// wire this up prematurely see a clear panic pointing to the next
+// phase rather than silent garbage. `mla` uses the X.4.c.3.2
+// primitive when the branch is exercised; `kda` and `ffn moe` still
+// need per-head slicing + LatentMoE forward respectively.
+//
+// This lands the plumbing (struct + cache alloc + embedding + output
+// projection + layer dispatch skeleton) so the remaining forward
+// work is contained to inside the layer body.
+
+/// Per-layer cache for Kimi K3 forward (Phase X.4.c.3.1).
+///
+/// Layer `il` is exactly one of MLA (dense-KV attention) or KDA
+/// (linear-attention with recurrent state per head). The enum tag
+/// tracks which flavour the layer uses; runtime dispatch reads
+/// `KimiDeltaConfig::is_mla_layer(il)` to pick the branch and
+/// pushes/reads the matching cache variant.
+#[allow(dead_code)]
+pub(crate) enum KimiK3LayerCache {
+    Mla(KimiK3MlaCache),
+    Kda(Vec<KimiDeltaHeadCache>),
+}
+
+/// Full model state for Kimi K3 forward (Phase X.4.c.3.1).
+///
+/// Owns the weight bundle from [`load_kimi_k3_model_weights`], a
+/// clone of the [`Llama3Config`], and all runtime caches. Callers
+/// construct via [`KimiK3Model::new`] once and then call
+/// [`KimiK3Model::forward`] per token to produce logits. Cache
+/// state is preserved across calls until [`KimiK3Model::reset`]
+/// starts a new sequence.
+///
+/// Memory footprint (K3 defaults, 93 layers × 96 heads):
+///
+/// - Per-head KDA cache: ~68 KB × 96 × 69 KDA layers ≈ 450 MB
+/// - Per-layer MLA cache (initial): 0 B; grows by ~2.3 KB / token
+///   × 24 MLA layers ≈ 55 KB / token
+/// - Block AttnRes: ~9 block reps × 28 KB ≈ 250 KB
+///
+/// Total resident, no context: ~450 MB. Sequence growth: ~55 KB /
+/// token, dominated by the MLA KV cache.
+#[allow(dead_code)]
+pub(crate) struct KimiK3Model<'a> {
+    weights: KimiK3ModelWeights<'a>,
+    config: Llama3Config,
+    /// Per-layer runtime caches, one entry per layer in
+    /// `0..config.num_layers`.
+    layer_caches: Vec<KimiK3LayerCache>,
+    /// Block Attention Residuals runtime state. Initialized lazily
+    /// on the first `forward` call so callers do not need to pass
+    /// the token embedding at `new` time.
+    block_attnres: Option<BlockAttnResState>,
+    /// AttnRes block size, from [`KimiDeltaConfig::attn_res_block_size`]
+    /// (K3: 12). Cached at construction so `forward` does not need
+    /// to reach into the sub-config on every call.
+    block_size: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> KimiK3Model<'a> {
+    /// Allocate a Kimi K3 model from an already-loaded weight bundle.
+    ///
+    /// The typical construction path is:
+    ///
+    /// ```ignore
+    /// let config = Llama3Config::from_gguf(&gguf).expect("K3 config");
+    /// let weights = load_kimi_k3_model_weights(&gguf, &config)?;
+    /// let model = KimiK3Model::new(weights, config)?;
+    /// ```
+    ///
+    /// Per-layer caches are allocated eagerly at K3 default sizes
+    /// so the first forward pass does not stall on cache growth.
+    /// The MLA KV cache reserves capacity for 4096 positions by
+    /// default; longer sequences will grow the underlying `Vec`s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `config.kimi_delta` is `None` (the
+    /// GGUF did not populate the K3 sub-config — see Phase X.4.b.1),
+    /// when critical dimensions (`kimi_delta.kda_head_dim`,
+    /// `kv_lora_rank`, `qk_rope_head_dim`, etc.) are missing, or
+    /// when `attn_res_block_size` is absent.
+    pub(crate) fn new(
+        weights: KimiK3ModelWeights<'a>,
+        config: Llama3Config,
+    ) -> Result<Self, String> {
+        let kd = config
+            .kimi_delta
+            .as_ref()
+            .ok_or_else(|| "kimi_delta sub-config missing (X.4.b.1 loader?)".to_string())?;
+        let block_size = kd
+            .attn_res_block_size
+            .ok_or_else(|| "attn_res_block_size missing from kimi_delta config".to_string())?;
+        let kda_head_dim = kd
+            .kda_head_dim
+            .ok_or_else(|| "kda_head_dim missing from kimi_delta config".to_string())?;
+        let kda_num_heads = kd.kda_num_heads.unwrap_or(config.num_heads);
+        let kda_short_conv_kernel_size = kd.kda_short_conv_kernel_size.unwrap_or(4);
+        let kv_lora_rank = kd
+            .kv_lora_rank
+            .ok_or_else(|| "kv_lora_rank missing from kimi_delta config".to_string())?;
+        let qk_rope_head_dim = kd
+            .qk_rope_head_dim
+            .ok_or_else(|| "qk_rope_head_dim missing from kimi_delta config".to_string())?;
+
+        // Reserve capacity for a 4K context in the MLA cache; longer
+        // sequences reallocate transparently.
+        const MLA_CACHE_CAPACITY: usize = 4096;
+
+        let mut layer_caches: Vec<KimiK3LayerCache> = Vec::with_capacity(config.num_layers);
+        for il in 0..config.num_layers {
+            let is_mla = kd.is_mla_layer(il).ok_or_else(|| {
+                format!("layer {il}: full_attn_layers missing from kimi_delta config")
+            })?;
+            if is_mla {
+                layer_caches.push(KimiK3LayerCache::Mla(KimiK3MlaCache::new(
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    MLA_CACHE_CAPACITY,
+                )));
+            } else {
+                let heads: Vec<KimiDeltaHeadCache> = (0..kda_num_heads)
+                    .map(|_| {
+                        KimiDeltaHeadCache::new(
+                            kda_head_dim,
+                            kda_head_dim,
+                            kda_short_conv_kernel_size,
+                        )
+                    })
+                    .collect();
+                layer_caches.push(KimiK3LayerCache::Kda(heads));
+            }
+        }
+
+        Ok(Self {
+            weights,
+            config,
+            layer_caches,
+            block_attnres: None,
+            block_size,
+        })
+    }
+
+    /// Reset every cache — start of a new sequence.
+    pub(crate) fn reset(&mut self) {
+        for cache in &mut self.layer_caches {
+            match cache {
+                KimiK3LayerCache::Mla(c) => c.reset(),
+                KimiK3LayerCache::Kda(heads) => {
+                    for head in heads {
+                        head.reset();
+                    }
+                }
+            }
+        }
+        self.block_attnres = None;
+    }
+
+    /// Number of layers this model dispatches over (`config.num_layers`,
+    /// K3: 93). Useful for callers that want to iterate manually.
+    #[must_use]
+    pub(crate) fn num_layers(&self) -> usize {
+        self.config.num_layers
+    }
+
+    /// Number of currently-cached positions in the MLA layer at
+    /// index `il`. Returns `None` if `il` names a KDA layer or is
+    /// out of bounds. Primarily useful for tests and observability.
+    #[must_use]
+    pub(crate) fn mla_cache_positions(&self, il: usize) -> Option<usize> {
+        match self.layer_caches.get(il)? {
+            KimiK3LayerCache::Mla(c) => Some(c.n_positions()),
+            KimiK3LayerCache::Kda(_) => None,
+        }
+    }
+
+    /// Skeleton one-token forward (Phase X.4.c.3.1).
+    ///
+    /// Wired stages:
+    ///
+    /// 1. **Token embedding lookup** — `x = token_embd[token_id]`.
+    /// 2. **Per-layer dispatch loop** — MLA branch calls the
+    ///    [`kimi_k3_gated_mla_step`] primitive; KDA and LatentMoE
+    ///    branches still `todo!()` pending Phase X.4.c.3.3 which
+    ///    lands the per-head KDA aggregation (needs per-head weight
+    ///    slicing from the fused `attn_q/k/v` tensors) and the
+    ///    Stable LatentMoE forward.
+    /// 3. **Residual add** — simple `h += layer_output` (K3 Block
+    ///    AttnRes wiring is X.4.c.3.4 — the current AttnRes
+    ///    primitives from X.4.d.1 need per-layer pseudo-query
+    ///    tensors that the GGUF may store under
+    ///    `attn_res_proj`/`ffn_res_proj`; the mapping is still being
+    ///    confirmed).
+    /// 4. **Final RMSNorm** — `x = RMSNorm(x, output_norm)`.
+    /// 5. **Output projection** — `logits = output.matvec(x)` →
+    ///    `[vocab_size]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a descriptive `todo!()` message from inside the
+    /// KDA / LatentMoE layer bodies when the caller tries to run a
+    /// K3 layer that this phase has not yet wired. The panic message
+    /// includes the layer index and the missing sub-phase reference
+    /// so a user hitting it can find the roadmap entry.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn forward(&mut self, token_id: u32) -> Vec<f32> {
+        // ── Step 1: embedding lookup ──
+        let vocab_size = self.config.vocab_size;
+        let hidden_dim = self.config.hidden_dim;
+        assert!(
+            (token_id as usize) < vocab_size,
+            "token_id {token_id} out of vocab range 0..{vocab_size}"
+        );
+        let embed_row_bytes =
+            self.weights.token_embd.cols * bytes_per_element(self.weights.token_embd.qtype);
+        let row_start = (token_id as usize) * embed_row_bytes;
+        let row_bytes = &self.weights.token_embd.data[row_start..row_start + embed_row_bytes];
+        let mut x = vec![0.0_f32; hidden_dim];
+        dequantize_row_to_f32(
+            row_bytes,
+            self.weights.token_embd.qtype,
+            &mut x[..hidden_dim.min(self.weights.token_embd.cols)],
+        );
+
+        // ── Step 2-3: per-layer dispatch + residual add ──
+        // Both match arms currently `todo!()`, so the residual add
+        // and the loop's subsequent iterations are unreachable —
+        // that is the intended fail-fast behaviour until Phase
+        // X.4.c.3.3 lands the KDA per-head aggregation + LatentMoE
+        // forward. Once those arms return real `Vec<f32>` outputs,
+        // the unreachable-code allows below can be dropped.
+        #[allow(unreachable_code, unused_variables)]
+        for il in 0..self.config.num_layers {
+            let layer_output: Vec<f32> = match &self.layer_caches[il] {
+                KimiK3LayerCache::Mla(_) => {
+                    todo!(
+                        "KIMI-K3 forward: MLA layer {il} — Phase X.4.c.3.3 will wire \
+                         `kimi_k3_gated_mla_step` (X.4.c.3.2) into this branch with the \
+                         real per-layer MLA cache. See docs/KIMI_K3_INTEGRATION.md \
+                         Phase X.4.c.3."
+                    )
+                }
+                KimiK3LayerCache::Kda(_) => {
+                    todo!(
+                        "KIMI-K3 forward: KDA layer {il} — Phase X.4.c.3.3 will wire \
+                         `kimi_delta_forward_head` (X.4.c.2) with per-head weight \
+                         slicing from the fused `attn_q/k/v` tensors. See \
+                         docs/KIMI_K3_INTEGRATION.md Phase X.4.c.3."
+                    )
+                }
+            };
+            // Simple residual (K3 Block AttnRes wiring is X.4.c.3.4).
+            for i in 0..hidden_dim {
+                x[i] += layer_output[i];
+            }
+        }
+
+        // ── Step 4: final RMSNorm ──
+        let mut x_norm = vec![0.0_f32; hidden_dim];
+        rms_norm(
+            &x,
+            &self.weights.output_norm,
+            self.config.norm_eps,
+            &mut x_norm,
+        );
+
+        // ── Step 5: output projection to logits ──
+        let mut logits = vec![0.0_f32; vocab_size];
+        self.weights.output.matvec(&x_norm, &mut logits);
+        logits
+    }
+}
+
+/// Return the byte size of one element for a given GGUF quantization
+/// type. Used by the K3 model to compute per-row byte offsets into
+/// the `token_embd` tensor for embedding lookup.
+#[allow(dead_code)]
+fn bytes_per_element(qtype: GgmlType) -> usize {
+    match qtype {
+        GgmlType::F32 => 4,
+        GgmlType::F16 => 2,
+        // Fallback: use block-level accounting via QK per format;
+        // callers must not hit this path with quantized token_embd
+        // in the current skeleton (a real quantized embedding needs
+        // block-aware slicing, not per-element indexing).
+        _ => panic!(
+            "bytes_per_element: quantized token_embd type {qtype:?} not yet supported \
+             in KimiK3Model skeleton — Phase X.4.c.3.3 will add block-aware embed lookup"
+        ),
+    }
+}
+
+/// Dequantize a raw byte row to f32. Delegates to the existing
+/// GGUF-side dequant machinery.
+#[allow(dead_code)]
+fn dequantize_row_to_f32(bytes: &[u8], qtype: GgmlType, out: &mut [f32]) {
+    match qtype {
+        GgmlType::F32 => {
+            let n = out.len().min(bytes.len() / 4);
+            for i in 0..n {
+                let b = &bytes[i * 4..i * 4 + 4];
+                out[i] = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        GgmlType::F16 => {
+            let n = out.len().min(bytes.len() / 2);
+            for i in 0..n {
+                let raw = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                out[i] = crate::gguf::f16_to_f32(raw);
+            }
+        }
+        _ => panic!(
+            "dequantize_row_to_f32: quantized type {qtype:?} not yet supported \
+             in KimiK3Model skeleton — Phase X.4.c.3.3 will add block-aware dequant"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod kimi_k3_model_tests {
+    use super::{
+        BlockAttnResState, GgmlType, KimiDeltaConfig, KimiK3LayerCache, KimiK3Model,
+        KimiK3ModelWeights, Llama3Config, ModelArch, WeightRef,
+    };
+
+    /// Build a minimal `Llama3Config` with a populated `KimiDeltaConfig`
+    /// so [`KimiK3Model::new`] can wire the per-layer caches. Dims
+    /// are the same 8-layer / hidden=64 / num_heads=8 mini-model
+    /// fixture used by the loader tests.
+    fn tiny_kimi_k3_config() -> Llama3Config {
+        Llama3Config {
+            arch: ModelArch::KimiK3,
+            vocab_size: 256,
+            hidden_dim: 64,
+            intermediate_dim: 128,
+            num_heads: 8,
+            num_kv_heads: 8,
+            num_layers: 8,
+            max_seq_len: 4096,
+            head_dim: 8,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
+            deepseek_v3: None,
+            kimi_delta: Some(KimiDeltaConfig {
+                full_attn_layers: Some(vec![3, 7]),
+                kda_layers: Some(vec![0, 1, 2, 4, 5, 6]),
+                kda_head_dim: Some(8),
+                kda_num_heads: Some(8),
+                kda_short_conv_kernel_size: Some(4),
+                kda_use_full_rank_gate: Some(true),
+                kda_gate_lower_bound: Some(-5.0),
+                q_lora_rank: Some(16),
+                kv_lora_rank: Some(8),
+                qk_nope_head_dim: Some(8),
+                qk_rope_head_dim: Some(4),
+                v_head_dim: Some(8),
+                mla_use_nope: Some(true),
+                mla_use_output_gate: Some(true),
+                attn_res_block_size: Some(4),
+                situ_beta: Some(4.0),
+                situ_linear_beta: Some(25.0),
+                n_routed_experts: Some(32),
+                num_experts_per_tok: Some(4),
+                n_shared_experts: Some(2),
+                num_expert_group: Some(1),
+                topk_group: Some(1),
+                moe_router_activation: Some("sigmoid".to_string()),
+                moe_topk_method: Some("noaux_tc".to_string()),
+                moe_intermediate_size: Some(64),
+                first_k_dense_replace: Some(1),
+                moe_renormalize: Some(true),
+                routed_expert_hidden_size: Some(32),
+                latent_moe_use_norm: Some(true),
+                routed_scaling_factor: Some(1.0),
+                num_nextn_predict_layers: None,
+                mxfp4_group_size: None,
+                mxfp4_num_bits: None,
+            }),
+        }
+    }
+
+    /// Build a minimal `KimiK3ModelWeights` with placeholder byte
+    /// data. Not usable for real forward but sufficient for
+    /// construction-path tests.
+    fn dummy_weights(hidden_dim: usize, vocab_size: usize, buf: &[u8]) -> KimiK3ModelWeights<'_> {
+        let empty_ref = || WeightRef {
+            data: buf,
+            qtype: GgmlType::F32,
+            rows: 1,
+            cols: 1,
+        };
+        KimiK3ModelWeights {
+            token_embd: WeightRef {
+                data: buf,
+                qtype: GgmlType::F32,
+                rows: vocab_size,
+                cols: hidden_dim,
+            },
+            output_norm: vec![1.0; hidden_dim],
+            output: WeightRef {
+                data: buf,
+                qtype: GgmlType::F32,
+                rows: vocab_size,
+                cols: hidden_dim,
+            },
+            output_attn_res_norm: vec![1.0; hidden_dim],
+            output_attn_res_proj: empty_ref(),
+            layers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn model_new_allocates_per_layer_caches_matching_layer_type() {
+        // 8 layers, full_attn_layers = [3, 7] → 6 KDA + 2 MLA.
+        let config = tiny_kimi_k3_config();
+        // We need enough backing bytes for the token embedding
+        // (vocab_size × hidden_dim × 4 bytes for F32).
+        let hidden = config.hidden_dim;
+        let vocab = config.vocab_size;
+        let buf = vec![0u8; vocab * hidden * 4];
+        let weights = dummy_weights(hidden, vocab, &buf);
+        let model = KimiK3Model::new(weights, config).expect("model must construct");
+        assert_eq!(model.num_layers(), 8);
+        assert_eq!(model.layer_caches.len(), 8);
+        // Layers 0/1/2/4/5/6 = KDA, 3/7 = MLA.
+        for (il, cache) in model.layer_caches.iter().enumerate() {
+            match cache {
+                KimiK3LayerCache::Mla(_) => {
+                    assert!(il == 3 || il == 7, "layer {il} unexpectedly MLA");
+                }
+                KimiK3LayerCache::Kda(heads) => {
+                    assert!(il != 3 && il != 7, "layer {il} unexpectedly KDA");
+                    assert_eq!(heads.len(), 8, "KDA layer {il} must have 8 head caches");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_new_returns_err_when_kimi_delta_config_absent() {
+        // Same shape but with `kimi_delta = None` — construction
+        // must Err with a descriptive message.
+        let mut config = tiny_kimi_k3_config();
+        config.kimi_delta = None;
+        let buf = vec![0u8; 4];
+        let weights = dummy_weights(config.hidden_dim, config.vocab_size, &buf);
+        let Err(err) = KimiK3Model::new(weights, config) else {
+            panic!("expected Err on missing kimi_delta");
+        };
+        assert!(
+            err.contains("kimi_delta"),
+            "expected error to mention kimi_delta, got: {err}"
+        );
+    }
+
+    #[test]
+    fn model_reset_clears_all_caches_and_block_attnres() {
+        let config = tiny_kimi_k3_config();
+        let hidden = config.hidden_dim;
+        let vocab = config.vocab_size;
+        let buf = vec![0u8; vocab * hidden * 4];
+        let weights = dummy_weights(hidden, vocab, &buf);
+        let mut model = KimiK3Model::new(weights, config).expect("construct");
+        // Muck with the MLA cache manually to prove reset works.
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![0.0; 8], &vec![0.0; 4]);
+            c.append(&vec![0.0; 8], &vec![0.0; 4]);
+            assert_eq!(c.n_positions(), 2);
+        }
+        // Inject a fake BlockAttnResState to observe the reset.
+        model.block_attnres = Some(BlockAttnResState::new(&vec![1.0_f32; hidden], 4));
+
+        model.reset();
+
+        assert_eq!(model.mla_cache_positions(3), Some(0));
+        assert!(model.block_attnres.is_none());
+    }
+
+    #[test]
+    fn model_forward_panics_at_first_kda_layer_with_todo_message() {
+        // Layer 0 is KDA (not in full_attn_layers = [3, 7]) so the
+        // layer body hits the KDA `todo!()`. The panic must mention
+        // the layer index and the phase reference.
+        let config = tiny_kimi_k3_config();
+        let hidden = config.hidden_dim;
+        let vocab = config.vocab_size;
+        let buf = vec![0u8; vocab * hidden * 4];
+        let weights = dummy_weights(hidden, vocab, &buf);
+        let mut model = KimiK3Model::new(weights, config).expect("construct");
+
+        let panic_msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(0)))
+            .expect_err("forward must panic on the KDA layer todo!()");
+        let s = panic_msg
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic_msg.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            s.contains("KDA layer 0") && s.contains("X.4.c.3.3"),
+            "panic message must reference KDA layer 0 + phase X.4.c.3.3, got: {s}"
+        );
     }
 }
 
