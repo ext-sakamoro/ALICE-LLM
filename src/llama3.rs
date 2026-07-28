@@ -7412,163 +7412,87 @@ fn kimi_k3_kda_layer_forward(
     // no `.bias`). Substitute zeros; `causal_conv1d_step` expects
     // a bias slice.
     let zero_bias = vec![0.0_f32; head_dim];
+    // Identity gate fallback (used when `ssm_g` is absent — reused
+    // across all heads instead of re-allocating per head).
+    let identity_gate = identity_matrix_f32(v_head_dim);
+    // Phase X.4.b.7 perf: ssm_f_a is SHARED across heads (`[alpha_rank,
+    // d]`). Dequantize ONCE outside the head loop instead of 96 times
+    // per KDA layer. For K3 (alpha_rank ≈ 64, d = 7168, Q4_K), this
+    // saves ~1.8 MB dequant × 95 redundant repeats × 69 KDA layers =
+    // ~12 GB of wasted dequant work per token forward.
+    let ssm_f_a_f32 = weight_ref_row_dequant(&kda.ssm_f_a);
+    // Phase X.4.b.7 perf: b_alpha is per-head but not per-layer (K3
+    // does not ship it, so we use zeros). Hoist the allocation out of
+    // the head loop — was `vec![0.0_f32; head_dim]` × 96 heads/layer
+    // × 69 layers = 6624 zero-vec allocations per token.
+    let b_alpha_zeros = vec![0.0_f32; head_dim];
+    // Also hoist w_out identity_matrix (per-head loop was allocating
+    // it 96 × 69 = 6624 times per token, same as identity_gate).
+    let identity_out = identity_matrix_f32(v_head_dim);
 
-    for head_idx in 0..num_heads {
-        let row_start = head_idx * head_dim;
-        let row_end = row_start + head_dim;
+    // Phase X.4.b.7 perf: parallelize per-head loop via rayon (feature
+    // `parallel`). Each head is independent: distinct slice of caches,
+    // distinct slice of concat_out, only-read shared inputs (`x_norm`,
+    // `ssm_f_a_f32`, etc.). Zip caches + concat_out chunks so rayon
+    // handles the mutable split cleanly.
+    let head_iter = caches
+        .iter_mut()
+        .zip(concat_out.chunks_mut(v_head_dim))
+        .enumerate();
 
-        let describe = |t: &WeightRef<'_>| {
-            format!(
-                "qtype={:?} rows={} cols={} data_len={} elements_per_block={} block_bytes={}",
-                t.qtype,
-                t.rows,
-                t.cols,
-                t.data.len(),
-                t.qtype.elements_per_block(),
-                t.qtype.block_bytes()
-            )
-        };
-        let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end).unwrap_or_else(|| {
-            panic!(
-                "kda_layer_forward: q slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
-                 tensor {})",
-                describe(&kda.q)
-            )
-        });
-        let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end).unwrap_or_else(|| {
-            panic!(
-                "kda_layer_forward: k slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
-                 tensor {})",
-                describe(&kda.k)
-            )
-        });
-        let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end).unwrap_or_else(|| {
-            panic!(
-                "kda_layer_forward: v slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
-                 tensor {})",
-                describe(&kda.v)
-            )
-        });
-        let w_conv_q = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end)
-            .unwrap_or_else(|| {
-                panic!(
-                    "kda_layer_forward: conv1d_q slice failed (head {head_idx}, rows \
-                     [{row_start}..{row_end}], tensor {})",
-                    describe(&kda.ssm_conv1d_q)
-                )
-            });
-        let w_conv_k = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end)
-            .unwrap_or_else(|| {
-                panic!(
-                    "kda_layer_forward: conv1d_k slice failed (head {head_idx}, rows \
-                     [{row_start}..{row_end}], tensor {})",
-                    describe(&kda.ssm_conv1d_k)
-                )
-            });
-        let w_conv_v = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end)
-            .unwrap_or_else(|| {
-                panic!(
-                    "kda_layer_forward: conv1d_v slice failed (head {head_idx}, rows \
-                     [{row_start}..{row_end}], tensor {})",
-                    describe(&kda.ssm_conv1d_v)
-                )
-            });
-        let w_alpha_up = kimi_k3_slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end)
-            .unwrap_or_else(|| {
-                panic!(
-                    "kda_layer_forward: ssm_f_b slice failed (head {head_idx}, rows \
-                     [{row_start}..{row_end}], tensor {})",
-                    describe(&kda.ssm_f_b)
-                )
-            });
+    #[cfg(feature = "parallel")]
+    let head_iter = {
+        use rayon::iter::ParallelBridge;
+        head_iter.par_bridge()
+    };
 
-        // `ssm_beta` is per-head 1×d, so slice one row.
-        let w_beta_ref = kimi_k3_slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
-            .unwrap_or_else(|| {
-                panic!("kda_layer_forward: ssm_beta slice failed (head {head_idx})")
-            });
-        let w_beta = weight_ref_row_dequant(&w_beta_ref);
-
-        // `ssm_norm` is a `Vec<f32>` per-channel γ. Layout differs
-        // across K3 exports:
-        // - real GrEarl K3 GGUF: `[head_dim]` (128 elements),
-        //   shared/broadcast across all heads;
-        // - some synthetic fixtures: `[num_heads * head_dim]`,
-        //   sliced per-head.
-        // We disambiguate by length: if `ssm_norm.len() == head_dim`,
-        // reuse the same slice for every head; otherwise slice
-        // `[row_start..row_end]` as before.
-        let ssm_norm_f32: Vec<f32> = if kda.ssm_norm.len() == head_dim {
-            kda.ssm_norm.clone()
-        } else if row_end <= kda.ssm_norm.len() {
-            kda.ssm_norm[row_start..row_end].to_vec()
-        } else {
-            panic!(
-                "kda_layer_forward: ssm_norm shape unexpected (len={}, head_dim={}, \
-                 head_idx={head_idx}, num_heads={num_heads}). Expected `[head_dim]` \
-                 (shared) or `[num_heads * head_dim]` (per-head).",
-                kda.ssm_norm.len(),
-                head_dim
+    #[cfg(feature = "parallel")]
+    let process_head =
+        |(head_idx, (cache, out_slice)): (usize, (&mut KimiDeltaHeadCache, &mut [f32]))| {
+            kimi_k3_kda_head_forward(
+                head_idx,
+                &x_norm,
+                head_dim,
+                v_head_dim,
+                alpha_rank,
+                g_min,
+                rms_eps,
+                kda,
+                &ssm_f_a_f32,
+                &zero_bias,
+                &b_alpha_zeros,
+                &identity_gate,
+                &identity_out,
+                cache,
+                out_slice,
             );
         };
 
-        // Phase X.4.b.5: per-head A_h from ssm_a array (real GrEarl
-        // K3 GGUF ships `blk.{il}.ssm_a` as a per-head f32 array of
-        // length num_heads). Falls back to 0.0 (paper init) when
-        // absent (skeleton / pwilkin-synth fixtures).
-        let a_h = kda
-            .ssm_a
-            .as_ref()
-            .and_then(|arr| arr.get(head_idx).copied())
-            .unwrap_or(0.0);
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::iter::ParallelIterator;
+        head_iter.for_each(process_head);
+    }
 
-        // Phase X.4.b.5: per-head ssm_g slice for K3's full-rank
-        // output gate. real K3 exports `blk.{il}.ssm_g.weight` with
-        // shape `[num_heads * v_head_dim, hidden]`. Per-head slice
-        // takes rows [head_idx*v_head_dim..(head_idx+1)*v_head_dim].
-        // When absent (skeleton / pwilkin-synth), the identity gate
-        // fallback keeps unit-test behavior unchanged.
-        let ssm_g_slice = kda
-            .ssm_g
-            .as_ref()
-            .and_then(|g| kimi_k3_slice_weight_ref_rows(g, row_start, row_end));
-        let identity_gate = identity_matrix_f32(v_head_dim);
-        let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_row_dequant);
-        let w_gate_ref: &[f32] = w_gate_owned.as_deref().unwrap_or(&identity_gate);
-
-        let params = KimiDeltaHeadParams {
-            w_q: &weight_ref_row_dequant(&w_q),
-            w_k: &weight_ref_row_dequant(&w_k),
-            w_v: &weight_ref_row_dequant(&w_v),
-            conv_kernel_q: &weight_ref_row_dequant(&w_conv_q),
-            conv_kernel_k: &weight_ref_row_dequant(&w_conv_k),
-            conv_kernel_v: &weight_ref_row_dequant(&w_conv_v),
-            conv_bias_q: &zero_bias,
-            conv_bias_k: &zero_bias,
-            conv_bias_v: &zero_bias,
-            w_beta: &w_beta,
-            // `ssm_f_a` is shared across heads (`[alpha_rank, d]`).
-            w_alpha_down: &weight_ref_row_dequant(&kda.ssm_f_a),
-            w_alpha_up: &weight_ref_row_dequant(&w_alpha_up),
-            // `b_alpha` is not shipped in K3 GGUF — substitute zeros.
-            b_alpha: &vec![0.0_f32; head_dim],
-            a_h,
+    #[cfg(not(feature = "parallel"))]
+    for (head_idx, (cache, out_slice)) in head_iter {
+        kimi_k3_kda_head_forward(
+            head_idx,
+            &x_norm,
+            head_dim,
+            v_head_dim,
             alpha_rank,
             g_min,
-            // Per-head output gate: real K3 uses ssm_g (full-rank),
-            // fallback to identity when absent. Output projection is
-            // applied once at the layer level after concat.
-            w_gate: w_gate_ref,
-            w_out: &identity_matrix_f32(v_head_dim),
-            d_out: v_head_dim,
-            rms_gamma: Some(&ssm_norm_f32),
             rms_eps,
-        };
-
-        let head_out = kimi_delta_forward_head(&x_norm, &params, &mut caches[head_idx], rms_eps);
-        // Copy into the concat buffer at slot `head_idx * v_head_dim`.
-        let dst_start = head_idx * v_head_dim;
-        concat_out[dst_start..dst_start + v_head_dim].copy_from_slice(&head_out);
+            kda,
+            &ssm_f_a_f32,
+            &zero_bias,
+            &b_alpha_zeros,
+            &identity_gate,
+            &identity_out,
+            cache,
+            out_slice,
+        );
     }
 
     // Shared output projection: [d_out, num_heads × v_head_dim].
@@ -7584,6 +7508,153 @@ fn kimi_k3_kda_layer_forward(
     let mut y = vec![0.0_f32; d];
     attn_output.matvec(&concat_out, &mut y);
     y
+}
+
+/// Per-head KDA forward, extracted from `kimi_k3_kda_layer_forward` so
+/// the head loop can be parallelized via rayon (Phase X.4.b.7 perf).
+/// Handles slice + dequant + `kimi_delta_forward_head` for one head,
+/// writing the concatenated output slot in-place.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn kimi_k3_kda_head_forward(
+    head_idx: usize,
+    x_norm: &[f32],
+    head_dim: usize,
+    v_head_dim: usize,
+    alpha_rank: usize,
+    g_min: f32,
+    rms_eps: f32,
+    kda: &KimiK3KdaAttn<'_>,
+    ssm_f_a_f32: &[f32],
+    zero_bias: &[f32],
+    b_alpha_zeros: &[f32],
+    identity_gate: &[f32],
+    identity_out: &[f32],
+    cache: &mut KimiDeltaHeadCache,
+    out_slice: &mut [f32],
+) {
+    let row_start = head_idx * head_dim;
+    let row_end = row_start + head_dim;
+
+    let describe = |t: &WeightRef<'_>| {
+        format!(
+            "qtype={:?} rows={} cols={} data_len={} elements_per_block={} block_bytes={}",
+            t.qtype,
+            t.rows,
+            t.cols,
+            t.data.len(),
+            t.qtype.elements_per_block(),
+            t.qtype.block_bytes()
+        )
+    };
+    let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end).unwrap_or_else(|| {
+        panic!(
+            "kda_layer_forward: q slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+             tensor {})",
+            describe(&kda.q)
+        )
+    });
+    let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end).unwrap_or_else(|| {
+        panic!(
+            "kda_layer_forward: k slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+             tensor {})",
+            describe(&kda.k)
+        )
+    });
+    let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end).unwrap_or_else(|| {
+        panic!(
+            "kda_layer_forward: v slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+             tensor {})",
+            describe(&kda.v)
+        )
+    });
+    let w_conv_q = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: conv1d_q slice failed (head {head_idx}, rows \
+                 [{row_start}..{row_end}], tensor {})",
+                describe(&kda.ssm_conv1d_q)
+            )
+        });
+    let w_conv_k = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: conv1d_k slice failed (head {head_idx}, rows \
+                 [{row_start}..{row_end}], tensor {})",
+                describe(&kda.ssm_conv1d_k)
+            )
+        });
+    let w_conv_v = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: conv1d_v slice failed (head {head_idx}, rows \
+                 [{row_start}..{row_end}], tensor {})",
+                describe(&kda.ssm_conv1d_v)
+            )
+        });
+    let w_alpha_up = kimi_k3_slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: ssm_f_b slice failed (head {head_idx}, rows \
+                 [{row_start}..{row_end}], tensor {})",
+                describe(&kda.ssm_f_b)
+            )
+        });
+
+    let w_beta_ref = kimi_k3_slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
+        .unwrap_or_else(|| panic!("kda_layer_forward: ssm_beta slice failed (head {head_idx})"));
+    let w_beta = weight_ref_row_dequant(&w_beta_ref);
+
+    let ssm_norm_f32: Vec<f32> = if kda.ssm_norm.len() == head_dim {
+        kda.ssm_norm.clone()
+    } else if row_end <= kda.ssm_norm.len() {
+        kda.ssm_norm[row_start..row_end].to_vec()
+    } else {
+        panic!(
+            "kda_layer_forward: ssm_norm shape unexpected (len={}, head_dim={head_dim}, \
+             head_idx={head_idx}). Expected `[head_dim]` (shared) or `[num_heads * head_dim]`.",
+            kda.ssm_norm.len(),
+        );
+    };
+
+    let a_h = kda
+        .ssm_a
+        .as_ref()
+        .and_then(|arr| arr.get(head_idx).copied())
+        .unwrap_or(0.0);
+
+    let ssm_g_slice = kda
+        .ssm_g
+        .as_ref()
+        .and_then(|g| kimi_k3_slice_weight_ref_rows(g, row_start, row_end));
+    let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_row_dequant);
+    let w_gate_ref: &[f32] = w_gate_owned.as_deref().unwrap_or(identity_gate);
+
+    let params = KimiDeltaHeadParams {
+        w_q: &weight_ref_row_dequant(&w_q),
+        w_k: &weight_ref_row_dequant(&w_k),
+        w_v: &weight_ref_row_dequant(&w_v),
+        conv_kernel_q: &weight_ref_row_dequant(&w_conv_q),
+        conv_kernel_k: &weight_ref_row_dequant(&w_conv_k),
+        conv_kernel_v: &weight_ref_row_dequant(&w_conv_v),
+        conv_bias_q: zero_bias,
+        conv_bias_k: zero_bias,
+        conv_bias_v: zero_bias,
+        w_beta: &w_beta,
+        w_alpha_down: ssm_f_a_f32,
+        w_alpha_up: &weight_ref_row_dequant(&w_alpha_up),
+        b_alpha: b_alpha_zeros,
+        a_h,
+        alpha_rank,
+        g_min,
+        w_gate: w_gate_ref,
+        w_out: identity_out,
+        d_out: v_head_dim,
+        rms_gamma: Some(&ssm_norm_f32),
+        rms_eps,
+    };
+
+    let head_out = kimi_delta_forward_head(x_norm, &params, cache, rms_eps);
+    out_slice.copy_from_slice(&head_out);
 }
 
 /// Interpret a `WeightRef` as an owned `Vec<f32>`. F32 only.
