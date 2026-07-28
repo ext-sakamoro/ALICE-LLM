@@ -140,7 +140,7 @@ pub enum ModelArch {
 
 impl ModelArch {
     /// Detect architecture from GGUF metadata key `general.architecture`.
-    pub fn from_gguf(gguf: &GgufFile<'_>) -> Self {
+    pub fn from_gguf<'a, G: crate::gguf::GgufSource<'a>>(gguf: &'a G) -> Self {
         match gguf.meta_str("general.architecture") {
             Some("mistral") => Self::Mistral,
             Some("gemma2") => Self::Gemma2,
@@ -230,7 +230,7 @@ impl ModelArch {
     }
 
     /// Resolve the actual GGUF metadata prefix (some models use versioned keys).
-    fn resolve_prefix(&self, gguf: &GgufFile<'_>) -> String {
+    fn resolve_prefix<'a, G: crate::gguf::GgufSource<'a>>(&self, gguf: &'a G) -> String {
         let raw = gguf
             .meta_str("general.architecture")
             .unwrap_or(self.meta_prefix());
@@ -609,7 +609,7 @@ impl KimiDeltaConfig {
     /// text-only variant without MXFP4 quantization metadata) still
     /// parses without erroring.
     #[must_use]
-    pub fn from_gguf(gguf: &crate::gguf::GgufFile<'_>, prefix: &str) -> Self {
+    pub fn from_gguf<'a, G: crate::gguf::GgufSource<'a>>(gguf: &'a G, prefix: &str) -> Self {
         let opt_usize = |key: &str| gguf.meta_u32(key).map(|v| v as usize);
         let opt_bool = |key: &str| gguf.meta_bool(key);
         let opt_str = |key: &str| gguf.meta_str(key).map(str::to_owned);
@@ -3715,7 +3715,7 @@ impl Llama3Config {
     }
 
     /// Load config from GGUF metadata (auto-detects architecture).
-    pub fn from_gguf(gguf: &GgufFile<'_>) -> Option<Self> {
+    pub fn from_gguf<'a, G: crate::gguf::GgufSource<'a>>(gguf: &'a G) -> Option<Self> {
         let arch = ModelArch::from_gguf(gguf);
         let prefix = arch.resolve_prefix(gguf);
 
@@ -6329,8 +6329,8 @@ pub struct KimiK3ModelWeights<'a> {
 /// name to look at when the GGUF is malformed or a K3 variant ships
 /// a tensor under a different name than TENSOR_MAP.md documents.
 #[allow(dead_code)]
-fn load_kimi_k3_layer_weights<'a>(
-    gguf: &'a GgufFile<'a>,
+fn load_kimi_k3_layer_weights<'a, G: crate::gguf::GgufSource<'a>>(
+    gguf: &'a G,
     il: usize,
     config: &Llama3Config,
 ) -> Result<KimiK3LayerWeights<'a>, String> {
@@ -6524,8 +6524,8 @@ fn load_kimi_k3_layer_weights<'a>(
 /// per-layer bundles. Returns a descriptive `Err` on the first
 /// missing tensor.
 #[allow(dead_code)]
-pub fn load_kimi_k3_model_weights<'a>(
-    gguf: &'a GgufFile<'a>,
+pub fn load_kimi_k3_model_weights<'a, G: crate::gguf::GgufSource<'a>>(
+    gguf: &'a G,
     config: &Llama3Config,
 ) -> Result<KimiK3ModelWeights<'a>, String> {
     let load_ref = |name: &str| -> Result<WeightRef<'a>, String> {
@@ -14871,7 +14871,10 @@ fn load_weight_ref<'a>(
 /// (Phase X.4.b.2) for tensors whose shape varies per layer type
 /// (MLA-split vs KDA vs LatentMoE per-expert) and would be brittle to
 /// hardcode.
-fn load_weight_ref_any_shape<'a>(gguf: &'a GgufFile<'a>, name: &str) -> Option<WeightRef<'a>> {
+fn load_weight_ref_any_shape<'a, G: crate::gguf::GgufSource<'a>>(
+    gguf: &'a G,
+    name: &str,
+) -> Option<WeightRef<'a>> {
     let info = gguf.tensor_info(name)?;
     let data = gguf.tensor_data(name)?;
     let cols = *info.dims.first()? as usize;
