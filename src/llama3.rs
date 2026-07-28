@@ -9127,9 +9127,25 @@ impl<'a> KimiK3Model<'a> {
 
         let mut layer_caches: Vec<KimiK3LayerCache> = Vec::with_capacity(config.num_layers);
         for il in 0..config.num_layers {
-            let is_mla = kd.is_mla_layer(il).ok_or_else(|| {
-                format!("layer {il}: full_attn_layers missing from kimi_delta config")
-            })?;
+            // Phase X.4.b.4 continued: derive layer type from the
+            // already-loaded `weights.layers[il].attn` enum discriminant.
+            // The loader (Phase X.4.b.4) uses `full_attn_layers` metadata
+            // when present, else tensor-name presence fallback; by the
+            // time `KimiK3Model::new` runs, that decision is baked into
+            // the KimiK3Attention enum. This lets us allocate the right
+            // cache type without needing `full_attn_layers` metadata.
+            //
+            // Fallback: if `weights.layers` is shorter than `config.num_layers`
+            // (test fixtures using `dummy_weights` do this), fall back to
+            // the `KimiDeltaConfig::is_mla_layer` metadata path, and treat
+            // "no metadata AND no matching weight layer" as `is_mla = false`
+            // (KDA) so cache allocation stays valid for construction-path
+            // tests that never call `forward()`.
+            let is_mla = if il < weights.layers.len() {
+                matches!(weights.layers[il].attn, KimiK3Attention::Mla(_))
+            } else {
+                kd.is_mla_layer(il).unwrap_or(false)
+            };
             if is_mla {
                 layer_caches.push(KimiK3LayerCache::Mla(KimiK3MlaCache::new(
                     kv_lora_rank,
