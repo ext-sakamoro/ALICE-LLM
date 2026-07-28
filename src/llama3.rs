@@ -6699,6 +6699,288 @@ fn kimi_k3_gated_mla_step(
     y
 }
 
+// ── Kimi K3 forward helpers (Phase X.4.c.3.3.a) ─────────────────────
+//
+// Small pure functions that bridge the K3 sub-config + weight refs
+// into the argument shape expected by the layer primitives from
+// X.4.c.3.2 (MLA) and the standard SwiGLU pattern used by the layer-0
+// dense FFN.
+
+/// Extract a [`KimiK3MlaConfig`] from a populated [`Llama3Config`]
+/// (Phase X.4.c.3.3.a). Returns `None` when the K3 sub-config or any
+/// required MLA dim is absent.
+///
+/// The runtime dims live inline on `KimiK3MlaConfig` because
+/// `kimi_k3_gated_mla_step` is dim-agnostic — it does not reach
+/// back into the parent config on the hot path. This helper is
+/// called once at model construction (or once per forward if the
+/// caller does not cache the result).
+#[allow(dead_code)]
+fn kimi_k3_extract_mla_config(config: &Llama3Config) -> Option<KimiK3MlaConfig> {
+    let kd = config.kimi_delta.as_ref()?;
+    Some(KimiK3MlaConfig {
+        d: config.hidden_dim,
+        num_heads: config.num_heads,
+        qk_nope_head_dim: kd.qk_nope_head_dim?,
+        qk_rope_head_dim: kd.qk_rope_head_dim?,
+        v_head_dim: kd.v_head_dim?,
+        q_lora_rank: kd.q_lora_rank?,
+        kv_lora_rank: kd.kv_lora_rank?,
+        rms_eps: config.norm_eps,
+    })
+}
+
+/// Kimi K3 dense-FFN forward (Phase X.4.c.3.3.a).
+///
+/// Applied to layer 0 only (K3 `first_k_dense_replace = 1`). Uses
+/// the standard SwiGLU pattern from llama.cpp / DeepSeek V3 dense
+/// layers — `y = W_down · (Swish(W_gate · x_norm) ⊙ W_up · x_norm)`.
+///
+/// K3 tech report does not explicitly specify the dense-FFN
+/// activation. The Stable LatentMoE path uses SiTU-GLU (§2.3.2), but
+/// the layer-0 dense FFN is unspecified. We match the DeepSeek V3
+/// dense-layer convention (SwiGLU) since (a) DeepSeek V3 is the
+/// closest architectural sibling and (b) the tensor names in
+/// TENSOR_MAP.md (`ffn_gate` / `ffn_up` / `ffn_down`) match the
+/// llama.cpp SwiGLU convention exactly.
+///
+/// # Arguments
+///
+/// - `x`: input hidden state `[d]`.
+/// - `ffn_norm`: RMSNorm γ applied to `x` before the SwiGLU.
+/// - `gate`: `W_gate` `[intermediate, d]`.
+/// - `up`: `W_up` `[intermediate, d]`.
+/// - `down`: `W_down` `[d, intermediate]`.
+/// - `rms_eps`: RMSNorm epsilon.
+///
+/// # Returns
+///
+/// `y ∈ ℝ^d` — the dense-FFN output ready for residual add.
+#[allow(dead_code)]
+fn kimi_k3_dense_ffn_forward(
+    x: &[f32],
+    ffn_norm: &[f32],
+    gate: &WeightRef<'_>,
+    up: &WeightRef<'_>,
+    down: &WeightRef<'_>,
+    rms_eps: f32,
+) -> Vec<f32> {
+    let d = x.len();
+    debug_assert_eq!(ffn_norm.len(), d);
+    debug_assert_eq!(down.rows, d, "down.rows must equal hidden dim");
+    let intermediate = gate.rows;
+    debug_assert_eq!(
+        up.rows, intermediate,
+        "gate/up must have same intermediate dim"
+    );
+    debug_assert_eq!(
+        down.cols, intermediate,
+        "down.cols must equal intermediate dim"
+    );
+
+    // Pre-FFN RMSNorm.
+    let x_norm = kimi_k3_rms_norm(x, ffn_norm, rms_eps);
+
+    // SwiGLU: gated = Swish(W_gate x_norm) ⊙ W_up x_norm.
+    let mut gate_out = vec![0.0_f32; intermediate];
+    gate.matvec(&x_norm, &mut gate_out);
+    let mut up_out = vec![0.0_f32; intermediate];
+    up.matvec(&x_norm, &mut up_out);
+    let mut gated = vec![0.0_f32; intermediate];
+    for i in 0..intermediate {
+        gated[i] = silu(gate_out[i]) * up_out[i];
+    }
+
+    // W_down projects back to hidden.
+    let mut y = vec![0.0_f32; d];
+    down.matvec(&gated, &mut y);
+    y
+}
+
+#[cfg(test)]
+mod kimi_k3_forward_helpers_tests {
+    use super::{
+        kimi_k3_dense_ffn_forward, kimi_k3_extract_mla_config, GgmlType, KimiDeltaConfig,
+        Llama3Config, ModelArch, WeightRef,
+    };
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    fn tiny_k3_config() -> Llama3Config {
+        Llama3Config {
+            arch: ModelArch::KimiK3,
+            vocab_size: 32,
+            hidden_dim: 4,
+            intermediate_dim: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 2,
+            max_seq_len: 128,
+            head_dim: 2,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            attention_extras: None,
+            ssm: None,
+            moe: None,
+            gemma3n: None,
+            gemma4: None,
+            deepseek_v3: None,
+            kimi_delta: Some(KimiDeltaConfig {
+                full_attn_layers: Some(vec![0, 1]),
+                kda_layers: Some(vec![]),
+                kda_head_dim: Some(2),
+                kda_num_heads: Some(2),
+                kda_short_conv_kernel_size: Some(4),
+                kda_use_full_rank_gate: Some(true),
+                kda_gate_lower_bound: Some(-5.0),
+                q_lora_rank: Some(4),
+                kv_lora_rank: Some(2),
+                qk_nope_head_dim: Some(2),
+                qk_rope_head_dim: Some(1),
+                v_head_dim: Some(2),
+                mla_use_nope: Some(true),
+                mla_use_output_gate: Some(true),
+                attn_res_block_size: Some(2),
+                situ_beta: Some(4.0),
+                situ_linear_beta: Some(25.0),
+                n_routed_experts: Some(4),
+                num_experts_per_tok: Some(2),
+                n_shared_experts: Some(1),
+                num_expert_group: Some(1),
+                topk_group: Some(1),
+                moe_router_activation: Some("sigmoid".to_string()),
+                moe_topk_method: Some("noaux_tc".to_string()),
+                moe_intermediate_size: Some(4),
+                first_k_dense_replace: Some(2),
+                moe_renormalize: Some(true),
+                routed_expert_hidden_size: Some(2),
+                latent_moe_use_norm: Some(true),
+                routed_scaling_factor: Some(1.0),
+                num_nextn_predict_layers: None,
+                mxfp4_group_size: None,
+                mxfp4_num_bits: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn extract_mla_config_populates_from_llama3_config() {
+        let config = tiny_k3_config();
+        let mla_cfg = kimi_k3_extract_mla_config(&config).expect("mla config must extract");
+        assert_eq!(mla_cfg.d, 4);
+        assert_eq!(mla_cfg.num_heads, 2);
+        assert_eq!(mla_cfg.qk_nope_head_dim, 2);
+        assert_eq!(mla_cfg.qk_rope_head_dim, 1);
+        assert_eq!(mla_cfg.v_head_dim, 2);
+        assert_eq!(mla_cfg.q_lora_rank, 4);
+        assert_eq!(mla_cfg.kv_lora_rank, 2);
+        assert!((mla_cfg.rms_eps - 1e-5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn extract_mla_config_returns_none_when_kimi_delta_absent() {
+        let mut config = tiny_k3_config();
+        config.kimi_delta = None;
+        assert!(kimi_k3_extract_mla_config(&config).is_none());
+    }
+
+    #[test]
+    fn extract_mla_config_returns_none_when_required_dim_absent() {
+        let mut config = tiny_k3_config();
+        if let Some(kd) = config.kimi_delta.as_mut() {
+            kd.q_lora_rank = None;
+        }
+        assert!(kimi_k3_extract_mla_config(&config).is_none());
+    }
+
+    #[test]
+    fn dense_ffn_forward_zero_input_gives_zero_output() {
+        // x = 0 → x_norm = 0 (all-zero mean, RMSNorm scales 0 by
+        // 1/sqrt(eps) = large, but 0 × large = 0) → gate_out = up_out
+        // = 0 → gated = 0 → y = 0.
+        let x = vec![0.0_f32; 4];
+        let ffn_norm = vec![1.0_f32; 4];
+        // Non-trivial weights so we can be sure the zero comes from x=0.
+        let gate_bytes = f32_bytes(&(0..32).map(|i| 0.01 * i as f32).collect::<Vec<_>>());
+        let up_bytes = f32_bytes(&(0..32).map(|i| 0.02 * i as f32).collect::<Vec<_>>());
+        let down_bytes = f32_bytes(&(0..32).map(|i| 0.03 * i as f32).collect::<Vec<_>>());
+        let gate = WeightRef {
+            data: &gate_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let up = WeightRef {
+            data: &up_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let down = WeightRef {
+            data: &down_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 8,
+        };
+        let y = kimi_k3_dense_ffn_forward(&x, &ffn_norm, &gate, &up, &down, 1e-5);
+        for (i, &v) in y.iter().enumerate() {
+            assert_eq!(v, 0.0, "y[{i}] = {v} but zero input must give zero output");
+        }
+    }
+
+    #[test]
+    fn dense_ffn_forward_produces_finite_bounded_output() {
+        // Non-zero input, non-zero weights — verify output is finite
+        // and within a reasonable envelope for the tiny scale.
+        let x = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let ffn_norm = vec![1.0_f32; 4];
+        let gate_bytes = f32_bytes(
+            &(0..32)
+                .map(|i| 0.01 * (i as f32 - 15.5))
+                .collect::<Vec<_>>(),
+        );
+        let up_bytes = f32_bytes(
+            &(0..32)
+                .map(|i| 0.02 * (i as f32 - 15.5))
+                .collect::<Vec<_>>(),
+        );
+        let down_bytes = f32_bytes(
+            &(0..32)
+                .map(|i| 0.03 * (i as f32 - 15.5))
+                .collect::<Vec<_>>(),
+        );
+        let gate = WeightRef {
+            data: &gate_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let up = WeightRef {
+            data: &up_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let down = WeightRef {
+            data: &down_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 8,
+        };
+        let y = kimi_k3_dense_ffn_forward(&x, &ffn_norm, &gate, &up, &down, 1e-5);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "y[{i}] = {v} not finite");
+            assert!(v.abs() <= 2.0, "y[{i}] = {v} exceeds reasonable envelope");
+        }
+    }
+}
+
 #[cfg(test)]
 mod kimi_k3_gated_mla_tests {
     use super::{
@@ -7208,35 +7490,95 @@ impl<'a> KimiK3Model<'a> {
         );
 
         // ── Step 2-3: per-layer dispatch + residual add ──
-        // Both match arms currently `todo!()`, so the residual add
-        // and the loop's subsequent iterations are unreachable —
-        // that is the intended fail-fast behaviour until Phase
-        // X.4.c.3.3 lands the KDA per-head aggregation + LatentMoE
-        // forward. Once those arms return real `Vec<f32>` outputs,
-        // the unreachable-code allows below can be dropped.
-        #[allow(unreachable_code, unused_variables)]
+        //
+        // Phase X.4.c.3.3.a landing (2026-07-28):
+        // - **MLA branch**: real forward via `kimi_k3_gated_mla_step`
+        //   (X.4.c.3.2 primitive). Requires `weights.layers[il]`
+        //   populated by `load_kimi_k3_model_weights` (X.4.b.2).
+        // - **Dense FFN** (`il < first_k_dense_replace`, K3 only
+        //   layer 0): real forward via `kimi_k3_dense_ffn_forward`
+        //   (SwiGLU pattern).
+        // - **KDA branch**: still `todo!()` — X.4.c.3.3.b will land
+        //   per-head weight slicing from fused `attn_q/k/v` tensors
+        //   + per-head `kimi_delta_forward_head` aggregation.
+        // - **LatentMoE FFN** (`il >= first_k_dense_replace`, K3
+        //   layers 1..93): still `todo!()` — X.4.c.3.3.c will land
+        //   sigmoid router top-16 from 896 experts + 2 shared
+        //   experts + latent `W↓` / RMSNorm / `W↑` + SiTU-GLU per
+        //   routed expert.
+        // - **AttnRes**: still a simple residual add. X.4.c.3.4 will
+        //   wire the Block AttnRes primitive from X.4.d.1 + the
+        //   final aggregation from X.4.d.2 via
+        //   `output_attn_res_norm` + `output_attn_res_proj`.
+        let mla_config = kimi_k3_extract_mla_config(&self.config).expect(
+            "KimiK3Model was constructed but MLA sub-config no longer extractable — \
+             invariant broken (should have failed at ::new)",
+        );
+
         for il in 0..self.config.num_layers {
-            let layer_output: Vec<f32> = match &self.layer_caches[il] {
-                KimiK3LayerCache::Mla(_) => {
-                    todo!(
-                        "KIMI-K3 forward: MLA layer {il} — Phase X.4.c.3.3 will wire \
-                         `kimi_k3_gated_mla_step` (X.4.c.3.2) into this branch with the \
-                         real per-layer MLA cache. See docs/KIMI_K3_INTEGRATION.md \
-                         Phase X.4.c.3."
+            let layer = &self.weights.layers[il];
+
+            // Attention half.
+            let attn_output: Vec<f32> = match (&mut self.layer_caches[il], &layer.attn) {
+                (KimiK3LayerCache::Mla(cache), KimiK3Attention::Mla(mla_attn)) => {
+                    kimi_k3_gated_mla_step(
+                        &x,
+                        &layer.attn_norm,
+                        &layer.attn_gate,
+                        &layer.attn_output,
+                        mla_attn,
+                        cache,
+                        &mla_config,
                     )
                 }
-                KimiK3LayerCache::Kda(_) => {
+                (KimiK3LayerCache::Kda(_), KimiK3Attention::Kda(_)) => {
                     todo!(
-                        "KIMI-K3 forward: KDA layer {il} — Phase X.4.c.3.3 will wire \
+                        "KIMI-K3 forward: KDA layer {il} — Phase X.4.c.3.3.b will wire \
                          `kimi_delta_forward_head` (X.4.c.2) with per-head weight \
                          slicing from the fused `attn_q/k/v` tensors. See \
                          docs/KIMI_K3_INTEGRATION.md Phase X.4.c.3."
                     )
                 }
+                _ => panic!(
+                    "KimiK3Model layer {il}: cache/attn tag mismatch — invariant \
+                     broken (cache and weights.layers[{il}].attn must both be MLA or \
+                     both KDA, dispatched by `is_mla_layer` at construction and \
+                     tensor-load time)"
+                ),
             };
-            // Simple residual (K3 Block AttnRes wiring is X.4.c.3.4).
+
+            // Simple residual — K3 Block AttnRes wiring is X.4.c.3.4.
             for i in 0..hidden_dim {
-                x[i] += layer_output[i];
+                x[i] += attn_output[i];
+            }
+
+            // FFN half.
+            let ffn_output: Vec<f32> = match &layer.ffn {
+                KimiK3Ffn::Dense { gate, up, down } => kimi_k3_dense_ffn_forward(
+                    &x,
+                    &layer.ffn_norm,
+                    gate,
+                    up,
+                    down,
+                    self.config.norm_eps,
+                ),
+                KimiK3Ffn::LatentMoe(_) => {
+                    todo!(
+                        "KIMI-K3 forward: LatentMoE FFN at layer {il} — Phase \
+                         X.4.c.3.3.c will land Stable LatentMoE: sigmoid router top-16 \
+                         from 896 experts (`ffn_gate_inp` + `exp_probs_b` bias for \
+                         noaux_tc), 2 shared experts (`ffn_{{gate,up,down}}_shexp`), \
+                         latent projections (`routed_exp_up`/`down` + \
+                         `routed_exp_norm` K3-specific RMSNorm before W↑), and \
+                         SiTU-GLU per routed expert. K3 default \
+                         `first_k_dense_replace = 1` means layers 1..93 all take this \
+                         branch. See paper §2.3."
+                    )
+                }
+            };
+
+            for i in 0..hidden_dim {
+                x[i] += ffn_output[i];
             }
         }
 
@@ -7467,10 +7809,21 @@ mod kimi_k3_model_tests {
     }
 
     #[test]
-    fn model_forward_panics_at_first_kda_layer_with_todo_message() {
-        // Layer 0 is KDA (not in full_attn_layers = [3, 7]) so the
-        // layer body hits the KDA `todo!()`. The panic must mention
-        // the layer index and the phase reference.
+    fn model_forward_panics_on_empty_layers_vec() {
+        // Phase X.4.c.3.3.a wired the MLA and Dense FFN branches
+        // into `forward`, so the layer body now reaches into
+        // `self.weights.layers[il]` to fetch the per-layer weight
+        // bundle. The `dummy_weights` helper still ships an empty
+        // `layers: Vec::new()`, so `forward` panics with
+        // index-out-of-bounds *before* it can reach the KDA /
+        // LatentMoE `todo!()`s.
+        //
+        // A full-fixture test that populates `weights.layers` with
+        // synthetic tensors + exercises the real MLA branch is
+        // scheduled at Phase X.4.c.3.3.d once we have a synthetic-
+        // GGUF builder that emits the per-layer tensor set. For
+        // now this regression guard documents the precondition:
+        // `load_kimi_k3_model_weights` must run before `forward`.
         let config = tiny_kimi_k3_config();
         let hidden = config.hidden_dim;
         let vocab = config.vocab_size;
@@ -7479,15 +7832,16 @@ mod kimi_k3_model_tests {
         let mut model = KimiK3Model::new(weights, config).expect("construct");
 
         let panic_msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(0)))
-            .expect_err("forward must panic on the KDA layer todo!()");
+            .expect_err("forward must panic when weights.layers is empty");
         let s = panic_msg
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| panic_msg.downcast_ref::<&str>().copied())
             .unwrap_or("");
         assert!(
-            s.contains("KDA layer 0") && s.contains("X.4.c.3.3"),
-            "panic message must reference KDA layer 0 + phase X.4.c.3.3, got: {s}"
+            s.contains("index out of bounds"),
+            "panic message must reference index out of bounds (unpopulated \
+             weights.layers), got: {s}"
         );
     }
 }
