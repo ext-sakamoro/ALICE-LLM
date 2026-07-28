@@ -6195,14 +6195,27 @@ enum KimiK3Ffn<'a> {
     LatentMoe(KimiK3LatentMoe<'a>),
 }
 
-/// Kimi K3 per-layer weight bundle (Phase X.4.b.2).
+/// Kimi K3 per-layer weight bundle (Phase X.4.b.2, refactored in
+/// X.4.c.3.4.b).
 ///
-/// Every K3 layer carries the eight COMMON tensors from TENSOR_MAP.md
-/// (`attn_norm`, `ffn_norm`, `attn_output`, `attn_gate`, plus the four
-/// AttnRes tensors `{attn,ffn}_res_{norm,proj}`) plus one of two
-/// attention layouts (MLA or KDA) and one of two FFN layouts (Dense or
-/// LatentMoE). The `KimiK3Attention` and `KimiK3Ffn` enums encode both
-/// dispatches so no `Option` juggling is needed in the forward path.
+/// Every K3 layer carries the 4 COMMON tensors + 2 AttnRes score
+/// vectors (`attn_norm`, `ffn_norm`, `attn_output`, `attn_gate`,
+/// `attn_res_score`, `ffn_res_score`) plus one of two attention
+/// layouts (MLA or KDA) and one of two FFN layouts (Dense or
+/// LatentMoE). The `KimiK3Attention` and `KimiK3Ffn` enums encode
+/// both dispatches so no `Option` juggling is needed in the forward
+/// path.
+///
+/// **Phase X.4.c.3.4.b refactor**: paper §2.2 originally used
+/// `attn_res_norm` (RMSNorm γ) + `attn_res_proj` (per-layer pseudo-
+/// query projection) as two separate tensors. The pwilkin
+/// `ggml-org/llama.cpp` PR #26185 real GGUF export fuses these into
+/// a single 1D score vector `attn_res_score` per site (its
+/// `constants.py` comment reads
+/// `# Kimi K3 (fused res_norm * res_proj, pre-attention)`). The
+/// pre-refactor 4-tensor layout (`{attn,ffn}_res_{norm,proj}`) has
+/// been collapsed to 2 tensors (`attn_res_score`, `ffn_res_score`),
+/// each `Vec<f32>` of length `n_embd`.
 #[allow(dead_code)]
 struct KimiK3LayerWeights<'a> {
     attn_norm: Vec<f32>,
@@ -6212,29 +6225,33 @@ struct KimiK3LayerWeights<'a> {
     /// every layer (MLA `mla_use_output_gate = true` + KDA
     /// `use_full_rank_gate = true`).
     attn_gate: WeightRef<'a>,
-    /// K3-only Attention Residuals: post-attn AttnRes RMSNorm + proj.
-    attn_res_norm: Vec<f32>,
-    attn_res_proj: WeightRef<'a>,
-    /// K3-only Attention Residuals: post-FFN AttnRes RMSNorm + proj.
-    ffn_res_norm: Vec<f32>,
-    ffn_res_proj: WeightRef<'a>,
+    /// K3-only Attention Residuals: pre-attention fused score vector
+    /// (`blk.{N}.attn_res_score` in GGUF, shape `[n_embd]`, `= res_norm
+    /// * res_proj` fused per pwilkin PR).
+    attn_res_score: Vec<f32>,
+    /// K3-only Attention Residuals: pre-FFN fused score vector
+    /// (`blk.{N}.ffn_res_score` in GGUF, shape `[n_embd]`, `= res_norm
+    /// * res_proj` fused per pwilkin PR).
+    ffn_res_score: Vec<f32>,
     attn: KimiK3Attention<'a>,
     ffn: KimiK3Ffn<'a>,
 }
 
-/// Kimi K3 full-model weight bundle (Phase X.4.b.2).
+/// Kimi K3 full-model weight bundle (Phase X.4.b.2, refactored in
+/// X.4.c.3.4.c).
 ///
-/// Global tensors (5) + a per-layer vector matching
-/// `config.num_layers` (K3: 93). `output_attn_res_norm` +
-/// `output_attn_res_proj` are the K3-only tensors that implement the
-/// final N-block aggregation of AttnRes (paper §2.2, X.4.d.2).
+/// Global tensors (4) + a per-layer vector matching
+/// `config.num_layers` (K3: 93). `output_res_score` is the K3-only
+/// 1D fused score vector for the final N-block aggregation of
+/// AttnRes (paper §2.2 / pwilkin PR #26185 `output_res_score`).
 #[allow(dead_code)]
 pub(crate) struct KimiK3ModelWeights<'a> {
     token_embd: WeightRef<'a>,
     output_norm: Vec<f32>,
     output: WeightRef<'a>,
-    output_attn_res_norm: Vec<f32>,
-    output_attn_res_proj: WeightRef<'a>,
+    /// K3-only AttnRes: final output-side fused score vector
+    /// (`output_res_score` in GGUF, shape `[n_embd]`).
+    output_res_score: Vec<f32>,
     layers: Vec<KimiK3LayerWeights<'a>>,
 }
 
@@ -6278,10 +6295,12 @@ fn load_kimi_k3_layer_weights<'a>(
     let ffn_norm = load_norm(&format!("{prefix}.ffn_norm.weight"))?;
     let attn_output = load_ref(&format!("{prefix}.attn_output.weight"))?;
     let attn_gate = load_ref(&format!("{prefix}.attn_gate.weight"))?;
-    let attn_res_norm = load_norm(&format!("{prefix}.attn_res_norm.weight"))?;
-    let attn_res_proj = load_ref(&format!("{prefix}.attn_res_proj.weight"))?;
-    let ffn_res_norm = load_norm(&format!("{prefix}.ffn_res_norm.weight"))?;
-    let ffn_res_proj = load_ref(&format!("{prefix}.ffn_res_proj.weight"))?;
+    // AttnRes fused 1D score vectors (pwilkin PR #26185 GGUF export
+    // convention: `blk.{N}.attn_res_score` + `blk.{N}.ffn_res_score`,
+    // each `[n_embd]`). Paper §2.2 originally splits these as
+    // `res_norm * res_proj`; the export fuses them.
+    let attn_res_score = load_norm(&format!("{prefix}.attn_res_score.weight"))?;
+    let ffn_res_score = load_norm(&format!("{prefix}.ffn_res_score.weight"))?;
 
     // ── Attention (MLA XOR KDA) ──────────────────────────────────────
     let is_mla = kd
@@ -6347,10 +6366,8 @@ fn load_kimi_k3_layer_weights<'a>(
         ffn_norm,
         attn_output,
         attn_gate,
-        attn_res_norm,
-        attn_res_proj,
-        ffn_res_norm,
-        ffn_res_proj,
+        attn_res_score,
+        ffn_res_score,
         attn,
         ffn,
     })
@@ -6379,8 +6396,9 @@ fn load_kimi_k3_model_weights<'a>(
     let token_embd = load_ref("token_embd.weight")?;
     let output_norm = load_norm("output_norm.weight")?;
     let output = load_ref("output.weight")?;
-    let output_attn_res_norm = load_norm("output_attn_res_norm.weight")?;
-    let output_attn_res_proj = load_ref("output_attn_res_proj.weight")?;
+    // AttnRes fused 1D output-side score vector (pwilkin PR #26185
+    // GGUF export convention: `output_res_score`, `[n_embd]`).
+    let output_res_score = load_norm("output_res_score.weight")?;
 
     let mut layers = Vec::with_capacity(config.num_layers);
     for il in 0..config.num_layers {
@@ -6391,8 +6409,7 @@ fn load_kimi_k3_model_weights<'a>(
         token_embd,
         output_norm,
         output,
-        output_attn_res_norm,
-        output_attn_res_proj,
+        output_res_score,
         layers,
     })
 }
@@ -6795,6 +6812,299 @@ fn kimi_k3_dense_ffn_forward(
     let mut y = vec![0.0_f32; d];
     down.matvec(&gated, &mut y);
     y
+}
+
+// ── Kimi K3 AttnRes runtime state + res_mix primitive ─────────────
+// (Phase X.4.c.3.4.a — pwilkin PR #26185 semantics)
+//
+// Mirrors `src/models/kimi-k3.cpp` L199-257 (`res_push` /
+// `res_stack` / `res_mix`). Diverges from the paper's
+// `BlockAttnResState` (which tracks per-position partial sums within
+// the current block); the pwilkin export instead banks the RAW input
+// to each checkpoint layer and mixes against banked ckpts + current
+// residual stream at every layer.
+
+/// Runtime state for K3 Block Attention Residuals (pwilkin PR #26185
+/// wiring, Phase X.4.c.3.4.a).
+///
+/// Owns a growing list of `banked` checkpoints (each `[n_embd]`,
+/// pushed at every checkpoint layer `il % block_size == 0`) and the
+/// AttnRes block size cached at construction. The current residual
+/// stream is passed in per-call rather than held inside the state;
+/// this matches the pwilkin design where `prefix_sum` is a graph
+/// tensor threaded through each layer.
+///
+/// Fresh state has zero banked ckpts, so `res_mix` at layer 0 is an
+/// identity pass-through (nothing to mix against). Layer 0 is a
+/// checkpoint layer (`0 % block_size == 0`), so the first `bank`
+/// call happens after the initial `res_mix` and before the layer's
+/// attention forward.
+#[allow(dead_code)]
+pub(crate) struct KimiK3AttnResState {
+    d: usize,
+    block_size: usize,
+    banked: Vec<Vec<f32>>,
+}
+
+#[allow(dead_code)]
+impl KimiK3AttnResState {
+    /// Construct fresh state for a K3 model with `hidden_dim` and
+    /// `attn_res_block_size` (K3 default 12).
+    pub(crate) fn new(hidden_dim: usize, block_size: usize) -> Self {
+        assert!(hidden_dim > 0, "hidden_dim must be > 0");
+        assert!(block_size > 0, "block_size must be > 0");
+        Self {
+            d: hidden_dim,
+            block_size,
+            banked: Vec::new(),
+        }
+    }
+
+    /// True if layer `il` is a checkpoint layer that should
+    /// (1) bank the raw prefix_sum before its attention, and
+    /// (2) reset prefix_sum to the attention output alone after.
+    pub(crate) fn is_checkpoint_layer(&self, il: usize) -> bool {
+        il.is_multiple_of(self.block_size)
+    }
+
+    /// Push the raw prefix_sum into the ckpt bank. Called at
+    /// checkpoint layer entry, BEFORE the layer's `res_mix` output
+    /// is applied (i.e. bank the pre-mix, pre-attention input).
+    pub(crate) fn bank(&mut self, prefix_sum: &[f32]) {
+        assert_eq!(
+            prefix_sum.len(),
+            self.d,
+            "prefix_sum length {} must equal hidden dim {}",
+            prefix_sum.len(),
+            self.d
+        );
+        self.banked.push(prefix_sum.to_vec());
+    }
+
+    /// Reset all banked state — called on sequence boundary.
+    pub(crate) fn reset(&mut self) {
+        self.banked.clear();
+    }
+
+    /// Number of banked ckpts (for testing / diagnostics).
+    #[cfg(test)]
+    pub(crate) fn banked_count(&self) -> usize {
+        self.banked.len()
+    }
+}
+
+/// K3 Block AttnRes `res_mix` primitive (pwilkin PR #26185
+/// `src/models/kimi-k3.cpp` L218-257 verbatim math, Phase
+/// X.4.c.3.4.a).
+///
+/// Computes a softmax-weighted mixture of banked checkpoints + the
+/// current residual stream, using a fused 1D `score_w` vector.
+///
+/// **Semantics** (paraphrased from L229-256):
+///
+/// 1. For each banked ckpt `k_i`:
+///    `score_i = Σ_j RMSNorm(k_i)[j] · score_w[j]`
+///    (RMSNorm gain fused into `score_w`; norm eps = `rms_eps`).
+/// 2. For the current stream `prefix_sum`:
+///    `score_cur = Σ_j RMSNorm(prefix_sum)[j] · score_w[j]`
+/// 3. Concatenate: `scores = [score_0, ..., score_{n-1}, score_cur]`
+///    (length `n_ckpt + 1`).
+/// 4. Softmax over concatenated scores → `probs`.
+/// 5. **Weighted sum uses RAW non-normalized values**
+///    (paper §2.2 duality — norm is for score computation only):
+///    `out = Σ_i probs[i] · k_i + probs[n] · prefix_sum`.
+///
+/// When `state.banked` is empty (e.g. first `res_mix` call before
+/// any layer has banked), returns `prefix_sum` unchanged (identity
+/// pass-through).
+///
+/// # Panics
+///
+/// Panics if `prefix_sum.len() != state.d` or `score_w.len() != state.d`.
+#[allow(dead_code)]
+pub(crate) fn kimi_k3_res_mix(
+    state: &KimiK3AttnResState,
+    prefix_sum: &[f32],
+    score_w: &[f32],
+    rms_eps: f32,
+) -> Vec<f32> {
+    let d = state.d;
+    assert_eq!(prefix_sum.len(), d, "prefix_sum length must equal d");
+    assert_eq!(score_w.len(), d, "score_w length must equal d");
+
+    if state.banked.is_empty() {
+        return prefix_sum.to_vec();
+    }
+
+    let n_ckpt = state.banked.len();
+
+    // Step 1: score each banked ckpt: sum_j RMSNorm(k_i)[j] * score_w[j].
+    // This equals score_w · RMSNorm(k_i) (dot product with normalized k).
+    let mut scores = Vec::with_capacity(n_ckpt + 1);
+    for bank in &state.banked {
+        let ss: f64 = bank.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        let mean = (ss / d as f64) as f32;
+        let scale = (mean + rms_eps).sqrt().recip();
+        let mut s = 0.0_f64;
+        for j in 0..d {
+            s += f64::from(bank[j]) * f64::from(scale) * f64::from(score_w[j]);
+        }
+        scores.push(s as f32);
+    }
+
+    // Step 2: score current stream.
+    let ss: f64 = prefix_sum
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum();
+    let mean = (ss / d as f64) as f32;
+    let scale_cur = (mean + rms_eps).sqrt().recip();
+    let mut s_cur = 0.0_f64;
+    for j in 0..d {
+        s_cur += f64::from(prefix_sum[j]) * f64::from(scale_cur) * f64::from(score_w[j]);
+    }
+    scores.push(s_cur as f32);
+
+    // Step 3-4: softmax over (n_ckpt + 1) with log-sum-exp stability.
+    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_s = Vec::with_capacity(scores.len());
+    let mut sum_exp = 0.0_f64;
+    for &sc in &scores {
+        let e = (sc - max_s).exp();
+        exp_s.push(e);
+        sum_exp += f64::from(e);
+    }
+    let inv_sum = (sum_exp as f32).recip();
+
+    // Step 5: weighted sum using RAW (non-normalized) values.
+    let mut out = vec![0.0_f32; d];
+    for (i, bank) in state.banked.iter().enumerate() {
+        let p = exp_s[i] * inv_sum;
+        for j in 0..d {
+            out[j] += p * bank[j];
+        }
+    }
+    let p_cur = exp_s[n_ckpt] * inv_sum;
+    for j in 0..d {
+        out[j] += p_cur * prefix_sum[j];
+    }
+    out
+}
+
+#[cfg(test)]
+mod kimi_k3_attnres_tests {
+    use super::{kimi_k3_res_mix, KimiK3AttnResState};
+
+    #[test]
+    fn attnres_state_new_starts_empty() {
+        let state = KimiK3AttnResState::new(4, 12);
+        assert_eq!(state.banked_count(), 0);
+    }
+
+    #[test]
+    fn attnres_state_checkpoint_layer_predicate() {
+        let state = KimiK3AttnResState::new(4, 12);
+        assert!(state.is_checkpoint_layer(0));
+        assert!(!state.is_checkpoint_layer(1));
+        assert!(!state.is_checkpoint_layer(11));
+        assert!(state.is_checkpoint_layer(12));
+        assert!(state.is_checkpoint_layer(24));
+        assert!(!state.is_checkpoint_layer(23));
+    }
+
+    #[test]
+    fn attnres_state_bank_grows_banked_list() {
+        let mut state = KimiK3AttnResState::new(3, 12);
+        let inp1 = vec![1.0_f32, 2.0, 3.0];
+        state.bank(&inp1);
+        assert_eq!(state.banked_count(), 1);
+        let inp2 = vec![4.0_f32, 5.0, 6.0];
+        state.bank(&inp2);
+        assert_eq!(state.banked_count(), 2);
+    }
+
+    #[test]
+    fn attnres_state_reset_clears_banked() {
+        let mut state = KimiK3AttnResState::new(2, 12);
+        state.bank(&[1.0_f32, 2.0]);
+        assert_eq!(state.banked_count(), 1);
+        state.reset();
+        assert_eq!(state.banked_count(), 0);
+    }
+
+    #[test]
+    fn res_mix_identity_when_no_banked_ckpts() {
+        // Empty bank → returns prefix_sum unchanged.
+        let state = KimiK3AttnResState::new(3, 12);
+        let prefix = vec![0.5_f32, -0.5, 0.25];
+        let score_w = vec![1.0_f32; 3];
+        let out = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
+        assert_eq!(out, prefix, "no banked → return prefix_sum unchanged");
+    }
+
+    #[test]
+    fn res_mix_with_one_bank_gives_convex_combination() {
+        // 1 banked ckpt + 1 current stream. Softmax over 2 scores;
+        // output is a convex combination of the two RAW vectors.
+        let mut state = KimiK3AttnResState::new(3, 12);
+        let bank = vec![10.0_f32, 20.0, 30.0];
+        state.bank(&bank);
+        let prefix = vec![100.0_f32, 200.0, 300.0];
+        // Uniform score_w → both scores dominated by norm of raw vec;
+        // just need to verify output lives in [min, max] of the two.
+        let score_w = vec![1.0_f32; 3];
+        let out = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
+        assert_eq!(out.len(), 3);
+        for i in 0..3 {
+            let lo = bank[i].min(prefix[i]);
+            let hi = bank[i].max(prefix[i]);
+            assert!(
+                out[i] >= lo - 1e-4 && out[i] <= hi + 1e-4,
+                "out[{i}]={} must lie in [{lo}, {hi}]",
+                out[i]
+            );
+        }
+        // Softmax probs sum to 1, so output is a proper convex combo.
+        // For two equally-scaled equally-normed vectors with the same
+        // score_w, probs should be near 0.5/0.5 (since bank & prefix
+        // have different magnitudes but their RMSNorm makes them
+        // similar, and score = RMSNorm · score_w is similar too).
+    }
+
+    #[test]
+    fn res_mix_score_w_bias_shifts_weight_toward_matching_bank() {
+        // 2 banked ckpts. score_w matches ckpt 1's direction, so
+        // probs should favor ckpt 1's raw value in the output.
+        let mut state = KimiK3AttnResState::new(3, 12);
+        let bank_orthogonal = vec![1.0_f32, 0.0, 0.0]; // score_w · RMSNorm ≈ 0
+        let bank_aligned = vec![0.0_f32, 1.0, 0.0]; //   ≈ 1
+        state.bank(&bank_orthogonal);
+        state.bank(&bank_aligned);
+        // Prefix chosen to have low overlap with score_w.
+        let prefix = vec![1.0_f32, 0.0, 0.0];
+        let score_w = vec![0.0_f32, 1.0, 0.0];
+        let out = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
+        // With softmax favoring bank_aligned (score ≈ 1) over
+        // bank_orthogonal (score ≈ 0) and prefix (score ≈ 0), the
+        // output's y-component should be closest to bank_aligned[1] = 1.
+        assert!(
+            out[1] > 0.5,
+            "aligned bank must dominate output y-component, got {}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn res_mix_deterministic_across_repeated_calls() {
+        let mut state = KimiK3AttnResState::new(4, 12);
+        state.bank(&[1.0_f32, 2.0, 3.0, 4.0]);
+        state.bank(&[5.0_f32, 6.0, 7.0, 8.0]);
+        let prefix = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let score_w = vec![1.0_f32, -1.0, 1.0, -1.0];
+        let out1 = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
+        let out2 = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
+        assert_eq!(out1, out2, "res_mix must be deterministic");
+    }
 }
 
 // ── Kimi K3 KDA per-head aggregation (Phase X.4.c.3.3.b) ──────────
@@ -8439,10 +8749,11 @@ pub(crate) struct KimiK3Model<'a> {
     /// Per-layer runtime caches, one entry per layer in
     /// `0..config.num_layers`.
     layer_caches: Vec<KimiK3LayerCache>,
-    /// Block Attention Residuals runtime state. Initialized lazily
-    /// on the first `forward` call so callers do not need to pass
-    /// the token embedding at `new` time.
-    block_attnres: Option<BlockAttnResState>,
+    /// Block Attention Residuals runtime state (X.4.c.3.4.d wiring,
+    /// pwilkin PR #26185 semantics). Initialized eagerly at
+    /// construction so `forward` can `bank` on the first layer
+    /// without an option check.
+    attn_res_state: KimiK3AttnResState,
     /// AttnRes block size, from [`KimiDeltaConfig::attn_res_block_size`]
     /// (K3: 12). Cached at construction so `forward` does not need
     /// to reach into the sub-config on every call.
@@ -8525,11 +8836,12 @@ impl<'a> KimiK3Model<'a> {
             }
         }
 
+        let attn_res_state = KimiK3AttnResState::new(config.hidden_dim, block_size);
         Ok(Self {
             weights,
             config,
             layer_caches,
-            block_attnres: None,
+            attn_res_state,
             block_size,
         })
     }
@@ -8546,7 +8858,7 @@ impl<'a> KimiK3Model<'a> {
                 }
             }
         }
-        self.block_attnres = None;
+        self.attn_res_state.reset();
     }
 
     /// Number of layers this model dispatches over (`config.num_layers`,
@@ -8579,11 +8891,11 @@ impl<'a> KimiK3Model<'a> {
     ///    slicing from the fused `attn_q/k/v` tensors) and the
     ///    Stable LatentMoE forward.
     /// 3. **Residual add** — simple `h += layer_output` (K3 Block
-    ///    AttnRes wiring is X.4.c.3.4 — the current AttnRes
-    ///    primitives from X.4.d.1 need per-layer pseudo-query
-    ///    tensors that the GGUF may store under
-    ///    `attn_res_proj`/`ffn_res_proj`; the mapping is still being
-    ///    confirmed).
+    ///    AttnRes wiring is X.4.c.3.4 — the fused 1D score vectors
+    ///    `attn_res_score` / `ffn_res_score` per layer are already
+    ///    loaded via `KimiK3LayerWeights` X.4.c.3.4.b refactor;
+    ///    actual `res_mix` insertion into the layer loop is
+    ///    X.4.c.3.4.d).
     /// 4. **Final RMSNorm** — `x = RMSNorm(x, output_norm)`.
     /// 5. **Output projection** — `logits = output.matvec(x)` →
     ///    `[vocab_size]`.
@@ -8632,10 +8944,11 @@ impl<'a> KimiK3Model<'a> {
         //   sigmoid router top-16 from 896 experts + 2 shared
         //   experts + latent `W↓` / RMSNorm / `W↑` + SiTU-GLU per
         //   routed expert.
-        // - **AttnRes**: still a simple residual add. X.4.c.3.4 will
-        //   wire the Block AttnRes primitive from X.4.d.1 + the
-        //   final aggregation from X.4.d.2 via
-        //   `output_attn_res_norm` + `output_attn_res_proj`.
+        // - **AttnRes**: still a simple residual add. X.4.c.3.4.d
+        //   will wire per-layer `res_mix` (2× per layer, using the
+        //   fused 1D `attn_res_score` / `ffn_res_score` loaded via
+        //   X.4.c.3.4.b) + banking + final output mix using
+        //   `output_res_score`.
         let mla_config = kimi_k3_extract_mla_config(&self.config).expect(
             "KimiK3Model was constructed but MLA sub-config no longer extractable — \
              invariant broken (should have failed at ::new)",
@@ -8644,11 +8957,28 @@ impl<'a> KimiK3Model<'a> {
         for il in 0..self.config.num_layers {
             let layer = &self.weights.layers[il];
 
-            // Attention half.
+            // ── AttnRes pre-attention mix (X.4.c.3.4.d) ──────────
+            // Follows pwilkin PR #26185 `src/models/kimi-k3.cpp`
+            // L305-329: `cur = res_mix(prefix_sum, attn_res_score)`,
+            // then bank RAW prefix_sum on checkpoint layers, then
+            // attention consumes `cur`, then prefix_sum resets to
+            // attn output on checkpoint layers (else standard add).
+            let cur_attn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.attn_res_score,
+                self.config.norm_eps,
+            );
+            let banked = self.attn_res_state.is_checkpoint_layer(il);
+            if banked {
+                self.attn_res_state.bank(&x);
+            }
+
+            // Attention half. Feeds `cur_attn` (post-mix) not raw x.
             let attn_output: Vec<f32> = match (&mut self.layer_caches[il], &layer.attn) {
                 (KimiK3LayerCache::Mla(cache), KimiK3Attention::Mla(mla_attn)) => {
                     kimi_k3_gated_mla_step(
-                        &x,
+                        &cur_attn,
                         &layer.attn_norm,
                         &layer.attn_gate,
                         &layer.attn_output,
@@ -8676,7 +9006,7 @@ impl<'a> KimiK3Model<'a> {
                     let g_min = kd.kda_gate_lower_bound.unwrap_or(-5.0);
                     let alpha_rank = kda_attn.ssm_f_a.rows;
                     kimi_k3_kda_layer_forward(
-                        &x,
+                        &cur_attn,
                         &layer.attn_norm,
                         &layer.attn_output,
                         kda_attn,
@@ -8696,15 +9026,28 @@ impl<'a> KimiK3Model<'a> {
                 ),
             };
 
-            // Simple residual — K3 Block AttnRes wiring is X.4.c.3.4.
-            for i in 0..hidden_dim {
-                x[i] += attn_output[i];
+            // Post-attention prefix_sum update: banked → reset to
+            // attn output alone; else → standard residual add.
+            if banked {
+                x.copy_from_slice(&attn_output);
+            } else {
+                for i in 0..hidden_dim {
+                    x[i] += attn_output[i];
+                }
             }
 
-            // FFN half.
+            // ── AttnRes pre-FFN mix (X.4.c.3.4.d) ────────────────
+            let cur_ffn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.ffn_res_score,
+                self.config.norm_eps,
+            );
+
+            // FFN half. Feeds `cur_ffn` (post-mix) not raw x.
             let ffn_output: Vec<f32> = match &layer.ffn {
                 KimiK3Ffn::Dense { gate, up, down } => kimi_k3_dense_ffn_forward(
-                    &x,
+                    &cur_ffn,
                     &layer.ffn_norm,
                     gate,
                     up,
@@ -8712,11 +9055,9 @@ impl<'a> KimiK3Model<'a> {
                     self.config.norm_eps,
                 ),
                 KimiK3Ffn::LatentMoe(moe) => {
-                    // Phase X.4.c.3.3.c partial landing (2026-07-28):
-                    // sigmoid router + shared experts fully wired;
-                    // routed dispatch still `todo!()` inside
-                    // `kimi_k3_latent_moe_forward` (per-expert 3-D
-                    // cube slicing = X.4.c.3.3.c.2).
+                    // Phase X.4.c.3.3.c.2 landing (2026-07-28):
+                    // sigmoid router + shared experts + routed
+                    // per-expert dispatch fully wired (F32 only).
                     let kd = self
                         .config
                         .kimi_delta
@@ -8725,7 +9066,7 @@ impl<'a> KimiK3Model<'a> {
                     let top_k = kd.num_experts_per_tok.unwrap_or(16);
                     let renormalize = kd.moe_renormalize.unwrap_or(true);
                     kimi_k3_latent_moe_forward(
-                        &x,
+                        &cur_ffn,
                         &layer.ffn_norm,
                         moe,
                         top_k,
@@ -8740,10 +9081,20 @@ impl<'a> KimiK3Model<'a> {
             }
         }
 
+        // ── AttnRes final output mix (X.4.c.3.4.e) ──────────────
+        // Follows pwilkin `src/models/kimi-k3.cpp` L358-360:
+        // `cur = res_mix(cur, output_res_score)` before `output_norm`.
+        let x_after_final_mix = kimi_k3_res_mix(
+            &self.attn_res_state,
+            &x,
+            &self.weights.output_res_score,
+            self.config.norm_eps,
+        );
+
         // ── Step 4: final RMSNorm ──
         let mut x_norm = vec![0.0_f32; hidden_dim];
         rms_norm(
-            &x,
+            &x_after_final_mix,
             &self.weights.output_norm,
             self.config.norm_eps,
             &mut x_norm,
@@ -8893,8 +9244,7 @@ mod kimi_k3_model_tests {
                 rows: vocab_size,
                 cols: hidden_dim,
             },
-            output_attn_res_norm: vec![1.0; hidden_dim],
-            output_attn_res_proj: empty_ref(),
+            output_res_score: vec![1.0; hidden_dim],
             layers: Vec::new(),
         }
     }
@@ -8957,13 +9307,14 @@ mod kimi_k3_model_tests {
             c.append(&vec![0.0; 8], &vec![0.0; 4]);
             assert_eq!(c.n_positions(), 2);
         }
-        // Inject a fake BlockAttnResState to observe the reset.
-        model.block_attnres = Some(BlockAttnResState::new(&vec![1.0_f32; hidden], 4));
+        // Bank a fake ckpt into the AttnRes state to observe reset.
+        model.attn_res_state.bank(&vec![1.0_f32; hidden]);
+        assert_eq!(model.attn_res_state.banked_count(), 1);
 
         model.reset();
 
         assert_eq!(model.mla_cache_positions(3), Some(0));
-        assert!(model.block_attnres.is_none());
+        assert_eq!(model.attn_res_state.banked_count(), 0);
     }
 
     #[test]
