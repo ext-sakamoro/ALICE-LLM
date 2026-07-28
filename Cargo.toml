@@ -143,6 +143,12 @@ required-features = ["grammar", "gguf"]
 name = "kimi_k3_forward"
 required-features = ["gguf", "hf-config"]
 
+# Phase X.4.b.8: Kimi K3 multi-token greedy generate. Encodes prompt
+# via tokenizer, runs prefill + decode loop, prints streamed text.
+[[example]]
+name = "kimi_k3_generate"
+required-features = ["gguf", "hf-config"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
