@@ -6304,7 +6304,7 @@ struct KimiK3LayerWeights<'a> {
 /// 1D fused score vector for the final N-block aggregation of
 /// AttnRes (paper §2.2 / pwilkin PR #26185 `output_res_score`).
 #[allow(dead_code)]
-pub(crate) struct KimiK3ModelWeights<'a> {
+pub struct KimiK3ModelWeights<'a> {
     token_embd: WeightRef<'a>,
     output_norm: Vec<f32>,
     output: WeightRef<'a>,
@@ -6524,7 +6524,7 @@ fn load_kimi_k3_layer_weights<'a>(
 /// per-layer bundles. Returns a descriptive `Err` on the first
 /// missing tensor.
 #[allow(dead_code)]
-fn load_kimi_k3_model_weights<'a>(
+pub fn load_kimi_k3_model_weights<'a>(
     gguf: &'a GgufFile<'a>,
     config: &Llama3Config,
 ) -> Result<KimiK3ModelWeights<'a>, String> {
@@ -9060,7 +9060,7 @@ pub(crate) enum KimiK3LayerCache {
 /// Total resident, no context: ~450 MB. Sequence growth: ~55 KB /
 /// token, dominated by the MLA KV cache.
 #[allow(dead_code)]
-pub(crate) struct KimiK3Model<'a> {
+pub struct KimiK3Model<'a> {
     weights: KimiK3ModelWeights<'a>,
     config: Llama3Config,
     /// Per-layer runtime caches, one entry per layer in
@@ -9101,10 +9101,7 @@ impl<'a> KimiK3Model<'a> {
     /// when critical dimensions (`kimi_delta.kda_head_dim`,
     /// `kv_lora_rank`, `qk_rope_head_dim`, etc.) are missing, or
     /// when `attn_res_block_size` is absent.
-    pub(crate) fn new(
-        weights: KimiK3ModelWeights<'a>,
-        config: Llama3Config,
-    ) -> Result<Self, String> {
+    pub fn new(weights: KimiK3ModelWeights<'a>, config: Llama3Config) -> Result<Self, String> {
         let kd = config
             .kimi_delta
             .as_ref()
@@ -9164,7 +9161,7 @@ impl<'a> KimiK3Model<'a> {
     }
 
     /// Reset every cache — start of a new sequence.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         for cache in &mut self.layer_caches {
             match cache {
                 KimiK3LayerCache::Mla(c) => c.reset(),
@@ -9181,7 +9178,7 @@ impl<'a> KimiK3Model<'a> {
     /// Number of layers this model dispatches over (`config.num_layers`,
     /// K3: 93). Useful for callers that want to iterate manually.
     #[must_use]
-    pub(crate) fn num_layers(&self) -> usize {
+    pub fn num_layers(&self) -> usize {
         self.config.num_layers
     }
 
@@ -9189,7 +9186,7 @@ impl<'a> KimiK3Model<'a> {
     /// index `il`. Returns `None` if `il` names a KDA layer or is
     /// out of bounds. Primarily useful for tests and observability.
     #[must_use]
-    pub(crate) fn mla_cache_positions(&self, il: usize) -> Option<usize> {
+    pub fn mla_cache_positions(&self, il: usize) -> Option<usize> {
         match self.layer_caches.get(il)? {
             KimiK3LayerCache::Mla(c) => Some(c.n_positions()),
             KimiK3LayerCache::Kda(_) => None,
@@ -9225,7 +9222,7 @@ impl<'a> KimiK3Model<'a> {
     /// includes the layer index and the missing sub-phase reference
     /// so a user hitting it can find the roadmap entry.
     #[allow(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn forward(&mut self, token_id: u32) -> Vec<f32> {
+    pub fn forward(&mut self, token_id: u32) -> Vec<f32> {
         // ── Step 1: embedding lookup ──
         let vocab_size = self.config.vocab_size;
         let hidden_dim = self.config.hidden_dim;
