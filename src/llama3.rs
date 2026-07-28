@@ -7842,13 +7842,48 @@ fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
 /// - `w.qtype` is quantized AND `dim0 * dim1 % elements_per_block != 0`
 ///   (plane splits mid-block), or
 /// - `cube.data.len()` is too small for `num_experts` planes.
+/// Per-expert row count for a K3 3-D expert cube.
+///
+/// Real GrEarl K3 GGUF stores expert cubes as 3-D
+/// `[cols=d0, per_expert_rows=d1, num_experts=d2]` which
+/// `load_weight_ref_any_shape` flattens to
+/// `cube.rows = per_expert_rows * num_experts`. Test fixtures use a
+/// 2-D per-expert layout where `cube.rows` already equals
+/// `per_expert_rows`. Both interpretations converge on
+/// `per_expert_bytes = cube.data.len() / num_experts`, from which the
+/// row count can be derived block-safely for any quant type.
+#[allow(dead_code)]
+fn kimi_k3_cube_per_expert_rows(cube: &WeightRef<'_>, num_experts: usize) -> usize {
+    if num_experts == 0 {
+        return cube.rows;
+    }
+    let block_bytes = cube.qtype.block_bytes();
+    let elements_per_block = cube.qtype.elements_per_block();
+    if block_bytes == 0 || elements_per_block == 0 || cube.cols == 0 {
+        return cube.rows;
+    }
+    if !cube.data.len().is_multiple_of(num_experts) {
+        return cube.rows;
+    }
+    let per_expert_bytes = cube.data.len() / num_experts;
+    if !per_expert_bytes.is_multiple_of(block_bytes) {
+        return cube.rows;
+    }
+    let per_expert_blocks = per_expert_bytes / block_bytes;
+    let per_expert_elements = per_expert_blocks * elements_per_block;
+    if !per_expert_elements.is_multiple_of(cube.cols) {
+        return cube.rows;
+    }
+    per_expert_elements / cube.cols
+}
+
 #[allow(dead_code)]
 fn kimi_k3_expert_plane_weight_ref<'a>(
     cube: &WeightRef<'a>,
     expert_idx: usize,
     num_experts: usize,
 ) -> Option<WeightRef<'a>> {
-    if expert_idx >= num_experts {
+    if expert_idx >= num_experts || num_experts == 0 {
         return None;
     }
     if matches!(cube.qtype, GgmlType::Other(_)) {
@@ -7859,14 +7894,28 @@ fn kimi_k3_expert_plane_weight_ref<'a>(
     if elements_per_block == 0 || block_bytes == 0 {
         return None;
     }
-    let plane_elements = cube.rows.checked_mul(cube.cols)?;
-    if !plane_elements.is_multiple_of(elements_per_block) {
+    // Determine per-expert plane size from BYTE budget, not the row
+    // count. Data is authoritative — real K3 GGUF stores 3-D cubes
+    // flattened as `[cols=d0, rows=d1*num_experts]` (cube.rows carries
+    // num_experts inside), while test fixtures use 2-D per-expert
+    // (cube.rows is already per-expert with data holding num_experts
+    // planes back-to-back). Both cases have the SAME per-expert byte
+    // count = cube.data.len() / num_experts.
+    if !cube.data.len().is_multiple_of(num_experts) {
         return None;
     }
-    let plane_blocks = plane_elements / elements_per_block;
-    let plane_bytes = plane_blocks.checked_mul(block_bytes)?;
-    let total_bytes_expected = plane_bytes.checked_mul(num_experts)?;
-    if cube.data.len() < total_bytes_expected {
+    let plane_bytes = cube.data.len() / num_experts;
+    if !plane_bytes.is_multiple_of(block_bytes) {
+        return None;
+    }
+    let plane_blocks = plane_bytes / block_bytes;
+    let plane_elements = plane_blocks.checked_mul(elements_per_block)?;
+    // Per-expert row count: plane_elements / cols. Must divide evenly.
+    if cube.cols == 0 || !plane_elements.is_multiple_of(cube.cols) {
+        return None;
+    }
+    let per_expert_rows = plane_elements / cube.cols;
+    if !plane_elements.is_multiple_of(elements_per_block) {
         return None;
     }
     let start = expert_idx.checked_mul(plane_bytes)?;
@@ -7874,7 +7923,7 @@ fn kimi_k3_expert_plane_weight_ref<'a>(
     Some(WeightRef {
         data: &cube.data[start..end],
         qtype: cube.qtype,
-        rows: cube.rows,
+        rows: per_expert_rows,
         cols: cube.cols,
     })
 }
@@ -7986,10 +8035,14 @@ fn kimi_k3_latent_moe_forward(
     );
     let num_experts = moe.ffn_gate_inp.len() / hidden;
 
-    // ffn_gate_exps / ffn_up_exps: cols=n_embd_latent, rows=n_ff_exp per expert
-    // (load_weight_ref_any_shape reads dims[0]=cols, dims[1]=rows; dims[2] is
-    // silently dropped, so the byte buffer holds `rows * cols * num_experts`
-    // elements even though rows/cols on the WeightRef reflect a single expert).
+    // ffn_gate_exps / ffn_up_exps: real K3 GGUF stores as 3-D cube
+    // `[n_embd_latent, n_ff_exp, n_experts]` (ggml ne order). After
+    // load_weight_ref_any_shape's flatten:
+    //   cols = dims[0] = n_embd_latent
+    //   rows = product(dims[1..]) = n_ff_exp * n_experts (flattened)
+    // So the actual per-expert row count is `rows / num_experts`.
+    // ffn_down_exps has swapped 1st/2nd dims: [n_ff_exp, n_embd_latent, n_experts]
+    // → cols = n_ff_exp, rows = n_embd_latent * n_experts.
     assert_eq!(
         moe.ffn_gate_exps.cols, n_embd_latent,
         "ffn_gate_exps.cols must equal n_embd_latent"
@@ -7998,18 +8051,24 @@ fn kimi_k3_latent_moe_forward(
         moe.ffn_up_exps.cols, n_embd_latent,
         "ffn_up_exps.cols must equal n_embd_latent"
     );
-    let n_ff_exp = moe.ffn_gate_exps.rows;
+    // Per-expert n_ff_exp derivation: authoritative via data-length /
+    // num_experts (works for both 2-D fixtures and real 3-D-flattened
+    // K3 GrEarl cubes). Helper matches kimi_k3_expert_plane_weight_ref
+    // internal logic.
+    let n_ff_exp = kimi_k3_cube_per_expert_rows(&moe.ffn_gate_exps, num_experts);
+    let per_expert_up_rows = kimi_k3_cube_per_expert_rows(&moe.ffn_up_exps, num_experts);
     assert_eq!(
-        moe.ffn_up_exps.rows, n_ff_exp,
-        "ffn_up_exps.rows must equal ffn_gate_exps.rows"
+        per_expert_up_rows, n_ff_exp,
+        "ffn_up_exps per-expert rows must equal ffn_gate_exps per-expert rows"
     );
     assert_eq!(
         moe.ffn_down_exps.cols, n_ff_exp,
         "ffn_down_exps.cols must equal n_ff_exp"
     );
+    let per_expert_down_rows = kimi_k3_cube_per_expert_rows(&moe.ffn_down_exps, num_experts);
     assert_eq!(
-        moe.ffn_down_exps.rows, n_embd_latent,
-        "ffn_down_exps.rows must equal n_embd_latent"
+        per_expert_down_rows, n_embd_latent,
+        "ffn_down_exps per-expert rows must equal n_embd_latent"
     );
 
     // Step 4: down-project x_norm to latent space.
@@ -8271,23 +8330,26 @@ mod kimi_k3_latent_moe_tests {
 
     #[test]
     fn expert_plane_weight_ref_supports_quantized_cube_when_aligned() {
-        // Phase X.4.c.3.3.b.2: Q4_K per-expert slicing now works when
-        // plane_elements (rows * cols) is a multiple of QK_K (256).
-        // 4 rows × 64 cols = 256 elements per plane = 1 Q4_K block per
-        // plane = 144 bytes per plane.
+        // Phase X.4.c.3.3.b.2 + X.4.b.6: Q4_K per-expert slicing works
+        // when per-expert plane_elements is a multiple of QK_K (256).
+        // Real K3 GGUF stores cubes as 3-D flattened `[cols, per_expert_rows
+        // * num_experts]`. Per-expert plane = 4 rows × 64 cols = 256
+        // elements = 1 Q4_K block per plane = 144 bytes/plane.
+        // Total cube rows = 4 × 2 = 8, cube data = 288 bytes (2 planes).
         let num_experts = 2;
+        let per_expert_rows = 4;
         let bytes = vec![0u8; 144 * num_experts];
         let cube = WeightRef {
             data: &bytes,
             qtype: GgmlType::Q4_K,
-            rows: 4,
+            rows: per_expert_rows * num_experts,
             cols: 64,
         };
         let plane0 = kimi_k3_expert_plane_weight_ref(&cube, 0, num_experts)
-            .expect("Q4_K plane slicing must succeed when plane_elements % 256 == 0");
-        assert_eq!(plane0.rows, 4);
+            .expect("Q4_K plane slicing must succeed when per-expert plane % 256 == 0");
+        assert_eq!(plane0.rows, per_expert_rows);
         assert_eq!(plane0.cols, 64);
-        assert_eq!(plane0.data.len(), 144, "1 Q4_K block");
+        assert_eq!(plane0.data.len(), 144, "1 Q4_K block per plane");
         let plane1 = kimi_k3_expert_plane_weight_ref(&cube, 1, num_experts)
             .expect("expert 1 slice must succeed for aligned Q4_K cube");
         assert_eq!(plane1.data.len(), 144);
@@ -8295,18 +8357,22 @@ mod kimi_k3_latent_moe_tests {
 
     #[test]
     fn expert_plane_weight_ref_rejects_quantized_cube_when_misaligned() {
-        // Plane_elements = 4 × 32 = 128, not a multiple of QK_K (256).
-        // Slicing at plane boundary would land mid-Q4_K-block.
-        let bytes = vec![0u8; 144]; // enough for 1 block, but plane is 0.5 blocks
+        // Phase X.4.b.6 rewrite: with data-length-based per-expert
+        // derivation, "misalignment" means data length not divisible
+        // by (num_experts * block_bytes) — the per-expert byte count
+        // doesn't land on a block boundary. Test: 200 bytes total /
+        // 2 experts = 100 bytes/expert, not a Q4_K block multiple
+        // (144).
+        let bytes = vec![0u8; 200];
         let cube = WeightRef {
             data: &bytes,
             qtype: GgmlType::Q4_K,
             rows: 4,
-            cols: 32,
+            cols: 64,
         };
         assert!(
-            kimi_k3_expert_plane_weight_ref(&cube, 0, 1).is_none(),
-            "misaligned Q4_K (plane 128 elements, block 256) must fail slicing"
+            kimi_k3_expert_plane_weight_ref(&cube, 0, 2).is_none(),
+            "misaligned Q4_K (100 bytes/expert vs 144-byte block) must fail slicing"
         );
     }
 
