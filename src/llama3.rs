@@ -7246,27 +7246,105 @@ fn kimi_k3_shared_experts_forward(
     y
 }
 
-/// K3 Stable LatentMoE forward — router + shared aggregator with
-/// routed-expert dispatch stubbed (Phase X.4.c.3.3.c, K3 tech
-/// report §2.3 Eq 11).
+/// SiTU-GLU activation (K3 tech report §2.3.2 Eq 12) — scalar form.
 ///
-/// Wired stages:
+/// ```text
+/// situ(g, u) = β_1 · tanh(g / β_1) · σ(g) · β_2 · tanh(u / β_2)
+/// ```
 ///
-/// 1. **Router** (`kimi_k3_moe_router`) — sigmoid + noaux_tc +
-///    top-16 selection.
-/// 2. **Shared experts** (`kimi_k3_shared_experts_forward`) —
-///    always-active SwiGLU, returns `[d]`.
-/// 3. **Routed dispatch** — **`todo!()`** pending Phase
-///    X.4.c.3.3.c.2. The 3-D per-expert cubes need per-expert
-///    byte-slice indexing that plugs into the Phase X.4.e.1
-///    streaming pool; scoping this session on the outer routing
-///    shell keeps the surface area tractable.
-/// 4. **Aggregation** (unreachable this phase): would be
-///    `y = shared_out + W↑ · RMSNorm(u)` where
-///    `u = Σ p_i · E_i^routed(W↓ · x)`. Once the routed dispatch
-///    lands, the caller assembles `u`, applies the K3-specific
-///    `routed_exp_norm` RMSNorm, then the `routed_exp_up`
-///    projection, then adds `shared_out`.
+/// K3 defaults: `β_1 = situ_beta = 4.0`, `β_2 = situ_linear_beta = 25.0`.
+/// llama.cpp uses the same formula (`src/models/kimi-k3.cpp` L181-192).
+#[allow(dead_code)]
+fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
+    let g_tanh = (g / beta).tanh() * beta;
+    let g_sig = sigmoid(g);
+    let u_tanh = (u / linear_beta).tanh() * linear_beta;
+    g_tanh * g_sig * u_tanh
+}
+
+/// Slice one expert's 2-D plane out of a 3-D per-expert weight cube
+/// (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`) as a fresh
+/// `WeightRef` pointing at the sub-slice of the underlying byte buffer.
+///
+/// The GGUF cubes are stored as `[dim0, dim1, num_experts]` in ggml
+/// convention (`ne[0]` fastest-varying, i.e. row-major with dim0 = column
+/// stride). Each expert's plane is a contiguous `dim0 * dim1` block, so
+/// per-expert byte offset is `expert_idx * dim0 * dim1 * bytes_per_element`.
+///
+/// **F32 only** for Phase X.4.c.3.3.c.2. Quantized per-expert slicing
+/// (Q4_K / IQ1_S / MXFP4) requires block-boundary alignment and is
+/// deferred to Phase X.4.c.3.3.b.2 (which will also cover per-head KDA
+/// slicing).
+#[allow(dead_code)]
+fn kimi_k3_expert_plane_weight_ref<'a>(
+    cube: &WeightRef<'a>,
+    expert_idx: usize,
+    num_experts: usize,
+) -> Option<WeightRef<'a>> {
+    if !matches!(cube.qtype, GgmlType::F32) {
+        return None;
+    }
+    if expert_idx >= num_experts {
+        return None;
+    }
+    let plane_elements = cube.rows.checked_mul(cube.cols)?;
+    let plane_bytes = plane_elements.checked_mul(4)?; // F32 = 4 bytes/elem
+    let total_bytes_expected = plane_bytes.checked_mul(num_experts)?;
+    if cube.data.len() < total_bytes_expected {
+        return None;
+    }
+    let start = expert_idx.checked_mul(plane_bytes)?;
+    let end = start.checked_add(plane_bytes)?;
+    Some(WeightRef {
+        data: &cube.data[start..end],
+        qtype: cube.qtype,
+        rows: cube.rows,
+        cols: cube.cols,
+    })
+}
+
+/// K3 Stable LatentMoE forward — router + shared + routed dispatch,
+/// end-to-end (Phase X.4.c.3.3.c.2, K3 tech report §2.3 Eq 11).
+///
+/// Follows the llama.cpp reference (`src/models/kimi-k3.cpp` L596-645
+/// `build_latent_moe`):
+///
+/// 1. **Pre-FFN RMSNorm** applied to `x` using `ffn_norm` (this
+///    convention differs from llama.cpp which does the norm in the
+///    caller; we match the sibling `kimi_k3_dense_ffn_forward`).
+/// 2. **Router** (`kimi_k3_moe_router`) — runs on FULL-WIDTH `x_norm`
+///    (n_embd), NOT the latent projection. Sigmoid + optional
+///    noaux_tc bias + top-k + renormalize.
+/// 3. **Shared experts** (`kimi_k3_shared_experts_forward`) — also
+///    on full-width `x_norm`, single fused SwiGLU (K3 folds the 2
+///    shared experts into 1 triple at export time).
+/// 4. **Down-project to latent**: `routed_in = W↓ · x_norm`
+///    (`routed_exp_down`, shape `[n_embd_latent, n_embd]` in
+///    WeightRef convention).
+/// 5. **Per-expert dispatch in latent space**: for each selected
+///    `(expert_idx, weight)` pair,
+///    - slice per-expert planes out of `ffn_gate_exps` /
+///      `ffn_up_exps` (each `[n_embd_latent, n_ff_exp]` per expert)
+///      and `ffn_down_exps` (`[n_ff_exp, n_embd_latent]` per expert)
+///    - `gate = gate_e @ routed_in` (latent → intermediate)
+///    - `up = up_e @ routed_in`
+///    - `act = SiTU(gate, up)` (K3 SiTU-GLU with `β=4`, `β_linear=25`)
+///    - `expert_out = down_e @ act` (intermediate → latent)
+///    - `routed_sum += weight * expert_out`
+/// 6. **K3-only stabilization**: RMSNorm on `routed_sum` using
+///    `routed_exp_norm` (γ of dim `n_embd_latent`), then up-project
+///    back to hidden via `routed_exp_up` (shape `[n_embd, n_embd_latent]`).
+/// 7. **Combine**: `y = shared_out + up_projected_routed_agg`
+///    (both `[n_embd]`).
+///
+/// **Panics on quantized cubes** (Q4_K / IQ1_S / MXFP4) with an
+/// explicit Phase X.4.c.3.3.b.2 message — F32 fixtures are the only
+/// working path in this landing, matching the KDA per-head aggregation
+/// F32 restriction from Phase X.4.c.3.3.b.
+///
+/// SiTU coefficients hardcoded to `β=4, β_linear=25` (K3 defaults from
+/// pwilkin PR `constants.py` `activation.situ_beta` / `situ_linear_beta`).
+/// A config-plumbed variant is deferred to a later refinement.
 #[allow(dead_code, clippy::too_many_arguments)]
 fn kimi_k3_latent_moe_forward(
     x: &[f32],
@@ -7276,12 +7354,15 @@ fn kimi_k3_latent_moe_forward(
     renormalize: bool,
     rms_eps: f32,
 ) -> Vec<f32> {
-    // Pre-FFN RMSNorm applied to `x` before both the router and
-    // the shared / routed experts (mirrors the standard pattern
-    // llama.cpp uses for MoE layers).
+    // Pre-FFN RMSNorm applied to `x` before both the router and the
+    // shared / routed experts (mirrors the sibling
+    // `kimi_k3_dense_ffn_forward` pattern; llama.cpp applies the
+    // norm in the caller instead, but the aggregate math is
+    // identical).
     let x_norm = kimi_k3_rms_norm(x, ffn_norm, rms_eps);
+    let hidden = x.len();
 
-    // Step 1: router (real).
+    // Step 1: router (runs on full-width x_norm, not latent).
     let selected = kimi_k3_moe_router(
         &x_norm,
         &moe.ffn_gate_inp,
@@ -7290,7 +7371,7 @@ fn kimi_k3_latent_moe_forward(
         renormalize,
     );
 
-    // Step 2: shared experts (real).
+    // Step 2: shared experts (full-width n_embd, SwiGLU fused).
     let shared_out = kimi_k3_shared_experts_forward(
         &x_norm,
         &moe.ffn_gate_shexp,
@@ -7298,25 +7379,130 @@ fn kimi_k3_latent_moe_forward(
         &moe.ffn_down_shexp,
     );
 
-    // Step 3: routed dispatch — TODO. See docstring for the plan.
-    todo!(
-        "K3 LatentMoE routed dispatch — Phase X.4.c.3.3.c.2. Router selected {} \
-         experts and shared_out is {} f32; the remaining step is to loop over \
-         `selected` (each `(expert_idx, weight)`) and slice the per-expert weight \
-         planes out of the 3-D cubes `ffn_gate_exps` / `ffn_up_exps` / \
-         `ffn_down_exps` (shape [moe_intermediate, latent_hidden, num_experts]), \
-         compute latent-space `W_down x_norm` once, run SiTU-GLU per expert, \
-         weight-sum by `weight`, then apply `routed_exp_norm` + `routed_exp_up`, \
-         and finally `y = shared_out + up_projected_routed_agg`. See paper §2.3 \
-         Eq 11 + `routed_exp_norm` = K3-only RMSNorm before W↑ from §2.3.1.",
-        selected.len(),
-        shared_out.len()
-    )
+    // Step 3: derive latent dims + expert count from the loaded WeightRefs.
+    // routed_exp_down: [n_embd_latent (rows), n_embd (cols)]
+    // routed_exp_up:   [n_embd (rows), n_embd_latent (cols)]
+    let n_embd_latent = moe.routed_exp_down.rows;
+    assert_eq!(
+        moe.routed_exp_down.cols, hidden,
+        "routed_exp_down.cols must equal hidden dim"
+    );
+    assert_eq!(
+        moe.routed_exp_up.cols, n_embd_latent,
+        "routed_exp_up.cols must equal n_embd_latent"
+    );
+    assert_eq!(
+        moe.routed_exp_up.rows, hidden,
+        "routed_exp_up.rows must equal hidden dim"
+    );
+    assert_eq!(
+        moe.routed_exp_norm.len(),
+        n_embd_latent,
+        "routed_exp_norm length must equal n_embd_latent"
+    );
+    assert!(
+        moe.ffn_gate_inp.len().is_multiple_of(hidden),
+        "ffn_gate_inp length {} must be multiple of hidden {hidden}",
+        moe.ffn_gate_inp.len()
+    );
+    let num_experts = moe.ffn_gate_inp.len() / hidden;
+
+    // ffn_gate_exps / ffn_up_exps: cols=n_embd_latent, rows=n_ff_exp per expert
+    // (load_weight_ref_any_shape reads dims[0]=cols, dims[1]=rows; dims[2] is
+    // silently dropped, so the byte buffer holds `rows * cols * num_experts`
+    // elements even though rows/cols on the WeightRef reflect a single expert).
+    assert_eq!(
+        moe.ffn_gate_exps.cols, n_embd_latent,
+        "ffn_gate_exps.cols must equal n_embd_latent"
+    );
+    assert_eq!(
+        moe.ffn_up_exps.cols, n_embd_latent,
+        "ffn_up_exps.cols must equal n_embd_latent"
+    );
+    let n_ff_exp = moe.ffn_gate_exps.rows;
+    assert_eq!(
+        moe.ffn_up_exps.rows, n_ff_exp,
+        "ffn_up_exps.rows must equal ffn_gate_exps.rows"
+    );
+    assert_eq!(
+        moe.ffn_down_exps.cols, n_ff_exp,
+        "ffn_down_exps.cols must equal n_ff_exp"
+    );
+    assert_eq!(
+        moe.ffn_down_exps.rows, n_embd_latent,
+        "ffn_down_exps.rows must equal n_embd_latent"
+    );
+
+    // Step 4: down-project x_norm to latent space.
+    let mut routed_in = vec![0.0_f32; n_embd_latent];
+    moe.routed_exp_down.matvec(&x_norm, &mut routed_in);
+
+    // Step 5: per-expert dispatch, weighted sum in latent space.
+    let mut routed_sum = vec![0.0_f32; n_embd_latent];
+    for (expert_idx, weight) in &selected {
+        let gate_ref =
+            kimi_k3_expert_plane_weight_ref(&moe.ffn_gate_exps, *expert_idx, num_experts)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "K3 LatentMoE routed dispatch — Phase X.4.c.3.3.b.2 required: \
+                     ffn_gate_exps for expert {expert_idx} not sliceable (qtype {:?}, \
+                     num_experts {num_experts}, cube bytes {} vs expected \
+                     {plane_bytes} * num_experts). Quantized per-expert slicing is \
+                     deferred to Phase X.4.c.3.3.b.2; F32 fixtures work today.",
+                        moe.ffn_gate_exps.qtype,
+                        moe.ffn_gate_exps.data.len(),
+                        plane_bytes = moe.ffn_gate_exps.rows * moe.ffn_gate_exps.cols * 4
+                    )
+                });
+        let up_ref = kimi_k3_expert_plane_weight_ref(&moe.ffn_up_exps, *expert_idx, num_experts)
+            .expect("ffn_up_exps expert slice must succeed if gate slice did");
+        let down_ref =
+            kimi_k3_expert_plane_weight_ref(&moe.ffn_down_exps, *expert_idx, num_experts)
+                .expect("ffn_down_exps expert slice must succeed if gate slice did");
+
+        let mut gate_out = vec![0.0_f32; n_ff_exp];
+        gate_ref.matvec(&routed_in, &mut gate_out);
+        let mut up_out = vec![0.0_f32; n_ff_exp];
+        up_ref.matvec(&routed_in, &mut up_out);
+
+        // SiTU-GLU per element (β=4, β_linear=25 = K3 defaults).
+        let act: Vec<f32> = gate_out
+            .iter()
+            .zip(up_out.iter())
+            .map(|(&g, &u)| kimi_k3_situ_scalar(g, u, 4.0, 25.0))
+            .collect();
+
+        let mut expert_out = vec![0.0_f32; n_embd_latent];
+        down_ref.matvec(&act, &mut expert_out);
+
+        for i in 0..n_embd_latent {
+            routed_sum[i] += weight * expert_out[i];
+        }
+    }
+
+    // Step 6a: K3-only RMSNorm on aggregated routed sum (paper §2.3.1
+    // "Stable LatentMoE" — this norm prevents scale drift when the
+    // per-expert outputs sum in an unbounded way).
+    let routed_normed = kimi_k3_rms_norm(&routed_sum, &moe.routed_exp_norm, rms_eps);
+
+    // Step 6b: up-project from latent back to hidden.
+    let mut up_projected = vec![0.0_f32; hidden];
+    moe.routed_exp_up.matvec(&routed_normed, &mut up_projected);
+
+    // Step 7: combine with shared experts.
+    let mut y = up_projected;
+    for i in 0..hidden {
+        y[i] += shared_out[i];
+    }
+    y
 }
 
 #[cfg(test)]
 mod kimi_k3_latent_moe_tests {
-    use super::{kimi_k3_moe_router, kimi_k3_shared_experts_forward, GgmlType, WeightRef};
+    use super::{
+        kimi_k3_expert_plane_weight_ref, kimi_k3_latent_moe_forward, kimi_k3_moe_router,
+        kimi_k3_shared_experts_forward, kimi_k3_situ_scalar, GgmlType, KimiK3LatentMoe, WeightRef,
+    };
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(v.len() * 4);
@@ -7423,6 +7609,225 @@ mod kimi_k3_latent_moe_tests {
         let y = kimi_k3_shared_experts_forward(&x, &gate, &up, &down);
         for (i, &v) in y.iter().enumerate() {
             assert_eq!(v, 0.0, "y[{i}] = {v} but zero input must give zero");
+        }
+    }
+
+    #[test]
+    fn situ_scalar_at_zero_gives_zero() {
+        // SiTU: β · tanh(g/β) · σ(g) · β_linear · tanh(u/β_linear).
+        // At g = u = 0: tanh(0) = 0 for both, product is 0.
+        let y = kimi_k3_situ_scalar(0.0, 0.0, 4.0, 25.0);
+        assert!(y.abs() < 1e-6, "situ(0, 0) must be 0, got {y}");
+    }
+
+    #[test]
+    fn situ_scalar_saturates_symmetric_at_large_gate() {
+        // For |g| >> β: tanh(g/β) ≈ sign(g) · 1, σ(g) ≈ 1 (g>0) or 0 (g<0).
+        // For |u| >> β_linear: tanh(u/β_linear) · β_linear ≈ sign(u) · β_linear.
+        // g=+40, u=+250 (10× each β): approx 4 · 1 · 1 · 25 · 1 = 100.
+        let y = kimi_k3_situ_scalar(40.0, 250.0, 4.0, 25.0);
+        assert!(
+            (y - 100.0).abs() < 0.1,
+            "situ(+40, +250) with β=4, β_linear=25 must saturate near 100, got {y}"
+        );
+        // Negative gate → σ ≈ 0, whole product collapses.
+        let y_neg = kimi_k3_situ_scalar(-40.0, 250.0, 4.0, 25.0);
+        assert!(
+            y_neg.abs() < 1e-3,
+            "situ(-40, +250) must collapse via σ(-40) ≈ 0, got {y_neg}"
+        );
+    }
+
+    #[test]
+    fn expert_plane_weight_ref_extracts_correct_slice() {
+        // 3-D cube [cols=2, rows=3, num_experts=2] (ggml order: fastest = cols).
+        // Expert 0 plane: 6 F32 values [1, 2, 3, 4, 5, 6].
+        // Expert 1 plane: 6 F32 values [10, 20, 30, 40, 50, 60].
+        let e0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let e1: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let mut cube_vals = e0.clone();
+        cube_vals.extend(e1.clone());
+        let cube_bytes = f32_bytes(&cube_vals);
+        let cube = WeightRef {
+            data: &cube_bytes,
+            qtype: GgmlType::F32,
+            rows: 3, // n_ff_exp per expert
+            cols: 2, // n_embd_latent per expert
+        };
+
+        let plane0 =
+            kimi_k3_expert_plane_weight_ref(&cube, 0, 2).expect("expert 0 plane must extract");
+        assert_eq!(plane0.rows, 3);
+        assert_eq!(plane0.cols, 2);
+        assert_eq!(plane0.data.len(), 6 * 4, "24 bytes = 6 F32");
+        // Verify first f32 = 1.0
+        let first_bytes: [u8; 4] = plane0.data[..4].try_into().unwrap();
+        assert_eq!(f32::from_le_bytes(first_bytes), 1.0);
+
+        let plane1 =
+            kimi_k3_expert_plane_weight_ref(&cube, 1, 2).expect("expert 1 plane must extract");
+        let first_bytes: [u8; 4] = plane1.data[..4].try_into().unwrap();
+        assert_eq!(f32::from_le_bytes(first_bytes), 10.0);
+    }
+
+    #[test]
+    fn expert_plane_weight_ref_rejects_out_of_range_expert() {
+        let bytes = vec![0u8; 24];
+        let cube = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::F32,
+            rows: 3,
+            cols: 2,
+        };
+        // num_experts = 2, expert_idx 2 is out of range.
+        assert!(kimi_k3_expert_plane_weight_ref(&cube, 2, 2).is_none());
+    }
+
+    #[test]
+    fn expert_plane_weight_ref_rejects_quantized_cube() {
+        let bytes = vec![0u8; 144]; // Q4_K block bytes
+        let cube = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Q4_K,
+            rows: 4,
+            cols: 64,
+        };
+        assert!(
+            kimi_k3_expert_plane_weight_ref(&cube, 0, 1).is_none(),
+            "quantized cube slicing is Phase X.4.c.3.3.b.2 territory"
+        );
+    }
+
+    #[test]
+    fn latent_moe_forward_smoke_test_with_2_experts_f32() {
+        // Minimal end-to-end smoke test: 2 experts, top-k=1, deterministic
+        // router selection, verify no panic + output shape correct + non-zero.
+        // Dims: hidden = 4, n_embd_latent = 2, n_ff_exp = 3, num_experts = 2.
+        let hidden = 4;
+        let n_embd_latent = 2;
+        let n_ff_exp = 3;
+        let num_experts = 2;
+        let x = vec![0.5_f32; hidden];
+        let ffn_norm = vec![1.0_f32; hidden]; // identity gain
+
+        // Router: 2×4 = 8 elements. Expert 1 strongly preferred.
+        let ffn_gate_inp = vec![
+            0.1, 0.1, 0.1, 0.1, // expert 0
+            5.0, 5.0, 5.0, 5.0, // expert 1
+        ];
+
+        // Shared experts: gate/up/down each [8, 4] / [8, 4] / [4, 8].
+        let gate_shexp_vals: Vec<f32> = (0..32).map(|i| 0.01 * i as f32).collect();
+        let up_shexp_vals: Vec<f32> = (0..32).map(|i| 0.02 * i as f32).collect();
+        let down_shexp_vals: Vec<f32> = (0..32).map(|i| 0.03 * i as f32).collect();
+        let gate_shexp_bytes = f32_bytes(&gate_shexp_vals);
+        let up_shexp_bytes = f32_bytes(&up_shexp_vals);
+        let down_shexp_bytes = f32_bytes(&down_shexp_vals);
+
+        // Routed down: [n_embd_latent=2, n_embd=4] → 8 F32.
+        let routed_exp_down_vals: Vec<f32> = vec![
+            0.1, 0.2, 0.3, 0.4, // row 0
+            0.5, 0.6, 0.7, 0.8, // row 1
+        ];
+        let routed_exp_down_bytes = f32_bytes(&routed_exp_down_vals);
+
+        // Routed up: [n_embd=4, n_embd_latent=2] → 8 F32.
+        let routed_exp_up_vals: Vec<f32> = vec![
+            0.5, 0.5, // row 0
+            0.4, 0.4, // row 1
+            0.3, 0.3, // row 2
+            0.2, 0.2, // row 3
+        ];
+        let routed_exp_up_bytes = f32_bytes(&routed_exp_up_vals);
+
+        // routed_exp_norm [n_embd_latent].
+        let routed_exp_norm = vec![1.0_f32; n_embd_latent];
+
+        // Per-expert cubes: gate_exps / up_exps [cols=2, rows=3] per expert × 2 experts
+        // = 12 F32 each; down_exps [cols=3, rows=2] per expert × 2 experts = 12 F32.
+        let per_expert_gate = 6;
+        let per_expert_up = 6;
+        let per_expert_down = 6;
+        let mut gate_exps_vals: Vec<f32> = Vec::new();
+        gate_exps_vals.extend((0..per_expert_gate).map(|i| 0.1 + 0.1 * i as f32));
+        gate_exps_vals.extend((0..per_expert_gate).map(|i| 1.0 + 0.1 * i as f32));
+        let mut up_exps_vals: Vec<f32> = Vec::new();
+        up_exps_vals.extend((0..per_expert_up).map(|i| 0.15 + 0.05 * i as f32));
+        up_exps_vals.extend((0..per_expert_up).map(|i| 1.5 + 0.05 * i as f32));
+        let mut down_exps_vals: Vec<f32> = Vec::new();
+        down_exps_vals.extend((0..per_expert_down).map(|i| 0.2 + 0.1 * i as f32));
+        down_exps_vals.extend((0..per_expert_down).map(|i| 2.0 + 0.1 * i as f32));
+
+        let gate_exps_bytes = f32_bytes(&gate_exps_vals);
+        let up_exps_bytes = f32_bytes(&up_exps_vals);
+        let down_exps_bytes = f32_bytes(&down_exps_vals);
+
+        let moe = KimiK3LatentMoe {
+            ffn_gate_inp,
+            exp_probs_b: None,
+            ffn_gate_shexp: WeightRef {
+                data: &gate_shexp_bytes,
+                qtype: GgmlType::F32,
+                rows: 8,
+                cols: 4,
+            },
+            ffn_up_shexp: WeightRef {
+                data: &up_shexp_bytes,
+                qtype: GgmlType::F32,
+                rows: 8,
+                cols: 4,
+            },
+            ffn_down_shexp: WeightRef {
+                data: &down_shexp_bytes,
+                qtype: GgmlType::F32,
+                rows: 4,
+                cols: 8,
+            },
+            routed_exp_up: WeightRef {
+                data: &routed_exp_up_bytes,
+                qtype: GgmlType::F32,
+                rows: hidden,
+                cols: n_embd_latent,
+            },
+            routed_exp_down: WeightRef {
+                data: &routed_exp_down_bytes,
+                qtype: GgmlType::F32,
+                rows: n_embd_latent,
+                cols: hidden,
+            },
+            routed_exp_norm,
+            ffn_gate_exps: WeightRef {
+                data: &gate_exps_bytes,
+                qtype: GgmlType::F32,
+                rows: n_ff_exp,
+                cols: n_embd_latent,
+            },
+            ffn_up_exps: WeightRef {
+                data: &up_exps_bytes,
+                qtype: GgmlType::F32,
+                rows: n_ff_exp,
+                cols: n_embd_latent,
+            },
+            ffn_down_exps: WeightRef {
+                data: &down_exps_bytes,
+                qtype: GgmlType::F32,
+                rows: n_embd_latent,
+                cols: n_ff_exp,
+            },
+        };
+        let _ = num_experts;
+
+        // top-k = 1, renormalize = true, rms_eps = 1e-6.
+        let y = kimi_k3_latent_moe_forward(&x, &ffn_norm, &moe, 1, true, 1e-6);
+        assert_eq!(y.len(), hidden, "output must have hidden dim");
+        // Should not be all-zero (input is non-zero, all weights are non-zero).
+        assert!(
+            y.iter().any(|&v| v.abs() > 1e-6),
+            "output must be non-zero for non-zero input"
+        );
+        // Should be finite.
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "y[{i}] = {v} must be finite");
         }
     }
 }
