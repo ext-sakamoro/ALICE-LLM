@@ -2443,6 +2443,360 @@ mod block_attnres_tests {
     }
 }
 
+// ── KDA chunkwise scalar reference (Phase X.4.h.1) ─────────────────
+//
+// K3 tech report §2.1.1 "Chunkwise parallel form" (Eq 3-4) describes
+// a chunked prefill algorithm that is recurrent across chunks and
+// parallel within each chunk. The full parallel form uses a UT
+// transform (inherited from Kimi Linear ref [63]) to produce a
+// pseudo-value term `Ṽ_[t] := U_[t] - W_[t] S_[t]`, then computes
+// all `C` outputs in one batched matmul via
+//
+//   A_[t] = Tril[(Q_[t] ⊙ Γ_[t]^{1→C})(K_[t] / Γ_[t]^{1→C})^T]
+//   O_[t] = (Γ_[t]^{1→C} ⊙ Q_[t]) S_[t] + A_[t] Ṽ_[t]
+//
+// K3 uses a 16-token tile (C = 16, cumulative log-decay in (-80, 0)
+// with the g_min = -5 lower bound from Eq 5). This form gives the
+// Tensor-Core matmul speedup on GPU during prefill.
+//
+// This module ships a **scalar reference** — a batched-sequential
+// wrapper that composes `kimi_delta_forward_head` C times per chunk
+// and returns the C output vectors. It gives us:
+//
+// 1. A stable chunk-level API surface for future SIMD / GPU
+//    replacements (the caller shape does not change when the fast
+//    kernel lands at Phase X.4.h.2).
+// 2. A bit-exact parity oracle for that future kernel (chunk output
+//    must equal C sequential `kimi_delta_forward_head` calls).
+// 3. Correctness cover for the cumulative-decay math (Eq 3) even
+//    without the true parallel matmul.
+//
+// The full UT-transform parallel form (Eq 4 as written) is deferred
+// to Phase X.4.h.2 because it depends on the UT construction in
+// Kimi Linear ref [63], which is not spelled out at the level of
+// detail needed for a standalone bit-exact test in the K3 tech
+// report. The reference kernel here is what X.4.h.2 will parity-
+// check against.
+
+/// Fixed chunk size for K3 KDA prefill (`C = 16`).
+///
+/// From tech report §2.1.1: "Kimi Linear controls this numerical
+/// range by computing relative decay in log space and dividing each
+/// chunk into secondary 16-token tiles". K3 inherits the same tile
+/// size.
+pub const KIMI_DELTA_CHUNK_SIZE: usize = 16;
+
+/// Chunkwise reference wrapper: runs [`kimi_delta_forward_head`]
+/// `C` times sequentially and returns the `C` output vectors.
+///
+/// # Arguments
+///
+/// - `xs`: `C` hidden-state inputs, each of length `d`. Length must
+///   equal [`KIMI_DELTA_CHUNK_SIZE`] (16 for K3).
+/// - `params`: per-head weight references (see
+///   [`KimiDeltaHeadParams`]).
+/// - `cache`: per-head mutable state (see [`KimiDeltaHeadCache`]).
+///   Advances by `C` tokens across this call — the recurrent state
+///   picks up 16 delta writes and the three ShortConv ring buffers
+///   each advance 16 slots.
+/// - `l2_eps`: epsilon added to the L2Norm denominator on q, k
+///   inside each per-token forward.
+///
+/// # Returns
+///
+/// `C` output vectors, each of length `params.d_out`, in the same
+/// order as `xs`. The `n`-th entry is what
+/// [`kimi_delta_forward_head`] would return if called on `xs[n]`
+/// after the previous `n` inputs.
+///
+/// # Panics
+///
+/// Panics if `xs.len() != KIMI_DELTA_CHUNK_SIZE`.
+///
+/// # Numerics
+///
+/// Bit-exact with `C = KIMI_DELTA_CHUNK_SIZE` sequential calls to
+/// [`kimi_delta_forward_head`]. A dedicated unit test enforces this
+/// so any future Eq 3-4 parallel form (X.4.h.2) can be parity-tested
+/// against this reference.
+#[must_use]
+pub fn kimi_delta_chunk_forward(
+    xs: &[Vec<f32>],
+    params: &KimiDeltaHeadParams<'_>,
+    cache: &mut KimiDeltaHeadCache,
+    l2_eps: f32,
+) -> Vec<Vec<f32>> {
+    assert_eq!(
+        xs.len(),
+        KIMI_DELTA_CHUNK_SIZE,
+        "chunk must contain exactly {KIMI_DELTA_CHUNK_SIZE} tokens, got {}",
+        xs.len()
+    );
+    let mut outs = Vec::with_capacity(KIMI_DELTA_CHUNK_SIZE);
+    for x in xs {
+        outs.push(kimi_delta_forward_head(x, params, cache, l2_eps));
+    }
+    outs
+}
+
+/// Compute the per-position cumulative decay `Γ_[t]^{1→j} = Π_{r=1}^j α_r`
+/// (Eq 3 of the K3 tech report) for a chunk of `C` per-channel
+/// retention vectors, each of length `d_k`.
+///
+/// Result layout: `[C][d_k]` (outer = position, inner = channel).
+/// `result[0]` is `α_1` itself (product over a single position).
+///
+/// # Panics
+///
+/// Panics if `alphas.is_empty()`, if any `alphas[i].len() != d_k`
+/// where `d_k = alphas[0].len()`, or if `alphas.len() > 128` (a
+/// safety bound to catch obvious caller bugs — K3 uses 16 and
+/// larger tiles are not part of the design).
+///
+/// # Numerics
+///
+/// Uses `f32` element-wise product, matching the accumulation
+/// precision of every other KDA primitive. K3's `g_min = -5`
+/// guarantees `α ≥ exp(-5) ≈ 6.7e-3`, so a 16-position product
+/// stays above `~1.3e-35` (well above f32 denormal threshold at
+/// `1.2e-38`).
+#[must_use]
+pub fn kimi_delta_chunk_cumulative_decay(alphas: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    assert!(!alphas.is_empty(), "alphas must not be empty");
+    assert!(
+        alphas.len() <= 128,
+        "chunk length {} exceeds safety bound 128",
+        alphas.len()
+    );
+    let d_k = alphas[0].len();
+    for (i, a) in alphas.iter().enumerate() {
+        assert_eq!(a.len(), d_k, "alphas[{i}].len() = {} != d_k {d_k}", a.len());
+    }
+    let mut gamma = Vec::with_capacity(alphas.len());
+    let mut running = alphas[0].clone();
+    gamma.push(running.clone());
+    for a in &alphas[1..] {
+        for j in 0..d_k {
+            running[j] *= a[j];
+        }
+        gamma.push(running.clone());
+    }
+    gamma
+}
+
+#[cfg(test)]
+mod kimi_delta_chunk_tests {
+    use super::{
+        kimi_delta_chunk_cumulative_decay, kimi_delta_chunk_forward, kimi_delta_forward_head,
+        KimiDeltaHeadCache, KimiDeltaHeadParams, KIMI_DELTA_CHUNK_SIZE,
+    };
+
+    /// Build a minimal identity-weight `KimiDeltaHeadParams` for a
+    /// `d`-dim head, matching the `PassThroughHead` used in
+    /// `kimi_delta_forward_tests`. Copied here so the tests are
+    /// self-contained.
+    struct PassThroughHead {
+        d: usize,
+        w_q: Vec<f32>,
+        w_k: Vec<f32>,
+        w_v: Vec<f32>,
+        conv_kernel: Vec<f32>,
+        conv_bias: Vec<f32>,
+        w_beta: Vec<f32>,
+        w_alpha_down: Vec<f32>,
+        w_alpha_up: Vec<f32>,
+        b_alpha: Vec<f32>,
+        w_gate: Vec<f32>,
+        w_out: Vec<f32>,
+    }
+
+    impl PassThroughHead {
+        fn new(d: usize) -> Self {
+            let mut identity = vec![0.0_f32; d * d];
+            for i in 0..d {
+                identity[i * d + i] = 1.0;
+            }
+            let kernel_size = 3;
+            let mut conv_kernel = vec![0.0_f32; d * kernel_size];
+            for c in 0..d {
+                conv_kernel[c * kernel_size + (kernel_size - 1)] = 1.0;
+            }
+            Self {
+                d,
+                w_q: identity.clone(),
+                w_k: identity.clone(),
+                w_v: identity.clone(),
+                conv_kernel,
+                conv_bias: vec![0.0; d],
+                w_beta: vec![0.0; d],
+                w_alpha_down: vec![0.0; d],
+                w_alpha_up: vec![0.0; d],
+                b_alpha: vec![0.0; d],
+                w_gate: identity.clone(),
+                w_out: identity,
+            }
+        }
+
+        fn params(&self) -> KimiDeltaHeadParams<'_> {
+            KimiDeltaHeadParams {
+                w_q: &self.w_q,
+                w_k: &self.w_k,
+                w_v: &self.w_v,
+                conv_kernel_q: &self.conv_kernel,
+                conv_kernel_k: &self.conv_kernel,
+                conv_kernel_v: &self.conv_kernel,
+                conv_bias_q: &self.conv_bias,
+                conv_bias_k: &self.conv_bias,
+                conv_bias_v: &self.conv_bias,
+                w_beta: &self.w_beta,
+                w_alpha_down: &self.w_alpha_down,
+                w_alpha_up: &self.w_alpha_up,
+                b_alpha: &self.b_alpha,
+                a_h: 0.0,
+                alpha_rank: 1,
+                g_min: -5.0,
+                w_gate: &self.w_gate,
+                w_out: &self.w_out,
+                d_out: self.d,
+                rms_gamma: None,
+                rms_eps: 1e-6,
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_size_is_sixteen_per_paper() {
+        assert_eq!(KIMI_DELTA_CHUNK_SIZE, 16);
+    }
+
+    #[test]
+    fn chunk_forward_matches_sequential_forward_bit_exact() {
+        // The reference kernel IS sequential kimi_delta_forward_head
+        // under the hood, so bit-exact parity is enforced (this test
+        // will keep any future refactor honest — if someone swaps the
+        // per-token loop for a parallel form the parity oracle catches
+        // the divergence).
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache_a = KimiDeltaHeadCache::new(2, 2, 3);
+        let mut cache_b = KimiDeltaHeadCache::new(2, 2, 3);
+
+        let xs: Vec<Vec<f32>> = (0..KIMI_DELTA_CHUNK_SIZE)
+            .map(|i| vec![(i as f32) * 0.1, -((i as f32) * 0.05)])
+            .collect();
+
+        // Chunk API.
+        let chunk_out = kimi_delta_chunk_forward(&xs, &params, &mut cache_a, 1e-6);
+
+        // Sequential oracle.
+        let mut seq_out: Vec<Vec<f32>> = Vec::with_capacity(KIMI_DELTA_CHUNK_SIZE);
+        for x in &xs {
+            seq_out.push(kimi_delta_forward_head(x, &params, &mut cache_b, 1e-6));
+        }
+
+        assert_eq!(chunk_out.len(), seq_out.len());
+        for (t, (c, s)) in chunk_out.iter().zip(seq_out.iter()).enumerate() {
+            assert_eq!(c, s, "token {t}: chunk output must equal sequential output");
+        }
+    }
+
+    #[test]
+    fn chunk_forward_advances_cache_state() {
+        // After a chunk of 16 tokens, the recurrent state and conv
+        // rings must all have advanced. In particular, ring position
+        // for kernel_size = 3 → ring size = 2 → pos = 16 % 2 = 0.
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(2, 2, 3);
+        let xs: Vec<Vec<f32>> = (0..KIMI_DELTA_CHUNK_SIZE)
+            .map(|_| vec![0.5_f32, -0.5])
+            .collect();
+        let _ = kimi_delta_chunk_forward(&xs, &params, &mut cache, 1e-6);
+        // Recurrent state has picked up mass from 16 delta writes.
+        let state_sum: f32 = cache.state.as_slice().iter().map(|&v| v.abs()).sum();
+        assert!(
+            state_sum > 0.0,
+            "state must be non-zero after a full chunk of writes"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk must contain exactly 16 tokens")]
+    fn chunk_forward_rejects_wrong_chunk_size() {
+        let head = PassThroughHead::new(2);
+        let params = head.params();
+        let mut cache = KimiDeltaHeadCache::new(2, 2, 3);
+        // 8 tokens ≠ KIMI_DELTA_CHUNK_SIZE = 16.
+        let xs = vec![vec![0.0_f32, 0.0]; 8];
+        let _ = kimi_delta_chunk_forward(&xs, &params, &mut cache, 1e-6);
+    }
+
+    #[test]
+    fn cumulative_decay_single_position_returns_alpha_1() {
+        // C = 1 → gamma[0] = alpha[0].
+        let alphas = vec![vec![0.5_f32, 0.25, 0.9]];
+        let gamma = kimi_delta_chunk_cumulative_decay(&alphas);
+        assert_eq!(gamma.len(), 1);
+        assert_eq!(gamma[0], vec![0.5_f32, 0.25, 0.9]);
+    }
+
+    #[test]
+    fn cumulative_decay_computes_running_product() {
+        // C = 3 with alphas [0.5, 0.5] × 3.
+        // gamma[0] = [0.5, 0.5], gamma[1] = [0.25, 0.25], gamma[2] = [0.125, 0.125].
+        let alphas = vec![vec![0.5_f32, 0.5], vec![0.5_f32, 0.5], vec![0.5_f32, 0.5]];
+        let gamma = kimi_delta_chunk_cumulative_decay(&alphas);
+        assert_eq!(gamma.len(), 3);
+        assert_eq!(gamma[0], vec![0.5_f32, 0.5]);
+        for j in 0..2 {
+            assert!((gamma[1][j] - 0.25).abs() < 1e-6);
+            assert!((gamma[2][j] - 0.125).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cumulative_decay_all_ones_stays_at_one() {
+        let alphas = vec![vec![1.0_f32; 4]; KIMI_DELTA_CHUNK_SIZE];
+        let gamma = kimi_delta_chunk_cumulative_decay(&alphas);
+        assert_eq!(gamma.len(), KIMI_DELTA_CHUNK_SIZE);
+        for g in &gamma {
+            for &v in g {
+                assert!((v - 1.0).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn cumulative_decay_channel_independence() {
+        // channel 0: alpha = 1.0 → gamma stays at 1.0
+        // channel 1: alpha = 0.5 → gamma at pos t = 0.5^(t+1)
+        let alphas: Vec<Vec<f32>> = (0..4).map(|_| vec![1.0_f32, 0.5]).collect();
+        let gamma = kimi_delta_chunk_cumulative_decay(&alphas);
+        for (t, g) in gamma.iter().enumerate() {
+            let expected_ch1 = 0.5_f32.powi((t + 1) as i32);
+            assert!((g[0] - 1.0).abs() < 1e-6);
+            assert!(
+                (g[1] - expected_ch1).abs() < 1e-6,
+                "pos {t} channel 1: got {}, expected {expected_ch1}",
+                g[1]
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "alphas must not be empty")]
+    fn cumulative_decay_rejects_empty_input() {
+        let _ = kimi_delta_chunk_cumulative_decay(&[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "!= d_k")]
+    fn cumulative_decay_rejects_mismatched_dims() {
+        let alphas = vec![vec![0.5_f32; 3], vec![0.5_f32; 4]];
+        let _ = kimi_delta_chunk_cumulative_decay(&alphas);
+    }
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
