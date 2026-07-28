@@ -619,6 +619,11 @@ impl KimiDeltaConfig {
                 .and_then(crate::gguf::MetaValue::as_u32_array)
                 .map(|arr| arr.into_iter().map(|v| v as usize).collect())
         };
+        // First-non-None helpers: real K3 GGUF (GrEarl 2026-07-28
+        // inspection) diverges from the pwilkin PR / synthetic k3meta
+        // conventions on ~5 keys — check both spellings.
+        let opt_usize_any = |keys: &[String]| keys.iter().find_map(|k| opt_usize(k));
+        let opt_f32_any = |keys: &[String]| keys.iter().find_map(|k| opt_f32(k));
 
         // MLA sub-config keys land under the shared `.attention.*`
         // namespace so llama.cpp's existing MLA machinery can reuse
@@ -629,6 +634,11 @@ impl KimiDeltaConfig {
         let rope = |key: &str| format!("{prefix}.rope.{key}");
         // K3-only keys live in the plain `kimi-k3.*` namespace.
         let k3 = |key: &str| format!("{prefix}.{key}");
+        // K3 KDA namespace (`kimi-k3.kda.*`): real GrEarl exports use
+        // this instead of the `attention.kda_*` synthetic naming.
+        let kda = |key: &str| format!("{prefix}.kda.{key}");
+        // K3 AttnRes namespace (`kimi-k3.attn_res.*`).
+        let attn_res = |key: &str| format!("{prefix}.attn_res.{key}");
 
         // Derive nope/rope head dims from the split key_length_mla and
         // rope.dimension_count values (following the k3meta.py write
@@ -641,13 +651,21 @@ impl KimiDeltaConfig {
 
         Self {
             // Hybrid attention routing (0-indexed after conversion).
+            // Real GrEarl K3 GGUF does not export these arrays — the
+            // loader falls back to per-layer tensor-name inspection
+            // (`load_kimi_k3_layer_weights` sees whether `attn_q_a`
+            // or `attn_q` exists) when both keys are absent.
             full_attn_layers: opt_vec_usize(&k3("full_attn_layers")),
             kda_layers: opt_vec_usize(&k3("kda_layers")),
-            kda_head_dim: opt_usize(&attn("kda_head_dim")),
+            // KDA head dim: pwilkin/synthetic = `attention.kda_head_dim`,
+            // real GrEarl = `kimi-k3.kda.head_dim`.
+            kda_head_dim: opt_usize_any(&[attn("kda_head_dim"), kda("head_dim")]),
             kda_num_heads: opt_usize(&attn("head_count")),
             kda_short_conv_kernel_size: opt_usize(&ssm("conv_kernel")),
             kda_use_full_rank_gate: opt_bool(&k3("use_full_rank_gate")),
-            kda_gate_lower_bound: opt_f32(&k3("gate_lower_bound")),
+            // Gate lower bound: synthetic = `gate_lower_bound`, real =
+            // `kimi-k3.kda.gate_lower_bound`.
+            kda_gate_lower_bound: opt_f32_any(&[k3("gate_lower_bound"), kda("gate_lower_bound")]),
 
             // Gated MLA config.
             q_lora_rank: opt_usize(&attn("q_lora_rank")),
@@ -658,24 +676,48 @@ impl KimiDeltaConfig {
             mla_use_nope: opt_bool(&k3("mla_use_nope")),
             mla_use_output_gate: opt_bool(&k3("mla_use_output_gate")),
 
-            // Attention Residuals + SiTU-GLU.
-            attn_res_block_size: opt_usize(&k3("attn_res_block_size")),
-            situ_beta: opt_f32(&k3("activation_situ_beta")),
-            situ_linear_beta: opt_f32(&k3("activation_situ_linear_beta")),
+            // Attention Residuals + SiTU-GLU. AttnRes block size:
+            // synthetic = `attn_res_block_size`, real =
+            // `kimi-k3.attn_res.block_size`.
+            attn_res_block_size: opt_usize_any(&[
+                k3("attn_res_block_size"),
+                attn_res("block_size"),
+            ]),
+            // SiTU coefficients: synthetic = `activation_situ_beta`
+            // (single-underscore), real = `activation.situ_beta`
+            // (dot-separated).
+            situ_beta: opt_f32_any(&[k3("activation_situ_beta"), k3("activation.situ_beta")]),
+            situ_linear_beta: opt_f32_any(&[
+                k3("activation_situ_linear_beta"),
+                k3("activation.situ_linear_beta"),
+            ]),
 
             // Stable LatentMoE. Uses the standard llama.cpp expert
-            // metadata keys plus a K3-only `routed_expert_hidden_size`.
+            // metadata keys plus a K3-only `routed_expert_hidden_size`
+            // (real GrEarl exports it as `expert_latent_length` — see
+            // pwilkin constants.py `EXPERT_LATENT_LENGTH`).
             n_routed_experts: opt_usize(&k3("expert_count")),
             num_experts_per_tok: opt_usize(&k3("expert_used_count")),
             n_shared_experts: opt_usize(&k3("expert_shared_count")),
             num_expert_group: opt_usize(&k3("num_expert_group")),
             topk_group: opt_usize(&k3("topk_group")),
-            moe_router_activation: opt_str(&k3("moe_router_activation_func")),
+            // Router activation: synthetic = `moe_router_activation_func`,
+            // real = `expert_gating_func`.
+            moe_router_activation: opt_str(&k3("moe_router_activation_func"))
+                .or_else(|| opt_str(&k3("expert_gating_func"))),
             moe_topk_method: opt_str(&k3("topk_method")),
             moe_intermediate_size: opt_usize(&k3("expert_feed_forward_length")),
             first_k_dense_replace: opt_usize(&k3("leading_dense_block_count")),
-            moe_renormalize: opt_bool(&k3("moe_renormalize")),
-            routed_expert_hidden_size: opt_usize(&k3("routed_expert_hidden_size")),
+            // Renormalize: synthetic = `moe_renormalize`, real =
+            // `expert_weights_norm`.
+            moe_renormalize: opt_bool(&k3("moe_renormalize"))
+                .or_else(|| opt_bool(&k3("expert_weights_norm"))),
+            // Latent hidden size: synthetic = `routed_expert_hidden_size`,
+            // real = `expert_latent_length`.
+            routed_expert_hidden_size: opt_usize_any(&[
+                k3("routed_expert_hidden_size"),
+                k3("expert_latent_length"),
+            ]),
             latent_moe_use_norm: opt_bool(&k3("latent_moe_use_norm")),
             routed_scaling_factor: opt_f32(&k3("expert_weights_scale")),
 
