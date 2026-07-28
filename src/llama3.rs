@@ -7077,6 +7077,356 @@ fn identity_matrix_f32(d: usize) -> Vec<f32> {
     out
 }
 
+// ── Kimi K3 Stable LatentMoE forward (Phase X.4.c.3.3.c) ──────────
+//
+// K3 tech report §2.3 (Stable LatentMoE, Eq 11) forward for one
+// non-dense layer. Handles the **sigmoid router with `noaux_tc`
+// bias correction**, the **2 shared experts** (always-active), and
+// the **latent-space projection** path (`W↓` down → K3-specific
+// `RMSNorm` → `W↑` up + SiTU-GLU per routed expert).
+//
+// Scope of Phase X.4.c.3.3.c (this landing):
+//
+// - **Router + shared experts + latent aggregation shell**: real
+//   implementation of sigmoid gating, top-k selection with
+//   `noaux_tc` bias, and the shared-expert SwiGLU forward.
+// - **Routed expert per-expert loop**: `todo!()` fail-fast pending
+//   Phase X.4.c.3.3.c.2. Reason: the 3-D per-expert cubes
+//   (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` shaped
+//   `[moe_intermediate, latent_hidden, num_experts]`) need
+//   per-expert byte-slice indexing that plugs into the Phase
+//   X.4.e.1 streaming pool. Doing it correctly needs a
+//   `RoutedExpertStorage` extraction similar to DeepSeek V3's
+//   pattern; scoping this session on the outer routing loop keeps
+//   the surface area tractable.
+
+/// Sigmoid router with `noaux_tc` bias correction for K3 Stable
+/// LatentMoE (Phase X.4.c.3.3.c, K3 tech report §2.3.3 Eq 13).
+///
+/// Computes `p_i = Sigmoid(W_r x_i)` per expert, adds the
+/// noaux_tc bias `b_j` to the pre-selection scores (bias affects
+/// selection but not the returned weights), picks the top-k
+/// expert indices by `s_i + b`, and renormalizes so that
+/// `Σ_{j ∈ T_k} p_j = 1` when `moe_renormalize = true` (K3
+/// default). Bias-free variants (older MoE without noaux_tc) can
+/// pass `exp_probs_b = None`.
+///
+/// # Arguments
+///
+/// - `x`: input hidden state `[d]`.
+/// - `ffn_gate_inp`: dense f32 router weight, layout `[num_experts,
+///   d]` row-major (i.e. `num_experts` rows of `d` cols) — reads
+///   like `router.matvec(x, &mut scores)` where `scores` is
+///   `[num_experts]`.
+/// - `exp_probs_b`: optional per-expert bias `[num_experts]` for
+///   noaux_tc. `None` disables bias correction.
+/// - `top_k`: number of experts to select (K3: 16).
+/// - `renormalize`: when `true`, top-k weights sum to 1.
+///
+/// # Returns
+///
+/// A `Vec<(usize, f32)>` of `top_k` entries, each
+/// `(expert_index, normalized_weight)`, sorted by expert index
+/// ascending for deterministic downstream reduce.
+#[allow(dead_code)]
+fn kimi_k3_moe_router(
+    x: &[f32],
+    ffn_gate_inp: &[f32],
+    exp_probs_b: Option<&[f32]>,
+    top_k: usize,
+    renormalize: bool,
+) -> Vec<(usize, f32)> {
+    let d = x.len();
+    assert!(!ffn_gate_inp.is_empty(), "ffn_gate_inp must not be empty");
+    assert!(
+        ffn_gate_inp.len().is_multiple_of(d),
+        "ffn_gate_inp length {} must be multiple of hidden dim {d}",
+        ffn_gate_inp.len()
+    );
+    let num_experts = ffn_gate_inp.len() / d;
+    assert!(
+        top_k <= num_experts,
+        "top_k {top_k} > num_experts {num_experts}"
+    );
+
+    // Router scores: raw dot product then sigmoid.
+    let mut scores = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let row_start = e * d;
+        let mut acc = 0.0_f64;
+        for j in 0..d {
+            acc += f64::from(ffn_gate_inp[row_start + j]) * f64::from(x[j]);
+        }
+        scores.push(sigmoid(acc as f32));
+    }
+
+    // Bias-adjusted selection scores: `s_i + b_j` (K3 noaux_tc).
+    let selection_scores: Vec<f32> = if let Some(bias) = exp_probs_b {
+        assert_eq!(
+            bias.len(),
+            num_experts,
+            "exp_probs_b length must equal num_experts"
+        );
+        scores
+            .iter()
+            .zip(bias.iter())
+            .map(|(&s, &b)| s + b)
+            .collect()
+    } else {
+        scores.clone()
+    };
+
+    // Top-k selection by bias-adjusted score.
+    let mut indexed: Vec<(usize, f32)> = selection_scores
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.truncate(top_k);
+
+    // Weights use the raw scores (bias omitted, per §2.3.3 Eq 13
+    // "Because b is omitted from p_{i,j}").
+    let mut selected: Vec<(usize, f32)> =
+        indexed.into_iter().map(|(i, _)| (i, scores[i])).collect();
+
+    // Renormalize weights to sum to 1 (K3 default `moe_renormalize
+    // = true`).
+    if renormalize {
+        let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+        if sum > 0.0 {
+            let inv = sum.recip();
+            for (_, w) in &mut selected {
+                *w *= inv;
+            }
+        }
+    }
+
+    // Sort by expert index ascending for deterministic reduction.
+    selected.sort_by_key(|(i, _)| *i);
+    selected
+}
+
+/// K3 shared-experts forward (Phase X.4.c.3.3.c, K3 tech report
+/// §2.3 Eq 11 shared-expert branch `E_j^shared(x)`).
+///
+/// K3 fuses the `num_shared_experts` (K3 default 2) shared experts
+/// into a **single** SwiGLU block per layer — the GGUF tensor set
+/// only ships `ffn_gate_shexp` / `ffn_up_shexp` / `ffn_down_shexp`
+/// (one triple per layer). The forward is identical to the standard
+/// SwiGLU pattern used by [`kimi_k3_dense_ffn_forward`], just with
+/// the shared-expert weight refs.
+///
+/// Applied without RMSNorm at the shared-expert level because the
+/// outer layer already pre-normalized `x` via the FFN norm before
+/// entering the MoE dispatch.
+#[allow(dead_code)]
+fn kimi_k3_shared_experts_forward(
+    x: &[f32],
+    gate: &WeightRef<'_>,
+    up: &WeightRef<'_>,
+    down: &WeightRef<'_>,
+) -> Vec<f32> {
+    let d = x.len();
+    let intermediate = gate.rows;
+    debug_assert_eq!(up.rows, intermediate);
+    debug_assert_eq!(down.cols, intermediate);
+    debug_assert_eq!(down.rows, d);
+
+    let mut gate_out = vec![0.0_f32; intermediate];
+    gate.matvec(x, &mut gate_out);
+    let mut up_out = vec![0.0_f32; intermediate];
+    up.matvec(x, &mut up_out);
+    let mut gated = vec![0.0_f32; intermediate];
+    for i in 0..intermediate {
+        gated[i] = silu(gate_out[i]) * up_out[i];
+    }
+    let mut y = vec![0.0_f32; d];
+    down.matvec(&gated, &mut y);
+    y
+}
+
+/// K3 Stable LatentMoE forward — router + shared aggregator with
+/// routed-expert dispatch stubbed (Phase X.4.c.3.3.c, K3 tech
+/// report §2.3 Eq 11).
+///
+/// Wired stages:
+///
+/// 1. **Router** (`kimi_k3_moe_router`) — sigmoid + noaux_tc +
+///    top-16 selection.
+/// 2. **Shared experts** (`kimi_k3_shared_experts_forward`) —
+///    always-active SwiGLU, returns `[d]`.
+/// 3. **Routed dispatch** — **`todo!()`** pending Phase
+///    X.4.c.3.3.c.2. The 3-D per-expert cubes need per-expert
+///    byte-slice indexing that plugs into the Phase X.4.e.1
+///    streaming pool; scoping this session on the outer routing
+///    shell keeps the surface area tractable.
+/// 4. **Aggregation** (unreachable this phase): would be
+///    `y = shared_out + W↑ · RMSNorm(u)` where
+///    `u = Σ p_i · E_i^routed(W↓ · x)`. Once the routed dispatch
+///    lands, the caller assembles `u`, applies the K3-specific
+///    `routed_exp_norm` RMSNorm, then the `routed_exp_up`
+///    projection, then adds `shared_out`.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn kimi_k3_latent_moe_forward(
+    x: &[f32],
+    ffn_norm: &[f32],
+    moe: &KimiK3LatentMoe<'_>,
+    top_k: usize,
+    renormalize: bool,
+    rms_eps: f32,
+) -> Vec<f32> {
+    // Pre-FFN RMSNorm applied to `x` before both the router and
+    // the shared / routed experts (mirrors the standard pattern
+    // llama.cpp uses for MoE layers).
+    let x_norm = kimi_k3_rms_norm(x, ffn_norm, rms_eps);
+
+    // Step 1: router (real).
+    let selected = kimi_k3_moe_router(
+        &x_norm,
+        &moe.ffn_gate_inp,
+        moe.exp_probs_b.as_deref(),
+        top_k,
+        renormalize,
+    );
+
+    // Step 2: shared experts (real).
+    let shared_out = kimi_k3_shared_experts_forward(
+        &x_norm,
+        &moe.ffn_gate_shexp,
+        &moe.ffn_up_shexp,
+        &moe.ffn_down_shexp,
+    );
+
+    // Step 3: routed dispatch — TODO. See docstring for the plan.
+    todo!(
+        "K3 LatentMoE routed dispatch — Phase X.4.c.3.3.c.2. Router selected {} \
+         experts and shared_out is {} f32; the remaining step is to loop over \
+         `selected` (each `(expert_idx, weight)`) and slice the per-expert weight \
+         planes out of the 3-D cubes `ffn_gate_exps` / `ffn_up_exps` / \
+         `ffn_down_exps` (shape [moe_intermediate, latent_hidden, num_experts]), \
+         compute latent-space `W_down x_norm` once, run SiTU-GLU per expert, \
+         weight-sum by `weight`, then apply `routed_exp_norm` + `routed_exp_up`, \
+         and finally `y = shared_out + up_projected_routed_agg`. See paper §2.3 \
+         Eq 11 + `routed_exp_norm` = K3-only RMSNorm before W↑ from §2.3.1.",
+        selected.len(),
+        shared_out.len()
+    )
+}
+
+#[cfg(test)]
+mod kimi_k3_latent_moe_tests {
+    use super::{kimi_k3_moe_router, kimi_k3_shared_experts_forward, GgmlType, WeightRef};
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn moe_router_selects_top_k_by_score() {
+        // 4 experts, hidden = 2, top-k = 2. Router weights favour
+        // experts 0 and 3 (row 0 = strong positive dot with x,
+        // row 3 = same). Verify those two get selected.
+        let x = vec![1.0_f32, 1.0];
+        // Rows [e * d + j], row 0 = strong, row 1/2 = weak, row 3 = strong.
+        let router = vec![
+            5.0, 5.0, // expert 0
+            0.1, 0.1, // expert 1
+            0.1, 0.1, // expert 2
+            5.0, 5.0, // expert 3
+        ];
+        let selected = kimi_k3_moe_router(&x, &router, None, 2, true);
+        let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![0, 3], "top-2 should pick experts 0 and 3");
+        // Renormalized weights sum to 1.
+        let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "renormalized weights must sum to 1"
+        );
+    }
+
+    #[test]
+    fn moe_router_bias_shifts_selection_without_affecting_weights() {
+        // Same base scores, but expert 1's bias makes it selected
+        // over expert 3 despite lower raw sigmoid. Weights returned
+        // must still be based on raw sigmoid (bias omitted per
+        // paper §2.3.3 "b is omitted from p_{i,j}").
+        let x = vec![1.0_f32, 1.0];
+        let router = vec![
+            5.0, 5.0, // expert 0: high raw
+            1.0, 1.0, // expert 1: mid raw
+            0.0, 0.0, // expert 2: low raw
+            3.0, 3.0, // expert 3: mid-high raw
+        ];
+        // Bias pushes expert 1's selection score above expert 3.
+        let bias = vec![0.0_f32, 10.0, 0.0, 0.0];
+        let selected = kimi_k3_moe_router(&x, &router, Some(&bias), 2, false);
+        let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
+        // Selection order (by index ascending after sort): 0, 1.
+        assert_eq!(indices, vec![0, 1], "bias must promote expert 1 over 3");
+        // Weight for expert 1 must still be its raw sigmoid, not
+        // sigmoid + bias.
+        let raw_1 = 1.0_f32 / (1.0 + (-2.0_f32).exp()); // sigmoid(1+1=2)
+        let w_1 = selected.iter().find(|(i, _)| *i == 1).unwrap().1;
+        assert!(
+            (w_1 - raw_1).abs() < 1e-5,
+            "expert 1 weight {w_1} must equal raw sigmoid {raw_1}, bias omitted"
+        );
+    }
+
+    #[test]
+    fn moe_router_returns_sorted_indices() {
+        // Deterministic downstream reduction requires expert index
+        // ascending order in the returned selection.
+        let x = vec![1.0_f32, 1.0];
+        let router = vec![
+            0.1, 0.1, // expert 0: low
+            5.0, 5.0, // expert 1: high
+            3.0, 3.0, // expert 2: mid
+            5.0, 5.0, // expert 3: high
+        ];
+        let selected = kimi_k3_moe_router(&x, &router, None, 3, true);
+        let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![1, 2, 3], "indices must be sorted ascending");
+    }
+
+    #[test]
+    fn shared_experts_forward_zero_input_gives_zero() {
+        let x = vec![0.0_f32; 4];
+        // Non-trivial weights.
+        let gate_bytes = f32_bytes(&(0..32).map(|i| 0.01 * i as f32).collect::<Vec<_>>());
+        let up_bytes = f32_bytes(&(0..32).map(|i| 0.02 * i as f32).collect::<Vec<_>>());
+        let down_bytes = f32_bytes(&(0..32).map(|i| 0.03 * i as f32).collect::<Vec<_>>());
+        let gate = WeightRef {
+            data: &gate_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let up = WeightRef {
+            data: &up_bytes,
+            qtype: GgmlType::F32,
+            rows: 8,
+            cols: 4,
+        };
+        let down = WeightRef {
+            data: &down_bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 8,
+        };
+        let y = kimi_k3_shared_experts_forward(&x, &gate, &up, &down);
+        for (i, &v) in y.iter().enumerate() {
+            assert_eq!(v, 0.0, "y[{i}] = {v} but zero input must give zero");
+        }
+    }
+}
+
 #[cfg(test)]
 mod kimi_k3_kda_layer_tests {
     use super::{
@@ -7956,17 +8306,26 @@ impl<'a> KimiK3Model<'a> {
                     down,
                     self.config.norm_eps,
                 ),
-                KimiK3Ffn::LatentMoe(_) => {
-                    todo!(
-                        "KIMI-K3 forward: LatentMoE FFN at layer {il} — Phase \
-                         X.4.c.3.3.c will land Stable LatentMoE: sigmoid router top-16 \
-                         from 896 experts (`ffn_gate_inp` + `exp_probs_b` bias for \
-                         noaux_tc), 2 shared experts (`ffn_{{gate,up,down}}_shexp`), \
-                         latent projections (`routed_exp_up`/`down` + \
-                         `routed_exp_norm` K3-specific RMSNorm before W↑), and \
-                         SiTU-GLU per routed expert. K3 default \
-                         `first_k_dense_replace = 1` means layers 1..93 all take this \
-                         branch. See paper §2.3."
+                KimiK3Ffn::LatentMoe(moe) => {
+                    // Phase X.4.c.3.3.c partial landing (2026-07-28):
+                    // sigmoid router + shared experts fully wired;
+                    // routed dispatch still `todo!()` inside
+                    // `kimi_k3_latent_moe_forward` (per-expert 3-D
+                    // cube slicing = X.4.c.3.3.c.2).
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let top_k = kd.num_experts_per_tok.unwrap_or(16);
+                    let renormalize = kd.moe_renormalize.unwrap_or(true);
+                    kimi_k3_latent_moe_forward(
+                        &x,
+                        &layer.ffn_norm,
+                        moe,
+                        top_k,
+                        renormalize,
+                        self.config.norm_eps,
                     )
                 }
             };
