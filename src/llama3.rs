@@ -7417,26 +7417,70 @@ fn kimi_k3_kda_layer_forward(
         let row_start = head_idx * head_dim;
         let row_end = row_start + head_dim;
 
-        let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end)
-            .unwrap_or_else(|| panic!("kda_layer_forward: q slice failed (head {head_idx})"));
-        let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end)
-            .unwrap_or_else(|| panic!("kda_layer_forward: k slice failed (head {head_idx})"));
-        let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end)
-            .unwrap_or_else(|| panic!("kda_layer_forward: v slice failed (head {head_idx})"));
+        let describe = |t: &WeightRef<'_>| {
+            format!(
+                "qtype={:?} rows={} cols={} data_len={} elements_per_block={} block_bytes={}",
+                t.qtype,
+                t.rows,
+                t.cols,
+                t.data.len(),
+                t.qtype.elements_per_block(),
+                t.qtype.block_bytes()
+            )
+        };
+        let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end).unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: q slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+                 tensor {})",
+                describe(&kda.q)
+            )
+        });
+        let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end).unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: k slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+                 tensor {})",
+                describe(&kda.k)
+            )
+        });
+        let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end).unwrap_or_else(|| {
+            panic!(
+                "kda_layer_forward: v slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
+                 tensor {})",
+                describe(&kda.v)
+            )
+        });
         let w_conv_q = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end)
             .unwrap_or_else(|| {
-                panic!("kda_layer_forward: conv1d_q slice failed (head {head_idx})")
+                panic!(
+                    "kda_layer_forward: conv1d_q slice failed (head {head_idx}, rows \
+                     [{row_start}..{row_end}], tensor {})",
+                    describe(&kda.ssm_conv1d_q)
+                )
             });
         let w_conv_k = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end)
             .unwrap_or_else(|| {
-                panic!("kda_layer_forward: conv1d_k slice failed (head {head_idx})")
+                panic!(
+                    "kda_layer_forward: conv1d_k slice failed (head {head_idx}, rows \
+                     [{row_start}..{row_end}], tensor {})",
+                    describe(&kda.ssm_conv1d_k)
+                )
             });
         let w_conv_v = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end)
             .unwrap_or_else(|| {
-                panic!("kda_layer_forward: conv1d_v slice failed (head {head_idx})")
+                panic!(
+                    "kda_layer_forward: conv1d_v slice failed (head {head_idx}, rows \
+                     [{row_start}..{row_end}], tensor {})",
+                    describe(&kda.ssm_conv1d_v)
+                )
             });
         let w_alpha_up = kimi_k3_slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end)
-            .unwrap_or_else(|| panic!("kda_layer_forward: ssm_f_b slice failed (head {head_idx})"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "kda_layer_forward: ssm_f_b slice failed (head {head_idx}, rows \
+                     [{row_start}..{row_end}], tensor {})",
+                    describe(&kda.ssm_f_b)
+                )
+            });
 
         // `ssm_beta` is per-head 1×d, so slice one row.
         let w_beta_ref = kimi_k3_slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
