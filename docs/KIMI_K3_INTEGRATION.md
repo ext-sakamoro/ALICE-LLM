@@ -325,7 +325,9 @@ Kimi Delta is a Gated DeltaNet family, which ALICE-LLM already ships:
 |---|---|---|---|
 | **X.4.a** ✅ (2026-07-17) | Architecture enum variant + KimiDeltaConfig stub + fail-fast forward + docs | 完了 | — |
 | **X.4.a.1** ✅ (2026-07-28) | Post-release spec refinement: KimiDeltaConfig expanded from 10 → 32 fields with all HF-confirmed values + `KimiDeltaConfig::from_hf_config` JSON loader (`hf-config` feature) + 5 unit tests + doc sync | 完了 | — |
-| X.4.b | GGUF metadata detection + weight tensor mapping + config parity | 1-2 日 | 🚧 community GGUF conversion (mradermacher/bartowski). HF safetensors + config.json are now in hand |
+| X.4.b | GGUF metadata detection + weight tensor mapping + config parity | 1-2 日 | 🚧 (weight loader 残)。metadata 側は X.4.b.1 で完了 |
+| **X.4.b.1** ✅ (2026-07-28) | Kimi K3 GGUF metadata loader (`ModelArch::KimiK3::meta_prefix() = "kimi-k3"` + `KimiDeltaConfig::from_gguf(gguf, prefix)` で 30+ field 読取 + `Llama3Config::from_gguf` KimiK3 branch + `is_mla_layer(il)` predicate + 6 test with synthetic mini K3 GGUF fixture)。community conversion (`Kuberwastaken/Kimi-K3-GGUF/convert_kimi_k3.py` + upstream `pwilkin/kimi-k3-text` PR #26185) の layout に準拠。GrEarl/Kimi-K3-GGUF (Q2_K 94-part) + GrEarl/Kimi-K3-GGUF-IQ1_S (527 GB 94-part) が実 download target | 完了 | — |
+| X.4.b.2 | 実 GGUF tensor loader (per-layer tensor lookup + shape validation for ~2573 tensor、`TENSOR_MAP.md` に準拠) | 1-2 日 | forward path 実装と同時期 |
 | X.4.c | CPU forward path (reuse Bonsai gated_deltanet ~90%, swap gating if paper differs) | 3-5 日 | X.4.b + paper drop |
 | **X.4.c.1** ✅ (2026-07-28) | KDA CPU forward primitives scaffold: `KimiDeltaState` + `kimi_delta_step` (Eq 1) + `kimi_delta_read` + `kimi_delta_lower_bounded_decay` (Eq 5) + `kimi_delta_output_gate` (Eq 6/7) + 14 unit tests | 完了 | — |
 | **X.4.c.2** ✅ (2026-07-28) | KDA per-head composite forward: `KimiDeltaHeadCache` + `KimiDeltaHeadParams` + `kimi_delta_l2_norm_in_place` + `kimi_delta_forward_head` (Eq 2 + ShortConv + Swish + L2Norm + step + read + output gate、reuse 既存 `causal_conv1d_step` / `silu`) + 10 unit tests | 完了 | — |

@@ -191,9 +191,16 @@ impl ModelArch {
             Self::Qwen2 => "qwen2",
             Self::Qwen3 | Self::Qwen3_5 => "qwen3",
             Self::DeepSeekV3 => "deepseek2",
-            // TODO: confirm the actual llama.cpp prefix once conversion
-            // support lands (see docs/KIMI_K3_INTEGRATION.md).
-            Self::KimiK3 => "kimi",
+            // Phase X.4.b.1 (2026-07-28) confirmed: the community
+            // conversion (`Kuberwastaken/Kimi-K3-GGUF/convert_kimi_k3.py`
+            // + upstream `pwilkin/kimi-k3-text` PR #26185) writes
+            // `general.architecture = "kimi-k3"` (hyphenated). Existing
+            // arch auto-detect at `from_gguf` matches `starts_with("kimi")`
+            // and already routes hyphenated forms to `ModelArch::KimiK3`;
+            // the `meta_prefix` here is used for hyperparameter key
+            // lookups (`kimi-k3.embedding_length`, etc.), so it must be
+            // the full hyphenated string.
+            Self::KimiK3 => "kimi-k3",
             // Same TODO as KimiK3 — the eventual `general.architecture`
             // string for Hy3 GGUF is not yet fixed by the community.
             // `hunyuan` is the working guess based on the HuggingFace
@@ -575,6 +582,448 @@ impl KimiDeltaConfig {
             mxfp4_group_size: opt_usize(&qw["group_size"]),
             mxfp4_num_bits: opt_usize(&qw["num_bits"]),
         })
+    }
+}
+
+impl KimiDeltaConfig {
+    /// Parse a `KimiDeltaConfig` from a Kimi K3 GGUF file
+    /// (Phase X.4.b.1, 2026-07-28).
+    ///
+    /// Reads all K3-specific hyperparameters from the `kimi-k3.*`
+    /// namespace as written by `Kuberwastaken/Kimi-K3-GGUF/k3meta.py` +
+    /// upstream `pwilkin/kimi-k3-text` (llama.cpp PR #26185). Standard
+    /// hyperparameters (embedding_length, block_count, head_count,
+    /// etc.) are read separately by the outer `Llama3Config::from_gguf`
+    /// branch and populate [`Llama3Config`] core fields; this
+    /// function fills in only the K3-only fields.
+    ///
+    /// The `prefix` argument is normally `"kimi-k3"` (from
+    /// [`ModelArch::KimiK3::meta_prefix()`]) but is passed explicitly
+    /// so future prefix versioning (e.g. `kimi-k3v2`) can override
+    /// without touching this parser.
+    ///
+    /// # Missing fields
+    ///
+    /// Individual `Option` fields default to `None` when the
+    /// corresponding metadata key is absent, so a partial GGUF (e.g.
+    /// text-only variant without MXFP4 quantization metadata) still
+    /// parses without erroring.
+    #[must_use]
+    pub fn from_gguf(gguf: &crate::gguf::GgufFile<'_>, prefix: &str) -> Self {
+        let opt_usize = |key: &str| gguf.meta_u32(key).map(|v| v as usize);
+        let opt_bool = |key: &str| gguf.meta_bool(key);
+        let opt_str = |key: &str| gguf.meta_str(key).map(str::to_owned);
+        let opt_f32 = |key: &str| gguf.meta_f32(key);
+        let opt_vec_usize = |key: &str| {
+            gguf.meta(key)
+                .and_then(crate::gguf::MetaValue::as_u32_array)
+                .map(|arr| arr.into_iter().map(|v| v as usize).collect())
+        };
+
+        // MLA sub-config keys land under the shared `.attention.*`
+        // namespace so llama.cpp's existing MLA machinery can reuse
+        // them — `q_lora_rank`, `kv_lora_rank`, `key_length`,
+        // `value_length_mla`, etc.
+        let attn = |key: &str| format!("{prefix}.attention.{key}");
+        let ssm = |key: &str| format!("{prefix}.ssm.{key}");
+        let rope = |key: &str| format!("{prefix}.rope.{key}");
+        // K3-only keys live in the plain `kimi-k3.*` namespace.
+        let k3 = |key: &str| format!("{prefix}.{key}");
+
+        // Derive nope/rope head dims from the split key_length_mla and
+        // rope.dimension_count values (following the k3meta.py write
+        // order: `key_length_mla = qk_nope_head_dim + qk_rope_head_dim`,
+        // and `rope.dimension_count = qk_rope_head_dim`).
+        let qk_rope_head_dim = opt_usize(&rope("dimension_count"));
+        let qk_nope_head_dim = opt_usize(&attn("key_length_mla"))
+            .zip(qk_rope_head_dim)
+            .map(|(kl_mla, rope_dim)| kl_mla.saturating_sub(rope_dim));
+
+        Self {
+            // Hybrid attention routing (0-indexed after conversion).
+            full_attn_layers: opt_vec_usize(&k3("full_attn_layers")),
+            kda_layers: opt_vec_usize(&k3("kda_layers")),
+            kda_head_dim: opt_usize(&attn("kda_head_dim")),
+            kda_num_heads: opt_usize(&attn("head_count")),
+            kda_short_conv_kernel_size: opt_usize(&ssm("conv_kernel")),
+            kda_use_full_rank_gate: opt_bool(&k3("use_full_rank_gate")),
+            kda_gate_lower_bound: opt_f32(&k3("gate_lower_bound")),
+
+            // Gated MLA config.
+            q_lora_rank: opt_usize(&attn("q_lora_rank")),
+            kv_lora_rank: opt_usize(&attn("kv_lora_rank")),
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim: opt_usize(&attn("value_length_mla")),
+            mla_use_nope: opt_bool(&k3("mla_use_nope")),
+            mla_use_output_gate: opt_bool(&k3("mla_use_output_gate")),
+
+            // Attention Residuals + SiTU-GLU.
+            attn_res_block_size: opt_usize(&k3("attn_res_block_size")),
+            situ_beta: opt_f32(&k3("activation_situ_beta")),
+            situ_linear_beta: opt_f32(&k3("activation_situ_linear_beta")),
+
+            // Stable LatentMoE. Uses the standard llama.cpp expert
+            // metadata keys plus a K3-only `routed_expert_hidden_size`.
+            n_routed_experts: opt_usize(&k3("expert_count")),
+            num_experts_per_tok: opt_usize(&k3("expert_used_count")),
+            n_shared_experts: opt_usize(&k3("expert_shared_count")),
+            num_expert_group: opt_usize(&k3("num_expert_group")),
+            topk_group: opt_usize(&k3("topk_group")),
+            moe_router_activation: opt_str(&k3("moe_router_activation_func")),
+            moe_topk_method: opt_str(&k3("topk_method")),
+            moe_intermediate_size: opt_usize(&k3("expert_feed_forward_length")),
+            first_k_dense_replace: opt_usize(&k3("leading_dense_block_count")),
+            moe_renormalize: opt_bool(&k3("moe_renormalize")),
+            routed_expert_hidden_size: opt_usize(&k3("routed_expert_hidden_size")),
+            latent_moe_use_norm: opt_bool(&k3("latent_moe_use_norm")),
+            routed_scaling_factor: opt_f32(&k3("expert_weights_scale")),
+
+            // MTP head (K3 does not export any). Retained for parity
+            // with the DeepSeek V3 dispatch code.
+            num_nextn_predict_layers: gguf.meta_u32(&k3("mtp_layer_count")).map(|v| v as usize),
+
+            // MXFP4 native quantization. Not exported by k3meta.py in
+            // the current pwilkin PR; leave as `None` so callers know
+            // to fall back to per-tensor GGML type inspection.
+            mxfp4_group_size: None,
+            mxfp4_num_bits: None,
+        }
+    }
+
+    /// Layer-index predicate: returns `true` if layer `il` (0-indexed)
+    /// is a Gated MLA (full-attention) layer, `false` if it is a KDA
+    /// (linear-attention) layer, and `None` if `full_attn_layers` is
+    /// not populated.
+    ///
+    /// Uses the 0-indexed convention that `k3meta.py` writes into GGUF
+    /// (which subtracts 1 from `config.json`'s 1-indexed
+    /// `full_attn_layers` list at conversion time).
+    #[must_use]
+    pub fn is_mla_layer(&self, il: usize) -> Option<bool> {
+        self.full_attn_layers
+            .as_ref()
+            .map(|full| full.contains(&il))
+    }
+}
+
+#[cfg(test)]
+mod kimi_k3_gguf_loader_tests {
+    use super::{KimiDeltaConfig, ModelArch};
+    use crate::gguf::GgufFile;
+
+    // GGUF metadata value type IDs (see gguf.rs `MetaValue` parser).
+    const GGUF_TYPE_U32: u32 = 4;
+    const GGUF_TYPE_F32: u32 = 6;
+    const GGUF_TYPE_BOOL: u32 = 7;
+    const GGUF_TYPE_STRING: u32 = 8;
+    const GGUF_TYPE_ARRAY: u32 = 9;
+
+    fn write_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_f32(buf: &mut Vec<u8>, v: f32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_str(buf: &mut Vec<u8>, s: &str) {
+        write_u64(buf, s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+    }
+    fn write_kv_str(buf: &mut Vec<u8>, key: &str, value: &str) {
+        write_str(buf, key);
+        write_u32(buf, GGUF_TYPE_STRING);
+        write_str(buf, value);
+    }
+    fn write_kv_u32(buf: &mut Vec<u8>, key: &str, value: u32) {
+        write_str(buf, key);
+        write_u32(buf, GGUF_TYPE_U32);
+        write_u32(buf, value);
+    }
+    fn write_kv_f32(buf: &mut Vec<u8>, key: &str, value: f32) {
+        write_str(buf, key);
+        write_u32(buf, GGUF_TYPE_F32);
+        write_f32(buf, value);
+    }
+    fn write_kv_bool(buf: &mut Vec<u8>, key: &str, value: bool) {
+        write_str(buf, key);
+        write_u32(buf, GGUF_TYPE_BOOL);
+        buf.push(u8::from(value));
+    }
+    fn write_kv_u32_array(buf: &mut Vec<u8>, key: &str, values: &[u32]) {
+        write_str(buf, key);
+        write_u32(buf, GGUF_TYPE_ARRAY);
+        write_u32(buf, GGUF_TYPE_U32);
+        write_u64(buf, values.len() as u64);
+        for &v in values {
+            write_u32(buf, v);
+        }
+    }
+
+    /// Build a minimal but complete Kimi K3 GGUF byte buffer for
+    /// loader tests. Emits every metadata key that
+    /// `KimiDeltaConfig::from_gguf` inspects plus the standard
+    /// hyperparameters that `Llama3Config::from_gguf` needs to
+    /// dispatch to the K3 branch. Includes one dummy f32 tensor so
+    /// the GGUF file layout is valid.
+    ///
+    /// 8-layer mini config: `full_attn_layers = [3, 7]` (0-indexed
+    /// after k3meta.py conversion, mirroring the real K3 pattern of
+    /// every 4th layer being MLA), `kda_layers = [0, 1, 2, 4, 5, 6]`.
+    #[allow(clippy::too_many_lines)]
+    fn build_synthetic_kimi_k3_gguf() -> Vec<u8> {
+        // Build metadata block separately so we can count entries
+        // for the n_kv field, then splice everything into the final
+        // header.
+        let mut kv = Vec::new();
+        let mut n_kv: u64 = 0;
+
+        // Every write is direct + `n_kv += 1` so the borrow checker
+        // does not have to reason about a captured-`&mut n_kv`
+        // closure staying alive across the block below.
+        write_kv_str(&mut kv, "general.architecture", "kimi-k3");
+        n_kv += 1;
+
+        // Standard hyperparams needed by Llama3Config::from_gguf plus
+        // the K3-specific keys that KimiDeltaConfig::from_gguf reads.
+        {
+            write_kv_u32(&mut kv, "general.alignment", 32);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.block_count", 8);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.embedding_length", 64);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.feed_forward_length", 128);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.context_length", 4096);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.vocab_size", 256);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.attention.head_count", 8);
+            n_kv += 1;
+            write_kv_f32(&mut kv, "kimi-k3.attention.layer_norm_rms_epsilon", 1e-5);
+            n_kv += 1;
+
+            // MLA sub-config.
+            write_kv_u32(&mut kv, "kimi-k3.attention.q_lora_rank", 16);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.attention.kv_lora_rank", 8);
+            n_kv += 1;
+            // key_length_mla = qk_nope + qk_rope = 8 + 4 = 12
+            write_kv_u32(&mut kv, "kimi-k3.attention.key_length_mla", 12);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.attention.value_length_mla", 8);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.rope.dimension_count", 4);
+            n_kv += 1;
+            write_kv_bool(&mut kv, "kimi-k3.mla_use_nope", true);
+            n_kv += 1;
+            write_kv_bool(&mut kv, "kimi-k3.mla_use_output_gate", true);
+            n_kv += 1;
+
+            // KDA sub-config.
+            write_kv_u32(&mut kv, "kimi-k3.attention.kda_head_dim", 8);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.ssm.conv_kernel", 4);
+            n_kv += 1;
+            write_kv_bool(&mut kv, "kimi-k3.use_full_rank_gate", true);
+            n_kv += 1;
+            write_kv_f32(&mut kv, "kimi-k3.gate_lower_bound", -5.0);
+            n_kv += 1;
+
+            // Attention Residuals + SiTU-GLU.
+            write_kv_u32(&mut kv, "kimi-k3.attn_res_block_size", 4);
+            n_kv += 1;
+            write_kv_f32(&mut kv, "kimi-k3.activation_situ_beta", 4.0);
+            n_kv += 1;
+            write_kv_f32(&mut kv, "kimi-k3.activation_situ_linear_beta", 25.0);
+            n_kv += 1;
+            write_kv_str(&mut kv, "kimi-k3.activation", "situ");
+            n_kv += 1;
+
+            // Stable LatentMoE.
+            write_kv_u32(&mut kv, "kimi-k3.expert_count", 32);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.expert_used_count", 4);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.expert_shared_count", 2);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.num_expert_group", 1);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.topk_group", 1);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.expert_feed_forward_length", 64);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.leading_dense_block_count", 1);
+            n_kv += 1;
+            write_kv_u32(&mut kv, "kimi-k3.routed_expert_hidden_size", 32);
+            n_kv += 1;
+            write_kv_bool(&mut kv, "kimi-k3.moe_renormalize", true);
+            n_kv += 1;
+            write_kv_bool(&mut kv, "kimi-k3.latent_moe_use_norm", true);
+            n_kv += 1;
+            write_kv_f32(&mut kv, "kimi-k3.expert_weights_scale", 1.0);
+            n_kv += 1;
+            write_kv_str(&mut kv, "kimi-k3.moe_router_activation_func", "sigmoid");
+            n_kv += 1;
+            write_kv_str(&mut kv, "kimi-k3.topk_method", "noaux_tc");
+            n_kv += 1;
+
+            // Hybrid layer routing (0-indexed).
+            write_kv_u32_array(&mut kv, "kimi-k3.full_attn_layers", &[3, 7]);
+            n_kv += 1;
+            write_kv_u32_array(&mut kv, "kimi-k3.kda_layers", &[0, 1, 2, 4, 5, 6]);
+            n_kv += 1;
+        }
+
+        // ── Header ────────────────────────────────────────────────
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        write_u32(&mut buf, 3); // version 3
+        write_u64(&mut buf, 1); // n_tensors (1 dummy)
+        write_u64(&mut buf, n_kv);
+        buf.extend_from_slice(&kv);
+
+        // Tensor info: one dummy f32 scalar.
+        write_str(&mut buf, "token_embd.weight");
+        write_u32(&mut buf, 1); // ndims
+        write_u64(&mut buf, 1); // shape[0]
+        write_u32(&mut buf, 0); // ggml_type = F32
+        write_u64(&mut buf, 0); // data_offset
+
+        // Pad to alignment 32.
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        write_f32(&mut buf, 42.0);
+
+        buf
+    }
+
+    #[test]
+    fn detects_kimi_k3_arch_from_general_architecture() {
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("synthetic K3 GGUF must parse");
+        assert_eq!(gguf.meta_str("general.architecture"), Some("kimi-k3"));
+        assert_eq!(ModelArch::from_gguf(&gguf), ModelArch::KimiK3);
+    }
+
+    #[test]
+    fn parses_kimi_k3_metadata_from_synthetic_gguf() {
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let cfg = KimiDeltaConfig::from_gguf(&gguf, "kimi-k3");
+
+        // MLA sub-config.
+        assert_eq!(cfg.q_lora_rank, Some(16));
+        assert_eq!(cfg.kv_lora_rank, Some(8));
+        assert_eq!(cfg.qk_rope_head_dim, Some(4));
+        // qk_nope = key_length_mla (12) − rope (4) = 8.
+        assert_eq!(cfg.qk_nope_head_dim, Some(8));
+        assert_eq!(cfg.v_head_dim, Some(8));
+        assert_eq!(cfg.mla_use_nope, Some(true));
+        assert_eq!(cfg.mla_use_output_gate, Some(true));
+
+        // KDA sub-config.
+        assert_eq!(cfg.kda_head_dim, Some(8));
+        assert_eq!(cfg.kda_num_heads, Some(8));
+        assert_eq!(cfg.kda_short_conv_kernel_size, Some(4));
+        assert_eq!(cfg.kda_use_full_rank_gate, Some(true));
+        assert_eq!(cfg.kda_gate_lower_bound, Some(-5.0));
+
+        // AttnRes + SiTU-GLU.
+        assert_eq!(cfg.attn_res_block_size, Some(4));
+        assert_eq!(cfg.situ_beta, Some(4.0));
+        assert_eq!(cfg.situ_linear_beta, Some(25.0));
+
+        // Stable LatentMoE.
+        assert_eq!(cfg.n_routed_experts, Some(32));
+        assert_eq!(cfg.num_experts_per_tok, Some(4));
+        assert_eq!(cfg.n_shared_experts, Some(2));
+        assert_eq!(cfg.num_expert_group, Some(1));
+        assert_eq!(cfg.topk_group, Some(1));
+        assert_eq!(cfg.moe_intermediate_size, Some(64));
+        assert_eq!(cfg.first_k_dense_replace, Some(1));
+        assert_eq!(cfg.routed_expert_hidden_size, Some(32));
+        assert_eq!(cfg.moe_renormalize, Some(true));
+        assert_eq!(cfg.latent_moe_use_norm, Some(true));
+        assert_eq!(cfg.routed_scaling_factor, Some(1.0));
+        assert_eq!(cfg.moe_router_activation.as_deref(), Some("sigmoid"));
+        assert_eq!(cfg.moe_topk_method.as_deref(), Some("noaux_tc"));
+
+        // Hybrid layer routing.
+        assert_eq!(cfg.full_attn_layers.as_deref(), Some(&[3usize, 7][..]));
+        assert_eq!(
+            cfg.kda_layers.as_deref(),
+            Some(&[0usize, 1, 2, 4, 5, 6][..])
+        );
+
+        // MTP + MXFP4 keys are absent in the synthetic fixture — must
+        // default to None without erroring.
+        assert_eq!(cfg.num_nextn_predict_layers, None);
+        assert_eq!(cfg.mxfp4_group_size, None);
+        assert_eq!(cfg.mxfp4_num_bits, None);
+    }
+
+    #[test]
+    fn is_mla_layer_matches_full_attn_layers_zero_indexed() {
+        let bytes = build_synthetic_kimi_k3_gguf();
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let cfg = KimiDeltaConfig::from_gguf(&gguf, "kimi-k3");
+        // Fixture: full_attn_layers = [3, 7], kda_layers = [0, 1, 2, 4, 5, 6].
+        for il in 0..8 {
+            let expect_mla = il == 3 || il == 7;
+            assert_eq!(
+                cfg.is_mla_layer(il),
+                Some(expect_mla),
+                "layer {il}: expected MLA = {expect_mla}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_mla_layer_returns_none_when_full_attn_layers_absent() {
+        let cfg = KimiDeltaConfig::default();
+        assert_eq!(cfg.is_mla_layer(0), None);
+        assert_eq!(cfg.is_mla_layer(93), None);
+    }
+
+    #[test]
+    fn missing_optional_fields_default_to_none() {
+        // Minimal K3 GGUF: only arch + alignment + 1 dummy tensor.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        write_u32(&mut buf, 3);
+        write_u64(&mut buf, 1); // n_tensors
+        write_u64(&mut buf, 2); // n_kv
+        write_kv_str(&mut buf, "general.architecture", "kimi-k3");
+        write_kv_u32(&mut buf, "general.alignment", 32);
+        write_str(&mut buf, "token_embd.weight");
+        write_u32(&mut buf, 1);
+        write_u64(&mut buf, 1);
+        write_u32(&mut buf, 0);
+        write_u64(&mut buf, 0);
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        write_f32(&mut buf, 0.0);
+
+        let gguf = GgufFile::parse(&buf).expect("minimal K3 parse");
+        let cfg = KimiDeltaConfig::from_gguf(&gguf, "kimi-k3");
+        assert!(cfg.q_lora_rank.is_none());
+        assert!(cfg.n_routed_experts.is_none());
+        assert!(cfg.full_attn_layers.is_none());
+        assert!(cfg.attn_res_block_size.is_none());
+        assert!(cfg.moe_router_activation.is_none());
+    }
+
+    #[test]
+    fn meta_prefix_returns_hyphenated_kimi_k3() {
+        // Regression guard: `k3meta.py` writes `kimi-k3.*`; any
+        // refactor that drops the hyphen breaks GGUF key lookups.
+        assert_eq!(ModelArch::KimiK3.meta_prefix(), "kimi-k3");
     }
 }
 
@@ -3459,6 +3908,17 @@ impl Llama3Config {
             None
         };
 
+        // Kimi K3: read the `kimi-k3.*` sub-config (Phase X.4.b.1,
+        // 2026-07-28). All fields are `Option` inside
+        // `KimiDeltaConfig`, so a partial GGUF (e.g. K3 text-only
+        // variant without vision metadata) still populates whatever
+        // the file provides.
+        let kimi_delta = if arch == ModelArch::KimiK3 {
+            Some(KimiDeltaConfig::from_gguf(gguf, &prefix))
+        } else {
+            None
+        };
+
         Some(Self {
             arch,
             vocab_size,
@@ -3477,9 +3937,7 @@ impl Llama3Config {
             gemma3n,
             gemma4,
             deepseek_v3,
-            // Kimi K3 config population deferred to Phase X.4.b (2026-07-27
-            // open weight release). See docs/KIMI_K3_INTEGRATION.md.
-            kimi_delta: None,
+            kimi_delta,
         })
     }
 

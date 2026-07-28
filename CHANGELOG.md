@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.b.1 — Kimi K3 GGUF metadata loader** (2026-07-28).
+  The community `Kuberwastaken/Kimi-K3-GGUF/convert_kimi_k3.py`
+  + upstream llama.cpp PR #26185 (`pwilkin/kimi-k3-text`) settled
+  the GGUF metadata layout the same day as the 2026-07-27 open
+  weight release; this landing wires ALICE-LLM to consume that
+  layout directly. `GrEarl/Kimi-K3-GGUF` (Q2_K, 94-part) and
+  `GrEarl/Kimi-K3-GGUF-IQ1_S` (527 GB, 94-part) are the live
+  download targets — the loader here is what parses their
+  metadata. Changes:
+  - **`ModelArch::KimiK3::meta_prefix()`** — updated from the
+    guessed `"kimi"` to the confirmed `"kimi-k3"` (with hyphen).
+  - **`KimiDeltaConfig::from_gguf(gguf, prefix)`** — reads all
+    K3 hyperparameters from the `kimi-k3.*` namespace: MLA
+    sub-config (`q_lora_rank`, `kv_lora_rank`, split
+    `qk_nope`/`qk_rope`/`v_head_dim`, `mla_use_nope`,
+    `mla_use_output_gate`), KDA sub-config (`kda_head_dim`,
+    `ssm.conv_kernel`, `use_full_rank_gate`,
+    `gate_lower_bound`), Attention Residuals + SiTU-GLU
+    (`attn_res_block_size`, `activation_situ_beta`,
+    `activation_situ_linear_beta`), Stable LatentMoE (standard
+    llama.cpp `expert_*` keys + K3-only
+    `routed_expert_hidden_size` / `latent_moe_use_norm` /
+    `moe_router_activation_func` / `topk_method`), and the
+    hybrid-layer-routing arrays (`full_attn_layers` +
+    `kda_layers`, both 0-indexed after `k3meta.py` subtracts 1
+    from `config.json`'s 1-indexed lists).
+  - **`Llama3Config::from_gguf` K3 branch** — dispatches to
+    `KimiDeltaConfig::from_gguf` when `arch == ModelArch::KimiK3`,
+    populating the previously-`None` `kimi_delta` field.
+  - **`KimiDeltaConfig::is_mla_layer(il)`** — layer-index
+    predicate: `Some(true)` when layer `il` is a Gated MLA
+    layer, `Some(false)` when KDA, `None` when
+    `full_attn_layers` is absent. Layer `il` is MLA iff
+    `il ∈ full_attn_layers` (0-indexed to match the GGUF-side
+    convention).
+- **6 integration tests** driven off a synthetic mini K3 GGUF
+  built entirely in-test (no download required): arch detection
+  from `general.architecture`, full 30-field metadata parse
+  parity, `is_mla_layer` behavior on both populated and empty
+  configs, graceful handling of missing optional keys, and a
+  regression guard on the hyphenated `meta_prefix`.
+
+### Deferred (X.4.b.2 + X.4.c.3, next session)
+
+- **Weight tensor loader**: per-layer tensor lookup + shape
+  validation for the ~2573 tensors K3 emits (F32 + Q4_K + F16 +
+  IQ1_S mix in the GrEarl IQ1_S build), following
+  `Kuberwastaken/Kimi-K3-GGUF/TENSOR_MAP.md`.
+- **`forward_kimi_k3` block-level integration**: wire the
+  primitives shipped in X.4.c.1 + X.4.c.2 + X.4.d.1 + X.4.h.1
+  together, add a Gated MLA layer forward, apply
+  `output_attn_res_norm` + `output_attn_res_proj` for the final
+  N-block aggregation (X.4.d.2), and produce logits.
+
 - **Phase X.4.f.1 — MXFP4 fused scalar matvec kernel** (2026-07-28).
   Lands the fused scalar matvec that was left as a `todo!()`
   fail-fast in the 2026-07-24 MXFP4 skeleton, closing the CPU-side
