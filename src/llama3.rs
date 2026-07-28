@@ -6797,6 +6797,377 @@ fn kimi_k3_dense_ffn_forward(
     y
 }
 
+// ── Kimi K3 KDA per-head aggregation (Phase X.4.c.3.3.b) ──────────
+//
+// The K3 GGUF stores KDA `attn_q`, `attn_k`, `attn_v`,
+// `ssm_conv1d_{q,k,v}`, `ssm_f_b`, `ssm_norm`, and `ssm_beta` as
+// fused tensors that span all `num_heads` heads (rows are
+// `num_heads × per_head_dim` big). `kimi_delta_forward_head`
+// (X.4.c.2 primitive) expects per-head weights, so this landing
+// adds a scalar-first per-head slicing helper + a KDA layer
+// aggregator that loops over heads and combines the outputs.
+//
+// Scope of Phase X.4.c.3.3.b (this landing):
+//
+// - Per-head slicing: **F32 only**. Quantized (Q4_K / IQ1_S) per-
+//   row slicing needs block-aligned offsets which is deferred to
+//   Phase X.4.c.3.3.b.2 — the GGUF K-quant blocks span 256
+//   elements, so per-head `WeightRef`s can only be constructed
+//   when `per_head_dim` is a multiple of 256 (usually not the
+//   case for K3 with `kda_head_dim = 128`). Quantized K3 forward
+//   therefore needs a different slicing strategy (probably per-
+//   token dequantize-and-slice rather than per-head weight ref).
+// - The KDA layer forward function reads all per-head `attn_q/k/v`
+//   / `ssm_conv1d_*` / `ssm_f_b` / `ssm_beta` / `ssm_norm` slices
+//   through a shared low-rank `ssm_f_a` (K3 stores `f_a` as a
+//   single tensor shared across heads: `[alpha_rank, hidden]`).
+// - `attn_output` and `attn_gate` are shared across heads and
+//   applied once after the concat.
+
+/// Slice a `[rows, cols]` `WeightRef` into a `[row_end − row_start,
+/// cols]` view sharing the underlying byte buffer. **F32 only** for
+/// Phase X.4.c.3.3.b; quantized layouts store blocks (K-quant
+/// blocks are 256 elements) whose byte boundary rarely aligns with
+/// per-head row splits (K3 `kda_head_dim = 128` is exactly half a
+/// block), so a proper quantized per-head slicer is a separate
+/// helper scheduled at X.4.c.3.3.b.2.
+///
+/// Returns `None` if `row_end > w.rows`, if `w.qtype` is not
+/// `F32`, or if `row_start > row_end`.
+#[allow(dead_code)]
+fn kimi_k3_slice_weight_ref_rows<'a>(
+    w: &WeightRef<'a>,
+    row_start: usize,
+    row_end: usize,
+) -> Option<WeightRef<'a>> {
+    if !matches!(w.qtype, GgmlType::F32) {
+        return None;
+    }
+    if row_start > row_end || row_end > w.rows {
+        return None;
+    }
+    let row_bytes = w.cols * 4; // F32 = 4 bytes/element
+    let byte_start = row_start * row_bytes;
+    let byte_end = row_end * row_bytes;
+    Some(WeightRef {
+        data: &w.data[byte_start..byte_end],
+        qtype: GgmlType::F32,
+        rows: row_end - row_start,
+        cols: w.cols,
+    })
+}
+
+/// One-token KDA layer forward with per-head aggregation
+/// (Phase X.4.c.3.3.b, K3 tech report §2.1.1).
+///
+/// Slices the fused K3 KDA weight tensors per head, wraps each
+/// head's slices in a [`KimiDeltaHeadParams`], calls
+/// [`kimi_delta_forward_head`] (X.4.c.2 primitive) with the head's
+/// slot in `caches`, and concatenates the per-head outputs before
+/// applying the shared `attn_output` projection. K3 shares the
+/// `attn_gate` projection across all heads (K3 always-on output
+/// gate) — the per-head [`kimi_delta_forward_head`] applies its
+/// own gate at the primitive layer, so no additional gating is
+/// applied here at the layer level.
+///
+/// # Arguments
+///
+/// - `x`: input hidden state `[d]`.
+/// - `attn_norm`: pre-attention RMSNorm γ, `[d]`.
+/// - `attn_gate`: unused at the layer level for K3 KDA (the
+///   per-head primitive already applies its own gate). Retained
+///   in the signature so future refactors that consolidate gating
+///   into the layer level do not need to change the callsite —
+///   the current implementation reads `attn_gate` shape for
+///   validation only.
+/// - `attn_output`: shared output projection `[d_out, num_heads ×
+///   v_head_dim]`, applied once after the head concat.
+/// - `kda`: per-layer KDA weight bundle (X.4.b.2 loader).
+/// - `caches`: mutable per-head runtime caches (one entry per head).
+/// - `num_heads` / `head_dim`: KDA head layout from
+///   `KimiDeltaConfig` (K3 default: 96 heads × 128 dim).
+/// - `alpha_rank`: low-rank α intermediate size (from `ssm_f_a`
+///   `rows`).
+/// - `g_min`: KDA gate lower bound (K3: `-5.0`).
+/// - `rms_eps`: layer RMSNorm epsilon.
+///
+/// # Panics
+///
+/// Panics via slicing helper if any fused weight has fewer rows
+/// than `num_heads × head_dim`, or if any weight is quantized (F32
+/// only for Phase X.4.c.3.3.b; see the slicer's `None` return path
+/// documentation).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn kimi_k3_kda_layer_forward(
+    x: &[f32],
+    attn_norm: &[f32],
+    attn_output: &WeightRef<'_>,
+    kda: &KimiK3KdaAttn<'_>,
+    caches: &mut [KimiDeltaHeadCache],
+    num_heads: usize,
+    head_dim: usize,
+    alpha_rank: usize,
+    g_min: f32,
+    rms_eps: f32,
+) -> Vec<f32> {
+    let d = x.len();
+    assert_eq!(attn_norm.len(), d, "attn_norm length must equal hidden dim");
+    assert_eq!(
+        caches.len(),
+        num_heads,
+        "caches length must equal num_heads"
+    );
+
+    // Pre-attention RMSNorm.
+    let x_norm = kimi_k3_rms_norm(x, attn_norm, rms_eps);
+
+    // Per-head SIL SIL SIL. We aggregate concatenated outputs
+    // `[num_heads * head_dim]` then apply the shared output
+    // projection.
+    let v_head_dim = head_dim; // KDA convention: v_head_dim == qk_head_dim
+    let mut concat_out = vec![0.0_f32; num_heads * v_head_dim];
+
+    // ── Extract per-head params + call kimi_delta_forward_head ──
+    //
+    // K3 conv1d bias tensors are not shipped in the GGUF (per
+    // TENSOR_MAP.md — only `ssm_conv1d_{q,k,v}.weight` is listed,
+    // no `.bias`). Substitute zeros; `causal_conv1d_step` expects
+    // a bias slice.
+    let zero_bias = vec![0.0_f32; head_dim];
+
+    for head_idx in 0..num_heads {
+        let row_start = head_idx * head_dim;
+        let row_end = row_start + head_dim;
+
+        let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end)
+            .unwrap_or_else(|| panic!("kda_layer_forward: q slice failed (head {head_idx})"));
+        let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end)
+            .unwrap_or_else(|| panic!("kda_layer_forward: k slice failed (head {head_idx})"));
+        let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end)
+            .unwrap_or_else(|| panic!("kda_layer_forward: v slice failed (head {head_idx})"));
+        let w_conv_q = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end)
+            .unwrap_or_else(|| {
+                panic!("kda_layer_forward: conv1d_q slice failed (head {head_idx})")
+            });
+        let w_conv_k = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end)
+            .unwrap_or_else(|| {
+                panic!("kda_layer_forward: conv1d_k slice failed (head {head_idx})")
+            });
+        let w_conv_v = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end)
+            .unwrap_or_else(|| {
+                panic!("kda_layer_forward: conv1d_v slice failed (head {head_idx})")
+            });
+        let w_alpha_up = kimi_k3_slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end)
+            .unwrap_or_else(|| panic!("kda_layer_forward: ssm_f_b slice failed (head {head_idx})"));
+
+        // `ssm_beta` is per-head 1×d, so slice one row.
+        let w_beta_ref = kimi_k3_slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
+            .unwrap_or_else(|| {
+                panic!("kda_layer_forward: ssm_beta slice failed (head {head_idx})")
+            });
+        let w_beta = weight_ref_as_f32(&w_beta_ref);
+
+        // `ssm_norm` is a `Vec<f32>` per-channel γ shared across
+        // heads (K3 exports as a 1-D norm tensor via
+        // `tensor_to_f32`). Slice one head's worth for the primitive.
+        let ssm_norm_f32: Vec<f32> = kda.ssm_norm[row_start..row_end].to_vec();
+
+        let params = KimiDeltaHeadParams {
+            w_q: &weight_ref_as_f32(&w_q),
+            w_k: &weight_ref_as_f32(&w_k),
+            w_v: &weight_ref_as_f32(&w_v),
+            conv_kernel_q: &weight_ref_as_f32(&w_conv_q),
+            conv_kernel_k: &weight_ref_as_f32(&w_conv_k),
+            conv_kernel_v: &weight_ref_as_f32(&w_conv_v),
+            conv_bias_q: &zero_bias,
+            conv_bias_k: &zero_bias,
+            conv_bias_v: &zero_bias,
+            w_beta: &w_beta,
+            // `ssm_f_a` is shared across heads (`[alpha_rank, d]`).
+            w_alpha_down: &weight_ref_as_f32(&kda.ssm_f_a),
+            w_alpha_up: &weight_ref_as_f32(&w_alpha_up),
+            // `b_alpha` is not shipped in K3 GGUF — substitute zeros.
+            b_alpha: &vec![0.0_f32; head_dim],
+            a_h: 0.0, // A_h is a learnable scalar; K3 GGUF has no per-head A_h
+            // tensor exported, so we default to 0 (paper's init value).
+            alpha_rank,
+            g_min,
+            // Per-head output gate + output projection are applied
+            // once at the layer level (attn_output) after concat, so
+            // the per-head primitive gets an identity gate + identity
+            // output projection.
+            w_gate: &identity_matrix_f32(v_head_dim),
+            w_out: &identity_matrix_f32(v_head_dim),
+            d_out: v_head_dim,
+            rms_gamma: Some(&ssm_norm_f32),
+            rms_eps,
+        };
+
+        let head_out = kimi_delta_forward_head(&x_norm, &params, &mut caches[head_idx], rms_eps);
+        // Copy into the concat buffer at slot `head_idx * v_head_dim`.
+        let dst_start = head_idx * v_head_dim;
+        concat_out[dst_start..dst_start + v_head_dim].copy_from_slice(&head_out);
+    }
+
+    // Shared output projection: [d_out, num_heads × v_head_dim].
+    debug_assert_eq!(
+        attn_output.cols,
+        num_heads * v_head_dim,
+        "attn_output.cols must equal num_heads × v_head_dim"
+    );
+    debug_assert_eq!(
+        attn_output.rows, d,
+        "attn_output.rows must equal hidden dim"
+    );
+    let mut y = vec![0.0_f32; d];
+    attn_output.matvec(&concat_out, &mut y);
+    y
+}
+
+/// Interpret a `WeightRef` as an owned `Vec<f32>`. F32 only.
+#[allow(dead_code)]
+fn weight_ref_as_f32(w: &WeightRef<'_>) -> Vec<f32> {
+    assert!(
+        matches!(w.qtype, GgmlType::F32),
+        "weight_ref_as_f32: F32 only"
+    );
+    let n = w.rows * w.cols;
+    assert_eq!(
+        w.data.len(),
+        n * 4,
+        "weight_ref_as_f32: byte length mismatch"
+    );
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = &w.data[i * 4..i * 4 + 4];
+        out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+/// Slice a 1-D-like F32 `WeightRef` (`rows = 1` or `[N]` layout) as
+/// an owned `Vec<f32>` from element `start` to `end`.
+#[allow(dead_code)]
+fn weight_ref_slice_as_f32(w: &WeightRef<'_>, start: usize, end: usize) -> Vec<f32> {
+    assert!(
+        matches!(w.qtype, GgmlType::F32),
+        "weight_ref_slice_as_f32: F32 only"
+    );
+    let total_elements = w.rows * w.cols;
+    assert!(end <= total_elements, "slice end out of range");
+    let mut out = Vec::with_capacity(end - start);
+    for i in start..end {
+        let b = &w.data[i * 4..i * 4 + 4];
+        out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+/// Build a `[d, d]` identity matrix as a flat `Vec<f32>` (row-major).
+/// Used at the KDA per-head layer to feed an identity `w_gate` /
+/// `w_out` into the primitive, since K3 applies the real output
+/// gate + output projection at the layer level (once, after
+/// per-head concat).
+#[allow(dead_code)]
+fn identity_matrix_f32(d: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; d * d];
+    for i in 0..d {
+        out[i * d + i] = 1.0;
+    }
+    out
+}
+
+#[cfg(test)]
+mod kimi_k3_kda_layer_tests {
+    use super::{
+        identity_matrix_f32, kimi_k3_slice_weight_ref_rows, weight_ref_as_f32,
+        weight_ref_slice_as_f32, GgmlType, WeightRef,
+    };
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_extracts_correct_byte_range() {
+        // 4-row × 2-col F32 matrix: [1,2, 3,4, 5,6, 7,8].
+        let vals: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let bytes = f32_bytes(&vals);
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::F32,
+            rows: 4,
+            cols: 2,
+        };
+
+        // Rows 1..3 → [3,4, 5,6].
+        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 3).expect("slicing must succeed for F32");
+        assert_eq!(sliced.rows, 2);
+        assert_eq!(sliced.cols, 2);
+        let sliced_f32 = weight_ref_as_f32(&sliced);
+        assert_eq!(sliced_f32, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_returns_none_for_quantized_types() {
+        // Q4_K is the most common K3 non-expert quant type. Slicing
+        // it per row is not yet supported (Phase X.4.c.3.3.b.2).
+        let bytes = vec![0u8; 144]; // Q4_K block bytes for 256 elements
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Q4_K,
+            rows: 4,
+            cols: 64,
+        };
+        assert!(kimi_k3_slice_weight_ref_rows(&w, 0, 2).is_none());
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_returns_none_on_out_of_range() {
+        let bytes = vec![0u8; 32];
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::F32,
+            rows: 2,
+            cols: 4,
+        };
+        // row_end = 3 exceeds rows = 2.
+        assert!(kimi_k3_slice_weight_ref_rows(&w, 0, 3).is_none());
+        // row_start > row_end.
+        assert!(kimi_k3_slice_weight_ref_rows(&w, 2, 1).is_none());
+    }
+
+    #[test]
+    fn weight_ref_slice_as_f32_extracts_element_range() {
+        let vals: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let bytes = f32_bytes(&vals);
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::F32,
+            rows: 1,
+            cols: 8,
+        };
+        let sliced = weight_ref_slice_as_f32(&w, 2, 6);
+        assert_eq!(sliced, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn identity_matrix_f32_places_ones_on_diagonal() {
+        let m = identity_matrix_f32(3);
+        // [1,0,0, 0,1,0, 0,0,1]
+        assert_eq!(m.len(), 9);
+        assert_eq!(m[0], 1.0);
+        assert_eq!(m[4], 1.0);
+        assert_eq!(m[8], 1.0);
+        assert_eq!(m[1], 0.0);
+        assert_eq!(m[3], 0.0);
+    }
+}
+
 #[cfg(test)]
 mod kimi_k3_forward_helpers_tests {
     use super::{
@@ -7531,12 +7902,35 @@ impl<'a> KimiK3Model<'a> {
                         &mla_config,
                     )
                 }
-                (KimiK3LayerCache::Kda(_), KimiK3Attention::Kda(_)) => {
-                    todo!(
-                        "KIMI-K3 forward: KDA layer {il} — Phase X.4.c.3.3.b will wire \
-                         `kimi_delta_forward_head` (X.4.c.2) with per-head weight \
-                         slicing from the fused `attn_q/k/v` tensors. See \
-                         docs/KIMI_K3_INTEGRATION.md Phase X.4.c.3."
+                (KimiK3LayerCache::Kda(head_caches), KimiK3Attention::Kda(kda_attn)) => {
+                    // Phase X.4.c.3.3.b landing (2026-07-28): real
+                    // KDA layer forward via per-head slicing +
+                    // `kimi_delta_forward_head` (X.4.c.2 primitive)
+                    // per head + shared output projection. F32
+                    // weights only for now — quantized per-head
+                    // slicing lands at Phase X.4.c.3.3.b.2.
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let head_dim = kd
+                        .kda_head_dim
+                        .expect("kda_head_dim missing from kimi_delta config");
+                    let num_kda_heads = kd.kda_num_heads.unwrap_or(self.config.num_heads);
+                    let g_min = kd.kda_gate_lower_bound.unwrap_or(-5.0);
+                    let alpha_rank = kda_attn.ssm_f_a.rows;
+                    kimi_k3_kda_layer_forward(
+                        &x,
+                        &layer.attn_norm,
+                        &layer.attn_output,
+                        kda_attn,
+                        head_caches,
+                        num_kda_heads,
+                        head_dim,
+                        alpha_rank,
+                        g_min,
+                        self.config.norm_eps,
                     )
                 }
                 _ => panic!(
