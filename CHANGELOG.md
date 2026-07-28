@@ -9,6 +9,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **🎉 Real Kimi K3 (moonshotai/Kimi-K3 2.8T MoE) 1 token forward
+  完走達成** (2026-07-28 22:47 JST). Full pipeline demonstrated on
+  real GrEarl/Kimi-K3-GGUF-IQ1_S (566GB across 94 shards) via
+  ALICE-LLM pure Rust implementation. Only Rust K3 implementation
+  known to actually run real K3 weights end-to-end (llama.cpp
+  pwilkin PR #26185 is still draft stage; the reference GGUF
+  converter has not landed upstream). Environment: Mac mini M2 Pro
+  (10-core, 32 GB unified) + external USB SSD 960 GB ExFAT for
+  the split GGUF, macOS 26.5.1, Rust 1.94.1, alice-llm 1.6.0
+  features `gguf,hf-config,parallel`, invoked via
+  `cargo run --release --example kimi_k3_forward -- shard1.gguf 1`
+  with the split shard 1 path (sibling shards auto-discovered).
+  Metrics:
+  - **GGUF parse** (94 shards, 2573 tensors): 7 ms mmap + parse
+  - **Config extraction** (`Llama3Config::from_gguf`): 150 µs
+  - **Weight loading** (all K3 tensors across shards): 73.5 sec
+    (uncached cold; ~1 sec on second run with OS page cache)
+  - **Model construction** (`KimiK3Model::new`): 16 ms
+  - **Forward pass** (token_id=1, 93 layers): **1636 sec = 27.3 min**
+    - KDA + MoE layer: ~18.8 sec each (69 layers)
+    - MLA + MoE layer: ~12.3 sec each (23 layers)
+    - Dense layer 0 (KDA + Dense FFN Q4_K): 25 sec
+  - **Output**: 163840 logits (vocab_size), **163840/163840 finite**
+    (NaN/Inf = 0), argmax token_id=**220** with logit 7.8632, top-5
+    `[220, 269, 62, 12, 25]` — all math paths (KDA aggregation +
+    MLA + Dense + AttnRes + LatentMoE + IQ1_S expert dispatch)
+    produce sane numeric output.
+  - Bottleneck: **I/O bound** on external USB SSD (25-30 MB/s random
+    reads to page in mmapped expert cubes). Rayon parallelism helps
+    on the compute side (up to 6 cores active during rayon phases)
+    but the SSD I/O is the wall. Improvements roadmap: (1) NVMe
+    upgrade for 5-10× faster random reads, (2) per-token expert
+    cache to avoid re-paging the same experts across gate/up/down
+    matvec calls, (3) NEON-optimized fused IQ1_S × F32 matvec
+    (llama.cpp reference).
+
+- **Phase X.4.b.7 — IQ1_S dequant + fused-block matvec + rayon parallel**
+  (2026-07-28). llama.cpp k_quants `iq1_s` reference port. New
+  `src/iq1_s.rs` module (~625 LOC) with `IQ1S_GRID: [u64; 2048]`
+  codebook (ternary values packed 8-at-a-time), `IQ1S_DELTA = 0.125`,
+  and `dequantize_iq1_s(data, out)`. Wired into
+  `crate::gguf::tensor_to_f32` for the IQ1_S arm and into
+  `quantized_matvec` via new `iq1_s_matvec_fallback` that:
+  1. Row-parallelizes via rayon (`par_iter_mut` on output rows) —
+     each row = fully independent dequant-and-dot workload, up to
+     linear speedup with core count.
+  2. Uses `iq1_s_row_fused_dot`: per-block (256 elements) dequant
+     into a stack-allocated `[f32; 256]` buffer, dot with input,
+     accumulate. Zero per-row heap alloc (was 14 KB × 3072 rows
+     = 43 MB churn per matvec in the correctness-first version).
+
+- **Phase X.4.b.6 — GgufMultiFile split GGUF loader + GgufSource trait**
+  (2026-07-28). Real K3 distributions are 94-file splits (each
+  `<prefix>-NNNNN-of-TTTTT.gguf`), too large to merge (94 × ~6 GB
+  = 566 GB, and `llama-gguf-split --merge` would need 566 GB more
+  headroom that doesn't exist on the K3 test rig). Split loader
+  virtualises across shards: each shard is parsed as its own
+  `GgufFile`, then a global `tensor_name → shard_index` map
+  routes `tensor_data` / `tensor_info` calls to the right shard.
+  Model-level metadata is delegated to shard 0 (llama.cpp split
+  convention: shard 0 has full metadata, shards 1..N carry only
+  `split.*` keys). New `GgufSource<'a>` trait exposes the subset
+  of methods the K3 loader needs; blanket-implemented for both
+  `GgufFile<'a>` and `GgufMultiFile<'a>`, so downstream loaders
+  (`load_kimi_k3_model_weights`, `KimiDeltaConfig::from_gguf`,
+  `ModelArch::from_gguf`, `Llama3Config::from_gguf`,
+  `load_weight_ref_any_shape`) accept either transparently.
+
+- **Phase X.4.b.5 — real K3 tensor adaptations (ssm_g / ssm_a / MoE
+  aliases)** (2026-07-28). Real GrEarl K3 GGUF shard-1 inspection
+  revealed KDA layer structure additions:
+  - `blk.{N}.ssm_g.weight`: K3 full-rank per-head output gate
+    matrix, shape `[num_heads * v_head_dim, hidden]`, replaces
+    Kimi-Linear's low-rank `ssm_g_a` / `ssm_g_b` pair. Wired into
+    `KimiK3KdaAttn::ssm_g: Option<WeightRef>`; per-head slice fed
+    to `kimi_delta_forward_head` as `w_gate` (identity fallback
+    when absent for skeleton fixtures).
+  - `blk.{N}.ssm_a`: K3 per-head `A_h` log-scale array of length
+    `num_heads`. Replaces the paper's hardcoded `A_h = 0` init.
+    Wired into `KimiK3KdaAttn::ssm_a: Option<Vec<f32>>`; per-head
+    scalar plumbed to `KimiDeltaHeadParams::a_h`.
+  - MoE tensor name aliases: `routed_exp_up/down/norm` (Kuberwastaken
+    TENSOR_MAP.md) vs `ffn_routed_up/down/norm` (pwilkin PR #26185)
+    — loader tries both spellings, uses whichever exists per-tensor.
+  - `attn_gate` now treated as MLA-only (real K3 KDA layer has no
+    `attn_gate` — uses `ssm_g` instead). Placeholder `WeightRef`
+    substituted for KDA layers so struct layout stays uniform.
+
+- **Phase X.4.b.4 — layer type detection via tensor presence** (2026-07-28).
+  Real GrEarl K3 GGUF does not export `kimi-k3.full_attn_layers` /
+  `kimi-k3.kda_layers` metadata arrays that the skeleton loader
+  depended on. Two-tier resolution:
+  1. **Metadata path** — `KimiDeltaConfig::is_mla_layer(il)` returns
+     `Some(true/false)` when arrays are present (synthetic fixtures,
+     pwilkin PR export).
+  2. **Tensor-presence fallback** — when metadata returns `None`,
+     probe `blk.{il}.attn_q_a.weight` (MLA-only LoRA A projection)
+     via `gguf.tensor_info()`: exists → MLA, absent → KDA. Applied
+     in `load_kimi_k3_layer_weights` (loader-time dispatch) and
+     mirrored in `KimiK3Model::new` cache allocation (reads
+     `weights.layers[il].attn` enum discriminant, which was set
+     by the loader's fallback, so no re-probe needed).
+
+- **Phase X.4.b.3 — config key aliases for real GrEarl GGUF** (2026-07-28).
+  Six K3 metadata key spellings diverge between the pwilkin PR
+  synthetic export and real GrEarl output; loader now accepts both:
+  - `kimi-k3.attention.kda_head_dim` (synth) / `kimi-k3.kda.head_dim` (real)
+  - `kimi-k3.attn_res_block_size` / `kimi-k3.attn_res.block_size`
+  - `kimi-k3.gate_lower_bound` / `kimi-k3.kda.gate_lower_bound`
+  - `kimi-k3.activation_situ_beta` (underscore) / `kimi-k3.activation.situ_beta` (dot)
+  - `kimi-k3.moe_router_activation_func` / `kimi-k3.expert_gating_func`
+  - `kimi-k3.routed_expert_hidden_size` / `kimi-k3.expert_latent_length`
+
 - **Phase X.4.c.3.3.b.2 — quantized per-row + per-expert slicing
   (Q4_K/Q8_0/MXFP4/etc.)** (2026-07-28). Extends
   `kimi_k3_slice_weight_ref_rows` and `kimi_k3_expert_plane_weight_ref`
