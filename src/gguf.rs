@@ -16,7 +16,7 @@ const QK8_0: usize = 32;
 // ─── Half-precision conversion ──────────────────────────────────────────────
 
 #[inline]
-const fn f16_to_f32(h: u16) -> f32 {
+pub(crate) const fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exponent = ((h >> 10) & 0x1f) as u32;
     let mantissa = (h & 0x3ff) as u32;
