@@ -7489,10 +7489,28 @@ fn kimi_k3_kda_layer_forward(
             });
         let w_beta = weight_ref_row_dequant(&w_beta_ref);
 
-        // `ssm_norm` is a `Vec<f32>` per-channel γ shared across
-        // heads (K3 exports as a 1-D norm tensor via
-        // `tensor_to_f32`). Slice one head's worth for the primitive.
-        let ssm_norm_f32: Vec<f32> = kda.ssm_norm[row_start..row_end].to_vec();
+        // `ssm_norm` is a `Vec<f32>` per-channel γ. Layout differs
+        // across K3 exports:
+        // - real GrEarl K3 GGUF: `[head_dim]` (128 elements),
+        //   shared/broadcast across all heads;
+        // - some synthetic fixtures: `[num_heads * head_dim]`,
+        //   sliced per-head.
+        // We disambiguate by length: if `ssm_norm.len() == head_dim`,
+        // reuse the same slice for every head; otherwise slice
+        // `[row_start..row_end]` as before.
+        let ssm_norm_f32: Vec<f32> = if kda.ssm_norm.len() == head_dim {
+            kda.ssm_norm.clone()
+        } else if row_end <= kda.ssm_norm.len() {
+            kda.ssm_norm[row_start..row_end].to_vec()
+        } else {
+            panic!(
+                "kda_layer_forward: ssm_norm shape unexpected (len={}, head_dim={}, \
+                 head_idx={head_idx}, num_heads={num_heads}). Expected `[head_dim]` \
+                 (shared) or `[num_heads * head_dim]` (per-head).",
+                kda.ssm_norm.len(),
+                head_dim
+            );
+        };
 
         // Phase X.4.b.5: per-head A_h from ssm_a array (real GrEarl
         // K3 GGUF ships `blk.{il}.ssm_a` as a per-head f32 array of
