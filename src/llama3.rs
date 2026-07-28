@@ -735,6 +735,522 @@ mod kimi_k3_hf_config_tests {
     }
 }
 
+// ── Kimi Delta Attention (KDA) CPU primitives (Phase X.4.c.1) ─────────
+//
+// Scaffolding for the Kimi K3 KDA forward path. Implements the math
+// primitives of Section 2.1.1 of the K3 tech report (Eq 1, 5, 6) as
+// standalone, unit-testable functions. The `forward_kimi_k3` dispatch
+// still `todo!()`s until Phase X.4.c.2 wires these primitives into a
+// full per-head + per-layer forward with weight loading (Phase X.4.b)
+// and ShortConv history buffers.
+//
+// The composite `kimi_delta_forward_head` function (Eq 2 projections +
+// ShortConv + L2Norm + Swish + step + read + output gate) is
+// intentionally out of scope for X.4.c.1; ShortConv requires a
+// per-head 4-token history buffer and integrates with the layer-level
+// weight tensor management, so it lands together with the
+// `forward_kimi_k3` block-level integration.
+
+/// Per-head recurrent state for Kimi Delta Attention.
+///
+/// KDA maintains a fixed-size recurrent state `S ∈ ℝ^{d_k × d_v}` per
+/// head instead of a KV cache that grows with sequence length. This is
+/// what enables K3's fixed-size state property at 1M context: the 69
+/// KDA layers each hold `d_k × d_v = 128 × 128 = 16384 f32` per head
+/// (64 KB per head × 96 heads ≈ 6.1 MB per KDA layer), invariant of
+/// sequence length.
+///
+/// Layout: row-major flat `Vec<f32>` of length `d_k × d_v`, with
+/// `state[i * d_v + j] = S[i, j]`. The K3 defaults are `d_k = d_v =
+/// 128` (from HF `config.json` `linear_attn_config.head_dim`,
+/// captured in [`KimiDeltaConfig::kda_head_dim`]).
+#[derive(Debug, Clone)]
+pub struct KimiDeltaState {
+    state: Vec<f32>,
+    d_k: usize,
+    d_v: usize,
+}
+
+impl KimiDeltaState {
+    /// Allocate a zeroed state of shape `[d_k, d_v]`.
+    #[must_use]
+    pub fn new(d_k: usize, d_v: usize) -> Self {
+        Self {
+            state: vec![0.0; d_k * d_v],
+            d_k,
+            d_v,
+        }
+    }
+
+    /// Recurrent state dimension `d_k` (matches Q/K head dim).
+    #[inline]
+    #[must_use]
+    pub const fn d_k(&self) -> usize {
+        self.d_k
+    }
+
+    /// Recurrent state dimension `d_v` (matches V head dim).
+    #[inline]
+    #[must_use]
+    pub const fn d_v(&self) -> usize {
+        self.d_v
+    }
+
+    /// Zero out the state (start of a new sequence).
+    pub fn reset(&mut self) {
+        self.state.fill(0.0);
+    }
+
+    /// Read-only view of the flat `[d_k × d_v]` state buffer, row-major.
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[f32] {
+        &self.state
+    }
+
+    /// Mutable view of the flat `[d_k × d_v]` state buffer. Exposed
+    /// mainly for tests and future SIMD kernels that want to write
+    /// directly into the buffer without going through
+    /// [`kimi_delta_step`].
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.state
+    }
+}
+
+/// Apply one KDA recurrence step in-place on `state`, per Eq (1) of
+/// the K3 tech report:
+///
+/// ```text
+/// S_t = (I − β_t · k_t k_tᵀ) · Diag(α_t) · S_{t−1} + β_t · k_t v_tᵀ
+/// ```
+///
+/// Algorithm (all in-place on the flat `[d_k × d_v]` buffer):
+///
+/// 1. Scale each row `i` of `S` by `α[i]` → `S ← Diag(α) S`.
+/// 2. Compute `w = k^T S ∈ ℝ^{d_v}` (dot each column of `S` with `k`).
+/// 3. Update `S[i, j] += β · k[i] · (v[j] − w[j])` (fuses the
+///    `−β k k^T S` and `+β k v^T` updates into one pass).
+///
+/// # Panics
+///
+/// Panics if `k.len() != state.d_k()`, `v.len() != state.d_v()`, or
+/// `alpha.len() != state.d_k()`. All shape errors are programmer
+/// bugs (the caller derived them from [`KimiDeltaConfig`]), so a
+/// debug panic is more useful than a `Result` variant.
+pub fn kimi_delta_step(state: &mut KimiDeltaState, k: &[f32], v: &[f32], alpha: &[f32], beta: f32) {
+    let d_k = state.d_k;
+    let d_v = state.d_v;
+    assert_eq!(k.len(), d_k, "k length must equal d_k");
+    assert_eq!(v.len(), d_v, "v length must equal d_v");
+    assert_eq!(alpha.len(), d_k, "alpha length must equal d_k");
+
+    let s = &mut state.state;
+
+    // Step 1: row-wise scale by alpha (Diag(α) S).
+    for i in 0..d_k {
+        let a = alpha[i];
+        let row_start = i * d_v;
+        for j in 0..d_v {
+            s[row_start + j] *= a;
+        }
+    }
+
+    // Step 2: w = k^T S ∈ ℝ^{d_v}, i.e. w[j] = Σ_i k[i] · S[i, j].
+    let mut w = vec![0.0_f32; d_v];
+    for i in 0..d_k {
+        let ki = k[i];
+        if ki == 0.0 {
+            continue;
+        }
+        let row_start = i * d_v;
+        for j in 0..d_v {
+            w[j] += ki * s[row_start + j];
+        }
+    }
+
+    // Step 3: S[i, j] += β · k[i] · (v[j] − w[j]).
+    for i in 0..d_k {
+        let ki = k[i];
+        let coef = beta * ki;
+        if coef == 0.0 {
+            continue;
+        }
+        let row_start = i * d_v;
+        for j in 0..d_v {
+            s[row_start + j] += coef * (v[j] - w[j]);
+        }
+    }
+}
+
+/// Read the recurrent-attention output `ō_t = Sᵀ q_t ∈ ℝ^{d_v}` from
+/// the current KDA state.
+///
+/// This is the "recurrent read" half of Eq (1) — the output flows on
+/// to the RMSNorm + output-gate stage (Eq 6, see
+/// [`kimi_delta_output_gate`]).
+///
+/// # Panics
+///
+/// Panics if `q.len() != state.d_k()`.
+#[must_use]
+pub fn kimi_delta_read(state: &KimiDeltaState, q: &[f32]) -> Vec<f32> {
+    let d_k = state.d_k;
+    let d_v = state.d_v;
+    assert_eq!(q.len(), d_k, "q length must equal d_k");
+
+    let s = &state.state;
+    let mut out = vec![0.0_f32; d_v];
+    for i in 0..d_k {
+        let qi = q[i];
+        if qi == 0.0 {
+            continue;
+        }
+        let row_start = i * d_v;
+        for j in 0..d_v {
+            out[j] += qi * s[row_start + j];
+        }
+    }
+    out
+}
+
+/// Compute the lower-bounded per-channel retention factor `α_t^h` for
+/// KDA (Eq 5 of the K3 tech report):
+///
+/// ```text
+/// g_t = g_min · Sigmoid(exp(A_h) · z_t)   ∈ (g_min, 0)^{d_k}
+/// α_t = exp(g_t)                          ∈ (exp(g_min), 1)^{d_k}
+/// ```
+///
+/// where `A_h` is a learnable per-head log-scale (initialized to 0 in
+/// K3) and `g_min = -5.0` is the fixed lower bound (also stored as
+/// [`KimiDeltaConfig::kda_gate_lower_bound`]). The bound ensures the
+/// cumulative log-decay over a 16-token tile stays inside `(-80, 0)`,
+/// keeping the reciprocal rescaling factor within BF16 dynamic range
+/// so KDA's diagonal and off-diagonal tiles can both use dense Tensor
+/// Core matmul — the key departure from Kimi Linear's unbounded
+/// negative-Softplus mapping.
+///
+/// Returns a fresh `Vec<f32>` of length `z.len()`; callers on the hot
+/// path can inline the two lines (`exp(log_scale_a) * z_i` → sigmoid
+/// → `× g_min` → exp) to avoid the allocation.
+#[must_use]
+pub fn kimi_delta_lower_bounded_decay(z: &[f32], log_scale_a: f32, g_min: f32) -> Vec<f32> {
+    let a = log_scale_a.exp();
+    z.iter()
+        .map(|&zi| {
+            let g = g_min * sigmoid(a * zi);
+            g.exp()
+        })
+        .collect()
+}
+
+/// Apply the KDA full-rank output gate + optional RMSNorm + output
+/// projection (Eq 6 of the K3 tech report):
+///
+/// ```text
+/// y_t = W_o · [Sigmoid(W_g · x_t) ⊙ RMSNorm(ō_t)]
+/// ```
+///
+/// K3 differs from Kimi Linear by using a full-rank `W_g` projection
+/// (`use_full_rank_gate = true` in `linear_attn_config`) and by
+/// inserting an RMSNorm on the recurrent output `ō_t` before the
+/// element-wise gate. The Gated MLA layers use the same output-gate
+/// pattern (Eq 7), so callers may reuse this function for both the
+/// KDA and MLA paths by passing `rms_weight = None` to skip the
+/// normalize.
+///
+/// # Arguments
+///
+/// - `o_bar`: recurrent-attention output from [`kimi_delta_read`],
+///   length `d_v`.
+/// - `gate_pre`: pre-sigmoid gate `W_g x_t`, length `d_v`. Full-rank
+///   projection to preserve K3's "each token modulates channels from
+///   global attention" property.
+/// - `rms_weight`: optional learnable RMSNorm scale `γ`, length `d_v`.
+///   `None` disables the normalize (used by Gated MLA per Eq 7,
+///   which has no inner RMSNorm on `ō_t`).
+/// - `rms_eps`: RMSNorm epsilon (ignored when `rms_weight = None`).
+/// - `w_out`: output projection `W_o`, flat `[d_out × d_v]` row-major.
+/// - `d_out`: output dimension (typically the hidden dim `d`).
+///
+/// # Panics
+///
+/// Panics on any shape mismatch.
+#[must_use]
+pub fn kimi_delta_output_gate(
+    o_bar: &[f32],
+    gate_pre: &[f32],
+    rms_weight: Option<&[f32]>,
+    rms_eps: f32,
+    w_out: &[f32],
+    d_out: usize,
+) -> Vec<f32> {
+    let d_v = o_bar.len();
+    assert_eq!(
+        gate_pre.len(),
+        d_v,
+        "gate_pre length must equal o_bar length"
+    );
+    assert_eq!(
+        w_out.len(),
+        d_out * d_v,
+        "w_out length must equal d_out * d_v"
+    );
+    if let Some(gamma) = rms_weight {
+        assert_eq!(gamma.len(), d_v, "rms_weight length must equal d_v");
+    }
+
+    // Step 1: gated = Sigmoid(gate_pre) ⊙ [optional RMSNorm(o_bar)].
+    let mut gated = vec![0.0_f32; d_v];
+    if let Some(gamma) = rms_weight {
+        // f64 sum-of-squares accumulation matches this module's private
+        // rms_norm helper and llama.cpp's convention.
+        let mut ss = 0.0_f64;
+        for &o in o_bar {
+            ss += f64::from(o) * f64::from(o);
+        }
+        let mean = (ss / d_v as f64) as f32;
+        let scale = (mean + rms_eps).sqrt().recip();
+        for j in 0..d_v {
+            gated[j] = sigmoid(gate_pre[j]) * o_bar[j] * scale * gamma[j];
+        }
+    } else {
+        // No RMSNorm (Gated MLA output gate variant, Eq 7).
+        for j in 0..d_v {
+            gated[j] = sigmoid(gate_pre[j]) * o_bar[j];
+        }
+    }
+
+    // Step 2: y = W_o · gated ∈ ℝ^{d_out}.
+    let mut y = vec![0.0_f32; d_out];
+    for i in 0..d_out {
+        let row_start = i * d_v;
+        let mut acc = 0.0_f64;
+        for j in 0..d_v {
+            acc += f64::from(w_out[row_start + j]) * f64::from(gated[j]);
+        }
+        y[i] = acc as f32;
+    }
+    y
+}
+
+#[cfg(test)]
+mod kimi_delta_tests {
+    use super::{
+        kimi_delta_lower_bounded_decay, kimi_delta_output_gate, kimi_delta_read, kimi_delta_step,
+        KimiDeltaState,
+    };
+
+    /// Helper: build a [`KimiDeltaState`] with a specific pre-populated
+    /// buffer for test-input setup.
+    fn state_from(d_k: usize, d_v: usize, buf: Vec<f32>) -> KimiDeltaState {
+        assert_eq!(buf.len(), d_k * d_v);
+        let mut s = KimiDeltaState::new(d_k, d_v);
+        s.as_mut_slice().copy_from_slice(&buf);
+        s
+    }
+
+    #[test]
+    fn new_state_is_zeroed() {
+        let s = KimiDeltaState::new(4, 4);
+        assert_eq!(s.d_k(), 4);
+        assert_eq!(s.d_v(), 4);
+        assert!(s.as_slice().iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn reset_zeroes_state() {
+        let mut s = state_from(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        s.reset();
+        assert!(s.as_slice().iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn step_beta_1_alpha_1_from_zero_writes_k_v_transpose() {
+        // S_0 = 0, α = [1,1,1,1], β = 1, k = [1,0,0,0], v = [a,b,c,d].
+        // S_1 = (I − k k^T) · I · 0 + 1 · k v^T = k v^T
+        // → first row of S = v, other rows = 0.
+        let mut s = KimiDeltaState::new(4, 4);
+        let k = [1.0_f32, 0.0, 0.0, 0.0];
+        let v = [2.0_f32, -1.0, 3.5, 0.25];
+        let alpha = [1.0_f32; 4];
+        kimi_delta_step(&mut s, &k, &v, &alpha, 1.0);
+        let expected = [
+            2.0, -1.0, 3.5, 0.25, // row 0 = v
+            0.0, 0.0, 0.0, 0.0, // row 1
+            0.0, 0.0, 0.0, 0.0, // row 2
+            0.0, 0.0, 0.0, 0.0, // row 3
+        ];
+        assert_eq!(s.as_slice(), &expected);
+    }
+
+    #[test]
+    fn step_alpha_0_annihilates_history_before_write() {
+        // Preload S_0 with junk, set α = [0, 0] → history annihilated;
+        // then β · k v^T is written on top.
+        let mut s = state_from(2, 2, vec![7.0_f32, 8.0, 9.0, 10.0]);
+        let k = [1.0_f32, 0.0];
+        let v = [3.0_f32, 4.0];
+        let alpha = [0.0_f32, 0.0];
+        kimi_delta_step(&mut s, &k, &v, &alpha, 1.0);
+        // Diag(0) · S = 0; w = k^T · 0 = 0; update is +β k v^T.
+        let expected = [
+            3.0, 4.0, // row 0 = v
+            0.0, 0.0, // row 1
+        ];
+        assert_eq!(s.as_slice(), &expected);
+    }
+
+    #[test]
+    fn step_beta_0_only_applies_row_decay() {
+        // Preload S with known values, α = [0.5, 0.25], β = 0.
+        // Expected: S ← Diag(α) · S; k, v are ignored.
+        let mut s = state_from(2, 2, vec![10.0_f32, 20.0, 40.0, 80.0]);
+        let k = [1.0_f32, 1.0];
+        let v = [99.0_f32, 99.0];
+        let alpha = [0.5_f32, 0.25];
+        kimi_delta_step(&mut s, &k, &v, &alpha, 0.0);
+        let expected = [
+            5.0, 10.0, // row 0 × 0.5
+            10.0, 20.0, // row 1 × 0.25
+        ];
+        assert_eq!(s.as_slice(), &expected);
+    }
+
+    #[test]
+    fn step_two_orthogonal_writes_produce_two_row_state() {
+        // Two orthogonal k vectors, all-ones α, β = 1 → each write
+        // populates its own row without interfering with the other.
+        let mut s = KimiDeltaState::new(2, 2);
+        let alpha = [1.0_f32, 1.0];
+        // Step 1: k_1 = [1, 0], v_1 = [1, 2] → row 0 of S = v_1.
+        kimi_delta_step(&mut s, &[1.0, 0.0], &[1.0, 2.0], &alpha, 1.0);
+        // Step 2: k_2 = [0, 1], v_2 = [3, 4] → row 1 of S = v_2,
+        // row 0 unchanged because k_2 ⊥ k_1.
+        kimi_delta_step(&mut s, &[0.0, 1.0], &[3.0, 4.0], &alpha, 1.0);
+        let expected = [
+            1.0, 2.0, // row 0 = v_1 (retained)
+            3.0, 4.0, // row 1 = v_2 (new write)
+        ];
+        assert_eq!(s.as_slice(), &expected);
+    }
+
+    #[test]
+    fn read_from_zero_state_returns_zero() {
+        let s = KimiDeltaState::new(4, 4);
+        let q = [1.0_f32, 2.0, 3.0, 4.0];
+        let out = kimi_delta_read(&s, &q);
+        assert_eq!(out, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn read_recovers_v_after_single_write() {
+        // After step with k = [1, 0], v = [a, b], β = 1, α = 1: S has
+        // row 0 = v. Then Sᵀ q for q = [1, 0] gives
+        //   out[j] = Σ_i S[i,j] · q[i] = S[0, j] = v[j].
+        let mut s = KimiDeltaState::new(2, 2);
+        kimi_delta_step(&mut s, &[1.0, 0.0], &[5.0, -3.0], &[1.0, 1.0], 1.0);
+        let out = kimi_delta_read(&s, &[1.0, 0.0]);
+        assert_eq!(out, vec![5.0, -3.0]);
+    }
+
+    #[test]
+    fn lower_bounded_decay_at_zero_z_is_sigmoid_half() {
+        // z = 0, A = 0 (so exp(A) = 1) → sigmoid(0) = 0.5
+        // → g = -5 · 0.5 = -2.5 → α = exp(-2.5) ≈ 0.082085.
+        let alpha = kimi_delta_lower_bounded_decay(&[0.0, 0.0, 0.0], 0.0, -5.0);
+        let expected = (-2.5_f32).exp();
+        for &a in &alpha {
+            assert!(
+                (a - expected).abs() < 1e-6,
+                "α = {a}, expected ≈ {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_bounded_decay_saturates_to_lower_bound() {
+        // Large positive z → sigmoid → 1, g → g_min = -5, α → exp(-5).
+        let alpha = kimi_delta_lower_bounded_decay(&[100.0, 100.0], 0.0, -5.0);
+        let expected = (-5.0_f32).exp();
+        for &a in &alpha {
+            assert!(
+                (a - expected).abs() < 1e-4,
+                "large-positive-z α = {a}, expected ≈ {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_bounded_decay_saturates_to_one() {
+        // Large negative z → sigmoid → 0, g → 0, α → 1.
+        let alpha = kimi_delta_lower_bounded_decay(&[-100.0, -100.0], 0.0, -5.0);
+        for &a in &alpha {
+            assert!(
+                (a - 1.0).abs() < 1e-6,
+                "large-negative-z α = {a}, expected ≈ 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn output_gate_zero_gate_pre_gives_half_rms_norm() {
+        // gate_pre = 0 → sigmoid(0) = 0.5 per channel.
+        // rms_weight = 1, tiny rms_eps → RMSNorm(ō) = ō / sqrt(mean(ō²)).
+        // W_o = I (2×2) → y = 0.5 · RMSNorm(ō).
+        let o_bar = [3.0_f32, 4.0]; // mean of squares = 12.5
+        let inv_scale = (12.5_f32).sqrt();
+        let y = kimi_delta_output_gate(
+            &o_bar,
+            &[0.0, 0.0],
+            Some(&[1.0, 1.0]),
+            1e-6,
+            &[1.0, 0.0, 0.0, 1.0], // W_o = I
+            2,
+        );
+        let expected = [0.5 * 3.0 / inv_scale, 0.5 * 4.0 / inv_scale];
+        for i in 0..2 {
+            assert!(
+                (y[i] - expected[i]).abs() < 1e-4,
+                "y[{i}] = {}, expected ≈ {}",
+                y[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn output_gate_zero_o_bar_gives_zero() {
+        // ō = 0 → RMSNorm(0) = 0 · 1/sqrt(eps) = 0 → y = 0 regardless of gate.
+        let y = kimi_delta_output_gate(
+            &[0.0, 0.0, 0.0, 0.0],
+            &[1.5, -2.0, 3.0, 0.7],
+            Some(&[1.0, 1.0, 1.0, 1.0]),
+            1e-6,
+            &[1.0_f32; 4 * 4], // W_o = all ones (4×4)
+            4,
+        );
+        assert_eq!(y, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn output_gate_without_rms_norm_matches_mla_shape() {
+        // rms_weight = None → skip normalize (Gated MLA Eq 7 variant).
+        // gate_pre = 0 → sigmoid = 0.5 → gated = 0.5 · ō → y = W_o · gated.
+        let o_bar = [2.0_f32, 4.0];
+        let y = kimi_delta_output_gate(
+            &o_bar,
+            &[0.0, 0.0],
+            None,
+            1e-6,
+            &[1.0, 0.0, 0.0, 1.0], // W_o = I
+            2,
+        );
+        assert_eq!(y, vec![1.0, 2.0]); // 0.5 · [2, 4]
+    }
+}
+
 /// Supports Llama-3, Mistral, and Gemma-2 architectures.
 ///
 /// Architecture-specific extensions are grouped into 5 sub-configs
