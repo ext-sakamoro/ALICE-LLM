@@ -2,6 +2,8 @@
 
 **English** | [日本語](README_JP.md)
 
+> Part of **[ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System)** — 260+ crate Edge-to-Cloud data pipeline (SDF / Physics / LLM / Motion / Font / TTS)
+
 Pure Rust LLM inference engine focused on understanding and optimizing every layer of inference—from GGUF parsing to SIMD, GPU kernels, speculative decoding, and hybrid architectures. Built as a research and engineering project rather than a wrapper around existing ML frameworks.
 
 GGUF quantized models, zero external ML dependencies, 326 tests.
