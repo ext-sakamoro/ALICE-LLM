@@ -7135,33 +7135,57 @@ mod kimi_k3_attnres_tests {
 //   applied once after the concat.
 
 /// Slice a `[rows, cols]` `WeightRef` into a `[row_end − row_start,
-/// cols]` view sharing the underlying byte buffer. **F32 only** for
-/// Phase X.4.c.3.3.b; quantized layouts store blocks (K-quant
-/// blocks are 256 elements) whose byte boundary rarely aligns with
-/// per-head row splits (K3 `kda_head_dim = 128` is exactly half a
-/// block), so a proper quantized per-head slicer is a separate
-/// helper scheduled at X.4.c.3.3.b.2.
+/// cols]` view sharing the underlying byte buffer.
 ///
-/// Returns `None` if `row_end > w.rows`, if `w.qtype` is not
-/// `F32`, or if `row_start > row_end`.
+/// **Phase X.4.c.3.3.b.2 upgrade**: extended from F32-only to
+/// support the full K3 quant zoo (F32/F16/Q4_K/Q8_0/IQ4_XS/MXFP4/
+/// IQ1_S/Q2_0/etc.). The refactor exploits GGUF's row-major layout:
+/// as long as `cols % elements_per_block == 0` (which holds for K3
+/// tensors since `hidden = 7168` divides both 256 and 32), each row
+/// is an integer number of quant blocks and per-row byte offsets
+/// are block-aligned. The earlier concern about "K3 kda_head_dim =
+/// 128 is exactly half a block" was overly cautious: `kda_head_dim`
+/// is the ROW axis (per-head slicing = 128 consecutive rows), not
+/// the COLUMN axis, so block-alignment is preserved.
+///
+/// Returns `None` if:
+/// - `row_start > row_end` (invalid range),
+/// - `row_end > w.rows` (out of bounds),
+/// - `w.qtype` is quantized AND `w.cols % elements_per_block != 0`
+///   (per-row byte offsets would land mid-block), or
+/// - `w.qtype` is `GgmlType::Other(_)` (unknown quant type).
 #[allow(dead_code)]
 fn kimi_k3_slice_weight_ref_rows<'a>(
     w: &WeightRef<'a>,
     row_start: usize,
     row_end: usize,
 ) -> Option<WeightRef<'a>> {
-    if !matches!(w.qtype, GgmlType::F32) {
-        return None;
-    }
     if row_start > row_end || row_end > w.rows {
         return None;
     }
-    let row_bytes = w.cols * 4; // F32 = 4 bytes/element
-    let byte_start = row_start * row_bytes;
-    let byte_end = row_end * row_bytes;
+    if matches!(w.qtype, GgmlType::Other(_)) {
+        return None;
+    }
+    let elements_per_block = w.qtype.elements_per_block();
+    let block_bytes = w.qtype.block_bytes();
+    if elements_per_block == 0 || block_bytes == 0 {
+        return None;
+    }
+    // For F32/F16: elements_per_block = 1, row_bytes = cols * bytes.
+    // For quant types: row must contain integer blocks.
+    if !w.cols.is_multiple_of(elements_per_block) {
+        return None;
+    }
+    let blocks_per_row = w.cols / elements_per_block;
+    let row_bytes = blocks_per_row.checked_mul(block_bytes)?;
+    let byte_start = row_start.checked_mul(row_bytes)?;
+    let byte_end = row_end.checked_mul(row_bytes)?;
+    if byte_end > w.data.len() {
+        return None;
+    }
     Some(WeightRef {
         data: &w.data[byte_start..byte_end],
-        qtype: GgmlType::F32,
+        qtype: w.qtype,
         rows: row_end - row_start,
         cols: w.cols,
     })
@@ -7579,26 +7603,40 @@ fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
 /// The GGUF cubes are stored as `[dim0, dim1, num_experts]` in ggml
 /// convention (`ne[0]` fastest-varying, i.e. row-major with dim0 = column
 /// stride). Each expert's plane is a contiguous `dim0 * dim1` block, so
-/// per-expert byte offset is `expert_idx * dim0 * dim1 * bytes_per_element`.
+/// per-expert byte offset is `expert_idx * dim0 * dim1 * bytes_per_element`
+/// for F32/F16, or `expert_idx * blocks_per_plane * block_bytes` for
+/// quantized cubes (Phase X.4.c.3.3.b.2 upgrade — safe when
+/// `dim0 * dim1 % elements_per_block == 0`).
 ///
-/// **F32 only** for Phase X.4.c.3.3.c.2. Quantized per-expert slicing
-/// (Q4_K / IQ1_S / MXFP4) requires block-boundary alignment and is
-/// deferred to Phase X.4.c.3.3.b.2 (which will also cover per-head KDA
-/// slicing).
+/// Returns `None` when:
+/// - `expert_idx >= num_experts` (out of bounds),
+/// - `w.qtype` is `GgmlType::Other(_)` (unknown quant type),
+/// - `w.qtype` is quantized AND `dim0 * dim1 % elements_per_block != 0`
+///   (plane splits mid-block), or
+/// - `cube.data.len()` is too small for `num_experts` planes.
 #[allow(dead_code)]
 fn kimi_k3_expert_plane_weight_ref<'a>(
     cube: &WeightRef<'a>,
     expert_idx: usize,
     num_experts: usize,
 ) -> Option<WeightRef<'a>> {
-    if !matches!(cube.qtype, GgmlType::F32) {
-        return None;
-    }
     if expert_idx >= num_experts {
         return None;
     }
+    if matches!(cube.qtype, GgmlType::Other(_)) {
+        return None;
+    }
+    let elements_per_block = cube.qtype.elements_per_block();
+    let block_bytes = cube.qtype.block_bytes();
+    if elements_per_block == 0 || block_bytes == 0 {
+        return None;
+    }
     let plane_elements = cube.rows.checked_mul(cube.cols)?;
-    let plane_bytes = plane_elements.checked_mul(4)?; // F32 = 4 bytes/elem
+    if !plane_elements.is_multiple_of(elements_per_block) {
+        return None;
+    }
+    let plane_blocks = plane_elements / elements_per_block;
+    let plane_bytes = plane_blocks.checked_mul(block_bytes)?;
     let total_bytes_expected = plane_bytes.checked_mul(num_experts)?;
     if cube.data.len() < total_bytes_expected {
         return None;
@@ -7647,10 +7685,13 @@ fn kimi_k3_expert_plane_weight_ref<'a>(
 /// 7. **Combine**: `y = shared_out + up_projected_routed_agg`
 ///    (both `[n_embd]`).
 ///
-/// **Panics on quantized cubes** (Q4_K / IQ1_S / MXFP4) with an
-/// explicit Phase X.4.c.3.3.b.2 message — F32 fixtures are the only
-/// working path in this landing, matching the KDA per-head aggregation
-/// F32 restriction from Phase X.4.c.3.3.b.
+/// **Quantized cubes now supported** (Phase X.4.c.3.3.b.2 upgrade)
+/// when `n_embd_latent * n_ff_exp % elements_per_block == 0`, which
+/// holds for all K3 configs where both dims are multiples of 256
+/// (K-quant block size). Q4_K / Q8_0 / IQ4_XS / MXFP4 all work via
+/// existing `WeightRef::matvec` dispatch (dequantize-then-dot at
+/// matvec time). The routed dispatch panics with a diagnostic when
+/// a cube's plane splits mid-block.
 ///
 /// SiTU coefficients hardcoded to `β=4, β_linear=25` (K3 defaults from
 /// pwilkin PR `constants.py` `activation.situ_beta` / `situ_linear_beta`).
@@ -7754,14 +7795,21 @@ fn kimi_k3_latent_moe_forward(
             kimi_k3_expert_plane_weight_ref(&moe.ffn_gate_exps, *expert_idx, num_experts)
                 .unwrap_or_else(|| {
                     panic!(
-                        "K3 LatentMoE routed dispatch — Phase X.4.c.3.3.b.2 required: \
-                     ffn_gate_exps for expert {expert_idx} not sliceable (qtype {:?}, \
-                     num_experts {num_experts}, cube bytes {} vs expected \
-                     {plane_bytes} * num_experts). Quantized per-expert slicing is \
-                     deferred to Phase X.4.c.3.3.b.2; F32 fixtures work today.",
+                        "K3 LatentMoE routed dispatch: ffn_gate_exps for expert \
+                         {expert_idx} not sliceable (qtype {:?}, num_experts \
+                         {num_experts}, plane bytes {plane_bytes} × num_experts vs \
+                         cube data {}). Quantized cubes require \
+                         `plane_elements % elements_per_block == 0` — check that \
+                         `n_embd_latent * n_ff_exp` is a multiple of the quant \
+                         block size ({} for this qtype).",
                         moe.ffn_gate_exps.qtype,
                         moe.ffn_gate_exps.data.len(),
-                        plane_bytes = moe.ffn_gate_exps.rows * moe.ffn_gate_exps.cols * 4
+                        moe.ffn_gate_exps.qtype.elements_per_block(),
+                        plane_bytes = {
+                            let epb = moe.ffn_gate_exps.qtype.elements_per_block().max(1);
+                            let bb = moe.ffn_gate_exps.qtype.block_bytes();
+                            (moe.ffn_gate_exps.rows * moe.ffn_gate_exps.cols / epb) * bb
+                        }
                     )
                 });
         let up_ref = kimi_k3_expert_plane_weight_ref(&moe.ffn_up_exps, *expert_idx, num_experts)
@@ -7994,18 +8042,62 @@ mod kimi_k3_latent_moe_tests {
     }
 
     #[test]
-    fn expert_plane_weight_ref_rejects_quantized_cube() {
-        let bytes = vec![0u8; 144]; // Q4_K block bytes
+    fn expert_plane_weight_ref_supports_quantized_cube_when_aligned() {
+        // Phase X.4.c.3.3.b.2: Q4_K per-expert slicing now works when
+        // plane_elements (rows * cols) is a multiple of QK_K (256).
+        // 4 rows × 64 cols = 256 elements per plane = 1 Q4_K block per
+        // plane = 144 bytes per plane.
+        let num_experts = 2;
+        let bytes = vec![0u8; 144 * num_experts];
         let cube = WeightRef {
             data: &bytes,
             qtype: GgmlType::Q4_K,
             rows: 4,
             cols: 64,
         };
+        let plane0 = kimi_k3_expert_plane_weight_ref(&cube, 0, num_experts)
+            .expect("Q4_K plane slicing must succeed when plane_elements % 256 == 0");
+        assert_eq!(plane0.rows, 4);
+        assert_eq!(plane0.cols, 64);
+        assert_eq!(plane0.data.len(), 144, "1 Q4_K block");
+        let plane1 = kimi_k3_expert_plane_weight_ref(&cube, 1, num_experts)
+            .expect("expert 1 slice must succeed for aligned Q4_K cube");
+        assert_eq!(plane1.data.len(), 144);
+    }
+
+    #[test]
+    fn expert_plane_weight_ref_rejects_quantized_cube_when_misaligned() {
+        // Plane_elements = 4 × 32 = 128, not a multiple of QK_K (256).
+        // Slicing at plane boundary would land mid-Q4_K-block.
+        let bytes = vec![0u8; 144]; // enough for 1 block, but plane is 0.5 blocks
+        let cube = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Q4_K,
+            rows: 4,
+            cols: 32,
+        };
         assert!(
             kimi_k3_expert_plane_weight_ref(&cube, 0, 1).is_none(),
-            "quantized cube slicing is Phase X.4.c.3.3.b.2 territory"
+            "misaligned Q4_K (plane 128 elements, block 256) must fail slicing"
         );
+    }
+
+    #[test]
+    fn expert_plane_weight_ref_supports_mxfp4_when_aligned() {
+        // Phase X.4.c.3.3.b.2: MXFP4 per-expert slicing (17 bytes/block,
+        // 32 elements/block). Plane = 4 × 32 = 128 elements = 4 MXFP4
+        // blocks = 68 bytes.
+        let num_experts = 3;
+        let bytes = vec![0u8; 68 * num_experts];
+        let cube = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Mxfp4,
+            rows: 4,
+            cols: 32,
+        };
+        let plane2 = kimi_k3_expert_plane_weight_ref(&cube, 2, num_experts)
+            .expect("MXFP4 plane slicing must succeed at aligned boundary");
+        assert_eq!(plane2.data.len(), 68);
     }
 
     #[test]
@@ -8178,9 +8270,11 @@ mod kimi_k3_kda_layer_tests {
     }
 
     #[test]
-    fn slice_weight_ref_rows_returns_none_for_quantized_types() {
-        // Q4_K is the most common K3 non-expert quant type. Slicing
-        // it per row is not yet supported (Phase X.4.c.3.3.b.2).
+    fn slice_weight_ref_rows_rejects_misaligned_quantized_cols() {
+        // Q4_K block = 256 elements. cols = 64 → row-length 64 is not
+        // a multiple of 256, so per-row slicing would land mid-block
+        // and must be rejected. (Real K3 hidden = 7168 = 28 × 256, so
+        // this misalignment case is a defensive test not a K3 case.)
         let bytes = vec![0u8; 144]; // Q4_K block bytes for 256 elements
         let w = WeightRef {
             data: &bytes,
@@ -8189,6 +8283,63 @@ mod kimi_k3_kda_layer_tests {
             cols: 64,
         };
         assert!(kimi_k3_slice_weight_ref_rows(&w, 0, 2).is_none());
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_supports_q4_k_when_aligned() {
+        // Phase X.4.c.3.3.b.2: Q4_K per-row slicing works when cols
+        // is a multiple of QK_K (256). 4 rows × 256 cols = 1024
+        // elements = 4 Q4_K blocks total, 1 block per row = 144
+        // bytes per row.
+        let bytes = vec![0u8; 144 * 4]; // 4 rows, 1 block each
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Q4_K,
+            rows: 4,
+            cols: 256,
+        };
+        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 3)
+            .expect("Q4_K per-row slicing must succeed when cols % 256 == 0");
+        assert_eq!(sliced.rows, 2);
+        assert_eq!(sliced.cols, 256);
+        assert_eq!(sliced.data.len(), 144 * 2, "2 Q4_K blocks");
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_supports_mxfp4_when_aligned() {
+        // MXFP4 block = 32 elements, 17 bytes/block. K3 hidden = 7168
+        // = 224 × 32, so per-row slicing is block-aligned.
+        // 4 rows × 32 cols = 128 elements = 4 MXFP4 blocks total,
+        // 1 block per row = 17 bytes per row.
+        let bytes = vec![0u8; 17 * 4];
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Mxfp4,
+            rows: 4,
+            cols: 32,
+        };
+        let sliced = kimi_k3_slice_weight_ref_rows(&w, 0, 2)
+            .expect("MXFP4 per-row slicing must succeed at 32-element aligned cols");
+        assert_eq!(sliced.rows, 2);
+        assert_eq!(sliced.cols, 32);
+        assert_eq!(sliced.data.len(), 17 * 2);
+    }
+
+    #[test]
+    fn slice_weight_ref_rows_supports_q8_0_when_aligned() {
+        // Q8_0 block = 32 elements, 34 bytes/block.
+        // 3 rows × 64 cols = 192 elements = 6 Q8_0 blocks, 2 blocks/row.
+        let bytes = vec![0u8; 34 * 6];
+        let w = WeightRef {
+            data: &bytes,
+            qtype: GgmlType::Q8_0,
+            rows: 3,
+            cols: 64,
+        };
+        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 2)
+            .expect("Q8_0 per-row slicing must succeed at 32-element aligned cols");
+        assert_eq!(sliced.rows, 1);
+        assert_eq!(sliced.data.len(), 34 * 2);
     }
 
     #[test]
