@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase X.4.c.3.3.a — MLA + Dense FFN wiring into `forward_kimi_k3`**
+  (2026-07-28). Wires the X.4.c.3.2 Gated MLA primitive + a new
+  Dense-FFN SwiGLU primitive into `KimiK3Model::forward`, replacing
+  two of the four remaining `todo!()` fail-fasts. K3 forward now
+  really runs the MLA attention path + the layer-0 dense FFN path
+  end-to-end when handed a populated `KimiK3ModelWeights` bundle;
+  KDA per-head aggregation (X.4.c.3.3.b) and Stable LatentMoE
+  (X.4.c.3.3.c) remain the two panics keeping the full 24-MLA +
+  69-KDA + 92-MoE forward from running.
+  - **`kimi_k3_extract_mla_config(config)`** — pulls the runtime
+    dims for `kimi_k3_gated_mla_step` (`d`, `num_heads`,
+    `qk_nope/rope/v_head_dim`, `q_lora_rank`, `kv_lora_rank`,
+    `rms_eps`) off a populated `Llama3Config` in one step.
+    Returns `None` when the K3 sub-config or any required MLA dim
+    is absent.
+  - **`kimi_k3_dense_ffn_forward(x, ffn_norm, gate, up, down, eps)`**
+    — SwiGLU forward for the K3 layer-0 dense FFN
+    (`first_k_dense_replace = 1`). Follows the DeepSeek V3 dense-
+    layer convention (Swish gate ⊙ up branch → down projection)
+    since the K3 tech report leaves the dense-FFN activation
+    unspecified but TENSOR_MAP.md ships the standard `ffn_gate` /
+    `ffn_up` / `ffn_down` triple.
+  - **`KimiK3Model::forward` update** — MLA branch delegates to
+    `kimi_k3_gated_mla_step` with per-layer weight refs from the
+    X.4.b.2 loader; Dense branch delegates to
+    `kimi_k3_dense_ffn_forward`. Cache/attn tag mismatch (i.e. a
+    KDA layer wrapping an MLA cache or vice-versa, which
+    `KimiK3Model::new` should have made impossible) hits an
+    explicit `panic!` naming the invariant instead of silently
+    misinterpreting the weights.
+- **5 new unit tests** covering the helper surfaces:
+  `extract_mla_config` positive path + two failure modes
+  (missing sub-config, missing individual dim), and
+  `dense_ffn_forward` zero-input-gives-zero + bounded-output
+  smoke tests.
+
+### Changed
+
+- **`model_forward_panics_at_first_kda_layer_with_todo_message`**
+  → **`model_forward_panics_on_empty_layers_vec`**. The KDA
+  `todo!()` message was previously the first panic
+  `KimiK3Model::forward` raised because the layer loop never
+  touched `weights.layers`. With X.4.c.3.3.a wiring the MLA and
+  Dense branches into real per-layer weight lookups, the
+  metadata-only `dummy_weights` fixture (which ships
+  `layers: Vec::new()`) now panics with index-out-of-bounds
+  first. The updated test asserts that behaviour and documents
+  the precondition: `load_kimi_k3_model_weights` must run before
+  `forward`. A full-fixture end-to-end forward test lands at
+  Phase X.4.c.3.3.d when a synthetic-GGUF-with-tensors builder
+  is available.
+
+### Deferred (X.4.c.3.3.b/c + X.4.c.3.4, next sessions — still needed for real K3)
+
+- **X.4.c.3.3.b KDA per-head aggregation**: per-head slicing from
+  the fused `attn_q` / `attn_k` / `attn_v` tensors + per-head
+  `kimi_delta_forward_head` (X.4.c.2 primitive) call + output
+  aggregation. Quantized-per-head slicing (Q4_K / IQ1_S block
+  alignment) is the tricky bit; F32 first, then quantized helper.
+- **X.4.c.3.3.c Stable LatentMoE forward**: sigmoid router (with
+  `noaux_tc` bias correction) top-16 from 896 experts + 2 shared
+  experts fused + latent `W↓` / RMSNorm / `W↑` + SiTU-GLU per
+  routed expert. Wires into layers 1..93 (K3
+  `first_k_dense_replace = 1`).
+- **X.4.c.3.4 Block AttnRes wiring**: replace the current simple
+  residual add (`x += layer_output`) with the X.4.d.1 Block
+  AttnRes primitive, plus the X.4.d.2 final aggregation via
+  `output_attn_res_norm` + `output_attn_res_proj`. `attn_res_norm`
+  / `attn_res_proj` / `ffn_res_norm` / `ffn_res_proj` semantics
+  need pwilkin PR #26185 precise reading before wiring — the K3
+  tech report §2.2 leaves the exact per-layer AttnRes projection
+  underspecified relative to the GGUF tensor set.
+- **Real K3 GGUF forward on Mac mini (via Tailscale)**: user
+  flagged that Mac mini has enough disk to hold the ~527 GB
+  GrEarl IQ1_S 94-part upload. Scheduled after X.4.c.3.3.b/c/4
+  land the real forward path.
+
 - **Phase X.4.b.2 — Kimi K3 GGUF tensor loader** (2026-07-28).
   Follows X.4.b.1 (metadata + config) with the tensor reference
   data structures + walker that turns a K3 GGUF into a fully
