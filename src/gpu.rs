@@ -18,6 +18,17 @@ const MATVEC_Q1_0_ROW4_BATCH4_SHADER: &str =
     include_str!("shaders/dequant_matvec_q1_0_row4_batch4.wgsl");
 const MATVEC_Q1_0_ROW8_BATCH4_SHADER: &str =
     include_str!("shaders/dequant_matvec_q1_0_row8_batch4.wgsl");
+// Phase X.4.g.1 (2026-07-28): MXFP4 block dequant shader source is
+// checked in for compile-time `include_str!` presence. The wgpu
+// pipeline binding + parity test is scheduled at X.4.g.2 (needs
+// bind group layout + dispatch + readback plumbing); until then the
+// constant is `#[allow(dead_code)]` so the shader source lives in
+// version control alongside its CPU counterparts
+// (`pack_mxfp4_for_gpu_upload` / `dequantize_mxfp4_block` in
+// `src/gguf.rs`) but does not force a pipeline in the current
+// `GpuModel` surface.
+#[allow(dead_code)]
+const DEQUANT_MXFP4_SHADER: &str = include_str!("shaders/dequant_mxfp4.wgsl");
 const RMSNORM_SHADER: &str = include_str!("shaders/rmsnorm.wgsl");
 const SILU_MUL_SHADER: &str = include_str!("shaders/silu_mul.wgsl");
 const SILU_GATE_APPLY_SHADER: &str = include_str!("shaders/silu_gate_apply.wgsl");
