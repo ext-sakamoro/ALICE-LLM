@@ -7487,7 +7487,7 @@ fn kimi_k3_kda_layer_forward(
             .unwrap_or_else(|| {
                 panic!("kda_layer_forward: ssm_beta slice failed (head {head_idx})")
             });
-        let w_beta = weight_ref_as_f32(&w_beta_ref);
+        let w_beta = weight_ref_row_dequant(&w_beta_ref);
 
         // `ssm_norm` is a `Vec<f32>` per-channel γ shared across
         // heads (K3 exports as a 1-D norm tensor via
@@ -7515,23 +7515,23 @@ fn kimi_k3_kda_layer_forward(
             .as_ref()
             .and_then(|g| kimi_k3_slice_weight_ref_rows(g, row_start, row_end));
         let identity_gate = identity_matrix_f32(v_head_dim);
-        let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_as_f32);
+        let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_row_dequant);
         let w_gate_ref: &[f32] = w_gate_owned.as_deref().unwrap_or(&identity_gate);
 
         let params = KimiDeltaHeadParams {
-            w_q: &weight_ref_as_f32(&w_q),
-            w_k: &weight_ref_as_f32(&w_k),
-            w_v: &weight_ref_as_f32(&w_v),
-            conv_kernel_q: &weight_ref_as_f32(&w_conv_q),
-            conv_kernel_k: &weight_ref_as_f32(&w_conv_k),
-            conv_kernel_v: &weight_ref_as_f32(&w_conv_v),
+            w_q: &weight_ref_row_dequant(&w_q),
+            w_k: &weight_ref_row_dequant(&w_k),
+            w_v: &weight_ref_row_dequant(&w_v),
+            conv_kernel_q: &weight_ref_row_dequant(&w_conv_q),
+            conv_kernel_k: &weight_ref_row_dequant(&w_conv_k),
+            conv_kernel_v: &weight_ref_row_dequant(&w_conv_v),
             conv_bias_q: &zero_bias,
             conv_bias_k: &zero_bias,
             conv_bias_v: &zero_bias,
             w_beta: &w_beta,
             // `ssm_f_a` is shared across heads (`[alpha_rank, d]`).
-            w_alpha_down: &weight_ref_as_f32(&kda.ssm_f_a),
-            w_alpha_up: &weight_ref_as_f32(&w_alpha_up),
+            w_alpha_down: &weight_ref_row_dequant(&kda.ssm_f_a),
+            w_alpha_up: &weight_ref_row_dequant(&w_alpha_up),
             // `b_alpha` is not shipped in K3 GGUF — substitute zeros.
             b_alpha: &vec![0.0_f32; head_dim],
             a_h,
