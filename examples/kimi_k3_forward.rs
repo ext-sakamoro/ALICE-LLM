@@ -225,9 +225,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Two forward passes: 1st cold, 2nd warm-cache. ──
+    // model.reset() before each pass so both see the same fresh KV cache
+    // + attn_res state — otherwise pass 1 accumulates pass 0's KV entries
+    // and effectively predicts the (t=1, t=1) context instead of (t=1).
+    // That gives math-correct but different logits and confounds the
+    // pure warm-cache measurement we want.
     for pass in 0..2 {
         let phase = if pass == 0 { "COLD" } else { "WARM" };
-        println!("\n=== Forward pass #{pass} ({phase}, token_id = {token_id}) ===");
+        model.reset();
+        println!("\n=== Forward pass #{pass} ({phase}, token_id = {token_id}, cache reset) ===");
         let t5 = Instant::now();
         let logits = model.forward(token_id);
         let elapsed = t5.elapsed();
