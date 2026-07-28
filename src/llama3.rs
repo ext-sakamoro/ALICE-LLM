@@ -14964,7 +14964,19 @@ fn load_weight_ref_any_shape<'a, G: crate::gguf::GgufSource<'a>>(
     let info = gguf.tensor_info(name)?;
     let data = gguf.tensor_data(name)?;
     let cols = *info.dims.first()? as usize;
-    let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+    // Multiply all trailing dims (dims[1] × dims[2] × ...) to get the total
+    // row count. Real K3 GGUF has 3-D tensors like `ssm_conv1d_q` with
+    // shape `[kernel_size=4, groups=1, dim=12288]` where the "rows" that
+    // downstream slicers expect is `groups * dim = 12288`. Prior code
+    // only read `dims[1]` and defaulted to 1, which mis-shaped 3-D
+    // tensors as `rows=1` (Phase X.4.b.6 continued fix, 2026-07-28).
+    let rows: usize = info
+        .dims
+        .iter()
+        .skip(1)
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
     Some(WeightRef {
         data,
         qtype: info.qtype,
