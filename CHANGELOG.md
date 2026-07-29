@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 2 — `speculative_dspark::PositionConfidenceHead`** (2026-07-29).
+  RadixArk/Kimi-K3-DSpark 3 要素の 2 番目 位置別 confidence head を実装
+  各 draft position i ごとに per-position 重み `w_i ∈ R^H` + bias `b_i ∈ R`
+  を持ち、`confidence_i = sigmoid(w_i · hidden_i + b_i) ∈ [0, 1]` を返す
+  SGD BCE 学習は canonical form `dL/dz = p - y` で数値安定 sigmoid + eps
+  clamp BCE 使用、log(0) 回避 API: `PositionConfidenceHead::{new, zeros,
+  block_size, hidden_dim, predict, predict_block, train_step, accept_mask}`
+  17 追加 unit test 全 pass (計 33 test)、clippy pedantic+nursery 0 warn、
+  `DsparkError` に 5 variant 追加 (ZeroBlockSize / ZeroHiddenDim /
+  HiddenLenMismatch / PositionOutOfRange / BlockStatesCountMismatch) Phase 3
+  (DFlashParallelDraft + `generate_speculative_dual` 配線) は次 session
+
 - **DSpark Phase 1 — `speculative_dspark::MarkovBigramBias`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 吸収 3 要素 (DFlash 並列 draft + Markov logit-bias +
   位置別 confidence head) の 1 要素目 Markov bigram bias を実装 各 prev
@@ -17,9 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   設定に対応 API: `MarkovBigramBias::{new, from_sequence, observe,
   observe_sequence, apply, vocab_size, rank, is_empty, observed_prev_count,
   bucket_len}` + `DsparkError` (4 variant) 16 unit test 全 pass、clippy
-  pedantic+nursery 0 warn (`imprecise_flops` 修正で `ln_1p` 使用) Phase 2
-  (PositionConfidenceHead) / Phase 3 (DFlashParallelDraft + `generate_speculative_dual`
-  配線) は次 session 以降
+  pedantic+nursery 0 warn (`imprecise_flops` 修正で `ln_1p` 使用)
 
 - **🎉 Real Kimi K3 (moonshotai/Kimi-K3 2.8T MoE) 1 token forward
   完走達成** (2026-07-28 22:47 JST). Full pipeline demonstrated on
