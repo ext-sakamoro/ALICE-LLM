@@ -9,7 +9,8 @@
 //!
 //! Phase 1 (完了): [`MarkovBigramBias`] vanilla DSpark は rank=256
 //! Phase 2 (完了): [`PositionConfidenceHead`] SGD BCE 学習可能な位置別 sigmoid confidence
-//! Phase 3 (次 session): `DFlashParallelDraft` + `generate_speculative_dual` 配線
+//! Phase 3 (完了): [`DFlashParallelDraft`] 外部 draft callback + [`DraftPosition`] / [`DraftBlock`] I/O 型
+//! Phase 4 (次 session): `generate_speculative_dual` 配線 (llama3.rs 側 optional feature gate) と full-count sketch
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -70,6 +71,47 @@ pub enum DsparkError {
         /// 実長
         got: usize,
     },
+    /// prefix が空 (DFlashParallelDraft)
+    EmptyPrefix,
+    /// 外部 draft model が返した position 数が block_size と不一致
+    DraftModelBlockSizeMismatch {
+        /// 期待長 = block_size
+        expected: usize,
+        /// 実長
+        got: usize,
+    },
+    /// vocab_size 一致検証で失敗 (bigram_bias or draft_fn logits)
+    VocabSizeMismatch {
+        /// 期待長
+        expected: u32,
+        /// 実長
+        got: u32,
+    },
+    /// hidden_dim 一致検証で失敗 (confidence_head or draft_fn hidden)
+    HiddenDimMismatch {
+        /// 期待長
+        expected: u32,
+        /// 実長
+        got: u32,
+    },
+    /// confidence_head.block_size と DFlashParallelDraft.block_size が不一致
+    ConfidenceHeadBlockSizeMismatch {
+        /// 期待長
+        expected: u32,
+        /// 実長
+        got: u32,
+    },
+    /// bigram_bias.vocab_size と DFlashParallelDraft.vocab_size が不一致
+    BigramVocabMismatch {
+        /// 期待長
+        expected: u32,
+        /// 実長
+        got: u32,
+    },
+    /// draft_fn の logits が全て NaN で argmax 不能
+    DraftLogitsAllNonFinite,
+    /// 外部 draft model が返した任意のエラー文字列
+    DraftModelFailed(String),
 }
 
 impl core::fmt::Display for DsparkError {
@@ -105,6 +147,37 @@ impl core::fmt::Display for DsparkError {
                     f,
                     "hidden_states count {got} does not match block_size {expected}"
                 )
+            }
+            Self::EmptyPrefix => write!(f, "prefix must be non-empty"),
+            Self::DraftModelBlockSizeMismatch { expected, got } => {
+                write!(
+                    f,
+                    "draft model returned {got} positions but expected {expected}"
+                )
+            }
+            Self::VocabSizeMismatch { expected, got } => {
+                write!(f, "vocab_size {got} does not match expected {expected}")
+            }
+            Self::HiddenDimMismatch { expected, got } => {
+                write!(f, "hidden_dim {got} does not match expected {expected}")
+            }
+            Self::ConfidenceHeadBlockSizeMismatch { expected, got } => {
+                write!(
+                    f,
+                    "confidence_head block_size {got} does not match expected {expected}"
+                )
+            }
+            Self::BigramVocabMismatch { expected, got } => {
+                write!(
+                    f,
+                    "bigram_bias vocab_size {got} does not match expected {expected}"
+                )
+            }
+            Self::DraftLogitsAllNonFinite => {
+                write!(f, "draft logits are all non-finite (NaN); cannot argmax")
+            }
+            Self::DraftModelFailed(msg) => {
+                write!(f, "draft model failed: {msg}")
             }
         }
     }
@@ -454,9 +527,227 @@ fn stable_bce(p: f32, y: f32) -> f32 {
     -(y * p_clamped.ln() + (1.0 - y) * (1.0 - p_clamped).ln())
 }
 
+// NaN skip 版 argmax +inf は正当な argmax として通す、全 NaN で Err
+fn argmax_finite(logits: &[f32]) -> Result<u32, DsparkError> {
+    let mut best_idx: Option<u32> = None;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        if v > best_val {
+            best_val = v;
+            best_idx = Some(i as u32);
+        }
+    }
+    best_idx.ok_or(DsparkError::DraftLogitsAllNonFinite)
+}
+
+/// 外部 draft model からの 1 位置分の出力 (DFlashParallelDraft 契約)
+#[derive(Debug, Clone)]
+pub struct DraftPosition {
+    /// draft model の hidden state (長さ = hidden_dim)
+    pub hidden: Vec<f32>,
+    /// vocab 上の logits (長さ = vocab_size)
+    pub logits: Vec<f32>,
+}
+
+/// [`DFlashParallelDraft::draft`] の結果 block
+#[derive(Debug, Clone)]
+pub struct DraftBlock {
+    /// argmax で選ばれた draft token 列 (長さ = block_size)
+    pub tokens: Vec<TokenId>,
+    /// [`PositionConfidenceHead`] が出した位置別 confidence (長さ = block_size)
+    pub confidences: Vec<f32>,
+    /// draft model が返した hidden state 列 (長さ = block_size)
+    pub hidden_states: Vec<Vec<f32>>,
+}
+
+/// DFlash 並列 draft (DSpark 3 要素の 3 番目)
+///
+/// 外部 draft model callback を closure で受け取り、block_size 個の (hidden, logits) を
+/// 並列に取得する 各 position の logits には optional の [`MarkovBigramBias`] を適用し、
+/// argmax で token を確定、[`PositionConfidenceHead`] で位置別 confidence を算出する
+///
+/// llama3.rs との配線は本 struct のスコープ外 caller が `Fn(prefix, block_size) -> Result<Vec<DraftPosition>>`
+/// を実装して渡す
+#[derive(Debug, Clone)]
+pub struct DFlashParallelDraft {
+    block_size: u32,
+    vocab_size: u32,
+    hidden_dim: u32,
+    bigram_strength: f32,
+}
+
+impl DFlashParallelDraft {
+    /// 新規構築 `bigram_strength = 0.0` で MarkovBigramBias を無効化できる
+    ///
+    /// # Errors
+    /// `block_size` / `vocab_size` / `hidden_dim` のいずれかが 0 の場合
+    pub fn new(
+        block_size: u32,
+        vocab_size: u32,
+        hidden_dim: u32,
+        bigram_strength: f32,
+    ) -> Result<Self, DsparkError> {
+        if block_size == 0 {
+            return Err(DsparkError::ZeroBlockSize);
+        }
+        if vocab_size == 0 {
+            return Err(DsparkError::ZeroVocab);
+        }
+        if hidden_dim == 0 {
+            return Err(DsparkError::ZeroHiddenDim);
+        }
+        Ok(Self {
+            block_size,
+            vocab_size,
+            hidden_dim,
+            bigram_strength,
+        })
+    }
+
+    /// 宣言 block size
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// 宣言 vocab size
+    pub fn vocab_size(&self) -> u32 {
+        self.vocab_size
+    }
+
+    /// 宣言 hidden dim
+    pub fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+
+    /// 現在の bigram strength (0.0 で bigram apply を skip)
+    pub fn bigram_strength(&self) -> f32 {
+        self.bigram_strength
+    }
+
+    /// bigram strength を更新する 値の finite 性は検証しない
+    pub fn set_bigram_strength(&mut self, strength: f32) {
+        self.bigram_strength = strength;
+    }
+
+    /// prefix と外部 draft callback を受けて DraftBlock を返す
+    ///
+    /// アルゴリズム:
+    /// 1. prefix 非空 + confidence_head / bigram 一致検証
+    /// 2. `draft_fn(prefix, block_size)` 呼出、returned positions の shape 検証
+    /// 3. 各 position i:
+    ///    - prev = if i == 0 { prefix.last() } else { tokens\[i-1\] }
+    ///    - bigram_bias 提供 && strength != 0 → `bigram.apply(prev, &mut logits, strength)`
+    ///    - `token = argmax_finite(logits)`
+    ///    - `conf = confidence_head.predict(i, &hidden)`
+    /// 4. `DraftBlock { tokens, confidences, hidden_states }` を返却
+    ///
+    /// # Errors
+    /// - `EmptyPrefix`: prefix が空
+    /// - `ConfidenceHeadBlockSizeMismatch` / `HiddenDimMismatch`: 構成不一致
+    /// - `BigramVocabMismatch`: bigram_bias.vocab_size 不一致
+    /// - `DraftModelBlockSizeMismatch` / `VocabSizeMismatch` / `HiddenDimMismatch`: draft_fn output shape 不一致
+    /// - `DraftLogitsAllNonFinite`: 全 NaN logits で argmax 不能
+    /// - `DraftModelFailed(msg)`: draft_fn 自身が返したエラー (`draft_fn` が返す `DsparkError` はそのまま伝播)
+    pub fn draft<F>(
+        &self,
+        prefix: &[TokenId],
+        bigram_bias: Option<&MarkovBigramBias>,
+        confidence_head: &PositionConfidenceHead,
+        draft_fn: F,
+    ) -> Result<DraftBlock, DsparkError>
+    where
+        F: FnOnce(&[TokenId], u32) -> Result<Vec<DraftPosition>, DsparkError>,
+    {
+        // (1) prefix 検証
+        let last_prefix_token = *prefix.last().ok_or(DsparkError::EmptyPrefix)?;
+
+        // (2) config 一致検証
+        if confidence_head.block_size() != self.block_size {
+            return Err(DsparkError::ConfidenceHeadBlockSizeMismatch {
+                expected: self.block_size,
+                got: confidence_head.block_size(),
+            });
+        }
+        if confidence_head.hidden_dim() != self.hidden_dim {
+            return Err(DsparkError::HiddenDimMismatch {
+                expected: self.hidden_dim,
+                got: confidence_head.hidden_dim(),
+            });
+        }
+        if let Some(b) = bigram_bias {
+            if b.vocab_size() != self.vocab_size {
+                return Err(DsparkError::BigramVocabMismatch {
+                    expected: self.vocab_size,
+                    got: b.vocab_size(),
+                });
+            }
+        }
+
+        // (3) draft_fn 呼出
+        let mut positions = draft_fn(prefix, self.block_size)?;
+        if positions.len() != self.block_size as usize {
+            return Err(DsparkError::DraftModelBlockSizeMismatch {
+                expected: self.block_size as usize,
+                got: positions.len(),
+            });
+        }
+        for pos in &positions {
+            if pos.hidden.len() != self.hidden_dim as usize {
+                return Err(DsparkError::HiddenDimMismatch {
+                    expected: self.hidden_dim,
+                    got: pos.hidden.len() as u32,
+                });
+            }
+            if pos.logits.len() != self.vocab_size as usize {
+                return Err(DsparkError::VocabSizeMismatch {
+                    expected: self.vocab_size,
+                    got: pos.logits.len() as u32,
+                });
+            }
+        }
+
+        // (4) 各 position の argmax + confidence
+        let mut tokens = Vec::with_capacity(self.block_size as usize);
+        let mut confidences = Vec::with_capacity(self.block_size as usize);
+        let mut hidden_states = Vec::with_capacity(self.block_size as usize);
+
+        let apply_bigram = bigram_bias.is_some() && self.bigram_strength != 0.0;
+
+        for (i, pos) in positions.iter_mut().enumerate() {
+            let prev = if i == 0 {
+                last_prefix_token
+            } else {
+                tokens[i - 1]
+            };
+            if apply_bigram {
+                if let Some(b) = bigram_bias {
+                    b.apply(prev, &mut pos.logits, self.bigram_strength)?;
+                }
+            }
+            let token = argmax_finite(&pos.logits)?;
+            let conf = confidence_head.predict(i as u32, &pos.hidden)?;
+            tokens.push(token);
+            confidences.push(conf);
+            hidden_states.push(core::mem::take(&mut pos.hidden));
+        }
+
+        Ok(DraftBlock {
+            tokens,
+            confidences,
+            hidden_states,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DsparkError, MarkovBigramBias, PositionConfidenceHead};
+    use super::{
+        DFlashParallelDraft, DraftBlock, DraftPosition, DsparkError, MarkovBigramBias,
+        PositionConfidenceHead, TokenId,
+    };
 
     #[test]
     fn new_rejects_zero_vocab() {
@@ -903,5 +1194,373 @@ mod tests {
             ),
             "hidden_states count 3 does not match block_size 7"
         );
+    }
+
+    // ---- DFlashParallelDraft tests ----
+
+    // vocab_size=8, hidden_dim=4, block_size=3 の draft position を生成する helper
+    // pos i の logits は index=(i * 2) が最大、それ以外は 0.0 (bigram なしで argmax=i*2)
+    fn mock_positions(block_size: u32) -> Vec<DraftPosition> {
+        let vocab = 8usize;
+        let hidden = 4usize;
+        let mut out = Vec::with_capacity(block_size as usize);
+        for i in 0..block_size {
+            let mut logits = vec![0.0_f32; vocab];
+            let target = (i as usize * 2) % vocab;
+            logits[target] = 5.0;
+            let h = vec![0.1_f32; hidden];
+            out.push(DraftPosition { hidden: h, logits });
+        }
+        out
+    }
+
+    #[test]
+    fn dfp_new_rejects_zero_block_size() {
+        let err = DFlashParallelDraft::new(0, 100, 4, 1.0).unwrap_err();
+        assert_eq!(err, DsparkError::ZeroBlockSize);
+    }
+
+    #[test]
+    fn dfp_new_rejects_zero_vocab() {
+        let err = DFlashParallelDraft::new(3, 0, 4, 1.0).unwrap_err();
+        assert_eq!(err, DsparkError::ZeroVocab);
+    }
+
+    #[test]
+    fn dfp_new_rejects_zero_hidden() {
+        let err = DFlashParallelDraft::new(3, 100, 0, 1.0).unwrap_err();
+        assert_eq!(err, DsparkError::ZeroHiddenDim);
+    }
+
+    #[test]
+    fn dfp_getters_and_setter() {
+        let mut dfp = DFlashParallelDraft::new(7, 128, 16, 0.5).expect("valid");
+        assert_eq!(dfp.block_size(), 7);
+        assert_eq!(dfp.vocab_size(), 128);
+        assert_eq!(dfp.hidden_dim(), 16);
+        assert!((dfp.bigram_strength() - 0.5).abs() < 1e-9);
+        dfp.set_bigram_strength(2.0);
+        assert!((dfp.bigram_strength() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dfp_draft_rejects_empty_prefix() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let err = dfp
+            .draft(&[], None, &head, |_p, bs| Ok(mock_positions(bs)))
+            .unwrap_err();
+        assert_eq!(err, DsparkError::EmptyPrefix);
+    }
+
+    #[test]
+    fn dfp_draft_rejects_confidence_head_block_mismatch() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(5, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, bs| Ok(mock_positions(bs)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::ConfidenceHeadBlockSizeMismatch {
+                expected: 3,
+                got: 5
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_confidence_head_hidden_mismatch() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 8).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, bs| Ok(mock_positions(bs)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::HiddenDimMismatch {
+                expected: 4,
+                got: 8
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_bigram_vocab_mismatch() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 1.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let bigram = MarkovBigramBias::new(16, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, Some(&bigram), &head, |_p, bs| {
+                Ok(mock_positions(bs))
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::BigramVocabMismatch {
+                expected: 8,
+                got: 16
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_draft_fn_position_count() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, _bs| Ok(mock_positions(2)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::DraftModelBlockSizeMismatch {
+                expected: 3,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_draft_fn_hidden_len_mismatch() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, bs| {
+                let mut ps = mock_positions(bs);
+                ps[1].hidden = vec![0.0; 2]; // 意図的に不一致
+                Ok(ps)
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::HiddenDimMismatch {
+                expected: 4,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_draft_fn_logits_len_mismatch() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, bs| {
+                let mut ps = mock_positions(bs);
+                ps[0].logits = vec![0.0; 3]; // 意図的に不一致
+                Ok(ps)
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::VocabSizeMismatch {
+                expected: 8,
+                got: 3
+            }
+        );
+    }
+
+    #[test]
+    fn dfp_draft_propagates_draft_fn_error() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, _bs| {
+                Err(DsparkError::DraftModelFailed(
+                    "external draft crashed".to_string(),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::DraftModelFailed("external draft crashed".to_string())
+        );
+    }
+
+    #[test]
+    fn dfp_draft_rejects_all_nan_logits() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let err = dfp
+            .draft(&prefix, None, &head, |_p, bs| {
+                let mut ps = mock_positions(bs);
+                for p in &mut ps {
+                    for v in &mut p.logits {
+                        *v = f32::NAN;
+                    }
+                }
+                Ok(ps)
+            })
+            .unwrap_err();
+        assert_eq!(err, DsparkError::DraftLogitsAllNonFinite);
+    }
+
+    #[test]
+    fn dfp_draft_argmax_and_half_confidence_at_init() {
+        let dfp = DFlashParallelDraft::new(3, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let prefix: [TokenId; 1] = [1];
+        let block = dfp
+            .draft(&prefix, None, &head, |_p, bs| Ok(mock_positions(bs)))
+            .expect("valid");
+        // mock_positions で pos i の argmax = i*2 (mod vocab)
+        assert_eq!(block.tokens, vec![0, 2, 4]);
+        assert_eq!(block.confidences.len(), 3);
+        for c in &block.confidences {
+            assert!((c - 0.5).abs() < 1e-6);
+        }
+        assert_eq!(block.hidden_states.len(), 3);
+        assert_eq!(block.hidden_states[0].len(), 4);
+    }
+
+    #[test]
+    fn dfp_draft_applies_bigram_bias_shifts_argmax() {
+        // vocab=8、position 0 で mock_positions は logits[0] = 5.0 (他 0.0)
+        // bigram を prev=1 → next=3 で count=10 学習し strength=100 apply すれば
+        // logits[3] = 0.0 + 100 * ln_1p(10) = 100 * 2.398 ≈ 239.8 > 5.0 で argmax=3 に変わる
+        let dfp = DFlashParallelDraft::new(1, 8, 4, 100.0).expect("valid");
+        let head = PositionConfidenceHead::new(1, 4).expect("valid");
+        let mut bigram = MarkovBigramBias::new(8, 4).expect("valid");
+        for _ in 0..10 {
+            bigram.observe(1, 3).expect("valid");
+        }
+        let prefix: [TokenId; 1] = [1];
+        let block = dfp
+            .draft(&prefix, Some(&bigram), &head, |_p, bs| {
+                Ok(mock_positions(bs))
+            })
+            .expect("valid");
+        assert_eq!(
+            block.tokens,
+            vec![3],
+            "bigram bias should shift argmax to 3"
+        );
+    }
+
+    #[test]
+    fn dfp_draft_ignores_bigram_when_strength_zero() {
+        // strength=0.0 なら bigram_bias があっても apply されず argmax は mock 通り 0
+        let dfp = DFlashParallelDraft::new(1, 8, 4, 0.0).expect("valid");
+        let head = PositionConfidenceHead::new(1, 4).expect("valid");
+        let mut bigram = MarkovBigramBias::new(8, 4).expect("valid");
+        for _ in 0..10 {
+            bigram.observe(1, 3).expect("valid");
+        }
+        let prefix: [TokenId; 1] = [1];
+        let block = dfp
+            .draft(&prefix, Some(&bigram), &head, |_p, bs| {
+                Ok(mock_positions(bs))
+            })
+            .expect("valid");
+        assert_eq!(block.tokens, vec![0], "strength=0 should skip bigram apply");
+    }
+
+    #[test]
+    fn dfp_draft_uses_previous_drafted_token_as_bigram_prev() {
+        // block_size=2、pos 0 draft = 0、pos 1 draft は prev=0 で bigram を引く
+        // bigram に (0, 6) を count 10 積み、strength=100 で pos 1 の argmax が 6 に変わることを確認
+        let dfp = DFlashParallelDraft::new(2, 8, 4, 100.0).expect("valid");
+        let head = PositionConfidenceHead::new(2, 4).expect("valid");
+        let mut bigram = MarkovBigramBias::new(8, 4).expect("valid");
+        for _ in 0..10 {
+            bigram.observe(0, 6).expect("valid");
+        }
+        // prev token は vocab 内 (< 8) で bigram に未登録の値
+        let prefix: [TokenId; 1] = [7];
+        let block = dfp
+            .draft(&prefix, Some(&bigram), &head, |_p, bs| {
+                Ok(mock_positions(bs))
+            })
+            .expect("valid");
+        // pos 0: prev=7、bigram で 7 は未観測 → apply no-op → argmax = 0
+        // pos 1: prev=0 (drafted[0])、bigram で (0,6) が引かれる → argmax = 6
+        assert_eq!(block.tokens, vec![0, 6]);
+    }
+
+    #[test]
+    fn dspark_error_display_draft_variants() {
+        assert_eq!(
+            format!("{}", DsparkError::EmptyPrefix),
+            "prefix must be non-empty"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                DsparkError::DraftModelBlockSizeMismatch {
+                    expected: 7,
+                    got: 5
+                }
+            ),
+            "draft model returned 5 positions but expected 7"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                DsparkError::VocabSizeMismatch {
+                    expected: 8,
+                    got: 4
+                }
+            ),
+            "vocab_size 4 does not match expected 8"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                DsparkError::HiddenDimMismatch {
+                    expected: 16,
+                    got: 8
+                }
+            ),
+            "hidden_dim 8 does not match expected 16"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                DsparkError::ConfidenceHeadBlockSizeMismatch {
+                    expected: 7,
+                    got: 3
+                }
+            ),
+            "confidence_head block_size 3 does not match expected 7"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                DsparkError::BigramVocabMismatch {
+                    expected: 8,
+                    got: 16
+                }
+            ),
+            "bigram_bias vocab_size 16 does not match expected 8"
+        );
+        assert_eq!(
+            format!("{}", DsparkError::DraftLogitsAllNonFinite),
+            "draft logits are all non-finite (NaN); cannot argmax"
+        );
+        assert_eq!(
+            format!("{}", DsparkError::DraftModelFailed("boom".to_string())),
+            "draft model failed: boom"
+        );
+    }
+
+    // DraftBlock を tests で touch していないと unused import 警告になるので確認テスト
+    #[test]
+    fn dfp_draft_block_field_visibility() {
+        let block = DraftBlock {
+            tokens: vec![0, 1],
+            confidences: vec![0.5, 0.7],
+            hidden_states: vec![vec![0.0]],
+        };
+        assert_eq!(block.tokens.len(), 2);
+        assert_eq!(block.confidences.len(), 2);
+        assert_eq!(block.hidden_states.len(), 1);
     }
 }

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 3 — `speculative_dspark::DFlashParallelDraft`** (2026-07-29).
+  RadixArk/Kimi-K3-DSpark 3 要素の 3 番目 DFlash 並列 draft を実装 外部
+  draft model は `FnOnce(&[TokenId], u32) -> Result<Vec<DraftPosition>, DsparkError>`
+  closure 経由で受け取り (llama3.rs 非依存)、`DraftPosition { hidden, logits }` /
+  `DraftBlock { tokens, confidences, hidden_states }` I/O 型で交換する
+  各 position i について prev = `if i == 0 { prefix.last() } else { tokens[i-1] }`
+  を bigram prev として使い、strength != 0 かつ bigram_bias 提供時のみ
+  `bigram.apply(prev, &mut logits, strength)` を適用、`argmax_finite` (NaN skip、
+  全 NaN で `DraftLogitsAllNonFinite`) で token 確定、`confidence_head.predict(i, hidden)`
+  で位置別 confidence を算出 API: `DFlashParallelDraft::{new, block_size,
+  vocab_size, hidden_dim, bigram_strength, set_bigram_strength, draft}`
+  `DsparkError` に 8 variant 追加 (EmptyPrefix / DraftModelBlockSizeMismatch /
+  VocabSizeMismatch / HiddenDimMismatch / ConfidenceHeadBlockSizeMismatch /
+  BigramVocabMismatch / DraftLogitsAllNonFinite / DraftModelFailed(String)) 計
+  17 variant 19 追加 unit test 全 pass (計 52 test)、clippy pedantic+nursery
+  0 warn、fmt check pass Phase 4 (llama3.rs `generate_speculative_dual` optional
+  feature 配線 + full-count sketch) は次 session
+
 - **DSpark Phase 2 — `speculative_dspark::PositionConfidenceHead`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 3 要素の 2 番目 位置別 confidence head を実装
   各 draft position i ごとに per-position 重み `w_i ∈ R^H` + bias `b_i ∈ R`
