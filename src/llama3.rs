@@ -13944,6 +13944,215 @@ impl<'a> Llama3Model<'a> {
         }
     }
 
+    /// DSpark 版 speculative dual decoding (Phase 5) [`generate_speculative_dual`] と同じ
+    /// draft/verify pipeline に、draft argmax の直前で [`crate::speculative_dspark::BigramBias`]
+    /// を各 draft position に in-place apply する
+    ///
+    /// - position 0 の bigram prev = `next_token` (直前 main sample)
+    /// - position i > 0 の bigram prev = `draft_tokens[i-1]`
+    /// - biased logits を argmax にも verify (`draft_logits_all`) にも使う → Leviathan `q`
+    ///   分布が実 draft policy と一致する
+    /// - `bigram_bias = None` または `bigram_strength = 0.0` の場合は vanilla と bit-exact
+    ///
+    /// # Errors
+    /// - [`crate::speculative_dspark::DsparkError::VocabSizeMismatch`]: bigram.vocab_size と
+    ///   draft_model の vocab_size が不一致
+    /// - [`crate::speculative_dspark::DsparkError`]: bigram apply が返す任意のエラー
+    #[cfg(feature = "dspark")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_speculative_dual_dspark(
+        &mut self,
+        draft_model: &mut Llama3Model,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+        spec_k: usize,
+        bigram_bias: Option<&dyn crate::speculative_dspark::BigramBias>,
+        bigram_strength: f32,
+    ) -> Result<GenerateResult, crate::speculative_dspark::DsparkError> {
+        // (0) precondition: bigram.vocab_size == draft_model.vocab_size
+        if let Some(b) = bigram_bias {
+            let draft_vocab = draft_model.config.vocab_size as u32;
+            if b.vocab_size() != draft_vocab {
+                return Err(crate::speculative_dspark::DsparkError::VocabSizeMismatch {
+                    expected: draft_vocab,
+                    got: b.vocab_size(),
+                });
+            }
+        }
+
+        let start = Instant::now();
+        let mut tokens = tokenizer.encode(prompt);
+        if tokenizer.add_bos_token && (tokens.is_empty() || tokens[0] != tokenizer.bos_id) {
+            tokens.insert(0, tokenizer.bos_id);
+        }
+
+        self.clear_cache();
+        draft_model.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        // Prefill both models
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward(tok);
+            draft_model.forward(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        // Decode with dual-model speculation + DSpark bigram bias
+        let decode_start = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut total_drafted: usize = 0;
+        let mut total_accepted: usize = 0;
+        let mut rng = Rng64::new(42);
+
+        while generated.len() < max_new_tokens {
+            let next_token = if temperature > 0.0 {
+                sample_from_probs(&softmax(&logits), rng.next_f32())
+            } else {
+                argmax(&logits)
+            };
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+            generated.push(next_token);
+            tokens.push(next_token);
+
+            let remaining = max_new_tokens - generated.len();
+            if remaining == 0 {
+                logits = self.forward(next_token);
+                draft_model.forward(next_token);
+                continue;
+            }
+
+            let k = spec_k.min(remaining);
+
+            let saved_draft_pos = draft_model.kv_cache.seq_len();
+            let _saved_main_pos = self.kv_cache.seq_len();
+            let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+            let mut draft_logits_all: Vec<Vec<f32>> = Vec::with_capacity(k);
+            let mut draft_input = next_token;
+
+            // Position 0 draft prev = next_token
+            let mut prev_for_bigram = next_token;
+            let mut dl = draft_model.forward(draft_input);
+            crate::speculative_dspark::apply_bigram_bias_maybe(
+                &mut dl,
+                prev_for_bigram,
+                bigram_bias,
+                bigram_strength,
+            )?;
+            draft_input = argmax(&dl);
+            draft_tokens.push(draft_input);
+            draft_logits_all.push(dl);
+
+            // Positions 1..k draft prev = draft_tokens[i-1]
+            for _ in 1..k {
+                prev_for_bigram = draft_input;
+                let mut dl = draft_model.forward(draft_input);
+                crate::speculative_dspark::apply_bigram_bias_maybe(
+                    &mut dl,
+                    prev_for_bigram,
+                    bigram_bias,
+                    bigram_strength,
+                )?;
+                draft_input = argmax(&dl);
+                draft_tokens.push(draft_input);
+                draft_logits_all.push(dl);
+            }
+            total_drafted += draft_tokens.len();
+
+            // --- Verify phase (vanilla と同じロジック) ---
+            logits = self.forward(next_token);
+
+            let mut num_accepted = 0;
+            let mut rejected = false;
+            for i in 0..draft_tokens.len() {
+                let p = softmax(&logits);
+                let q = softmax(&draft_logits_all[i]);
+                let x = draft_tokens[i] as usize;
+
+                let p_x = if x < p.len() { p[x] } else { 0.0 };
+                let q_x = if x < q.len() { q[x] } else { 1e-10 };
+                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+
+                let r = rng.next_f32();
+                if r < accept_prob {
+                    generated.push(draft_tokens[i]);
+                    tokens.push(draft_tokens[i]);
+                    total_accepted += 1;
+                    num_accepted += 1;
+                    logits = self.forward(draft_tokens[i]);
+                } else {
+                    let mut adjusted = vec![0.0f32; p.len()];
+                    let mut adj_sum = 0.0f32;
+                    for j in 0..p.len() {
+                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adj_sum += adjusted[j];
+                    }
+                    let resampled = if adj_sum > 0.0 {
+                        let inv = 1.0 / adj_sum;
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
+                        sample_from_probs(&adjusted, rng.next_f32())
+                    } else {
+                        sample_from_probs(&p, rng.next_f32())
+                    };
+                    if resampled != tokenizer.eos_id {
+                        generated.push(resampled);
+                        tokens.push(resampled);
+                        logits = self.forward(resampled);
+                    }
+                    rejected = true;
+                    break;
+                }
+            }
+
+            if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
+                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                if bonus != tokenizer.eos_id {
+                    generated.push(bonus);
+                    tokens.push(bonus);
+                    logits = self.forward(bonus);
+                }
+            }
+
+            let draft_keep = saved_draft_pos + 1 + num_accepted;
+            draft_model.kv_cache.rollback_to(draft_keep);
+            if let Some(&last) = tokens.last() {
+                draft_model.forward(last);
+            }
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        Ok(GenerateResult {
+            text: tokenizer.decode(&generated),
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+            spec_stats: Some(SpecStats {
+                draft_tokens: total_drafted,
+                accepted_tokens: total_accepted,
+                draft_layers: draft_model.config.num_layers,
+                spec_k,
+            }),
+        })
+    }
+
     /// Forward pass using ternary-quantized weights (no multiplications in projections).
     /// Must call `load_ternary()` before using this method.
     pub fn forward_ternary(&mut self, token_id: u32) -> Vec<f32> {
