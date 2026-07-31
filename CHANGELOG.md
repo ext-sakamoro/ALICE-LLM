@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 8 — `KimiK3Model::forward_with_layer_hook` +
+  `forward_capture_hidden` (K3 の 93 層 hook API)** (2026-08-01).
+  RadixArk/Kimi-K3-DSpark 吸収の Phase 8 として K3 model に hidden state
+  抽出 infrastructure を追加 (1) `KimiK3Model::forward_with_layer_hook<F:
+  FnMut(usize, &[f32])>` を新規追加、既存 `forward` を無改変に保つため
+  Approach A (duplicate) を採用 各 layer の post-FFN residual add 直後で
+  `hook(layer_idx, &x)` を呼ぶ K3 の AttnRes final output mix が最終 `x` を
+  要求するため hook は info-only (bool return なし、早期打切り不可) (2)
+  `KimiK3Model::forward_capture_hidden(token_id, layer_idx) -> (Vec<f32>,
+  Vec<f32>)` を `#[cfg(feature = "dspark")]` gate で追加 `layer_idx = None`
+  は最終層 (num_layers - 1)、範囲外なら最終層 fallback、`forward_with_layer_hook`
+  経由で target layer の hidden を clone Llama3Model 版と signature 統一
+  制約: K3 の `layer_caches` は `PagedKvCache` 不使用 (per-layer MLA/KDA
+  cache) のため `generate_speculative_dual` に K3 を draft として渡すには
+  `rollback_to` / `seq_len` 相当の trait 抽象が必要 (Phase 9+) 本 phase は
+  hidden capture infrastructure のみ提供 デフォルト lib test 558 pass 維持、
+  `cargo build --features dspark` compile pass、fmt / clippy 新規範囲 0 warn、
+  実 K3 動作検証は user が real weights (566GB) で実行 Phase 9 (DraftBackend
+  trait or wrapper design で K3 draft を generate_speculative_dual_dspark に
+  統合) は次 session
+
 - **DSpark Phase 7 — `DsparkLabelSample` + label collection method +
   `dspark_train_confidence_head` example + `--confidence-head` load path**
   (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の Phase 7 として Phase 6 の

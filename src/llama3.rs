@@ -9747,6 +9747,238 @@ impl<'a> KimiK3Model<'a> {
         self.weights.output.matvec(&x_norm, &mut logits);
         logits
     }
+
+    /// [`forward`](Self::forward) と同じ pipeline を実行しつつ、各 layer の
+    /// ffn residual add 直後で `hook(layer_idx, &x)` を呼ぶ K3 特有の
+    /// AttnRes final output mix が最終 `x` を要求するため hook で早期打切りは
+    /// できない (info-only) 早期打切りの bool return を持たない
+    ///
+    /// DSpark Phase 8: [`forward_capture_hidden`](Self::forward_capture_hidden) の
+    /// 基盤 method 将来的な per-layer 解析にも流用可能
+    ///
+    /// 実装 note: `forward` の body を完全 duplicate し、layer loop の trace 直前で
+    /// `hook(il, &x)` を挿入している 既存 `forward` を無改変に保つ意図的 duplication
+    /// (K3 forward は 200+ 行の複雑実装であり refactor リスクを避ける)
+    pub fn forward_with_layer_hook<F>(&mut self, token_id: u32, mut hook: F) -> Vec<f32>
+    where
+        F: FnMut(usize, &[f32]),
+    {
+        let vocab_size = self.config.vocab_size;
+        let hidden_dim = self.config.hidden_dim;
+        assert!(
+            (token_id as usize) < vocab_size,
+            "token_id {token_id} out of vocab range 0..{vocab_size}"
+        );
+        let row_start = token_id as usize;
+        let embed_row =
+            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
+                 (qtype {:?}, cols {}, rows {}). Ensure `cols % elements_per_block == 0` \
+                 (K3 hidden = 7168 = 28 × 256 = 224 × 32, block-aligned for all K3 quant \
+                 types). Phase X.4.c.3.3.b.2 upgrade.",
+                        self.weights.token_embd.qtype,
+                        self.weights.token_embd.cols,
+                        self.weights.token_embd.rows,
+                    )
+                });
+        let x_full = weight_ref_row_dequant(&embed_row);
+        let mut x = vec![0.0_f32; hidden_dim];
+        let take = hidden_dim.min(x_full.len());
+        x[..take].copy_from_slice(&x_full[..take]);
+
+        let mla_config = kimi_k3_extract_mla_config(&self.config).expect(
+            "KimiK3Model was constructed but MLA sub-config no longer extractable — \
+             invariant broken (should have failed at ::new)",
+        );
+
+        let trace = std::env::var("ALICE_K3_TRACE").ok().as_deref() == Some("1");
+        let layer_t0 = std::time::Instant::now();
+
+        for il in 0..self.config.num_layers {
+            let layer = &self.weights.layers[il];
+            let il_t0 = std::time::Instant::now();
+
+            let cur_attn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.attn_res_score,
+                self.config.norm_eps,
+            );
+            let banked = self.attn_res_state.is_checkpoint_layer(il);
+            if banked {
+                self.attn_res_state.bank(&x);
+            }
+
+            let attn_output: Vec<f32> = match (&mut self.layer_caches[il], &layer.attn) {
+                (KimiK3LayerCache::Mla(cache), KimiK3Attention::Mla(mla_attn)) => {
+                    kimi_k3_gated_mla_step(
+                        &cur_attn,
+                        &layer.attn_norm,
+                        &layer.attn_gate,
+                        &layer.attn_output,
+                        mla_attn,
+                        cache,
+                        &mla_config,
+                    )
+                }
+                (KimiK3LayerCache::Kda(head_caches), KimiK3Attention::Kda(kda_attn)) => {
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let head_dim = kd
+                        .kda_head_dim
+                        .expect("kda_head_dim missing from kimi_delta config");
+                    let num_kda_heads = kd.kda_num_heads.unwrap_or(self.config.num_heads);
+                    let g_min = kd.kda_gate_lower_bound.unwrap_or(-5.0);
+                    let alpha_rank = kda_attn.ssm_f_a.rows;
+                    kimi_k3_kda_layer_forward(
+                        &cur_attn,
+                        &layer.attn_norm,
+                        &layer.attn_output,
+                        kda_attn,
+                        head_caches,
+                        num_kda_heads,
+                        head_dim,
+                        alpha_rank,
+                        g_min,
+                        self.config.norm_eps,
+                    )
+                }
+                _ => panic!(
+                    "KimiK3Model layer {il}: cache/attn tag mismatch — invariant \
+                     broken (cache and weights.layers[{il}].attn must both be MLA or \
+                     both KDA, dispatched by `is_mla_layer` at construction and \
+                     tensor-load time)"
+                ),
+            };
+
+            if banked {
+                x.copy_from_slice(&attn_output);
+            } else {
+                for i in 0..hidden_dim {
+                    x[i] += attn_output[i];
+                }
+            }
+
+            let cur_ffn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.ffn_res_score,
+                self.config.norm_eps,
+            );
+
+            let ffn_output: Vec<f32> = match &layer.ffn {
+                KimiK3Ffn::Dense { gate, up, down } => kimi_k3_dense_ffn_forward(
+                    &cur_ffn,
+                    &layer.ffn_norm,
+                    gate,
+                    up,
+                    down,
+                    self.config.norm_eps,
+                ),
+                KimiK3Ffn::LatentMoe(moe) => {
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let top_k = kd.num_experts_per_tok.unwrap_or(16);
+                    let renormalize = kd.moe_renormalize.unwrap_or(true);
+                    kimi_k3_latent_moe_forward(
+                        &cur_ffn,
+                        &layer.ffn_norm,
+                        moe,
+                        top_k,
+                        renormalize,
+                        self.config.norm_eps,
+                    )
+                }
+            };
+
+            for i in 0..hidden_dim {
+                x[i] += ffn_output[i];
+            }
+
+            // Phase 8: layer hidden state hook (post-FFN residual)
+            hook(il, &x);
+
+            if trace {
+                let kind = if matches!(layer.attn, KimiK3Attention::Mla(_)) {
+                    "MLA"
+                } else {
+                    "KDA"
+                };
+                let ffn_kind = if matches!(layer.ffn, KimiK3Ffn::Dense { .. }) {
+                    "Dense"
+                } else {
+                    "MoE"
+                };
+                let ms = il_t0.elapsed().as_millis();
+                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
+                    self.config.num_layers
+                );
+            }
+        }
+
+        let x_after_final_mix = kimi_k3_res_mix(
+            &self.attn_res_state,
+            &x,
+            &self.weights.output_res_score,
+            self.config.norm_eps,
+        );
+
+        let mut x_norm = vec![0.0_f32; hidden_dim];
+        rms_norm(
+            &x_after_final_mix,
+            &self.weights.output_norm,
+            self.config.norm_eps,
+            &mut x_norm,
+        );
+
+        let mut logits = vec![0.0_f32; vocab_size];
+        self.weights.output.matvec(&x_norm, &mut logits);
+        logits
+    }
+
+    /// DSpark Phase 8: K3 forward + specified layer の hidden state を capture
+    ///
+    /// `layer_idx = None` は最終層 (num_layers - 1)、範囲外なら最終層 fallback
+    /// [`forward_with_layer_hook`](Self::forward_with_layer_hook) 経由で
+    /// target layer の post-FFN residual `x` (hidden_dim = 7168) を clone する
+    ///
+    /// 標準 Llama3Model の `forward_capture_hidden` と signature を揃えている
+    /// 実 K3 に対して DSpark [`PositionConfidenceHead`] を学習するには本 method の
+    /// 出力を [`generate_speculative_dual_collect_labels`] 相当の K3-draft 版に流し込む
+    /// (K3 draft の generate_speculative_dual 統合は Phase 9+、`layer_caches` の
+    /// rollback 相当 API が必要)
+    ///
+    /// [`PositionConfidenceHead`]: crate::speculative_dspark::PositionConfidenceHead
+    /// [`generate_speculative_dual_collect_labels`]: Llama3Model::generate_speculative_dual_collect_labels
+    #[cfg(feature = "dspark")]
+    pub fn forward_capture_hidden(
+        &mut self,
+        token_id: u32,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let num_layers = self.config.num_layers;
+        let target = layer_idx
+            .and_then(|n| if n < num_layers { Some(n) } else { None })
+            .unwrap_or(num_layers.saturating_sub(1));
+        let mut captured: Vec<f32> = Vec::new();
+        let logits = self.forward_with_layer_hook(token_id, |idx, hidden| {
+            if idx == target {
+                captured.clear();
+                captured.extend_from_slice(hidden);
+            }
+        });
+        (logits, captured)
+    }
 }
 
 /// Return the byte size of one element for a given GGUF quantization

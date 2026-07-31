@@ -14,7 +14,8 @@
 //! Phase 5 (完了): [`apply_bigram_bias_maybe`] helper + `dspark` feature 経由で `Llama3Model::generate_speculative_dual_dspark` を追加 (`examples/speculative_dspark_dual.rs` で A/B 比較)
 //! Phase 6 (完了): [`DsparkAdvancedConfig`] + `Llama3Model::forward_capture_hidden` (hidden state 抽出) + `generate_speculative_dual_dspark` に第 9 引数 `advanced: Option<&DsparkAdvancedConfig>` 追加、confidence-gated 早期打切り [`PositionConfidenceHead`] 統合完了 標準 arch (Llama/Mistral/Gemma2/Qwen2/Qwen3/Qwen3_5) 限定
 //! Phase 7 (完了): [`DsparkLabelSample`] + `Llama3Model::generate_speculative_dual_collect_labels` (accept/reject label collection) + `examples/dspark_train_confidence_head.rs` (SGD BCE 学習 + bincode save) + `examples/speculative_dspark_dual.rs` の `--confidence-head` オプション追加 (trained head load + threshold 0.3/0.5/0.7 の A/B/C 比較)
-//! Phase 8 (次 session): `KimiK3Model::forward_capture_hidden` 追加 (K3 の 93 層 hook API) or `DFlashParallelDraft` の llama3 統合検討
+//! Phase 8 (完了): `KimiK3Model::forward_with_layer_hook` + `KimiK3Model::forward_capture_hidden` を追加 (K3 の 93 層 KDA + Gated MLA + 1 dense 対応、hook は info-only で post-FFN residual `x` を expose、既存 `KimiK3Model::forward` 完全無改変の duplicate 実装で安全性優先) K3 を draft として `generate_speculative_dual` に統合するのは Phase 9+ (K3 の `layer_caches` は `PagedKvCache` 不使用で `rollback_to` / `seq_len` trait 抽象が必要)
+//! Phase 9 (次 session): K3 draft を `generate_speculative_dual_dspark` に統合する DraftBackend trait or wrapper 設計 + implementation
 //!
 //! ## Rank-K bigram bias 設計
 //!
