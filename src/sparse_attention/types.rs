@@ -24,6 +24,11 @@ pub enum SparseAttentionError {
     HeadDimMismatch,
     /// Empty input (`Tq == 0` or `Hkv == 0` or `topk == 0`).
     EmptyInput,
+    /// GPU backend initialization failed (only produced with the `gpu`
+    /// feature enabled).
+    GpuInitFailed { what: &'static str },
+    /// GPU backend runtime error (dispatch / readback / mapping).
+    GpuRuntimeError { what: &'static str },
 }
 
 impl core::fmt::Display for SparseAttentionError {
@@ -57,6 +62,8 @@ impl core::fmt::Display for SparseAttentionError {
             }
             Self::HeadDimMismatch => f.write_str("head dim mismatch across q/k_cache/v_cache"),
             Self::EmptyInput => f.write_str("empty input"),
+            Self::GpuInitFailed { what } => write!(f, "GPU init failed: {what}"),
+            Self::GpuRuntimeError { what } => write!(f, "GPU runtime error: {what}"),
         }
     }
 }
