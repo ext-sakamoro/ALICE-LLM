@@ -161,6 +161,13 @@ required-features = ["gguf", "hf-config"]
 name = "speculative_dspark_dual"
 required-features = ["dspark", "gguf"]
 
+# DSpark Phase 7: PositionConfidenceHead 学習 example
+# vanilla dual を走らせて (hidden, was_accepted) label を collect し
+# SGD BCE で PositionConfidenceHead を学習、bincode で save
+[[example]]
+name = "dspark_train_confidence_head"
+required-features = ["dspark", "dspark-serde", "gguf"]
+
 [[bin]]
 name = "alice-llm-server"
 path = "src/bin/server.rs"

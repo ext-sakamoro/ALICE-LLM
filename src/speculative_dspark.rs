@@ -13,7 +13,8 @@
 //! Phase 4 (完了): [`BigramBias`] trait + [`FullCountBigramBias`] (eager truncate 制約解消) + optional `dspark-serde` feature で serde derive
 //! Phase 5 (完了): [`apply_bigram_bias_maybe`] helper + `dspark` feature 経由で `Llama3Model::generate_speculative_dual_dspark` を追加 (`examples/speculative_dspark_dual.rs` で A/B 比較)
 //! Phase 6 (完了): [`DsparkAdvancedConfig`] + `Llama3Model::forward_capture_hidden` (hidden state 抽出) + `generate_speculative_dual_dspark` に第 9 引数 `advanced: Option<&DsparkAdvancedConfig>` 追加、confidence-gated 早期打切り [`PositionConfidenceHead`] 統合完了 標準 arch (Llama/Mistral/Gemma2/Qwen2/Qwen3/Qwen3_5) 限定
-//! Phase 7 (次 session): trained PositionConfidenceHead の学習 pipeline example (accept/reject label collection → train_step 反復) + `DFlashParallelDraft` の llama3 統合検討
+//! Phase 7 (完了): [`DsparkLabelSample`] + `Llama3Model::generate_speculative_dual_collect_labels` (accept/reject label collection) + `examples/dspark_train_confidence_head.rs` (SGD BCE 学習 + bincode save) + `examples/speculative_dspark_dual.rs` の `--confidence-head` オプション追加 (trained head load + threshold 0.3/0.5/0.7 の A/B/C 比較)
+//! Phase 8 (次 session): `KimiK3Model::forward_capture_hidden` 追加 (K3 の 93 層 hook API) or `DFlashParallelDraft` の llama3 統合検討
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -797,6 +798,25 @@ impl<'a> DsparkAdvancedConfig<'a> {
 
 /// bigram bias を条件付で logits に in-place 加算する DSpark llama3.rs 配線 (Phase 5) 用 helper
 ///
+/// [`Llama3Model::generate_speculative_dual_collect_labels`] (Phase 7) が collect する 1 サンプル
+///
+/// vanilla speculative dual pipeline を走らせて各 draft position の
+/// `(hidden_state, was_accepted)` を集める [`PositionConfidenceHead::train_step`] で
+/// SGD BCE 学習する input
+///
+/// **注**: verify で reject された position 以降は verify されないため label 非付与
+/// `bonus` は draft でなく main sample なので label 非付与
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone)]
+pub struct DsparkLabelSample {
+    /// 0..spec_k の draft position
+    pub position: u32,
+    /// draft model の hidden state (長さ = draft_model.config.hidden_dim)
+    pub hidden: Vec<f32>,
+    /// target model の verify で accept されたか (Leviathan sampling)
+    pub was_accepted: bool,
+}
+
 /// `bigram_bias = None` または `strength = 0.0` の場合は no-op で `Ok(())` を返す
 /// それ以外は `bigram_bias.apply(prev, logits, strength)` を呼び、error はそのまま伝播する
 ///
@@ -2259,5 +2279,67 @@ mod tests {
         let cfg2 = cfg;
         // cfg も cfg2 も使える (Copy semantics)
         assert!((cfg.confidence_threshold - cfg2.confidence_threshold).abs() < 1e-9);
+    }
+
+    // ---- DsparkLabelSample (Phase 7) tests ----
+
+    #[test]
+    fn dspark_label_sample_construction() {
+        let sample = super::DsparkLabelSample {
+            position: 3,
+            hidden: vec![0.1, 0.2, 0.3, 0.4],
+            was_accepted: true,
+        };
+        assert_eq!(sample.position, 3);
+        assert_eq!(sample.hidden.len(), 4);
+        assert!(sample.was_accepted);
+        // Clone test
+        let cloned = sample.clone();
+        assert_eq!(cloned.position, sample.position);
+        assert_eq!(cloned.hidden, sample.hidden);
+        assert_eq!(cloned.was_accepted, sample.was_accepted);
+    }
+
+    #[test]
+    fn dspark_label_sample_trains_confidence_head() {
+        // collect した labels で train_step を呼び、confidence が label 方向に動くか確認
+        let mut head = PositionConfidenceHead::new(4, 3).expect("valid");
+        let hidden = [1.0_f32, 1.0, 1.0];
+
+        // 全部 accepted な label 100 個で train
+        let samples: Vec<super::DsparkLabelSample> = (0..100)
+            .map(|_| super::DsparkLabelSample {
+                position: 0,
+                hidden: hidden.to_vec(),
+                was_accepted: true,
+            })
+            .collect();
+
+        let before = head.predict(0, &hidden).expect("valid");
+        for s in &samples {
+            head.train_step(s.position, &s.hidden, s.was_accepted, 0.1)
+                .expect("train_step");
+        }
+        let after = head.predict(0, &hidden).expect("valid");
+
+        assert!(
+            after > before + 0.2,
+            "predict should move toward 1.0 after training on accepted labels: before={before}, after={after}"
+        );
+    }
+
+    #[cfg(feature = "dspark-serde")]
+    #[test]
+    fn serde_roundtrip_dspark_label_sample() {
+        let sample = super::DsparkLabelSample {
+            position: 5,
+            hidden: vec![0.1, -0.2, 0.3, -0.4, 0.5],
+            was_accepted: false,
+        };
+        let encoded = bincode::serialize(&sample).expect("serialize");
+        let back: super::DsparkLabelSample = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(back.position, 5);
+        assert_eq!(back.hidden, sample.hidden);
+        assert!(!back.was_accepted);
     }
 }

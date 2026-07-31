@@ -55,6 +55,11 @@ fn main() {
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let spec_k: usize = parse_arg(&args, "--speculative-k").unwrap_or(4);
     let bigram_rank: u32 = parse_arg(&args, "--bigram-rank").unwrap_or(256);
+    let confidence_head_path: Option<&str> = args
+        .iter()
+        .position(|a| a == "--confidence-head")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
 
     println!("=== DSpark Phase 5: Speculative Dual with MarkovBigramBias ===");
     println!();
@@ -174,5 +179,76 @@ fn main() {
             println!("  Speedup vs baseline: {ratio:.2}x");
         }
         println!();
+    }
+
+    // --- DSpark + confidence-gated variants (Phase 7、trained head 指定時のみ) ---
+    // `dspark-serde` feature が有効なら trained PositionConfidenceHead を bincode で load して
+    // confidence_threshold 0.3/0.5/0.7 で追加 A/B/C 比較する trained head は
+    // `examples/dspark_train_confidence_head.rs` で事前学習する
+    #[cfg(feature = "dspark-serde")]
+    if let Some(head_path) = confidence_head_path {
+        use alice_llm::speculative_dspark::{DsparkAdvancedConfig, PositionConfidenceHead};
+        println!("=== Confidence-Gated variants (trained head loaded from {head_path}) ===");
+        let head_bytes = fs::read(head_path).expect("Failed to read confidence head");
+        let head: PositionConfidenceHead =
+            bincode::deserialize(&head_bytes).expect("Failed to deserialize confidence head");
+        println!(
+            "  loaded head: block_size={}, hidden_dim={}",
+            head.block_size(),
+            head.hidden_dim()
+        );
+        println!();
+
+        for threshold in [0.3_f32, 0.5, 0.7] {
+            println!(
+                "--- DSpark + confidence-gated (strength=0.5, threshold={threshold:.1}, K={spec_k}) ---"
+            );
+            let cfg = DsparkAdvancedConfig {
+                confidence_head: &head,
+                confidence_threshold: threshold,
+                hidden_capture_layer: None,
+            };
+            let result = main_model
+                .generate_speculative_dual_dspark(
+                    &mut draft_model,
+                    &tokenizer,
+                    &formatted,
+                    max_tokens,
+                    temperature,
+                    spec_k,
+                    Some(&bigram),
+                    0.5,
+                    Some(&cfg),
+                )
+                .expect("dspark generate (advanced)");
+            println!("{}", result.text);
+            println!(
+                "  {} tokens, {:.2} tok/s",
+                result.tokens_generated, result.tokens_per_sec
+            );
+            if let Some(stats) = &result.spec_stats {
+                let accept = if stats.draft_tokens > 0 {
+                    stats.accepted_tokens as f64 / stats.draft_tokens as f64 * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "  DSpark: {}/{} accepted ({:.1}%)",
+                    stats.accepted_tokens, stats.draft_tokens, accept
+                );
+            }
+            if baseline_tps > 0.0 {
+                let ratio = result.tokens_per_sec / baseline_tps;
+                println!("  Speedup vs baseline: {ratio:.2}x");
+            }
+            println!();
+        }
+    }
+
+    #[cfg(not(feature = "dspark-serde"))]
+    if confidence_head_path.is_some() {
+        eprintln!(
+            "warning: --confidence-head requires --features dspark-serde to load trained head; ignoring"
+        );
     }
 }

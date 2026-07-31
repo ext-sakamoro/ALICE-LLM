@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 7 — `DsparkLabelSample` + label collection method +
+  `dspark_train_confidence_head` example + `--confidence-head` load path**
+  (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の Phase 7 として Phase 6 の
+  `DsparkAdvancedConfig` を実運用可能にする training pipeline を追加
+  (1) `speculative_dspark::DsparkLabelSample { position, hidden, was_accepted }`
+  を新規追加、`dspark-serde` feature で serde derive (2) `Llama3Model::generate_speculative_dual_collect_labels`
+  を `#[cfg(feature = "dspark")]` gate で追加、vanilla speculative dual pipeline
+  と同じ sampling path で各 draft position の `(hidden, was_accepted)` を
+  collect (verify で reject された draft 以降と bonus は label 非付与)
+  戻り値 `Result<(GenerateResult, Vec<DsparkLabelSample>), DsparkError>`
+  (3) `examples/dspark_train_confidence_head.rs` 新規追加、label collect →
+  position 別 accept rate 統計 → `PositionConfidenceHead::train_step` で
+  epochs × samples SGD BCE 学習 → bincode で save (required-features =
+  `[dspark, dspark-serde, gguf]`) (4) `examples/speculative_dspark_dual.rs`
+  に `--confidence-head <path>` optional CLI arg 追加、指定時は bincode
+  load + threshold 0.3/0.5/0.7 の A/B/C confidence-gated variant 追加、
+  `dspark-serde` feature 無しなら warning + skip 3 追加 unit test (計 79
+  default / 84 with dspark-serde) 全 pass、default lib test 558 pass、
+  clippy pedantic+nursery 0 warn 新規範囲、fmt check pass Phase 8
+  (KimiK3Model::forward_capture_hidden or DFlashParallelDraft の llama3
+  統合検討) は次 session
+
 - **Sparse attention (KV-outer) module — Phase MSA.1 – MSA.4** (2026-07-31).
   Rust-from-scratch port of the algorithm described in MiniMax Sparse
   Attention (`MiniMax-AI/MSA`, MIT) and Fireworks AI's M3 KV-outer sparse
