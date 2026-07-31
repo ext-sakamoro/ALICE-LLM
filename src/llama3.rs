@@ -5115,10 +5115,7 @@ fn gqa_attention(
             // gqa_attention itself only reads the first `expected_q_len`
             // elements. Guard the adapter with the same slicing so we
             // don't fail the strict shape check inside the bridge.
-            if used_len > 0
-                && q_buf.len() >= expected_q_len
-                && attn_out.len() >= expected_q_len
-            {
+            if used_len > 0 && q_buf.len() >= expected_q_len && attn_out.len() >= expected_q_len {
                 let mut k_dense = Vec::with_capacity(used_len * expected_kv_dim);
                 let mut v_dense = Vec::with_capacity(used_len * expected_kv_dim);
                 for t in attn_start..seq_len {
@@ -5160,6 +5157,11 @@ fn gqa_attention(
                             1,
                             &cfg,
                         );
+                    // `ALICE_SPARSE_DEBUG=1` emits per-layer hit / reject
+                    // lines to stderr — useful when triaging why the hook
+                    // isn't activating for a given arch. Extoria-Jetson
+                    // Llama 3.2-1B smoke (2026-08-01) exercised both
+                    // branches.
                     match bridge_result {
                         Ok(out) => {
                             if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
