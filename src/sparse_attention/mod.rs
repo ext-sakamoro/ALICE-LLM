@@ -24,7 +24,11 @@
 //!                       combine (Phase MSA.3, not yet present).
 
 pub mod index;
+pub mod proxy;
+pub mod topk;
 pub mod types;
 
 pub use index::build_kvouter_index;
+pub use proxy::compute_proxy_block_max_scores;
+pub use topk::{sparse_topk_select, sparse_topk_select_batch};
 pub use types::{BlockTables, CuSeqlensQ, KvOuterIndex, SparseAttentionError, SparseSelection};
