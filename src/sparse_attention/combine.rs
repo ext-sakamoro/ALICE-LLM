@@ -13,6 +13,7 @@
 //! Queries with zero valid partials receive an all-zero output row.
 
 use super::forward::ForwardPartials;
+use super::simd;
 use super::types::{KvOuterIndex, SparseAttentionError};
 
 #[cfg(feature = "parallel")]
@@ -100,15 +101,15 @@ pub fn lse_combine(
                     let scale = (m_p - m_final).exp();
                     l_final += scale * l_p;
                     let o_off = p_idx * head_dim;
-                    for d in 0..head_dim {
-                        row[row_off + d] += scale * partials.o_partial[o_off + d];
-                    }
+                    simd::axpy(
+                        &mut row[row_off..row_off + head_dim],
+                        scale,
+                        &partials.o_partial[o_off..o_off + head_dim],
+                    );
                 }
                 if l_final > 0.0 {
                     let inv_l = 1.0 / l_final;
-                    for d in 0..head_dim {
-                        row[row_off + d] *= inv_l;
-                    }
+                    simd::scale_in_place(&mut row[row_off..row_off + head_dim], inv_l);
                 }
             }
         }

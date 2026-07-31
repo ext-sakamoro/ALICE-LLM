@@ -28,6 +28,7 @@ pub mod forward;
 pub mod index;
 pub mod proxy;
 pub mod scheduler;
+mod simd;
 pub mod topk;
 pub mod types;
 
