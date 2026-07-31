@@ -5133,13 +5133,29 @@ fn gqa_attention(
                     hkv: num_kv_heads,
                     head_dim,
                 };
-                if let Ok(out) = crate::sparse_attention::llama3_bridge::llama3_sparse_attention(
-                    q_buf, &kv_view, 1, &cfg,
-                ) {
-                    attn_out.copy_from_slice(&out);
-                    return;
+                let bridge_result =
+                    crate::sparse_attention::llama3_bridge::llama3_sparse_attention(
+                        q_buf, &kv_view, 1, &cfg,
+                    );
+                match bridge_result {
+                    Ok(out) => {
+                        if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
+                            eprintln!(
+                                "[sparse] hit L{layer_idx} pos={pos} used_len={used_len} topk={sparse_topk} hq={num_heads} hkv={num_kv_heads} d={head_dim}"
+                            );
+                        }
+                        attn_out.copy_from_slice(&out);
+                        return;
+                    }
+                    Err(e) => {
+                        if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
+                            eprintln!(
+                                "[sparse] REJECT L{layer_idx} pos={pos} used_len={used_len} err={e}"
+                            );
+                        }
+                        // Fall through to dense.
+                    }
                 }
-                // Adapter rejected (geometry mismatch) → fall through to dense.
             }
         }
     }
