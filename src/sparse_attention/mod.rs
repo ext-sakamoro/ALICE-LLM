@@ -28,6 +28,7 @@ pub mod forward;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod index;
+pub mod llama3_bridge;
 pub mod proxy;
 #[cfg(feature = "quant")]
 pub mod quant;
