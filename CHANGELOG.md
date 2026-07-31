@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 10 — KimiK3Model snapshot/rollback infrastructure +
+  `impl DraftBackend for KimiK3Model`** (2026-08-01).
+  RadixArk/Kimi-K3-DSpark 吸収の Phase 10 として K3 を speculative
+  decoding の draft として使用可能にする snapshot 基盤を追加 (1)
+  `KimiK3AttnResState` に `#[derive(Clone)]` 追加 (2)
+  `KimiK3MlaCache::rollback_to(pos)` (positional truncate、n_positions +
+  c_k/k_rope を pos 位置で切詰) (3) `KimiK3LayerCache` + `KimiK3MlaCache`
+  に `Clone` derive 追加 (4) `KimiK3ModelSnapshot { layer_caches,
+  attn_res_state, token_count }` 新規 pub struct (5) `KimiK3Model` に
+  field 追加: `token_count: usize` / `snapshot_ring:
+  VecDeque<KimiK3ModelSnapshot>` / `max_snapshot_ring` (default
+  `KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING = 8`) (6) pub method 追加:
+  `snapshot()` / `restore(snap)` / `seq_len()` / `rollback_to(pos)` /
+  `set_max_snapshot_ring(n)` / `snapshot_ring_len()` (test/dspark 用) /
+  `forward_with_snapshot(token_id)` (feature-gated) /
+  `forward_capture_hidden_with_snapshot(token_id, layer)` (feature-gated)
+  (7) 既存 `reset()` を拡張: token_count = 0 + snapshot_ring.clear() (8)
+  `#[cfg(feature = "dspark")] impl DraftBackend for KimiK3Model<'_>` を
+  追加、`forward` → `forward_with_snapshot`、`rollback_to` →
+  inherent method 経由で snapshot ring から restore snapshot は forward
+  直前に push、bound 超過なら最古 drop、`rollback_to(pos)` は distance
+  = token_count - pos ≤ ring.len() を assert (超過は panic) 10 追加
+  unit test (`phase10_new_initializes_dspark_fields` /
+  `phase10_snapshot_captures_state` / `phase10_restore_replaces_state` /
+  `phase10_reset_clears_dspark_state` /
+  `phase10_set_max_snapshot_ring_trims_oldest` /
+  `phase10_set_max_snapshot_ring_rejects_zero` /
+  `phase10_rollback_to_current_position_is_noop` /
+  `phase10_rollback_to_future_panics` /
+  `phase10_rollback_to_beyond_ring_capacity_panics` /
+  `phase10_rollback_within_ring_restores_snapshot`) 全 pass、default
+  lib test 568 pass (+10)、speculative_dspark 84 test (with
+  dspark-serde) unchanged、両 example compile pass、clippy pedantic+nursery
+  0 warn 新規範囲、fmt check pass **メモリコスト**: snapshot 1 個 K3
+  default で ~36MB (KDA recurrent state 支配)、ring=8 で ~290MB overhead
+  during draft phase Phase 11 (Track 5-4 実測、user 実行) は次 session
+
 - **DSpark Phase 9 — `DraftBackend` trait + `impl for Llama3Model` +
   method refactor to `&mut dyn DraftBackend`** (2026-08-01).
   RadixArk/Kimi-K3-DSpark 吸収の Phase 9 として draft model 抽象化 trait
