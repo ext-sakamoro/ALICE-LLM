@@ -10964,6 +10964,50 @@ impl<'a> Llama3Model<'a> {
         self.forward_with_layer_hook(token_id, |_layer_idx, _hidden| false)
     }
 
+    /// DSpark Phase 6 helper: forward + hidden state capture at specified layer
+    ///
+    /// `layer_idx = None` は最終層 (num_layers - 1)、`Some(n)` は layer n
+    /// 範囲外の場合は最終層 fallback (silent ではなく documented behavior)
+    ///
+    /// # Panics
+    /// 非標準 arch (Gemma3n / Gemma4 / DeepSeekV3 / KimiK3 / Hy3) では
+    /// `forward_with_layer_hook` が specialized path に short-circuit するため
+    /// hook が呼ばれない `unimplemented!` で fail fast する 標準 arch
+    /// (Llama / Mistral / Gemma2 / Qwen2 / Qwen3 / Qwen3_5) のみ動作する
+    #[cfg(feature = "dspark")]
+    pub fn forward_capture_hidden(
+        &mut self,
+        token_id: u32,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        match self.config.arch {
+            ModelArch::Gemma3n
+            | ModelArch::Gemma4
+            | ModelArch::DeepSeekV3
+            | ModelArch::KimiK3
+            | ModelArch::Hy3 => {
+                unimplemented!(
+                    "dspark forward_capture_hidden: arch {:?} uses specialized forward path that does not invoke layer hook",
+                    self.config.arch
+                );
+            }
+            _ => {}
+        }
+        let num_layers = self.config.num_layers;
+        let target = layer_idx
+            .and_then(|n| if n < num_layers { Some(n) } else { None })
+            .unwrap_or(num_layers.saturating_sub(1));
+        let mut captured: Vec<f32> = Vec::new();
+        let logits = self.forward_with_layer_hook(token_id, |idx, hidden| {
+            if idx == target {
+                captured.clear();
+                captured.extend_from_slice(hidden);
+            }
+            false
+        });
+        (logits, captured)
+    }
+
     /// External-signal-driven per-layer routing convenience API.
     ///
     /// Thin wrapper around [`forward_with_layer_hook`] that standardises the
@@ -13957,7 +14001,11 @@ impl<'a> Llama3Model<'a> {
     /// # Errors
     /// - [`crate::speculative_dspark::DsparkError::VocabSizeMismatch`]: bigram.vocab_size と
     ///   draft_model の vocab_size が不一致
-    /// - [`crate::speculative_dspark::DsparkError`]: bigram apply が返す任意のエラー
+    /// - [`crate::speculative_dspark::DsparkError::ConfidenceHeadBlockSizeMismatch`]:
+    ///   advanced 指定時、confidence_head.block_size < spec_k
+    /// - [`crate::speculative_dspark::DsparkError::HiddenDimMismatch`]:
+    ///   advanced 指定時、confidence_head.hidden_dim != draft_model.hidden_dim
+    /// - [`crate::speculative_dspark::DsparkError`]: bigram apply / confidence predict の任意のエラー
     #[cfg(feature = "dspark")]
     #[allow(clippy::too_many_arguments)]
     pub fn generate_speculative_dual_dspark(
@@ -13970,14 +14018,35 @@ impl<'a> Llama3Model<'a> {
         spec_k: usize,
         bigram_bias: Option<&dyn crate::speculative_dspark::BigramBias>,
         bigram_strength: f32,
+        advanced: Option<&crate::speculative_dspark::DsparkAdvancedConfig<'_>>,
     ) -> Result<GenerateResult, crate::speculative_dspark::DsparkError> {
-        // (0) precondition: bigram.vocab_size == draft_model.vocab_size
+        // (0a) precondition: bigram.vocab_size == draft_model.vocab_size
         if let Some(b) = bigram_bias {
             let draft_vocab = draft_model.config.vocab_size as u32;
             if b.vocab_size() != draft_vocab {
                 return Err(crate::speculative_dspark::DsparkError::VocabSizeMismatch {
                     expected: draft_vocab,
                     got: b.vocab_size(),
+                });
+            }
+        }
+        // (0b) precondition: confidence_head shape matches draft model
+        if let Some(cfg) = advanced {
+            let head = cfg.confidence_head;
+            let need_block = spec_k as u32;
+            if head.block_size() < need_block {
+                return Err(
+                    crate::speculative_dspark::DsparkError::ConfidenceHeadBlockSizeMismatch {
+                        expected: need_block,
+                        got: head.block_size(),
+                    },
+                );
+            }
+            let draft_hidden = draft_model.config.hidden_dim as u32;
+            if head.hidden_dim() != draft_hidden {
+                return Err(crate::speculative_dspark::DsparkError::HiddenDimMismatch {
+                    expected: draft_hidden,
+                    got: head.hidden_dim(),
                 });
             }
         }
@@ -14034,33 +14103,37 @@ impl<'a> Llama3Model<'a> {
             let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
             let mut draft_logits_all: Vec<Vec<f32>> = Vec::with_capacity(k);
             let mut draft_input = next_token;
-
-            // Position 0 draft prev = next_token
             let mut prev_for_bigram = next_token;
-            let mut dl = draft_model.forward(draft_input);
-            crate::speculative_dspark::apply_bigram_bias_maybe(
-                &mut dl,
-                prev_for_bigram,
-                bigram_bias,
-                bigram_strength,
-            )?;
-            draft_input = argmax(&dl);
-            draft_tokens.push(draft_input);
-            draft_logits_all.push(dl);
 
-            // Positions 1..k draft prev = draft_tokens[i-1]
-            for _ in 1..k {
-                prev_for_bigram = draft_input;
-                let mut dl = draft_model.forward(draft_input);
+            // Draft loop: advanced = Some で hidden state 抽出 + confidence-gated 早期打切り
+            // advanced = None は Phase 5 と bit-exact (forward + argmax + push)
+            for i in 0..k {
+                let (mut dl, hidden_opt) = if let Some(cfg) = advanced {
+                    let (l, h) =
+                        draft_model.forward_capture_hidden(draft_input, cfg.hidden_capture_layer);
+                    (l, Some(h))
+                } else {
+                    (draft_model.forward(draft_input), None)
+                };
                 crate::speculative_dspark::apply_bigram_bias_maybe(
                     &mut dl,
                     prev_for_bigram,
                     bigram_bias,
                     bigram_strength,
                 )?;
+                // confidence-gated 早期打切り (hidden 取得済みの時のみ)
+                if let (Some(cfg), Some(hidden)) = (advanced, hidden_opt.as_ref()) {
+                    let conf = cfg.confidence_head.predict(i as u32, hidden)?;
+                    if conf < cfg.confidence_threshold {
+                        // KV cache は saved_draft_pos + 1 + num_accepted で rollback されるため
+                        // 打切り位置の forward 分は verify 後の rollback で自動廃棄される
+                        break;
+                    }
+                }
                 draft_input = argmax(&dl);
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
+                prev_for_bigram = draft_input;
             }
             total_drafted += draft_tokens.len();
 
