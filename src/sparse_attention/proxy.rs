@@ -9,6 +9,9 @@
 
 use super::types::{BlockTables, CuSeqlensQ, SparseAttentionError};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -112,7 +115,12 @@ pub fn compute_proxy_block_max_scores(
         }
     }
 
-    for i in 0..tq {
+    // Per-query row = `hkv * msb` scores. Filling each row is independent, so
+    // parallelize by chunking `out` into rows and mapping in parallel under
+    // the `parallel` feature.
+    let row_stride = hkv * msb;
+
+    let fill_row = |i: usize, row: &mut [f32]| -> Result<(), SparseAttentionError> {
         let b = batch_of_tq[i];
         let lk = used_kv_lens
             .map(|u| u[b].max(0) as usize)
@@ -123,17 +131,13 @@ pub fn compute_proxy_block_max_scores(
             let q = &proxy_q[q_base..q_base + head_dim];
             for blk in 0..valid_slots {
                 let mut block_max = f32::NEG_INFINITY;
-                // Real KV positions in this block are clipped by used_kv_lens.
                 let block_start = blk * block_size;
                 let block_end = ((blk + 1) * block_size).min(lk);
                 if block_end <= block_start {
-                    // Block is entirely past the real KV length — skip.
                     continue;
                 }
                 for page_local in 0..pages_per_block {
                     let page_slot = blk * pages_per_block + page_local;
-                    // Sequence-space KV range covered by this physical page,
-                    // clipped against the sparse block and used_kv_lens.
                     let page_seq_start = blk * block_size + page_local * page_size;
                     let page_seq_end = page_seq_start + page_size;
                     let page_kv_start = block_start.max(page_seq_start);
@@ -154,7 +158,6 @@ pub fn compute_proxy_block_max_scores(
                         });
                     }
                     let base_page = page_id_u * page_stride + h * page_size * head_dim;
-                    // Positions inside the physical page that map to real KV.
                     let pos_start = page_kv_start - page_seq_start;
                     let pos_end = page_kv_end - page_seq_start;
                     for pos in pos_start..pos_end {
@@ -170,9 +173,19 @@ pub fn compute_proxy_block_max_scores(
                         }
                     }
                 }
-                out[(i * hkv + h) * msb + blk] = block_max;
+                row[h * msb + blk] = block_max;
             }
         }
+        Ok(())
+    };
+
+    #[cfg(feature = "parallel")]
+    out.par_chunks_mut(row_stride)
+        .enumerate()
+        .try_for_each(|(i, row)| fill_row(i, row))?;
+    #[cfg(not(feature = "parallel"))]
+    for (i, row) in out.chunks_mut(row_stride).enumerate() {
+        fill_row(i, row)?;
     }
 
     Ok(out)

@@ -15,6 +15,9 @@
 use super::forward::ForwardPartials;
 use super::types::{KvOuterIndex, SparseAttentionError};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -51,7 +54,13 @@ pub fn lse_combine(
 
     let mut out = vec![0.0f32; tq * hq * head_dim];
 
-    for i in 0..tq {
+    // Combine walks per-query rows (`i`) independently: each row writes into a
+    // disjoint `hq * head_dim` slice of `out`, so we parallelize over `i` by
+    // chunking the output buffer into `hq * head_dim`-sized rows.
+    let row_stride = hq * head_dim;
+
+    // Closure: fill a single output row `i`.
+    let fill_row = |i: usize, row: &mut [f32]| {
         for h in 0..hkv {
             for qh in 0..qhead {
                 let hq_abs = h * qhead + qh;
@@ -70,12 +79,12 @@ pub fn lse_combine(
                     }
                 }
                 if !m_final.is_finite() {
-                    // No valid partials → leave zero output.
+                    // No valid partials → leave zero output for this head lane.
                     continue;
                 }
                 // Second pass: accumulate l_final and unnormalized o_final.
                 let mut l_final = 0.0f32;
-                let out_off = (i * hq + hq_abs) * head_dim;
+                let row_off = hq_abs * head_dim;
                 for r in 0..topk {
                     let inv_local = idx.inv_of(h, i, r);
                     if inv_local < 0 {
@@ -92,17 +101,26 @@ pub fn lse_combine(
                     l_final += scale * l_p;
                     let o_off = p_idx * head_dim;
                     for d in 0..head_dim {
-                        out[out_off + d] += scale * partials.o_partial[o_off + d];
+                        row[row_off + d] += scale * partials.o_partial[o_off + d];
                     }
                 }
                 if l_final > 0.0 {
                     let inv_l = 1.0 / l_final;
                     for d in 0..head_dim {
-                        out[out_off + d] *= inv_l;
+                        row[row_off + d] *= inv_l;
                     }
                 }
             }
         }
+    };
+
+    #[cfg(feature = "parallel")]
+    out.par_chunks_mut(row_stride)
+        .enumerate()
+        .for_each(|(i, row)| fill_row(i, row));
+    #[cfg(not(feature = "parallel"))]
+    for (i, row) in out.chunks_mut(row_stride).enumerate() {
+        fill_row(i, row);
     }
 
     Ok(out)
