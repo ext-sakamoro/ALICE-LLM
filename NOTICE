@@ -1,0 +1,34 @@
+ALICE-LLM
+Copyright 2024-2026 Moroya Sakamoto
+
+Licensed under the AGPL-3.0-or-later; see LICENSE.
+
+
+Third-party algorithm references
+================================
+
+The `src/sparse_attention/` module is a Rust-from-scratch port of the
+algorithm and tensor contracts described in the following upstream projects.
+None of their source code is vendored or copied — only the mathematical
+formulation, the CSR inverse-index construction, the KV-outer scheduling
+strategy, and the LSE-combine identity are used. Any similarity in
+identifier naming (e.g. `kvouter_attention`, `build_kvouter_index`,
+`sparse_topk_select`) is intentional so that readers cross-checking against
+the upstream documentation can navigate this crate.
+
+  * MiniMax Sparse Attention (MSA)
+    Repository: https://github.com/MiniMax-AI/MSA
+    License:    MIT
+    Copyright:  MiniMax
+    Reference:  docs/MiniMaxSparseAttention.pdf (upstream repository)
+
+  * MiniMax kernels for M3 KV-outer sparse attention
+    Repository: https://github.com/fw-ai/minimax-kernels
+    License:    Apache License 2.0
+    Copyright:  Fireworks AI, Inc.
+    Reference:  docs/m3-sparse-attention.md (upstream repository)
+
+  * FlashAttention-4 (algorithm foundation for the persistent SM100 forward
+    referenced by fw-ai/minimax-kernels).
+    Repository: https://github.com/Dao-AILab/flash-attention
+    License:    BSD 3-Clause

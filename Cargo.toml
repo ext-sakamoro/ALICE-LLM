@@ -43,6 +43,9 @@ serde_json = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 
 [[example]]
+name = "sparse_attention_demo"
+
+[[example]]
 name = "elyza_gguf"
 required-features = ["gguf"]
 
