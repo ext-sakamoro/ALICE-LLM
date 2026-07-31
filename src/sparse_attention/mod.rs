@@ -29,6 +29,8 @@ pub mod forward;
 pub mod gpu;
 pub mod index;
 pub mod proxy;
+#[cfg(feature = "quant")]
+pub mod quant;
 pub mod scheduler;
 mod simd;
 pub mod topk;
