@@ -12,7 +12,8 @@
 //! Phase 3 (完了): [`DFlashParallelDraft`] 外部 draft callback + [`DraftPosition`] / [`DraftBlock`] I/O 型
 //! Phase 4 (完了): [`BigramBias`] trait + [`FullCountBigramBias`] (eager truncate 制約解消) + optional `dspark-serde` feature で serde derive
 //! Phase 5 (完了): [`apply_bigram_bias_maybe`] helper + `dspark` feature 経由で `Llama3Model::generate_speculative_dual_dspark` を追加 (`examples/speculative_dspark_dual.rs` で A/B 比較)
-//! Phase 6 (次 session): `PositionConfidenceHead` / `DFlashParallelDraft` の llama3 統合 (hidden state exposure が必要、深い改修)
+//! Phase 6 (完了): [`DsparkAdvancedConfig`] + `Llama3Model::forward_capture_hidden` (hidden state 抽出) + `generate_speculative_dual_dspark` に第 9 引数 `advanced: Option<&DsparkAdvancedConfig>` 追加、confidence-gated 早期打切り [`PositionConfidenceHead`] 統合完了 標準 arch (Llama/Mistral/Gemma2/Qwen2/Qwen3/Qwen3_5) 限定
+//! Phase 7 (次 session): trained PositionConfidenceHead の学習 pipeline example (accept/reject label collection → train_step 反復) + `DFlashParallelDraft` の llama3 統合検討
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -748,6 +749,50 @@ fn argmax_finite(logits: &[f32]) -> Result<u32, DsparkError> {
         }
     }
     best_idx.ok_or(DsparkError::DraftLogitsAllNonFinite)
+}
+
+/// Phase 6 拡張 config `Llama3Model::generate_speculative_dual_dspark` の第 9 引数
+///
+/// `advanced = None` の場合は Phase 5 と bit-exact 同一動作
+/// `advanced = Some(cfg)` の場合は draft position ごとに hidden state を抽出し、
+/// `PositionConfidenceHead::predict` で confidence を算出、`confidence < confidence_threshold`
+/// なら draft loop を早期打切りして target verify 計算を省略する
+///
+/// 実 K3 accept length 実測には trained `PositionConfidenceHead` が必要 (accept/reject
+/// label collection example が Phase 7 相当) 現状は zero-init head で全 position が
+/// confidence = 0.5 になるため、threshold = 0.5 未満なら打切りなし、0.5 以上なら全打切りとなる
+// serde derive は付けない — reference field を持つため serialize 不能
+// (weight を配布したい場合は confidence_head 単体を serialize する)
+#[derive(Debug, Clone, Copy)]
+pub struct DsparkAdvancedConfig<'a> {
+    /// draft position ごとの confidence 算出に使う位置別 sigmoid head
+    ///
+    /// `block_size >= spec_k` を満たす必要がある (method entry で検証)
+    /// `hidden_dim` は `draft_model.config.hidden_dim` と一致 (method entry で検証)
+    pub confidence_head: &'a PositionConfidenceHead,
+    /// confidence がこの値未満なら draft 早期打切り
+    ///
+    /// `0.0` = 打切りなし (Phase 5 と同じ behavior)
+    /// `1.0` = 全 draft 打切り (spec_k = 0 相当、target のみで生成)
+    /// 通常は `0.3` 〜 `0.7` の範囲
+    pub confidence_threshold: f32,
+    /// draft model からどの layer の hidden state を抽出するか
+    ///
+    /// `None` = 最終層 (num_layers - 1)
+    /// `Some(n)` = layer n の hidden state (RMSNorm 適用後)
+    /// 範囲外の場合は最終層 fallback
+    pub hidden_capture_layer: Option<usize>,
+}
+
+impl<'a> DsparkAdvancedConfig<'a> {
+    /// 標準構成 confidence_threshold=0.5, hidden_capture_layer=None (最終層)
+    pub fn new(confidence_head: &'a PositionConfidenceHead) -> Self {
+        Self {
+            confidence_head,
+            confidence_threshold: 0.5,
+            hidden_capture_layer: None,
+        }
+    }
 }
 
 /// bigram bias を条件付で logits に in-place 加算する DSpark llama3.rs 配線 (Phase 5) 用 helper
@@ -2180,5 +2225,39 @@ mod tests {
                 got: 5,
             }
         );
+    }
+
+    // ---- DsparkAdvancedConfig (Phase 6) tests ----
+
+    #[test]
+    fn dspark_advanced_config_new_defaults() {
+        let head = PositionConfidenceHead::new(7, 4).expect("valid");
+        let cfg = super::DsparkAdvancedConfig::new(&head);
+        assert_eq!(cfg.confidence_head.block_size(), 7);
+        assert_eq!(cfg.confidence_head.hidden_dim(), 4);
+        assert!((cfg.confidence_threshold - 0.5).abs() < 1e-9);
+        assert!(cfg.hidden_capture_layer.is_none());
+    }
+
+    #[test]
+    fn dspark_advanced_config_custom_fields() {
+        let head = PositionConfidenceHead::new(3, 8).expect("valid");
+        let cfg = super::DsparkAdvancedConfig {
+            confidence_head: &head,
+            confidence_threshold: 0.7,
+            hidden_capture_layer: Some(5),
+        };
+        assert!((cfg.confidence_threshold - 0.7).abs() < 1e-9);
+        assert_eq!(cfg.hidden_capture_layer, Some(5));
+    }
+
+    #[test]
+    fn dspark_advanced_config_is_copy() {
+        // DsparkAdvancedConfig は Copy trait を持つので clone せず値渡しできる
+        let head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let cfg = super::DsparkAdvancedConfig::new(&head);
+        let cfg2 = cfg;
+        // cfg も cfg2 も使える (Copy semantics)
+        assert!((cfg.confidence_threshold - cfg2.confidence_threshold).abs() < 1e-9);
     }
 }

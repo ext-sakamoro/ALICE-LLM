@@ -135,6 +135,9 @@ fn main() {
     println!();
 
     // --- DSpark variants ---
+    // Phase 6 拡張: 第 9 引数 `advanced` に None を渡すと Phase 5 と bit-exact 同一動作
+    // trained PositionConfidenceHead を使った confidence-gated 早期打切りは Phase 7+ で
+    // accept/reject label collection example を追加後に demonstrable になる
     for strength in [0.1_f32, 0.5, 1.0] {
         println!("--- DSpark (bigram_strength={strength:.1}, K={spec_k}) ---");
         let result = main_model
@@ -147,6 +150,7 @@ fn main() {
                 spec_k,
                 Some(&bigram),
                 strength,
+                None,
             )
             .expect("dspark generate");
         println!("{}", result.text);

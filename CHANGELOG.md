@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 6 — `DsparkAdvancedConfig` + `forward_capture_hidden` +
+  `PositionConfidenceHead` 統合 with confidence-gated 早期打切り**
+  (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の Phase 6 として (1)
+  `Llama3Model::forward_capture_hidden(token_id, layer_idx) -> (Vec<f32>, Vec<f32>)`
+  を `#[cfg(feature = "dspark")]` gate で新規追加 既存
+  `forward_with_layer_hook` を経由して target layer の hidden state を
+  clone、`layer_idx = None` は最終層 (num_layers - 1)、非標準 arch
+  (Gemma3n/Gemma4/DeepSeekV3/KimiK3/Hy3) は specialized forward path が
+  hook を bypass するため `unimplemented!` で fail fast (2)
+  `speculative_dspark::DsparkAdvancedConfig<'a>` 新規追加、`confidence_head`
+  + `confidence_threshold` + `hidden_capture_layer` の 3 field、reference
+  field を持つため serde derive は付けない (weight 単体で serialize する
+  ことは可能) (3) `Llama3Model::generate_speculative_dual_dspark` に第 9
+  引数 `advanced: Option<&DsparkAdvancedConfig>` 追加、`None` は Phase 5
+  と bit-exact 同一動作、`Some(cfg)` で draft position ごとに hidden state
+  抽出 + `PositionConfidenceHead::predict` で confidence 算出 +
+  `confidence < threshold` で draft 早期打切り (KV cache は既存 rollback
+  で自動整合) (4) method entry で cfg.confidence_head.block_size >=
+  spec_k + hidden_dim 一致を検証、失敗時は `ConfidenceHeadBlockSizeMismatch`
+  / `HiddenDimMismatch` を返す (5) `examples/speculative_dspark_dual.rs`
+  を Phase 5 の 3 呼出 sites に `None` を追加して bit-exact 動作維持、
+  Phase 7+ の trained head 追加を promise API: `DsparkAdvancedConfig::{new,
+  confidence_head, confidence_threshold, hidden_capture_layer}` +
+  `Llama3Model::forward_capture_hidden` 3 追加 unit test (計 77 default /
+  81 with dspark-serde) 全 pass、clippy pedantic+nursery 0 warn 新規範囲、
+  fmt check pass、default lib test 515 pass (+3) Phase 7 (trained
+  PositionConfidenceHead の accept/reject label collection example +
+  DFlashParallelDraft の llama3 統合検討) は次 session
+
 - **DSpark Phase 5 — llama3 `generate_speculative_dual_dspark` +
   `dspark` feature + `apply_bigram_bias_maybe` helper +
   `examples/speculative_dspark_dual.rs`** (2026-07-31). RadixArk/Kimi-K3-DSpark
