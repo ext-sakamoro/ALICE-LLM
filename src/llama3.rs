@@ -5108,52 +5108,76 @@ fn gqa_attention(
             .and_then(|s| s.parse::<usize>().ok())
         {
             let used_len = seq_len - attn_start;
-            if used_len > 0 {
-                let kv_dim = num_kv_heads * head_dim;
-                let mut k_dense = Vec::with_capacity(used_len * kv_dim);
-                let mut v_dense = Vec::with_capacity(used_len * kv_dim);
+            let expected_q_len = num_heads * head_dim;
+            let expected_kv_dim = num_kv_heads * head_dim;
+            // Callers (e.g. speculative decode) may pass a `q_buf` /
+            // `attn_out` that is larger than one Q-head-set worth of data;
+            // gqa_attention itself only reads the first `expected_q_len`
+            // elements. Guard the adapter with the same slicing so we
+            // don't fail the strict shape check inside the bridge.
+            if used_len > 0
+                && q_buf.len() >= expected_q_len
+                && attn_out.len() >= expected_q_len
+            {
+                let mut k_dense = Vec::with_capacity(used_len * expected_kv_dim);
+                let mut v_dense = Vec::with_capacity(used_len * expected_kv_dim);
                 for t in attn_start..seq_len {
-                    k_dense.extend_from_slice(kv_cache.key_at(layer_idx, t));
-                    v_dense.extend_from_slice(kv_cache.value_at(layer_idx, t));
-                }
-                let cfg = crate::sparse_attention::llama3_bridge::BridgeConfig {
-                    hq: num_heads,
-                    hkv: num_kv_heads,
-                    head_dim,
-                    block_size: 64,
-                    page_size: 64,
-                    softmax_scale: inv_sqrt_d,
-                    causal: false,
-                    topk: sparse_topk,
-                };
-                let kv_view = crate::sparse_attention::llama3_bridge::DenseKvCacheView {
-                    k: &k_dense,
-                    v: &v_dense,
-                    seq_len: used_len,
-                    hkv: num_kv_heads,
-                    head_dim,
-                };
-                let bridge_result =
-                    crate::sparse_attention::llama3_bridge::llama3_sparse_attention(
-                        q_buf, &kv_view, 1, &cfg,
-                    );
-                match bridge_result {
-                    Ok(out) => {
-                        if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
-                            eprintln!(
-                                "[sparse] hit L{layer_idx} pos={pos} used_len={used_len} topk={sparse_topk} hq={num_heads} hkv={num_kv_heads} d={head_dim}"
-                            );
-                        }
-                        attn_out.copy_from_slice(&out);
-                        return;
+                    let k_row = kv_cache.key_at(layer_idx, t);
+                    let v_row = kv_cache.value_at(layer_idx, t);
+                    // Similar guard for KvCache slot width: some archs (Gemma 4
+                    // SWA) allocate a wider row than the layer's actual
+                    // kv_dim; take only the first expected_kv_dim elements.
+                    let take = expected_kv_dim.min(k_row.len());
+                    if take != expected_kv_dim {
+                        // Row too short — bail out and let dense path handle it.
+                        break;
                     }
-                    Err(e) => {
-                        if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
-                            eprintln!(
-                                "[sparse] REJECT L{layer_idx} pos={pos} used_len={used_len} err={e}"
-                            );
+                    k_dense.extend_from_slice(&k_row[..expected_kv_dim]);
+                    v_dense.extend_from_slice(&v_row[..expected_kv_dim]);
+                }
+                if k_dense.len() == used_len * expected_kv_dim {
+                    let cfg = crate::sparse_attention::llama3_bridge::BridgeConfig {
+                        hq: num_heads,
+                        hkv: num_kv_heads,
+                        head_dim,
+                        block_size: 64,
+                        page_size: 64,
+                        softmax_scale: inv_sqrt_d,
+                        causal: false,
+                        topk: sparse_topk,
+                    };
+                    let kv_view = crate::sparse_attention::llama3_bridge::DenseKvCacheView {
+                        k: &k_dense,
+                        v: &v_dense,
+                        seq_len: used_len,
+                        hkv: num_kv_heads,
+                        head_dim,
+                    };
+                    let bridge_result =
+                        crate::sparse_attention::llama3_bridge::llama3_sparse_attention(
+                            &q_buf[..expected_q_len],
+                            &kv_view,
+                            1,
+                            &cfg,
+                        );
+                    match bridge_result {
+                        Ok(out) => {
+                            if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
+                                eprintln!(
+                                    "[sparse] hit L{layer_idx} pos={pos} used_len={used_len} topk={sparse_topk} hq={num_heads} hkv={num_kv_heads} d={head_dim}"
+                                );
+                            }
+                            attn_out[..expected_q_len].copy_from_slice(&out);
+                            return;
                         }
-                        // Fall through to dense.
+                        Err(e) => {
+                            if std::env::var_os("ALICE_SPARSE_DEBUG").is_some() {
+                                eprintln!(
+                                    "[sparse] REJECT L{layer_idx} pos={pos} used_len={used_len} err={e}"
+                                );
+                            }
+                            // Fall through to dense.
+                        }
                     }
                 }
             }
