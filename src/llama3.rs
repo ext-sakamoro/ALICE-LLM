@@ -14333,7 +14333,7 @@ impl<'a> Llama3Model<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_speculative_dual_dspark(
         &mut self,
-        draft_model: &mut Llama3Model,
+        draft_model: &mut dyn crate::speculative_dspark::DraftBackend,
         tokenizer: &GgufTokenizer,
         prompt: &str,
         max_new_tokens: usize,
@@ -14345,7 +14345,7 @@ impl<'a> Llama3Model<'a> {
     ) -> Result<GenerateResult, crate::speculative_dspark::DsparkError> {
         // (0a) precondition: bigram.vocab_size == draft_model.vocab_size
         if let Some(b) = bigram_bias {
-            let draft_vocab = draft_model.config.vocab_size as u32;
+            let draft_vocab = draft_model.vocab_size();
             if b.vocab_size() != draft_vocab {
                 return Err(crate::speculative_dspark::DsparkError::VocabSizeMismatch {
                     expected: draft_vocab,
@@ -14365,7 +14365,7 @@ impl<'a> Llama3Model<'a> {
                     },
                 );
             }
-            let draft_hidden = draft_model.config.hidden_dim as u32;
+            let draft_hidden = draft_model.hidden_dim();
             if head.hidden_dim() != draft_hidden {
                 return Err(crate::speculative_dspark::DsparkError::HiddenDimMismatch {
                     expected: draft_hidden,
@@ -14421,7 +14421,7 @@ impl<'a> Llama3Model<'a> {
 
             let k = spec_k.min(remaining);
 
-            let saved_draft_pos = draft_model.kv_cache.seq_len();
+            let saved_draft_pos = draft_model.seq_len();
             let _saved_main_pos = self.kv_cache.seq_len();
             let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
             let mut draft_logits_all: Vec<Vec<f32>> = Vec::with_capacity(k);
@@ -14517,7 +14517,7 @@ impl<'a> Llama3Model<'a> {
             }
 
             let draft_keep = saved_draft_pos + 1 + num_accepted;
-            draft_model.kv_cache.rollback_to(draft_keep);
+            draft_model.rollback_to(draft_keep);
             if let Some(&last) = tokens.last() {
                 draft_model.forward(last);
             }
@@ -14543,7 +14543,7 @@ impl<'a> Llama3Model<'a> {
             spec_stats: Some(SpecStats {
                 draft_tokens: total_drafted,
                 accepted_tokens: total_accepted,
-                draft_layers: draft_model.config.num_layers,
+                draft_layers: draft_model.num_layers() as usize,
                 spec_k,
             }),
         })
@@ -14566,7 +14566,7 @@ impl<'a> Llama3Model<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_speculative_dual_collect_labels(
         &mut self,
-        draft_model: &mut Llama3Model,
+        draft_model: &mut dyn crate::speculative_dspark::DraftBackend,
         tokenizer: &GgufTokenizer,
         prompt: &str,
         max_new_tokens: usize,
@@ -14626,7 +14626,7 @@ impl<'a> Llama3Model<'a> {
 
             let k = spec_k.min(remaining);
 
-            let saved_draft_pos = draft_model.kv_cache.seq_len();
+            let saved_draft_pos = draft_model.seq_len();
             let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
             let mut draft_logits_all: Vec<Vec<f32>> = Vec::with_capacity(k);
             let mut draft_hiddens: Vec<Vec<f32>> = Vec::with_capacity(k);
@@ -14706,7 +14706,7 @@ impl<'a> Llama3Model<'a> {
             }
 
             let draft_keep = saved_draft_pos + 1 + num_accepted;
-            draft_model.kv_cache.rollback_to(draft_keep);
+            draft_model.rollback_to(draft_keep);
             if let Some(&last) = tokens.last() {
                 draft_model.forward(last);
             }
@@ -14732,7 +14732,7 @@ impl<'a> Llama3Model<'a> {
             spec_stats: Some(SpecStats {
                 draft_tokens: total_drafted,
                 accepted_tokens: total_accepted,
-                draft_layers: draft_model.config.num_layers,
+                draft_layers: draft_model.num_layers() as usize,
                 spec_k,
             }),
         };
@@ -15759,6 +15759,47 @@ impl<'a> Llama3Model<'a> {
             tokens_per_sec: tok_per_sec,
             spec_stats: None,
         })
+    }
+}
+
+// ─── DSpark Phase 9: DraftBackend trait impl for Llama3Model ─────────────────
+
+#[cfg(feature = "dspark")]
+impl crate::speculative_dspark::DraftBackend for Llama3Model<'_> {
+    fn forward(&mut self, token_id: crate::speculative_dspark::TokenId) -> Vec<f32> {
+        Self::forward(self, token_id)
+    }
+
+    fn forward_capture_hidden(
+        &mut self,
+        token_id: crate::speculative_dspark::TokenId,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        Self::forward_capture_hidden(self, token_id, layer_idx)
+    }
+
+    fn seq_len(&self) -> usize {
+        self.kv_seq_len()
+    }
+
+    fn rollback_to(&mut self, pos: usize) {
+        self.kv_rollback_to(pos);
+    }
+
+    fn clear_cache(&mut self) {
+        Self::clear_cache(self);
+    }
+
+    fn vocab_size(&self) -> u32 {
+        self.config.vocab_size as u32
+    }
+
+    fn hidden_dim(&self) -> u32 {
+        self.config.hidden_dim as u32
+    }
+
+    fn num_layers(&self) -> u32 {
+        self.config.num_layers as u32
     }
 }
 

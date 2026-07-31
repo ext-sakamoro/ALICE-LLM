@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 9 — `DraftBackend` trait + `impl for Llama3Model` +
+  method refactor to `&mut dyn DraftBackend`** (2026-08-01).
+  RadixArk/Kimi-K3-DSpark 吸収の Phase 9 として draft model 抽象化 trait
+  を導入 (1) `speculative_dspark::DraftBackend` trait 新規追加、9 method:
+  `forward(token_id)` / `forward_capture_hidden(token_id, layer)` /
+  `seq_len()` / `rollback_to(pos)` / `clear_cache()` / `vocab_size()` /
+  `hidden_dim()` / `num_layers()` 2 associated type なし、`#[cfg(feature =
+  "dspark")]` gate (2) `impl DraftBackend for Llama3Model<'_>` 追加、既存
+  `kv_seq_len` / `kv_rollback_to` / `clear_cache` / `forward_capture_hidden`
+  / `forward` / `config.{vocab_size, hidden_dim, num_layers}` の thin
+  wrapper (3) `Llama3Model::generate_speculative_dual_dspark` および
+  `generate_speculative_dual_collect_labels` の draft 引数を `&mut Llama3Model`
+  → `&mut dyn DraftBackend` に refactor 内部で
+  `draft_model.config.vocab_size` → `.vocab_size()` 等 trait method 経由に
+  変更、既存 example (`speculative_dspark_dual` / `dspark_train_confidence_head`)
+  は Rust 型推論で `&mut draft_model` を `&mut dyn DraftBackend` に無改修
+  coerce (4) `KimiK3Model` の impl は Phase 10 (KDA layer の recurrent
+  state snapshot 実装が blocker、詳細設計 memo は `reference_kimi_k3_dspark_speculative.md`
+  §4c) デフォルト lib test 558 pass 維持、speculative_dspark 84 test (with
+  dspark-serde) pass、両 example compile pass、clippy pedantic+nursery 0
+  warn 新規範囲、fmt check pass Phase 10 (KDA snapshot 実装 + `impl DraftBackend
+  for KimiK3Model`) は次 session
+
 - **DSpark Phase 8 — `KimiK3Model::forward_with_layer_hook` +
   `forward_capture_hidden` (K3 の 93 層 hook API)** (2026-08-01).
   RadixArk/Kimi-K3-DSpark 吸収の Phase 8 として K3 model に hidden state

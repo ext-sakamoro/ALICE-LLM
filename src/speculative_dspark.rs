@@ -15,7 +15,8 @@
 //! Phase 6 (完了): [`DsparkAdvancedConfig`] + `Llama3Model::forward_capture_hidden` (hidden state 抽出) + `generate_speculative_dual_dspark` に第 9 引数 `advanced: Option<&DsparkAdvancedConfig>` 追加、confidence-gated 早期打切り [`PositionConfidenceHead`] 統合完了 標準 arch (Llama/Mistral/Gemma2/Qwen2/Qwen3/Qwen3_5) 限定
 //! Phase 7 (完了): [`DsparkLabelSample`] + `Llama3Model::generate_speculative_dual_collect_labels` (accept/reject label collection) + `examples/dspark_train_confidence_head.rs` (SGD BCE 学習 + bincode save) + `examples/speculative_dspark_dual.rs` の `--confidence-head` オプション追加 (trained head load + threshold 0.3/0.5/0.7 の A/B/C 比較)
 //! Phase 8 (完了): `KimiK3Model::forward_with_layer_hook` + `KimiK3Model::forward_capture_hidden` を追加 (K3 の 93 層 KDA + Gated MLA + 1 dense 対応、hook は info-only で post-FFN residual `x` を expose、既存 `KimiK3Model::forward` 完全無改変の duplicate 実装で安全性優先) K3 を draft として `generate_speculative_dual` に統合するのは Phase 9+ (K3 の `layer_caches` は `PagedKvCache` 不使用で `rollback_to` / `seq_len` trait 抽象が必要)
-//! Phase 9 (次 session): K3 draft を `generate_speculative_dual_dspark` に統合する DraftBackend trait or wrapper 設計 + implementation
+//! Phase 9 (完了): [`DraftBackend`] trait 新規追加 (9 method で draft model 抽象化)、`impl DraftBackend for Llama3Model` + `Llama3Model::generate_speculative_dual_dspark` / `generate_speculative_dual_collect_labels` の draft 引数を `&mut dyn DraftBackend` に refactor (既存 example は Rust 型推論で無改修 coerce)、`KimiK3Model` の impl は Phase 10 (KDA snapshot 依存)
+//! Phase 10 (次 session): `KimiDeltaHeadCache::snapshot()/restore()` + `KimiK3MlaCache::rollback_to()` + `KimiK3AttnResState::snapshot()/restore()` + `impl DraftBackend for KimiK3Model` で K3 を draft として使用可能に (詳細設計は `memory/reference_kimi_k3_dspark_speculative.md` §4c)
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -799,6 +800,49 @@ impl<'a> DsparkAdvancedConfig<'a> {
 
 /// bigram bias を条件付で logits に in-place 加算する DSpark llama3.rs 配線 (Phase 5) 用 helper
 ///
+/// Phase 9: draft model 抽象 trait
+///
+/// [`Llama3Model::generate_speculative_dual_dspark`] と `generate_speculative_dual_collect_labels`
+/// の draft 引数を型消去して、将来的な K3 / DeepSeek / Hy3 draft も同じ pipeline で
+/// 使えるようにする trait 現状の impl は `Llama3Model` のみ (Phase 10 で K3 の KDA
+/// snapshot 実装後に `KimiK3Model` も対応予定)
+///
+/// **KDA snapshot 問題**: KimiK3Model の KDA layer は recurrent state (`S_t = f(S_{t-1}, ...)`)
+/// で positional cache を持たないため、`rollback_to` は state snapshot save/restore が
+/// 必要 これが Phase 10 の主要作業
+#[cfg(feature = "dspark")]
+pub trait DraftBackend {
+    /// 1 token forward、logits (長さ = vocab_size) を返す
+    fn forward(&mut self, token_id: TokenId) -> Vec<f32>;
+
+    /// forward + specified layer の hidden state を capture して返す
+    ///
+    /// `layer_idx = None` は最終層 (num_layers - 1)、範囲外は最終層 fallback
+    fn forward_capture_hidden(
+        &mut self,
+        token_id: TokenId,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>);
+
+    /// 現在の KV cache 内 token 数 (最後の `clear_cache` / `rollback_to` 以降に append された数)
+    fn seq_len(&self) -> usize;
+
+    /// KV cache を指定位置まで rollback する speculative verify で reject された draft を破棄する
+    fn rollback_to(&mut self, pos: usize);
+
+    /// KV cache を全部クリアする (`rollback_to(0)` と等価だが reset 意図を明示)
+    fn clear_cache(&mut self);
+
+    /// vocab size
+    fn vocab_size(&self) -> u32;
+
+    /// hidden dim
+    fn hidden_dim(&self) -> u32;
+
+    /// draft model の layer 数 (spec_stats.draft_layers に転記)
+    fn num_layers(&self) -> u32;
+}
+
 /// [`Llama3Model::generate_speculative_dual_collect_labels`] (Phase 7) が collect する 1 サンプル
 ///
 /// vanilla speculative dual pipeline を走らせて各 draft position の
