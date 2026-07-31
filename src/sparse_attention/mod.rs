@@ -23,12 +23,18 @@
 //!                       (partial output + online softmax), and LSE
 //!                       combine (Phase MSA.3, not yet present).
 
+pub mod combine;
+pub mod forward;
 pub mod index;
 pub mod proxy;
+pub mod scheduler;
 pub mod topk;
 pub mod types;
 
+pub use combine::lse_combine;
+pub use forward::{kvouter_forward, ForwardPartials};
 pub use index::build_kvouter_index;
 pub use proxy::compute_proxy_block_max_scores;
+pub use scheduler::{build_fixed_schedule, enumerate_work_units, WorkSplit};
 pub use topk::{sparse_topk_select, sparse_topk_select_batch};
 pub use types::{BlockTables, CuSeqlensQ, KvOuterIndex, SparseAttentionError, SparseSelection};
