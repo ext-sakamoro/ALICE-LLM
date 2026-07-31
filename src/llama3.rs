@@ -6678,6 +6678,7 @@ pub fn load_kimi_k3_model_weights<'a, G: crate::gguf::GgufSource<'a>>(
 /// = n × 576 f32` for K3, versus `n × num_heads × (qk + v) = n × 96
 /// × 256 ≈ n × 24576` for a naive dense KV cache — a **42× compression**.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct KimiK3MlaCache {
     /// Row-major `[n_positions × kv_lora_rank]`.
     c_k: Vec<f32>,
@@ -6709,6 +6710,21 @@ impl KimiK3MlaCache {
         self.c_k.clear();
         self.k_rope.clear();
         self.n_positions = 0;
+    }
+
+    /// DSpark Phase 10: rollback positional cache to `pos` positions
+    ///
+    /// `pos <= n_positions` の場合、c_k/k_rope を `pos * rank` にtruncate + `n_positions = pos`
+    /// `pos > n_positions` の場合は panic (invariant violation)
+    pub fn rollback_to(&mut self, pos: usize) {
+        assert!(
+            pos <= self.n_positions,
+            "KimiK3MlaCache::rollback_to({pos}) exceeds n_positions {}",
+            self.n_positions
+        );
+        self.c_k.truncate(pos * self.kv_lora_rank);
+        self.k_rope.truncate(pos * self.qk_rope_head_dim);
+        self.n_positions = pos;
     }
 
     #[inline]
@@ -7075,6 +7091,7 @@ fn kimi_k3_dense_ffn_forward(
 /// call happens after the initial `res_mix` and before the layer's
 /// attention forward.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KimiK3AttnResState {
     d: usize,
     block_size: usize,
@@ -9347,6 +9364,7 @@ mod kimi_k3_gated_mla_tests {
 /// `KimiDeltaConfig::is_mla_layer(il)` to pick the branch and
 /// pushes/reads the matching cache variant.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum KimiK3LayerCache {
     Mla(KimiK3MlaCache),
     Kda(Vec<KimiDeltaHeadCache>),
@@ -9386,7 +9404,40 @@ pub struct KimiK3Model<'a> {
     /// (K3: 12). Cached at construction so `forward` does not need
     /// to reach into the sub-config on every call.
     block_size: usize,
+    /// DSpark Phase 10: 1 前提の forward 呼出数 (`reset` で 0 に戻る)
+    /// `DraftBackend::seq_len` の返り値
+    token_count: usize,
+    /// DSpark Phase 10: rollback 用 snapshot ring buffer
+    /// 各 snapshot は forward 呼出の **直前** 状態を保存
+    /// bound = `max_snapshot_ring` を超えた場合、最古 snapshot を drop
+    snapshot_ring: std::collections::VecDeque<KimiK3ModelSnapshot>,
+    /// DSpark Phase 10: snapshot ring buffer の最大保持数
+    /// 実運用では spec_k + 1 以上を推奨 (default 8)
+    /// 大きくすれば深い rollback 可、メモリコストは linear に増加
+    max_snapshot_ring: usize,
 }
+
+/// DSpark Phase 10: [`KimiK3Model`] の rollback 用 snapshot
+///
+/// `layer_caches` (MLA positional + KDA recurrent state 両方) と
+/// `attn_res_state` (block bank) と `token_count` を保存する
+/// `KimiK3Model::snapshot()` で生成、`KimiK3Model::restore()` で復元
+///
+/// メモリコスト: K3 default (128 head_dim × 96 heads × 69 KDA layers) で
+/// snapshot 1 個 ~36MB (KDA recurrent state 支配)
+#[derive(Clone)]
+pub struct KimiK3ModelSnapshot {
+    /// Per-layer cache のフル clone (MLA positional + KDA recurrent)
+    layer_caches: Vec<KimiK3LayerCache>,
+    /// AttnRes bank state のフル clone
+    attn_res_state: KimiK3AttnResState,
+    /// snapshot 生成時点の `token_count`
+    token_count: usize,
+}
+
+/// DSpark Phase 10: `KimiK3Model::snapshot_ring` のデフォルト容量
+/// spec_k = 4-8 の速記デコーディングに十分
+pub const KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING: usize = 8;
 
 #[allow(dead_code)]
 impl<'a> KimiK3Model<'a> {
@@ -9484,6 +9535,11 @@ impl<'a> KimiK3Model<'a> {
             layer_caches,
             attn_res_state,
             block_size,
+            token_count: 0,
+            snapshot_ring: std::collections::VecDeque::with_capacity(
+                KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
+            ),
+            max_snapshot_ring: KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
         })
     }
 
@@ -9500,6 +9556,9 @@ impl<'a> KimiK3Model<'a> {
             }
         }
         self.attn_res_state.reset();
+        // DSpark Phase 10: token_count + snapshot ring もクリア
+        self.token_count = 0;
+        self.snapshot_ring.clear();
     }
 
     /// Number of layers this model dispatches over (`config.num_layers`,
@@ -9507,6 +9566,128 @@ impl<'a> KimiK3Model<'a> {
     #[must_use]
     pub fn num_layers(&self) -> usize {
         self.config.num_layers
+    }
+
+    /// DSpark Phase 10: 現在の forward 呼出数 (最後の `reset` 以降、`rollback_to` 反映後)
+    #[must_use]
+    pub fn seq_len(&self) -> usize {
+        self.token_count
+    }
+
+    /// DSpark Phase 10: snapshot ring buffer の現在サイズ
+    #[cfg(any(test, feature = "dspark"))]
+    #[must_use]
+    pub fn snapshot_ring_len(&self) -> usize {
+        self.snapshot_ring.len()
+    }
+
+    /// DSpark Phase 10: snapshot ring buffer の最大保持数を設定
+    /// spec_k + 1 以上を推奨 default: [`KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING`]
+    pub fn set_max_snapshot_ring(&mut self, new_max: usize) {
+        assert!(new_max > 0, "max_snapshot_ring must be > 0");
+        self.max_snapshot_ring = new_max;
+        while self.snapshot_ring.len() > new_max {
+            self.snapshot_ring.pop_front();
+        }
+    }
+
+    /// DSpark Phase 10: 現状態を snapshot として clone
+    ///
+    /// 返り値は `restore()` に渡せる clone-based snapshot
+    /// メモリコスト: layer_caches (MLA + KDA) + attn_res_state のフル clone
+    /// K3 default で ~36MB per snapshot
+    #[must_use]
+    pub fn snapshot(&self) -> KimiK3ModelSnapshot {
+        KimiK3ModelSnapshot {
+            layer_caches: self.layer_caches.clone(),
+            attn_res_state: self.attn_res_state.clone(),
+            token_count: self.token_count,
+        }
+    }
+
+    /// DSpark Phase 10: snapshot を復元 現状態を上書きする
+    /// snapshot 取得後に taken した forward はすべて捨てられる
+    pub fn restore(&mut self, snap: KimiK3ModelSnapshot) {
+        self.layer_caches = snap.layer_caches;
+        self.attn_res_state = snap.attn_res_state;
+        self.token_count = snap.token_count;
+        // snapshot_ring は restore しない (rollback 後の新規 forward で ring が再構築される)
+        self.snapshot_ring.clear();
+    }
+
+    /// DSpark Phase 10: 指定 position までの状態に rollback する
+    ///
+    /// 内部 snapshot ring buffer から `pos` に該当する snapshot を検索して restore する
+    /// `pos == self.token_count` は no-op、`pos > self.token_count` は panic
+    /// `pos < self.token_count - ring.len()` (rollback 距離が ring 容量超過) も panic
+    ///
+    /// # Panics
+    /// - `pos > self.token_count` (未来への rollback は不可)
+    /// - rollback 距離が `max_snapshot_ring` を超過 (snapshot 取得済でない position)
+    pub fn rollback_to(&mut self, pos: usize) {
+        if pos == self.token_count {
+            return;
+        }
+        assert!(
+            pos <= self.token_count,
+            "KimiK3Model::rollback_to({pos}) exceeds current token_count {}",
+            self.token_count
+        );
+        let distance = self.token_count - pos;
+        assert!(
+            distance <= self.snapshot_ring.len(),
+            "KimiK3Model::rollback_to({pos}) distance {distance} exceeds snapshot_ring size {} \
+             (max_snapshot_ring = {}). Increase max_snapshot_ring or reduce rollback distance.",
+            self.snapshot_ring.len(),
+            self.max_snapshot_ring
+        );
+        // snapshot_ring は forward 直前状態を保持 (position 別)
+        // token_count = N のとき、ring[N-1] は forward N 実行直前 (= position N-1 状態)
+        // rollback_to(pos) では ring[pos] を取得
+        // ring 内で drain して不要な後半 snapshot を除去、target snapshot を restore
+        let target_idx = self.snapshot_ring.len() - distance;
+        // Drain: 取得した snapshot 以降 (target_idx..) をすべて捨てる
+        let snap = self
+            .snapshot_ring
+            .get(target_idx)
+            .cloned()
+            .expect("target snapshot must exist (bounds checked)");
+        // Truncate ring to target_idx (drop everything from target_idx onward)
+        self.snapshot_ring.truncate(target_idx);
+        self.restore(snap);
+    }
+
+    /// DSpark Phase 10 internal: snapshot 保存 + forward + token_count advance
+    ///
+    /// [`DraftBackend::forward`] impl から呼ばれる
+    /// 通常の `forward` は snapshot を保存しないため、非 speculative caller は影響を受けない
+    #[cfg(feature = "dspark")]
+    pub fn forward_with_snapshot(&mut self, token_id: u32) -> Vec<f32> {
+        self.push_snapshot_bounded();
+        let logits = self.forward(token_id);
+        self.token_count += 1;
+        logits
+    }
+
+    /// DSpark Phase 10 internal: snapshot 保存 + forward_capture_hidden + token_count advance
+    #[cfg(feature = "dspark")]
+    pub fn forward_capture_hidden_with_snapshot(
+        &mut self,
+        token_id: u32,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.push_snapshot_bounded();
+        let out = self.forward_capture_hidden(token_id, layer_idx);
+        self.token_count += 1;
+        out
+    }
+
+    /// DSpark Phase 10 internal: snapshot を ring に push、bound 超過なら最古を drop
+    fn push_snapshot_bounded(&mut self) {
+        if self.snapshot_ring.len() >= self.max_snapshot_ring {
+            self.snapshot_ring.pop_front();
+        }
+        self.snapshot_ring.push_back(self.snapshot());
     }
 
     /// Number of currently-cached positions in the MLA layer at
@@ -10279,6 +10460,163 @@ mod kimi_k3_model_tests {
             "panic message must reference index out of bounds (unpopulated \
              weights.layers), got: {s}"
         );
+    }
+
+    // ---- DSpark Phase 10 tests (snapshot / rollback infrastructure) ----
+
+    fn build_model_for_snapshot_tests() -> KimiK3Model<'static> {
+        let config = tiny_kimi_k3_config();
+        let hidden = config.hidden_dim;
+        let vocab = config.vocab_size;
+        // Leak Vec<u8> so &[u8] can be 'static — test-only, memory freed at process exit
+        let buf: &'static [u8] = Vec::leak(vec![0u8; vocab * hidden * 4]);
+        let weights = dummy_weights(hidden, vocab, buf);
+        KimiK3Model::new(weights, config).expect("construct")
+    }
+
+    #[test]
+    fn phase10_new_initializes_dspark_fields() {
+        let model = build_model_for_snapshot_tests();
+        assert_eq!(model.seq_len(), 0);
+        assert_eq!(model.snapshot_ring_len(), 0);
+        assert_eq!(
+            model.max_snapshot_ring,
+            super::KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING
+        );
+    }
+
+    #[test]
+    fn phase10_snapshot_captures_state() {
+        let mut model = build_model_for_snapshot_tests();
+        // Muck with MLA cache to make state non-trivial
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![1.5; 8], &vec![2.5; 4]);
+        }
+        model
+            .attn_res_state
+            .bank(&vec![0.7; model.config.hidden_dim]);
+        model.token_count = 5;
+
+        let snap = model.snapshot();
+        assert_eq!(snap.token_count, 5);
+        // Snapshot layer_caches must reflect the mucked state
+        if let KimiK3LayerCache::Mla(c) = &snap.layer_caches[3] {
+            assert_eq!(c.n_positions(), 1);
+        } else {
+            panic!("layer 3 should be MLA");
+        }
+    }
+
+    #[test]
+    fn phase10_restore_replaces_state() {
+        let mut model = build_model_for_snapshot_tests();
+        // Baseline snapshot: everything empty
+        let baseline = model.snapshot();
+
+        // Muck up state
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![9.9; 8], &vec![9.9; 4]);
+        }
+        model.token_count = 42;
+
+        // Restore baseline
+        model.restore(baseline);
+        assert_eq!(model.seq_len(), 0);
+        assert_eq!(model.snapshot_ring_len(), 0);
+        if let KimiK3LayerCache::Mla(c) = &model.layer_caches[3] {
+            assert_eq!(c.n_positions(), 0);
+        }
+    }
+
+    #[test]
+    fn phase10_reset_clears_dspark_state() {
+        let mut model = build_model_for_snapshot_tests();
+        model.token_count = 7;
+        // push a fake snapshot
+        model.snapshot_ring.push_back(model.snapshot());
+        model.snapshot_ring.push_back(model.snapshot());
+        assert_eq!(model.snapshot_ring_len(), 2);
+
+        model.reset();
+        assert_eq!(model.seq_len(), 0);
+        assert_eq!(model.snapshot_ring_len(), 0);
+    }
+
+    #[test]
+    fn phase10_set_max_snapshot_ring_trims_oldest() {
+        let mut model = build_model_for_snapshot_tests();
+        for _ in 0..5 {
+            model.snapshot_ring.push_back(model.snapshot());
+        }
+        assert_eq!(model.snapshot_ring_len(), 5);
+        model.set_max_snapshot_ring(3);
+        assert_eq!(model.snapshot_ring_len(), 3);
+        assert_eq!(model.max_snapshot_ring, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be > 0")]
+    fn phase10_set_max_snapshot_ring_rejects_zero() {
+        let mut model = build_model_for_snapshot_tests();
+        model.set_max_snapshot_ring(0);
+    }
+
+    #[test]
+    fn phase10_rollback_to_current_position_is_noop() {
+        let mut model = build_model_for_snapshot_tests();
+        model.token_count = 3;
+        model.rollback_to(3);
+        assert_eq!(model.seq_len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds current token_count")]
+    fn phase10_rollback_to_future_panics() {
+        let mut model = build_model_for_snapshot_tests();
+        model.token_count = 3;
+        model.rollback_to(10);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds snapshot_ring size")]
+    fn phase10_rollback_to_beyond_ring_capacity_panics() {
+        let mut model = build_model_for_snapshot_tests();
+        // Simulate: 5 forwards, but ring only has 2 snapshots (too small max_snapshot_ring)
+        model.token_count = 5;
+        model.snapshot_ring.push_back(model.snapshot());
+        model.snapshot_ring.push_back(model.snapshot());
+        // rollback distance = 5 - 0 = 5 > ring len 2
+        model.rollback_to(0);
+    }
+
+    #[test]
+    fn phase10_rollback_within_ring_restores_snapshot() {
+        let mut model = build_model_for_snapshot_tests();
+        // Snapshot 0 (position 0)
+        let snap0 = model.snapshot();
+        model.snapshot_ring.push_back(snap0);
+        // "Forward 1": muck state
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![1.0; 8], &vec![1.0; 4]);
+        }
+        model.token_count = 1;
+        // Snapshot 1 (position 1)
+        let snap1 = model.snapshot();
+        model.snapshot_ring.push_back(snap1);
+        // "Forward 2": more muck
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![2.0; 8], &vec![2.0; 4]);
+        }
+        model.token_count = 2;
+
+        // Rollback to position 1 (distance 1)
+        model.rollback_to(1);
+        assert_eq!(model.seq_len(), 1);
+        if let KimiK3LayerCache::Mla(c) = &model.layer_caches[3] {
+            assert_eq!(c.n_positions(), 1);
+        }
+        // Rollback clears snapshot_ring (see restore semantics)
+        assert_eq!(model.snapshot_ring_len(), 0);
     }
 }
 
@@ -15788,6 +16126,48 @@ impl crate::speculative_dspark::DraftBackend for Llama3Model<'_> {
 
     fn clear_cache(&mut self) {
         Self::clear_cache(self);
+    }
+
+    fn vocab_size(&self) -> u32 {
+        self.config.vocab_size as u32
+    }
+
+    fn hidden_dim(&self) -> u32 {
+        self.config.hidden_dim as u32
+    }
+
+    fn num_layers(&self) -> u32 {
+        self.config.num_layers as u32
+    }
+}
+
+// ─── DSpark Phase 10: DraftBackend trait impl for KimiK3Model ────────────────
+
+#[cfg(feature = "dspark")]
+impl crate::speculative_dspark::DraftBackend for KimiK3Model<'_> {
+    fn forward(&mut self, token_id: crate::speculative_dspark::TokenId) -> Vec<f32> {
+        // Phase 10: snapshot 保存版 forward で rollback_to を成立させる
+        Self::forward_with_snapshot(self, token_id)
+    }
+
+    fn forward_capture_hidden(
+        &mut self,
+        token_id: crate::speculative_dspark::TokenId,
+        layer_idx: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        Self::forward_capture_hidden_with_snapshot(self, token_id, layer_idx)
+    }
+
+    fn seq_len(&self) -> usize {
+        Self::seq_len(self)
+    }
+
+    fn rollback_to(&mut self, pos: usize) {
+        Self::rollback_to(self, pos);
+    }
+
+    fn clear_cache(&mut self) {
+        Self::reset(self);
     }
 
     fn vocab_size(&self) -> u32 {
