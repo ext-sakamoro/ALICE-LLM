@@ -26,6 +26,7 @@ grammar = []
 server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:async-stream", "gpu", "gguf", "grammar"]
 hf-config = ["dep:serde", "dep:serde_json"]
 dspark-serde = ["dep:serde"]
+dspark = []
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
@@ -149,6 +150,12 @@ required-features = ["gguf", "hf-config"]
 [[example]]
 name = "kimi_k3_generate"
 required-features = ["gguf", "hf-config"]
+
+# DSpark Phase 5: llama3 speculative dual with MarkovBigramBias
+# baseline vs bigram_strength 0.1/0.5/1.0 で accept rate + tok/s を比較
+[[example]]
+name = "speculative_dspark_dual"
+required-features = ["dspark", "gguf"]
 
 [[bin]]
 name = "alice-llm-server"

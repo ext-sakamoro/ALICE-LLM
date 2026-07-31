@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 5 — llama3 `generate_speculative_dual_dspark` +
+  `dspark` feature + `apply_bigram_bias_maybe` helper +
+  `examples/speculative_dspark_dual.rs`** (2026-07-31). RadixArk/Kimi-K3-DSpark
+  吸収の Phase 5 として llama3.rs の speculative dual decoding pipeline
+  に DSpark bigram bias を統合 (1) `Llama3Model::generate_speculative_dual_dspark`
+  を `#[cfg(feature = "dspark")]` gate で新規追加 (既存 `generate_speculative_dual`
+  完全無改変)、signature は vanilla + `bigram_bias: Option<&dyn BigramBias>` +
+  `bigram_strength: f32` の 2 引数追加、戻り値は `Result<GenerateResult, DsparkError>`
+  で bigram apply エラーを silent 化せず propagate (2) draft argmax 前に
+  bigram bias を in-place 加算、biased logits を argmax にも
+  `draft_logits_all` (verify の `q`) にも使うため Leviathan formula の
+  q 分布が実 draft policy と一致 (3) `speculative_dspark::apply_bigram_bias_maybe`
+  helper を追加 (None or strength=0 で no-op、それ以外は `?` 伝播) 4 追加
+  unit test で helper 挙動を実測 (4) `Cargo.toml` に `dspark = []` feature
+  追加 + `[[example]] name = "speculative_dspark_dual"` (baseline vs
+  bigram_strength 0.1/0.5/1.0 の accept rate + tok/s + speedup 比較、実 K3
+  models で Track 5-4 続報記事の accept length 実測に直結) API:
+  `generate_speculative_dual_dspark(&mut self, draft_model, tokenizer, prompt,
+  max_new_tokens, temperature, spec_k, bigram_bias, bigram_strength)
+  -> Result<GenerateResult, DsparkError>` 全 test: default 512 pass /
+  `--features dspark-serde` で 78 speculative_dspark test / `cargo build
+  --features dspark --example speculative_dspark_dual` compile pass /
+  clippy pedantic+nursery 0 warn 新規範囲 / fmt check pass Phase 6
+  (PositionConfidenceHead / DFlashParallelDraft の llama3 統合) は hidden
+  state exposure が必要で次 session
+
 - **DSpark Phase 4 — `BigramBias` trait + `FullCountBigramBias` +
   `dspark-serde` feature** (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の
   Phase 4 として (1) `BigramBias` trait を追加 (`vocab_size` / `apply` の

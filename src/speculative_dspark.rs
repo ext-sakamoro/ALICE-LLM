@@ -11,7 +11,8 @@
 //! Phase 2 (完了): [`PositionConfidenceHead`] SGD BCE 学習可能な位置別 sigmoid confidence
 //! Phase 3 (完了): [`DFlashParallelDraft`] 外部 draft callback + [`DraftPosition`] / [`DraftBlock`] I/O 型
 //! Phase 4 (完了): [`BigramBias`] trait + [`FullCountBigramBias`] (eager truncate 制約解消) + optional `dspark-serde` feature で serde derive
-//! Phase 5 (次 session): llama3.rs `generate_speculative_dual` optional feature gate 配線
+//! Phase 5 (完了): [`apply_bigram_bias_maybe`] helper + `dspark` feature 経由で `Llama3Model::generate_speculative_dual_dspark` を追加 (`examples/speculative_dspark_dual.rs` で A/B 比較)
+//! Phase 6 (次 session): `PositionConfidenceHead` / `DFlashParallelDraft` の llama3 統合 (hidden state exposure が必要、深い改修)
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -747,6 +748,27 @@ fn argmax_finite(logits: &[f32]) -> Result<u32, DsparkError> {
         }
     }
     best_idx.ok_or(DsparkError::DraftLogitsAllNonFinite)
+}
+
+/// bigram bias を条件付で logits に in-place 加算する DSpark llama3.rs 配線 (Phase 5) 用 helper
+///
+/// `bigram_bias = None` または `strength = 0.0` の場合は no-op で `Ok(())` を返す
+/// それ以外は `bigram_bias.apply(prev, logits, strength)` を呼び、error はそのまま伝播する
+///
+/// # Errors
+/// [`BigramBias::apply`] と同じ
+pub fn apply_bigram_bias_maybe(
+    logits: &mut [f32],
+    prev: TokenId,
+    bigram_bias: Option<&dyn BigramBias>,
+    strength: f32,
+) -> Result<(), DsparkError> {
+    if let Some(b) = bigram_bias {
+        if strength != 0.0 {
+            b.apply(prev, logits, strength)?;
+        }
+    }
+    Ok(())
 }
 
 /// 外部 draft model からの 1 位置分の出力 (DFlashParallelDraft 契約)
@@ -2107,5 +2129,56 @@ mod tests {
             let back: DsparkError = bincode::deserialize(&encoded).expect("deserialize");
             assert_eq!(err, back);
         }
+    }
+
+    // ---- apply_bigram_bias_maybe (Phase 5 helper) tests ----
+
+    #[test]
+    fn apply_bigram_bias_maybe_returns_ok_when_none() {
+        let mut logits = vec![0.5_f32; 10];
+        super::apply_bigram_bias_maybe(&mut logits, 3, None, 1.0).expect("valid");
+        assert!(logits.iter().all(|&v| (v - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn apply_bigram_bias_maybe_returns_ok_when_strength_zero() {
+        let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
+        for _ in 0..5 {
+            bias.observe(3, 7).expect("valid");
+        }
+        let mut logits = vec![0.5_f32; 10];
+        super::apply_bigram_bias_maybe(&mut logits, 3, Some(&bias), 0.0).expect("valid");
+        assert!(logits.iter().all(|&v| (v - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn apply_bigram_bias_maybe_applies_bias_when_enabled() {
+        let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
+        for _ in 0..5 {
+            bias.observe(3, 7).expect("valid");
+        }
+        let mut logits = vec![0.0_f32; 10];
+        super::apply_bigram_bias_maybe(&mut logits, 3, Some(&bias), 1.0).expect("valid");
+        let expected = 6.0_f32.ln();
+        assert!(
+            (logits[7] - expected).abs() < 1e-6,
+            "logits[7] = {} expected {}",
+            logits[7],
+            expected
+        );
+    }
+
+    #[test]
+    fn apply_bigram_bias_maybe_propagates_error() {
+        let bias = MarkovBigramBias::new(10, 4).expect("valid");
+        let mut logits = vec![0.0_f32; 5]; // 意図的に vocab 不一致
+        let err = super::apply_bigram_bias_maybe(&mut logits, 3, Some(&bias), 1.0).unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::LogitsLenMismatch {
+                expected: 10,
+                got: 5,
+            }
+        );
     }
 }
