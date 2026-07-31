@@ -10,7 +10,8 @@
 //! Phase 1 (完了): [`MarkovBigramBias`] vanilla DSpark は rank=256
 //! Phase 2 (完了): [`PositionConfidenceHead`] SGD BCE 学習可能な位置別 sigmoid confidence
 //! Phase 3 (完了): [`DFlashParallelDraft`] 外部 draft callback + [`DraftPosition`] / [`DraftBlock`] I/O 型
-//! Phase 4 (次 session): `generate_speculative_dual` 配線 (llama3.rs 側 optional feature gate) と full-count sketch
+//! Phase 4 (完了): [`BigramBias`] trait + [`FullCountBigramBias`] (eager truncate 制約解消) + optional `dspark-serde` feature で serde derive
+//! Phase 5 (次 session): llama3.rs `generate_speculative_dual` optional feature gate 配線
 //!
 //! ## Rank-K bigram bias 設計
 //!
@@ -22,10 +23,14 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "dspark-serde")]
+use serde::{Deserialize, Serialize};
+
 /// DSpark primitives が扱う token id 型
 pub type TokenId = u32;
 
 /// DSpark primitive のエラー
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DsparkError {
     /// Token id が宣言 vocab_size を超過
@@ -185,9 +190,27 @@ impl core::fmt::Display for DsparkError {
 
 impl std::error::Error for DsparkError {}
 
+/// bigram bias 実装が実装すべき最小 API
+///
+/// `DFlashParallelDraft::draft` に渡す bigram_bias 側から要求される trait
+/// [`MarkovBigramBias`] (eager truncate、高速) と [`FullCountBigramBias`]
+/// (完全 top-K、apply 時 sort) の両方が実装する
+pub trait BigramBias {
+    /// 宣言 vocab size
+    fn vocab_size(&self) -> u32;
+    /// prev の top-K bucket から `logits[next] += strength * ln_1p(count)` を加算する
+    ///
+    /// # Errors
+    /// - `logits.len() != vocab_size` の場合
+    /// - `prev >= vocab_size` の場合
+    fn apply(&self, prev: TokenId, logits: &mut [f32], strength: f32) -> Result<(), DsparkError>;
+}
+
 /// Rank-K Markov bigram bias (DSpark vanilla rank=256)
 ///
 /// 各 prev token に対して観測頻度 top-K の (next, count) を eager truncate で保持する
+/// 完全 top-K が必要な場合は [`FullCountBigramBias`] を使う
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct MarkovBigramBias {
     vocab_size: u32,
@@ -343,6 +366,188 @@ impl MarkovBigramBias {
     }
 }
 
+impl BigramBias for MarkovBigramBias {
+    fn vocab_size(&self) -> u32 {
+        Self::vocab_size(self)
+    }
+
+    fn apply(&self, prev: TokenId, logits: &mut [f32], strength: f32) -> Result<(), DsparkError> {
+        Self::apply(self, prev, logits, strength)
+    }
+}
+
+/// Full-count Markov bigram bias
+///
+/// [`MarkovBigramBias`] の eager truncate 制約 (rank 到達後の tie で新規が drop される)
+/// を解消するため、全ての観測 (prev, next, count) を保持し、apply 時に count 降順で
+/// top-K を選ぶ apply コストは `O(N_unique_next * log N_unique_next)` per call で
+/// [`MarkovBigramBias`] より遅いが、正確な top-K を保証する
+///
+/// storage: `HashMap<TokenId, HashMap<TokenId, u32>>` (sparse)
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone)]
+pub struct FullCountBigramBias {
+    vocab_size: u32,
+    rank: u32,
+    counts: HashMap<TokenId, HashMap<TokenId, u32>>,
+}
+
+impl FullCountBigramBias {
+    /// 空の table を構築する
+    ///
+    /// # Errors
+    /// `vocab_size` または `rank` が 0 の場合
+    pub fn new(vocab_size: u32, rank: u32) -> Result<Self, DsparkError> {
+        if vocab_size == 0 {
+            return Err(DsparkError::ZeroVocab);
+        }
+        if rank == 0 {
+            return Err(DsparkError::ZeroRank);
+        }
+        Ok(Self {
+            vocab_size,
+            rank,
+            counts: HashMap::new(),
+        })
+    }
+
+    /// token 列から一括構築する 隣接 pair を全部 observe する
+    ///
+    /// # Errors
+    /// [`new`](Self::new) と [`observe_sequence`](Self::observe_sequence) と同じ
+    pub fn from_sequence(
+        vocab_size: u32,
+        rank: u32,
+        tokens: &[TokenId],
+    ) -> Result<Self, DsparkError> {
+        let mut bias = Self::new(vocab_size, rank)?;
+        bias.observe_sequence(tokens)?;
+        Ok(bias)
+    }
+
+    /// 宣言 vocab size
+    pub fn vocab_size(&self) -> u32 {
+        self.vocab_size
+    }
+
+    /// apply 時に取り出す top-K の K
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// 1 pair も観測していない場合 true
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// prev 側に 1 度でも出現した token の種類数
+    pub fn observed_prev_count(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// 特定 prev に対して観測された unique next の種類数 (未観測 prev は 0)
+    pub fn unique_next_count(&self, prev: TokenId) -> usize {
+        self.counts.get(&prev).map_or(0, HashMap::len)
+    }
+
+    /// prev → next の観測 count を返す (未観測は 0)
+    pub fn count(&self, prev: TokenId, next: TokenId) -> u32 {
+        self.counts
+            .get(&prev)
+            .and_then(|inner| inner.get(&next).copied())
+            .unwrap_or(0)
+    }
+
+    /// prev → next の観測を +1 する (saturating)
+    ///
+    /// # Errors
+    /// `prev` または `next` が vocab_size 以上の場合
+    pub fn observe(&mut self, prev: TokenId, next: TokenId) -> Result<(), DsparkError> {
+        if prev >= self.vocab_size {
+            return Err(DsparkError::TokenOutOfVocab {
+                token: prev,
+                vocab_size: self.vocab_size,
+            });
+        }
+        if next >= self.vocab_size {
+            return Err(DsparkError::TokenOutOfVocab {
+                token: next,
+                vocab_size: self.vocab_size,
+            });
+        }
+        let inner = self.counts.entry(prev).or_default();
+        let c = inner.entry(next).or_insert(0_u32);
+        *c = c.saturating_add(1);
+        Ok(())
+    }
+
+    /// token 列の隣接 pair を全部 observe する 最初の out-of-vocab で fail
+    ///
+    /// # Errors
+    /// [`observe`](Self::observe) と同じ
+    pub fn observe_sequence(&mut self, tokens: &[TokenId]) -> Result<(), DsparkError> {
+        for pair in tokens.windows(2) {
+            self.observe(pair[0], pair[1])?;
+        }
+        Ok(())
+    }
+
+    /// prev の観測 counts から top-K を count 降順 → token id 昇順で選び、
+    /// `logits[next] += strength * ln_1p(count)` を加算する
+    ///
+    /// - `strength = 0.0` は no-op で早期 return
+    /// - `prev` が未観測なら no-op で早期 return
+    ///
+    /// # Errors
+    /// - `logits.len() != vocab_size` の場合
+    /// - `prev >= vocab_size` の場合
+    pub fn apply(
+        &self,
+        prev: TokenId,
+        logits: &mut [f32],
+        strength: f32,
+    ) -> Result<(), DsparkError> {
+        if logits.len() != self.vocab_size as usize {
+            return Err(DsparkError::LogitsLenMismatch {
+                expected: self.vocab_size as usize,
+                got: logits.len(),
+            });
+        }
+        if prev >= self.vocab_size {
+            return Err(DsparkError::TokenOutOfVocab {
+                token: prev,
+                vocab_size: self.vocab_size,
+            });
+        }
+        if strength == 0.0 {
+            return Ok(());
+        }
+        let Some(inner) = self.counts.get(&prev) else {
+            return Ok(());
+        };
+        let rank = self.rank as usize;
+        let mut ranked: Vec<(TokenId, u32)> = inner.iter().map(|(&t, &c)| (t, c)).collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(rank);
+        for (next, count) in ranked {
+            let idx = next as usize;
+            let bias = strength * (count as f32).ln_1p();
+            logits[idx] += bias;
+        }
+        Ok(())
+    }
+}
+
+impl BigramBias for FullCountBigramBias {
+    fn vocab_size(&self) -> u32 {
+        Self::vocab_size(self)
+    }
+
+    fn apply(&self, prev: TokenId, logits: &mut [f32], strength: f32) -> Result<(), DsparkError> {
+        Self::apply(self, prev, logits, strength)
+    }
+}
+
 /// 位置別 confidence head (DSpark 3 要素の 2 番目)
 ///
 /// draft position i ∈ [0, block_size) ごとに per-position 重み `w_i ∈ R^H` と bias `b_i ∈ R`
@@ -351,6 +556,7 @@ impl MarkovBigramBias {
 /// sigmoid + BCE の canonical form `dL/dz = p - y` で SGD 1 step
 ///
 /// zero-init 時は全 position で sigmoid(0) = 0.5 (uninformative prior)
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct PositionConfidenceHead {
     block_size: u32,
@@ -544,6 +750,7 @@ fn argmax_finite(logits: &[f32]) -> Result<u32, DsparkError> {
 }
 
 /// 外部 draft model からの 1 位置分の出力 (DFlashParallelDraft 契約)
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct DraftPosition {
     /// draft model の hidden state (長さ = hidden_dim)
@@ -553,6 +760,7 @@ pub struct DraftPosition {
 }
 
 /// [`DFlashParallelDraft::draft`] の結果 block
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct DraftBlock {
     /// argmax で選ばれた draft token 列 (長さ = block_size)
@@ -571,6 +779,7 @@ pub struct DraftBlock {
 ///
 /// llama3.rs との配線は本 struct のスコープ外 caller が `Fn(prefix, block_size) -> Result<Vec<DraftPosition>>`
 /// を実装して渡す
+#[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct DFlashParallelDraft {
     block_size: u32,
@@ -654,7 +863,7 @@ impl DFlashParallelDraft {
     pub fn draft<F>(
         &self,
         prefix: &[TokenId],
-        bigram_bias: Option<&MarkovBigramBias>,
+        bigram_bias: Option<&dyn BigramBias>,
         confidence_head: &PositionConfidenceHead,
         draft_fn: F,
     ) -> Result<DraftBlock, DsparkError>
@@ -745,8 +954,8 @@ impl DFlashParallelDraft {
 #[cfg(test)]
 mod tests {
     use super::{
-        DFlashParallelDraft, DraftBlock, DraftPosition, DsparkError, MarkovBigramBias,
-        PositionConfidenceHead, TokenId,
+        BigramBias, DFlashParallelDraft, DraftBlock, DraftPosition, DsparkError,
+        FullCountBigramBias, MarkovBigramBias, PositionConfidenceHead, TokenId,
     };
 
     #[test]
@@ -1562,5 +1771,341 @@ mod tests {
         assert_eq!(block.tokens.len(), 2);
         assert_eq!(block.confidences.len(), 2);
         assert_eq!(block.hidden_states.len(), 1);
+    }
+
+    // ---- FullCountBigramBias tests ----
+
+    #[test]
+    fn full_count_new_rejects_zero_vocab() {
+        let err = FullCountBigramBias::new(0, 256).unwrap_err();
+        assert_eq!(err, DsparkError::ZeroVocab);
+    }
+
+    #[test]
+    fn full_count_new_rejects_zero_rank() {
+        let err = FullCountBigramBias::new(100, 0).unwrap_err();
+        assert_eq!(err, DsparkError::ZeroRank);
+    }
+
+    #[test]
+    fn full_count_new_defaults_are_empty() {
+        let bias = FullCountBigramBias::new(100, 4).expect("valid");
+        assert_eq!(bias.vocab_size(), 100);
+        assert_eq!(bias.rank(), 4);
+        assert!(bias.is_empty());
+        assert_eq!(bias.observed_prev_count(), 0);
+        assert_eq!(bias.unique_next_count(0), 0);
+        assert_eq!(bias.count(0, 0), 0);
+    }
+
+    #[test]
+    fn full_count_observe_rejects_prev_out_of_vocab() {
+        let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
+        let err = bias.observe(10, 5).unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::TokenOutOfVocab {
+                token: 10,
+                vocab_size: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn full_count_observe_rejects_next_out_of_vocab() {
+        let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
+        let err = bias.observe(5, 99).unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::TokenOutOfVocab {
+                token: 99,
+                vocab_size: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn full_count_observe_increments_count() {
+        let mut bias = FullCountBigramBias::new(20, 4).expect("valid");
+        for _ in 0..7 {
+            bias.observe(1, 2).expect("valid");
+        }
+        assert_eq!(bias.count(1, 2), 7);
+        assert_eq!(bias.unique_next_count(1), 1);
+        assert_eq!(bias.observed_prev_count(), 1);
+    }
+
+    #[test]
+    fn full_count_observe_sequence_from_stream() {
+        let mut bias = FullCountBigramBias::new(20, 8).expect("valid");
+        // 1 2 3 1 2 3 → pairs: (1,2), (2,3), (3,1), (1,2), (2,3)
+        bias.observe_sequence(&[1, 2, 3, 1, 2, 3]).expect("valid");
+        assert_eq!(bias.count(1, 2), 2);
+        assert_eq!(bias.count(2, 3), 2);
+        assert_eq!(bias.count(3, 1), 1);
+        assert_eq!(bias.observed_prev_count(), 3);
+    }
+
+    #[test]
+    fn full_count_from_sequence_constructor() {
+        let bias = FullCountBigramBias::from_sequence(20, 8, &[1, 2, 3, 4]).expect("valid");
+        assert_eq!(bias.observed_prev_count(), 3);
+        assert_eq!(bias.count(1, 2), 1);
+        assert_eq!(bias.count(2, 3), 1);
+        assert_eq!(bias.count(3, 4), 1);
+    }
+
+    #[test]
+    fn full_count_apply_strength_zero_is_noop() {
+        let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
+        bias.observe(1, 2).expect("valid");
+        let mut logits = vec![0.5_f32; 10];
+        bias.apply(1, &mut logits, 0.0).expect("valid");
+        assert!(logits.iter().all(|&v| (v - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn full_count_apply_unobserved_prev_is_noop() {
+        let bias = FullCountBigramBias::new(10, 4).expect("valid");
+        let mut logits = vec![0.0_f32; 10];
+        bias.apply(5, &mut logits, 1.0).expect("valid");
+        assert!(logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn full_count_apply_rejects_logits_len_mismatch() {
+        let bias = FullCountBigramBias::new(10, 4).expect("valid");
+        let mut logits = vec![0.0_f32; 5];
+        let err = bias.apply(0, &mut logits, 1.0).unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::LogitsLenMismatch {
+                expected: 10,
+                got: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn full_count_apply_rejects_prev_out_of_vocab() {
+        let bias = FullCountBigramBias::new(10, 4).expect("valid");
+        let mut logits = vec![0.0_f32; 10];
+        let err = bias.apply(10, &mut logits, 1.0).unwrap_err();
+        assert_eq!(
+            err,
+            DsparkError::TokenOutOfVocab {
+                token: 10,
+                vocab_size: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn full_count_apply_uses_ln_1p() {
+        // count=3 → bias = 1.0 * ln(4) を厳密確認
+        let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
+        for _ in 0..3 {
+            bias.observe(1, 2).expect("valid");
+        }
+        let mut logits = vec![0.0_f32; 10];
+        bias.apply(1, &mut logits, 1.0).expect("valid");
+        let expected = 4.0_f32.ln();
+        assert!(
+            (logits[2] - expected).abs() < 1e-6,
+            "logits[2] = {}",
+            logits[2]
+        );
+    }
+
+    #[test]
+    fn full_count_apply_top_k_by_count_desc() {
+        // rank=3、5 個の unique next を count 差付きで観測 → count 上位 3 のみ apply
+        let mut bias = FullCountBigramBias::new(20, 3).expect("valid");
+        for _ in 0..10 {
+            bias.observe(0, 11).expect("valid");
+        }
+        for _ in 0..8 {
+            bias.observe(0, 12).expect("valid");
+        }
+        for _ in 0..6 {
+            bias.observe(0, 13).expect("valid");
+        }
+        for _ in 0..4 {
+            bias.observe(0, 14).expect("valid");
+        }
+        for _ in 0..2 {
+            bias.observe(0, 15).expect("valid");
+        }
+        // unique_next は 5 個保存されているが apply は top-3
+        assert_eq!(bias.unique_next_count(0), 5);
+        let mut logits = vec![0.0_f32; 20];
+        bias.apply(0, &mut logits, 1.0).expect("valid");
+        assert!(logits[14] == 0.0, "14 (count 4) truncated by top-3");
+        assert!(logits[15] == 0.0, "15 (count 2) truncated by top-3");
+        assert!(logits[11] > logits[12]);
+        assert!(logits[12] > logits[13]);
+    }
+
+    #[test]
+    fn full_count_preserves_late_tied_arrivals() {
+        // ★ eager truncate 制約の解消を実証 ★
+        // [`MarkovBigramBias`] の同型テスト `observe_eager_truncate_drops_late_tied_arrivals`
+        // では 12 が全て drop されるが、FullCountBigramBias では count が積み上がり
+        // apply 時に top-K で選ばれる
+        let mut bias = FullCountBigramBias::new(20, 2).expect("valid");
+        bias.observe(0, 10).expect("valid");
+        bias.observe(0, 11).expect("valid");
+        // 12 を 5 回 observe → count=5 で 10 (count=1) を追い抜く
+        for _ in 0..5 {
+            bias.observe(0, 12).expect("valid");
+        }
+        assert_eq!(bias.count(0, 12), 5);
+        assert_eq!(bias.unique_next_count(0), 3);
+        let mut logits = vec![0.0_f32; 20];
+        bias.apply(0, &mut logits, 1.0).expect("valid");
+        // rank=2 → top 2 は 12 (count=5) と (10 or 11 の count=1、id 昇順 tie-break で 10)
+        assert!(logits[12] > 0.0, "12 must be in top-K (count=5)");
+        assert!(
+            logits[10] > 0.0,
+            "10 must be in top-K (count=1, id tiebreak)"
+        );
+        assert!(
+            logits[11] == 0.0,
+            "11 dropped by top-K (id 11 > 10 for tie)"
+        );
+        assert!(logits[12] > logits[10], "12 count 5 > 10 count 1");
+    }
+
+    // ---- BigramBias trait tests ----
+
+    fn assert_bigram_trait_applies_bias<B: BigramBias>(bias: &B, prev: TokenId) -> f32 {
+        let vocab = bias.vocab_size() as usize;
+        let mut logits = vec![0.0_f32; vocab];
+        bias.apply(prev, &mut logits, 1.0).expect("valid");
+        logits.iter().copied().fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn bigram_bias_trait_markov_impl() {
+        let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
+        for _ in 0..5 {
+            bias.observe(1, 2).expect("valid");
+        }
+        let peak = assert_bigram_trait_applies_bias(&bias, 1);
+        let expected = 6.0_f32.ln();
+        assert!((peak - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bigram_bias_trait_full_count_impl() {
+        let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
+        for _ in 0..5 {
+            bias.observe(1, 2).expect("valid");
+        }
+        let peak = assert_bigram_trait_applies_bias(&bias, 1);
+        let expected = 6.0_f32.ln();
+        assert!((peak - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dfp_draft_accepts_full_count_bigram_via_trait() {
+        // Phase 3 test `dfp_draft_applies_bigram_bias_shifts_argmax` の FullCount 版
+        let dfp = DFlashParallelDraft::new(1, 8, 4, 100.0).expect("valid");
+        let head = PositionConfidenceHead::new(1, 4).expect("valid");
+        let mut bigram = FullCountBigramBias::new(8, 4).expect("valid");
+        for _ in 0..10 {
+            bigram.observe(1, 3).expect("valid");
+        }
+        // vocab=8, hidden=4, block=1 の mock position (Phase 3 test 準拠)
+        let mut logits = vec![0.0_f32; 8];
+        logits[0] = 5.0;
+        let position = DraftPosition {
+            hidden: vec![0.1_f32; 4],
+            logits,
+        };
+        let prefix: [TokenId; 1] = [1];
+        let block = dfp
+            .draft(&prefix, Some(&bigram), &head, |_p, _bs| {
+                Ok(vec![position.clone()])
+            })
+            .expect("valid");
+        assert_eq!(
+            block.tokens,
+            vec![3],
+            "FullCount bigram bias should shift argmax to 3 via trait"
+        );
+    }
+
+    // ---- serde roundtrip tests (dspark-serde feature 有効時のみ) ----
+
+    #[cfg(feature = "dspark-serde")]
+    #[test]
+    fn serde_roundtrip_markov_bigram_bias() {
+        let mut bias = MarkovBigramBias::new(100, 4).expect("valid");
+        bias.observe_sequence(&[1, 2, 3, 1, 2, 4]).expect("valid");
+        let encoded = bincode::serialize(&bias).expect("serialize");
+        let back: MarkovBigramBias = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(back.vocab_size(), 100);
+        assert_eq!(back.rank(), 4);
+        assert_eq!(back.observed_prev_count(), 3);
+        // apply 出力が一致することで内部状態の bit-level 保存を確認
+        let mut logits_orig = vec![0.0_f32; 100];
+        let mut logits_back = vec![0.0_f32; 100];
+        bias.apply(1, &mut logits_orig, 1.0).expect("valid");
+        back.apply(1, &mut logits_back, 1.0).expect("valid");
+        assert_eq!(logits_orig, logits_back);
+    }
+
+    #[cfg(feature = "dspark-serde")]
+    #[test]
+    fn serde_roundtrip_full_count_bigram_bias() {
+        let mut bias = FullCountBigramBias::new(100, 4).expect("valid");
+        for _ in 0..3 {
+            bias.observe(1, 2).expect("valid");
+        }
+        bias.observe(5, 10).expect("valid");
+        let encoded = bincode::serialize(&bias).expect("serialize");
+        let back: FullCountBigramBias = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(back.vocab_size(), 100);
+        assert_eq!(back.rank(), 4);
+        assert_eq!(back.count(1, 2), 3);
+        assert_eq!(back.count(5, 10), 1);
+        assert_eq!(back.observed_prev_count(), 2);
+    }
+
+    #[cfg(feature = "dspark-serde")]
+    #[test]
+    fn serde_roundtrip_position_confidence_head() {
+        let mut head = PositionConfidenceHead::new(3, 4).expect("valid");
+        let hidden = [1.0_f32, 1.0, 1.0, 1.0];
+        for _ in 0..10 {
+            let _ = head.train_step(1, &hidden, true, 0.1).expect("valid");
+        }
+        let encoded = bincode::serialize(&head).expect("serialize");
+        let back: PositionConfidenceHead = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(back.block_size(), 3);
+        assert_eq!(back.hidden_dim(), 4);
+        let orig = head.predict(1, &hidden).expect("valid");
+        let back_pred = back.predict(1, &hidden).expect("valid");
+        assert!((orig - back_pred).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "dspark-serde")]
+    #[test]
+    fn serde_roundtrip_dspark_error() {
+        let cases = [
+            DsparkError::ZeroVocab,
+            DsparkError::EmptyPrefix,
+            DsparkError::TokenOutOfVocab {
+                token: 42,
+                vocab_size: 10,
+            },
+            DsparkError::DraftModelFailed("external boom".to_string()),
+        ];
+        for err in cases {
+            let encoded = bincode::serialize(&err).expect("serialize");
+            let back: DsparkError = bincode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(err, back);
+        }
     }
 }

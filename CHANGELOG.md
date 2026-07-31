@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 4 — `BigramBias` trait + `FullCountBigramBias` +
+  `dspark-serde` feature** (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の
+  Phase 4 として (1) `BigramBias` trait を追加 (`vocab_size` / `apply` の
+  2 method) + `MarkovBigramBias` / `FullCountBigramBias` の両方が実装、
+  (2) `FullCountBigramBias` は `HashMap<TokenId, HashMap<TokenId, u32>>`
+  で全観測 count を sparse 保持し apply 時に count 降順 → token id 昇順
+  で top-K を選択、Phase 1 の eager truncate 制約 (rank 到達後の tied
+  arrival が drop される罠) を解消、(3) `DFlashParallelDraft::draft` の
+  signature を `Option<&MarkovBigramBias>` → `Option<&dyn BigramBias>` に
+  変更 (Rust 型推論で既存呼出は無改修で coerce)、(4) optional feature
+  `dspark-serde = ["dep:serde"]` を追加、`MarkovBigramBias` /
+  `FullCountBigramBias` / `PositionConfidenceHead` / `DFlashParallelDraft`
+  / `DraftPosition` / `DraftBlock` / `DsparkError` に serde derive を条件付
+  追加、`[dev-dependencies] bincode = "1"` で roundtrip test API:
+  `FullCountBigramBias::{new, from_sequence, vocab_size, rank, is_empty,
+  observed_prev_count, unique_next_count, count, observe, observe_sequence,
+  apply}` 18 追加 unit test (計 70 test、+ serde feature で 4 追加、計 74
+  test) 全 pass、clippy pedantic+nursery 0 warn (両 feature)、fmt check
+  pass Phase 5 (llama3.rs `generate_speculative_dual` optional feature gate
+  配線) は次 session
+
 - **DSpark Phase 3 — `speculative_dspark::DFlashParallelDraft`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 3 要素の 3 番目 DFlash 並列 draft を実装 外部
   draft model は `FnOnce(&[TokenId], u32) -> Result<Vec<DraftPosition>, DsparkError>`

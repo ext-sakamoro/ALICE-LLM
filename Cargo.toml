@@ -25,6 +25,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 grammar = []
 server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:async-stream", "gpu", "gguf", "grammar"]
 hf-config = ["dep:serde", "dep:serde_json"]
+dspark-serde = ["dep:serde"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
@@ -153,3 +154,7 @@ required-features = ["gguf", "hf-config"]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+# DSpark Phase 4 serde roundtrip test 用 (dspark-serde feature 有効時のみ使用)
+[dev-dependencies]
+bincode = "1"
