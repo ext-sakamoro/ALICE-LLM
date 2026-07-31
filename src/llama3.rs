@@ -5095,6 +5095,55 @@ fn gqa_attention(
     // llama.cpp's arithmetic order for bit-comparable results.
     let use_online_softmax = std::env::var_os("ALICE_ATTN_ONLINE_SOFTMAX").is_some();
 
+    // Phase MSA.5.6: sparse-attention gate. When `ALICE_SPARSE_TOPK` is set
+    // to a non-negative integer, dispatch to
+    // `sparse_attention::llama3_bridge::llama3_sparse_attention` instead of
+    // the dense loops below. `topk = 0` means "select every block" and is
+    // arithmetically equivalent to dense attention modulo FP re-association.
+    // We only hook when the diagnostic env flags above are off and the
+    // caller isn't using softcap (adapter has no softcap support yet).
+    if attn_logit_softcap.is_none() && !use_online_softmax && !use_f64_acc {
+        if let Some(sparse_topk) = std::env::var("ALICE_SPARSE_TOPK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            let used_len = seq_len - attn_start;
+            if used_len > 0 {
+                let kv_dim = num_kv_heads * head_dim;
+                let mut k_dense = Vec::with_capacity(used_len * kv_dim);
+                let mut v_dense = Vec::with_capacity(used_len * kv_dim);
+                for t in attn_start..seq_len {
+                    k_dense.extend_from_slice(kv_cache.key_at(layer_idx, t));
+                    v_dense.extend_from_slice(kv_cache.value_at(layer_idx, t));
+                }
+                let cfg = crate::sparse_attention::llama3_bridge::BridgeConfig {
+                    hq: num_heads,
+                    hkv: num_kv_heads,
+                    head_dim,
+                    block_size: 64,
+                    page_size: 64,
+                    softmax_scale: inv_sqrt_d,
+                    causal: false,
+                    topk: sparse_topk,
+                };
+                let kv_view = crate::sparse_attention::llama3_bridge::DenseKvCacheView {
+                    k: &k_dense,
+                    v: &v_dense,
+                    seq_len: used_len,
+                    hkv: num_kv_heads,
+                    head_dim,
+                };
+                if let Ok(out) = crate::sparse_attention::llama3_bridge::llama3_sparse_attention(
+                    q_buf, &kv_view, 1, &cfg,
+                ) {
+                    attn_out.copy_from_slice(&out);
+                    return;
+                }
+                // Adapter rejected (geometry mismatch) → fall through to dense.
+            }
+        }
+    }
+
     attn_out.fill(0.0);
     for h in 0..num_heads {
         let kv_h = h / heads_per_kv;
@@ -14224,6 +14273,196 @@ impl<'a> Llama3Model<'a> {
                 spec_k,
             }),
         })
+    }
+
+    /// DSpark Phase 7: vanilla speculative dual pipeline + 各 draft position の
+    /// `(hidden, was_accepted)` を collect [`PositionConfidenceHead::train_step`] の training data
+    ///
+    /// verify で reject された draft 以降は verify 打切りとなるため label 非付与
+    /// bonus は draft でなく main sample なので label 非付与
+    ///
+    /// bigram_bias は使わず (baseline draft behavior)、confidence_head も使わない
+    /// pure vanilla dual と同一 sampling path を辿るため collect した labels は
+    /// vanilla policy の accept/reject 分布を反映する
+    ///
+    /// # Errors
+    /// - `hidden_capture_layer` を指定した layer が `forward_capture_hidden` の非標準 arch に該当する場合 panic (documented)
+    /// - DsparkError 系エラーは現状発生しないが、将来の validation 追加を見越して `Result` を返す
+    #[cfg(feature = "dspark")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_speculative_dual_collect_labels(
+        &mut self,
+        draft_model: &mut Llama3Model,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+        spec_k: usize,
+        hidden_capture_layer: Option<usize>,
+    ) -> Result<
+        (
+            GenerateResult,
+            Vec<crate::speculative_dspark::DsparkLabelSample>,
+        ),
+        crate::speculative_dspark::DsparkError,
+    > {
+        let start = Instant::now();
+        let mut tokens = tokenizer.encode(prompt);
+        if tokenizer.add_bos_token && (tokens.is_empty() || tokens[0] != tokenizer.bos_id) {
+            tokens.insert(0, tokenizer.bos_id);
+        }
+
+        self.clear_cache();
+        draft_model.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward(tok);
+            draft_model.forward(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        let decode_start = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut total_drafted: usize = 0;
+        let mut total_accepted: usize = 0;
+        let mut rng = Rng64::new(42);
+        let mut samples: Vec<crate::speculative_dspark::DsparkLabelSample> = Vec::new();
+
+        while generated.len() < max_new_tokens {
+            let next_token = if temperature > 0.0 {
+                sample_from_probs(&softmax(&logits), rng.next_f32())
+            } else {
+                argmax(&logits)
+            };
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+            generated.push(next_token);
+            tokens.push(next_token);
+
+            let remaining = max_new_tokens - generated.len();
+            if remaining == 0 {
+                logits = self.forward(next_token);
+                draft_model.forward(next_token);
+                continue;
+            }
+
+            let k = spec_k.min(remaining);
+
+            let saved_draft_pos = draft_model.kv_cache.seq_len();
+            let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+            let mut draft_logits_all: Vec<Vec<f32>> = Vec::with_capacity(k);
+            let mut draft_hiddens: Vec<Vec<f32>> = Vec::with_capacity(k);
+            let mut draft_input = next_token;
+
+            // Draft phase: capture hidden state per position (vanilla argmax、bigram なし)
+            for _ in 0..k {
+                let (dl, hidden) =
+                    draft_model.forward_capture_hidden(draft_input, hidden_capture_layer);
+                draft_input = argmax(&dl);
+                draft_tokens.push(draft_input);
+                draft_logits_all.push(dl);
+                draft_hiddens.push(hidden);
+            }
+            total_drafted += draft_tokens.len();
+
+            // Verify phase: vanilla Leviathan、accept/reject を position 別 label に転記
+            logits = self.forward(next_token);
+
+            let mut num_accepted = 0;
+            let mut rejected = false;
+            for i in 0..draft_tokens.len() {
+                let p = softmax(&logits);
+                let q = softmax(&draft_logits_all[i]);
+                let x = draft_tokens[i] as usize;
+                let p_x = if x < p.len() { p[x] } else { 0.0 };
+                let q_x = if x < q.len() { q[x] } else { 1e-10 };
+                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let r = rng.next_f32();
+                let accepted = r < accept_prob;
+                // ここで label 付与 (verify した position のみ)
+                samples.push(crate::speculative_dspark::DsparkLabelSample {
+                    position: i as u32,
+                    hidden: core::mem::take(&mut draft_hiddens[i]),
+                    was_accepted: accepted,
+                });
+                if accepted {
+                    generated.push(draft_tokens[i]);
+                    tokens.push(draft_tokens[i]);
+                    total_accepted += 1;
+                    num_accepted += 1;
+                    logits = self.forward(draft_tokens[i]);
+                } else {
+                    // vanilla resample from max(0, p - q)
+                    let mut adjusted = vec![0.0f32; p.len()];
+                    let mut adj_sum = 0.0f32;
+                    for j in 0..p.len() {
+                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adj_sum += adjusted[j];
+                    }
+                    let resampled = if adj_sum > 0.0 {
+                        let inv = 1.0 / adj_sum;
+                        for a in &mut adjusted {
+                            *a *= inv;
+                        }
+                        sample_from_probs(&adjusted, rng.next_f32())
+                    } else {
+                        sample_from_probs(&p, rng.next_f32())
+                    };
+                    if resampled != tokenizer.eos_id {
+                        generated.push(resampled);
+                        tokens.push(resampled);
+                        logits = self.forward(resampled);
+                    }
+                    rejected = true;
+                    break;
+                }
+            }
+
+            if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
+                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                if bonus != tokenizer.eos_id {
+                    generated.push(bonus);
+                    tokens.push(bonus);
+                    logits = self.forward(bonus);
+                }
+            }
+
+            let draft_keep = saved_draft_pos + 1 + num_accepted;
+            draft_model.kv_cache.rollback_to(draft_keep);
+            if let Some(&last) = tokens.last() {
+                draft_model.forward(last);
+            }
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let result = GenerateResult {
+            text: tokenizer.decode(&generated),
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+            spec_stats: Some(SpecStats {
+                draft_tokens: total_drafted,
+                accepted_tokens: total_accepted,
+                draft_layers: draft_model.config.num_layers,
+                spec_k,
+            }),
+        };
+        Ok((result, samples))
     }
 
     /// Forward pass using ternary-quantized weights (no multiplications in projections).
