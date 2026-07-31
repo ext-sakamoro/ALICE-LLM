@@ -7,6 +7,7 @@
 //!
 //! [`sparse_topk_select`]: super::topk::sparse_topk_select
 
+use super::simd;
 use super::types::{BlockTables, CuSeqlensQ, SparseAttentionError};
 
 #[cfg(feature = "parallel")]
@@ -163,11 +164,7 @@ pub fn compute_proxy_block_max_scores(
                     for pos in pos_start..pos_end {
                         let k_base = base_page + pos * head_dim;
                         let k = &k_pages[k_base..k_base + head_dim];
-                        let mut dot = 0.0f32;
-                        for d in 0..head_dim {
-                            dot += q[d] * k[d];
-                        }
-                        let s = dot * scale;
+                        let s = simd::dot(q, k) * scale;
                         if s > block_max {
                             block_max = s;
                         }

@@ -18,6 +18,7 @@
 //! standard FlashAttention log-sum-exp update.
 
 use super::scheduler::{enumerate_work_units, WorkSplit};
+use super::simd;
 use super::types::{BlockTables, CuSeqlensQ, KvOuterIndex, SparseAttentionError};
 
 #[cfg(feature = "parallel")]
@@ -348,11 +349,7 @@ fn process_work_unit(
                 let s = if alive {
                     let k_off = pos * ctx.head_dim;
                     let k_row = &k_block[k_off..k_off + ctx.head_dim];
-                    let mut dot = 0.0f32;
-                    for d in 0..ctx.head_dim {
-                        dot += q_vec[d] * k_row[d];
-                    }
-                    dot * ctx.softmax_scale
+                    simd::dot(q_vec, k_row) * ctx.softmax_scale
                 } else {
                     f32::NEG_INFINITY
                 };
@@ -368,9 +365,7 @@ fn process_work_unit(
             if !m.is_finite() {
                 m_slice[local_partial] = f32::NEG_INFINITY;
                 l_slice[local_partial] = 0.0;
-                for d in 0..ctx.head_dim {
-                    o_slice[o_off + d] = 0.0;
-                }
+                o_slice[o_off..o_off + ctx.head_dim].fill(0.0);
                 continue;
             }
 
@@ -380,9 +375,7 @@ fn process_work_unit(
                 l += p;
                 let v_off = pos * ctx.head_dim;
                 let v_row = &v_block[v_off..v_off + ctx.head_dim];
-                for d in 0..ctx.head_dim {
-                    o_slice[o_off + d] += p * v_row[d];
-                }
+                simd::axpy(&mut o_slice[o_off..o_off + ctx.head_dim], p, v_row);
             }
             m_slice[local_partial] = m;
             l_slice[local_partial] = l;
