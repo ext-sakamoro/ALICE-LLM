@@ -25,6 +25,8 @@
 
 pub mod combine;
 pub mod forward;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod index;
 pub mod proxy;
 pub mod scheduler;
