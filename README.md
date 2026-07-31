@@ -36,6 +36,8 @@ GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **Diagnostic tooling (Phase X.3.e.3.30+)** — new examples for depth-routing analysis: `examples/entropy_mod_qwen35.rs` (entropy-driven Mixture-of-Depths observation), `examples/early_exit_qwen35.rs` (early-exit ablation), `examples/entropy_ppl_correlation_qwen35.rs` (correlation validation between per-layer entropy and end-position PPL).
 
+**Sparse attention (KV-outer, `src/sparse_attention/`, 2026-07-31)** — pure-Rust CPU port of the MiniMax Sparse Attention (`MiniMax-AI/MSA`, MIT) + M3 KV-outer sparse (`fw-ai/minimax-kernels`, Apache-2.0) algorithms: CSR inverse-index builder, top-K KV-block selector, dense proxy pass, load-balance scheduler, KV-outer forward with GQA row-packing + online-softmax, and standard FlashAttention LSE combine. One-shot API `kvouter_attention(...)`. Verified against a naïve dense reference (no-causal / GQA / causal) with relative error < 1e-4 when every block is selected. See `examples/sparse_attention_demo.rs` and `NOTICE` for upstream attribution. Parallel / SIMD / GPU (wgpu) / FP8 paths deferred to Phase MSA.5.
+
 ## Quick Start
 
 ```bash

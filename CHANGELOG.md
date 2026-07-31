@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sparse attention (KV-outer) module — Phase MSA.1 – MSA.4** (2026-07-31).
+  Rust-from-scratch port of the algorithm described in MiniMax Sparse
+  Attention (`MiniMax-AI/MSA`, MIT) and Fireworks AI's M3 KV-outer sparse
+  attention (`fw-ai/minimax-kernels`, Apache-2.0); no upstream CUDA /
+  CuTe-DSL kernel is vendored, only mathematical formulation and tensor
+  contracts. The new module `src/sparse_attention/` ships (1) tensor types
+  (`SparseSelection`, `BlockTables`, `CuSeqlensQ`, `KvOuterIndex`,
+  `SparseAttentionError`); (2) CSR inverse-index builder
+  `build_kvouter_index` that collapses the upstream 5-kernel index-build
+  pipeline (`InitSlotsAndCounts` / `CountEdges` / `ReduceReplicas` /
+  `CountToOffsets` / `ScatterRanks`) into two linear passes; (3) top-K
+  KV-block selector `sparse_topk_select` (histogram + insertion-sort
+  translated from MSA's `sparse_topk_select.cuh`, itself derived from
+  TensorRT-LLM's `indexerTopK.cu`); (4) dense proxy pass
+  `compute_proxy_block_max_scores` for cheap-Q-slice per-block max score;
+  (5) load-balance scheduler (`WorkSplit`, `enumerate_work_units`,
+  `build_fixed_schedule`); (6) KV-outer forward `kvouter_forward` that
+  loads each selected KV block once and emits per-`(edge, qhead_lane)`
+  unnormalized partials plus online-softmax `(m, l)` stats with GQA row
+  packing and right-aligned causal masking; (7) LSE combine `lse_combine`
+  implementing the standard FlashAttention `M = max mᵢ`,
+  `l_out = Σ exp(mᵢ - M)·lᵢ`, `o_out = Σ exp(mᵢ - M)·oᵢ / l_out` identity;
+  and (8) one-shot `kvouter_attention` public entry point that chains the
+  three stages. Verified against a naïve dense reference in three
+  configurations (no-causal, GQA `Hq=4`/`Hkv=2`, causal) with relative
+  error < 1e-4 when every sparse block is selected. Adds
+  `examples/sparse_attention_demo.rs` (end-to-end pipeline runner) and a
+  new `NOTICE` file for upstream attribution. Everything is pure CPU with
+  zero new dependencies; parallel / SIMD / GPU (wgpu) / FP8 paths are
+  deferred to a follow-up Phase MSA.5. 33 new tests (11 index / 8 topk /
+  4 proxy / 4 scheduler / 4 combine / 1 API + 1 demo), 547 lib tests
+  total, clippy pedantic + nursery 0 warnings, `cargo fmt` clean.
+
 - **DSpark Phase 6 — `DsparkAdvancedConfig` + `forward_capture_hidden` +
   `PositionConfidenceHead` 統合 with confidence-gated 早期打切り**
   (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の Phase 6 として (1)
