@@ -2,13 +2,27 @@
 //! `kvouter_attention` without hand-rolling the paged-cache repack, block
 //! selection, and one-shot API plumbing themselves.
 //!
-//! ## Why this exists (Phase MSA.5.5)
+//! ## Architectural fit
 //!
-//! `src/llama3.rs` (20k+ lines, including the Kimi K3 forward path) keeps
-//! K / V as *dense* tensors of shape `[seq_len, hkv, head_dim]` per layer,
-//! optionally backed by `KvCache`. Wiring it to
-//! [`super::kvouter_attention`] requires four steps every call site would
-//! otherwise repeat:
+//! This adapter targets **standard Llama-3-style attention** — models that
+//! keep K / V as *dense* tensors of shape `[seq_len, hkv, head_dim]` per
+//! layer, accessed one KV token at a time. In `src/llama3.rs` this is the
+//! shape consumed by `gqa_attention` (Qwen 3.5, Llama 3, Bonsai, Elyza,
+//! Gemma, and every other GQA / MQA / MHA arch that uses the standard
+//! `KvCache`).
+//!
+//! **Not fit** for Kimi K3 (`kimi_k3_gated_mla_step`): K3 uses MLA
+//! (Multi-head Latent Attention), which stores a LoRA-compressed *latent*
+//! KV that gets decompressed on the fly per attention step. A separate
+//! `mla_bridge` would be needed to sparse-attend over MLA's latent
+//! representation; keeping K3's compression advantage while sparsifying
+//! is a redesign problem, not an adapter problem. See
+//! `memory/project_alice_llm_sparse_attention.md` for the rationale.
+//!
+//! ## Why this exists (Phase MSA.5.5 / 5.6)
+//!
+//! Wiring dense KV cache to [`super::kvouter_attention`] requires four
+//! steps every call site would otherwise repeat:
 //!
 //! 1. repack dense K / V into a paged layout
 //!    `[num_pages, hkv, page_size, head_dim]` with block tables;
@@ -17,31 +31,34 @@
 //! 3. build the ancillary `CuSeqlensQ` / `BlockTables` view;
 //! 4. invoke `kvouter_attention` with the correct softmax scale.
 //!
-//! [`k3_sparse_attention`] does all four in one call and returns the
+//! [`llama3_sparse_attention`] does all four in one call and returns the
 //! `[Tq, Hq, head_dim]` output ready to be consumed by the residual add.
 //!
-//! ## Env-gated activation in `llama3.rs`
+//! ## Env-gated activation
 //!
-//! The intended wiring in the K3 attention block (a follow-up sprint —
-//! this module deliberately does not edit `llama3.rs` itself, so we can
-//! validate the adapter in isolation first):
+//! `gqa_attention` in `llama3.rs` reads `ALICE_SPARSE_TOPK` at call time
+//! and, when set to a positive integer, dispatches this adapter with
+//! `topk = <env>`. `ALICE_SPARSE_TOPK=0` selects every sparse block and
+//! is arithmetically equivalent to dense attention modulo FP
+//! re-association (the parity guarantee tested below). Larger values pick
+//! only the top-K KV blocks per query.
 //!
 //! ```ignore
-//! if let Ok(topk) = std::env::var("ALICE_K3_SPARSE_TOPK").and_then(|s| s.parse::<usize>()) {
+//! // Actual code in llama3.rs::gqa_attention (roughly):
+//! if let Some(topk) = std::env::var("ALICE_SPARSE_TOPK")
+//!     .ok().and_then(|s| s.parse::<usize>().ok())
+//! {
 //!     let cfg = BridgeConfig { hq, hkv, head_dim, block_size: 64, page_size: 64,
-//!                              softmax_scale, causal: true, topk };
-//!     let kv_view = DenseKvCacheView { k: &k_all, v: &v_all,
-//!                                       seq_len: kv_seq_len, hkv, head_dim };
-//!     let out = k3_sparse_attention(&q_all, &kv_view, tq, &cfg)?;
-//!     // ... drop `out` into the residual stream ...
-//! } else {
-//!     // existing dense attention path
+//!                              softmax_scale, causal: false, topk };
+//!     let kv_view = DenseKvCacheView { k: &k_dense, v: &v_dense,
+//!                                       seq_len: used_len, hkv, head_dim };
+//!     if let Ok(out) = llama3_sparse_attention(q_buf, &kv_view, 1, &cfg) {
+//!         attn_out.copy_from_slice(&out);
+//!         return;
+//!     }
+//!     // adapter rejected (softcap / geometry) → fall back to dense
 //! }
 //! ```
-//!
-//! With `topk == 0` (or `topk >= num_blocks`) the adapter selects every
-//! sparse block and is arithmetically equivalent to dense attention modulo
-//! FP re-association; that's the parity guarantee tested below.
 
 use super::index::build_kvouter_index;
 use super::proxy::compute_proxy_block_max_scores;
@@ -107,7 +124,7 @@ pub struct BridgeConfig {
 /// * `cfg` — geometry + sparsity knobs.
 ///
 /// Returns `[tq * hq * head_dim]` FP32 attention output.
-pub fn k3_sparse_attention(
+pub fn llama3_sparse_attention(
     q: &[f32],
     kv: &DenseKvCacheView<'_>,
     tq: usize,
@@ -381,7 +398,7 @@ mod tests {
             causal: false,
             topk: 0, // full fallback
         };
-        let bridge_out = k3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
+        let bridge_out = llama3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
         let dense_out = naive_dense_reference(&q, &kv, tq, hq);
         assert_eq!(bridge_out.len(), dense_out.len());
         for (i, (a, b)) in bridge_out.iter().zip(&dense_out).enumerate() {
@@ -412,7 +429,7 @@ mod tests {
             causal: false,
             topk: 3,
         };
-        let bridge_out = k3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
+        let bridge_out = llama3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
         let dense_out = naive_dense_reference(&q, &kv, tq, hq);
         for (i, (a, b)) in bridge_out.iter().zip(&dense_out).enumerate() {
             let rel = (a - b).abs() / b.abs().max(1e-6);
@@ -442,7 +459,7 @@ mod tests {
             causal: false,
             topk: 2, // top-2 of 3 blocks
         };
-        let out = k3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
+        let out = llama3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
         assert_eq!(out.len(), tq * hq * head_dim);
         for (i, v) in out.iter().enumerate() {
             assert!(v.is_finite(), "non-finite output at {i}: {v}");
@@ -472,7 +489,7 @@ mod tests {
             topk: 0,
         };
         // Correct q length would be 1 * 4 * 8 = 32; supply 30.
-        let err = k3_sparse_attention(&vec![0.0f32; 30], &kv, 1, &cfg).unwrap_err();
+        let err = llama3_sparse_attention(&vec![0.0f32; 30], &kv, 1, &cfg).unwrap_err();
         matches!(err, SparseAttentionError::ShapeMismatch { .. });
     }
 
@@ -497,7 +514,7 @@ mod tests {
             causal: false,
             topk: 0,
         };
-        let err = k3_sparse_attention(&vec![0.0f32; 1 * 4 * 16], &kv, 1, &cfg).unwrap_err();
+        let err = llama3_sparse_attention(&vec![0.0f32; 1 * 4 * 16], &kv, 1, &cfg).unwrap_err();
         matches!(err, SparseAttentionError::HeadDimMismatch);
     }
 }

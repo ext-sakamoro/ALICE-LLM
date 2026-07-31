@@ -31,6 +31,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (KimiK3Model::forward_capture_hidden or DFlashParallelDraft の llama3
   統合検討) は次 session
 
+- **Sparse attention env hook in `gqa_attention` — Phase MSA.5.6**
+  (2026-07-31). `llama3.rs::gqa_attention` (Qwen 3.5 / Llama 3 / Bonsai /
+  Elyza / Gemma / every standard GQA arch) now checks the
+  `ALICE_SPARSE_TOPK` environment variable at call time. When set to a
+  non-negative integer (and no other diagnostic env is active, and
+  `attn_logit_softcap` is `None`) the function gathers the current layer's
+  dense KV slice, wraps it as `DenseKvCacheView`, and dispatches to
+  `sparse_attention::llama3_bridge::llama3_sparse_attention` (renamed from
+  the earlier `k3_sparse_attention` — the K3-specific naming was
+  misleading; the adapter targets standard dense-KV Llama-style attention,
+  not K3's MLA path). `TOPK=0` selects every sparse block and is
+  arithmetically equivalent to dense attention modulo FP re-association;
+  larger values pick only the top-K KV blocks per query, cutting attention
+  compute at the cost of some accuracy. When the adapter rejects the input
+  (e.g. exotic geometry) the function transparently falls back to the
+  existing dense path. Smoke: the full 558-test lib suite passes with
+  `ALICE_SPARSE_TOPK=0` and `ALICE_SPARSE_TOPK=4` set. Does **not** hook
+  the Kimi K3 MLA path (`kimi_k3_gated_mla_step`): K3 uses Multi-head
+  Latent Attention with LoRA-compressed KV, so sparsifying it requires a
+  separate MLA-aware bridge (documented in
+  `src/sparse_attention/llama3_bridge.rs` module header).
+
+- **Sparse attention llama3 bridge adapter — Phase MSA.5.5** (2026-07-31).
+  New `src/sparse_attention/llama3_bridge.rs` module ships
+  `DenseKvCacheView`, `BridgeConfig`, and `llama3_sparse_attention` as a
+  one-shot high-level adapter that wraps
+  `sparse_attention::kvouter_attention` for callers that keep K / V as
+  dense `[seq_len, hkv, head_dim]` tensors (the shape `gqa_attention`
+  consumes). Internally repacks the dense KV into the paged layout the
+  sparse pipeline expects, builds the block table + `SparseSelection` (dense
+  fallback when `topk == 0`, otherwise runs the dense proxy pass through
+  `sparse_topk_select_batch` to pick top-K blocks), and finally invokes
+  `kvouter_attention`. 5 tests cover 3-way parity (naive
+  `scaled_dot_product_attention` ≡ `sparse_attention::kvouter_attention`
+  with all blocks selected ≡ `llama3_sparse_attention` with `topk == 0`,
+  rel err < 1e-4), explicit `topk == num_blocks`, partial-`topk` bounded
+  output, and shape / head-dim mismatch rejection.
+
 - **Sparse attention (KV-outer) module — Phase MSA.1 – MSA.4** (2026-07-31).
   Rust-from-scratch port of the algorithm described in MiniMax Sparse
   Attention (`MiniMax-AI/MSA`, MIT) and Fireworks AI's M3 KV-outer sparse
