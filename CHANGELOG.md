@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12b Part 3c2 — K3Model integration + delta mode full
+  wiring** (2026-08-06). Phase 12b delta encoding pipeline の最終 wire-up、
+  Part 3a (head-level capture) + Part 3b (delta ring infrastructure) +
+  Part 3c1 (KDA capture wire-up) を統合して delta mode 完全機能を達成
+  (1) `KimiK3Model::forward_capture_updates(token_id) -> (Vec<f32>,
+  Vec<Vec<KimiDeltaHeadUpdate>>)` を `#[cfg(feature = "dspark")]` gate で
+  新規追加、既存 `forward` の 3rd duplicate (Phase 8 の Approach A pattern)
+  ~250 LOC、KDA layer 呼出で `kimi_k3_kda_layer_forward` に `Some(&mut
+  layer_capture)` を渡して per-head updates を capture、MLA / Dense 層は
+  空 vec、返り値の per_layer_updates は KDA layer 順で並ぶ 2 次元 vec
+  `[kda_layer_idx][head_idx]` (2) `forward_with_snapshot` に **delta mode
+  branch** 追加: `delta_snapshots = true` の時、現 delta ring が空 or
+  `back().per_step_updates.len() >= max_snapshot_ring` なら rebase (現状態
+  を新 base に snapshot、ring size を 2 chunks 保持で pop_front)、そう
+  でなければ `forward_capture_updates` 呼出、返り値の updates を現 delta
+  の `per_step_updates` に append、`token_count += 1` (3) Full / Compact
+  mode は既存経路維持 (`push_snapshot_bounded` + `forward`) **Part 3c2
+  完了で delta mode が完全機能**: `set_snapshot_delta_mode(true)` →
+  `forward_with_snapshot(token)` の N 回呼出 → delta ring に base + N
+  updates 蓄積 → `rollback_to(pos)` (Part 3b で実装) で base restore +
+  updates truncate + replay → state 復元 default lib test 568 pass
+  (unchanged)、dspark feature 594 pass (unchanged、mechanical wire-up で
+  test 追加なし、Part 3a bit-exact primitive + Part 3b synthetic rollback
+  test で正当性検証済)、speculative_dspark 84 test unchanged、clippy
+  pedantic+nursery 0 warn 新規範囲、fmt check pass 実 K3 (real weights
+  必要) で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実測可能
+
 - **DSpark Phase 12b Part 3c1 — KDA capture wire-up** (2026-08-06).
   Phase 12b Part 3c の KDA forward capture wire-up、Part 3a の primitive
   (`kimi_delta_forward_head_with_capture`) を KDA layer / head level に
