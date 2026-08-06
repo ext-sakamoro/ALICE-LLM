@@ -9407,14 +9407,26 @@ pub struct KimiK3Model<'a> {
     /// DSpark Phase 10: 1 前提の forward 呼出数 (`reset` で 0 に戻る)
     /// `DraftBackend::seq_len` の返り値
     token_count: usize,
-    /// DSpark Phase 10: rollback 用 snapshot ring buffer
+    /// DSpark Phase 10: rollback 用 snapshot ring buffer (full precision)
     /// 各 snapshot は forward 呼出の **直前** 状態を保存
     /// bound = `max_snapshot_ring` を超えた場合、最古 snapshot を drop
+    /// Phase 12: `compact_snapshots = true` の時は使わず `snapshot_ring_compact` に push
     snapshot_ring: std::collections::VecDeque<KimiK3ModelSnapshot>,
+    /// DSpark Phase 12: rollback 用 snapshot ring buffer (f16 圧縮版)
+    /// `compact_snapshots = true` の時のみ使用、~2× メモリ削減
+    /// (Full と Compact は排他、同時に両方に push しない)
+    #[cfg(feature = "dspark")]
+    snapshot_ring_compact: std::collections::VecDeque<KimiK3ModelSnapshotCompact>,
     /// DSpark Phase 10: snapshot ring buffer の最大保持数
     /// 実運用では spec_k + 1 以上を推奨 (default 8)
     /// 大きくすれば深い rollback 可、メモリコストは linear に増加
     max_snapshot_ring: usize,
+    /// DSpark Phase 12: compact (f16) snapshot mode flag
+    /// `true` の時 `push_snapshot_bounded` は f16 圧縮 snapshot を push、
+    /// `rollback_to` は `snapshot_ring_compact` から restore する
+    /// mode 切替時は既存 ring はクリアされる
+    #[cfg(feature = "dspark")]
+    compact_snapshots: bool,
 }
 
 /// DSpark Phase 10: [`KimiK3Model`] の rollback 用 snapshot
@@ -9438,6 +9450,149 @@ pub struct KimiK3ModelSnapshot {
 /// DSpark Phase 10: `KimiK3Model::snapshot_ring` のデフォルト容量
 /// spec_k = 4-8 の速記デコーディングに十分
 pub const KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING: usize = 8;
+
+// ── DSpark Phase 12 (Y1a): f16 quantized snapshot compression ───────────────
+//
+// K3 snapshot は KDA recurrent state 支配 (~36MB per snapshot、ring=8 で ~290MB)
+// f32 → IEEE 754 binary16 (half-precision) 変換で **2× 圧縮** (145MB)
+// 精度 loss ~1e-3、KDA state / MLA c_k/k_rope / AttnResState.banked 全部対象
+//
+// 手書き IEEE 754 half-precision 変換 (無依存追加、`half` crate 不要)
+
+/// f32 → IEEE 754 binary16 (u16 として保持)
+///
+/// - sign: 1 bit / exp: 5 bit (bias 15) / mant: 10 bit
+/// - overflow は Inf、underflow は 0 (denormal 非対応、K3 state で影響なし)
+/// - NaN は NaN 保持、Inf は Inf 保持
+#[cfg(feature = "dspark")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mantissa = bits & 0x007F_FFFF; // f32 mantissa is 23 bits
+    let exp32 = ((bits >> 23) & 0xFF) as i32;
+    if exp32 == 0xFF {
+        // Inf or NaN
+        return sign | 0x7C00 | if mantissa != 0 { 0x0200 } else { 0 };
+    }
+    let biased_exp = exp32 - 127 + 15;
+    if biased_exp >= 31 {
+        // Overflow → ±Inf
+        return sign | 0x7C00;
+    }
+    if biased_exp <= 0 {
+        // Underflow → ±0 (denormal は対応せず 0)
+        return sign;
+    }
+    // Round-to-nearest-even (mantissa の bit 12 を tie-break で使う)
+    let mantissa_shifted = mantissa >> 13;
+    let round_bit = (mantissa >> 12) & 1;
+    let sticky = mantissa & 0x0FFF;
+    let rounded = mantissa_shifted
+        + u32::from(round_bit != 0 && (sticky != 0 || (mantissa_shifted & 1) != 0));
+    // Rounding overflow: mant16 = 1024 なら exp + 1
+    if rounded > 0x3FF {
+        let new_exp = biased_exp + 1;
+        if new_exp >= 31 {
+            return sign | 0x7C00;
+        }
+        return sign | ((new_exp as u16) << 10);
+    }
+    sign | ((biased_exp as u16) << 10) | (rounded as u16)
+}
+
+/// IEEE 754 binary16 (u16) → f32
+///
+/// bit-exact 復元 (f16 が表現可能な数値については)、denormal は 0 として復元
+#[cfg(feature = "dspark")]
+#[allow(clippy::cast_sign_loss)]
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp16 = ((h >> 10) & 0x1F) as i32;
+    let mant16 = u32::from(h & 0x03FF);
+    if exp16 == 0 {
+        // ±0 or denormal (denormal は 0 として扱う)
+        return f32::from_bits(sign);
+    }
+    if exp16 == 0x1F {
+        // Inf or NaN
+        let mant32 = if mant16 != 0 { mant16 << 13 } else { 0 };
+        return f32::from_bits(sign | 0x7F80_0000 | mant32);
+    }
+    let exp32 = (exp16 - 15 + 127) as u32;
+    let mant32 = mant16 << 13;
+    f32::from_bits(sign | (exp32 << 23) | mant32)
+}
+
+/// Vec<f32> → Vec<u16> (f16 bits) 変換
+#[cfg(feature = "dspark")]
+fn f32_vec_to_f16_bits(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|&x| f32_to_f16_bits(x)).collect()
+}
+
+/// Vec<u16> (f16 bits) → Vec<f32> 復元
+#[cfg(feature = "dspark")]
+fn f16_bits_to_f32_vec(v: &[u16]) -> Vec<f32> {
+    v.iter().map(|&h| f16_bits_to_f32(h)).collect()
+}
+
+/// DSpark Phase 12: [`KimiK3Model`] snapshot の f16 圧縮版
+///
+/// [`KimiK3ModelSnapshot`] と同じ論理 state を持つが KDA state / MLA c_k/k_rope /
+/// AttnResState.banked を f16 (u16 として保持) で格納する ~2× 圧縮、精度 loss ~1e-3
+///
+/// 使用: `KimiK3Model::set_snapshot_compact_mode(true)` で有効化、以降の
+/// `forward_with_snapshot` は compact snapshot を ring に push する
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub struct KimiK3ModelSnapshotCompact {
+    layer_caches: Vec<KimiK3LayerCacheCompact>,
+    attn_res_state: KimiK3AttnResStateCompact,
+    token_count: usize,
+}
+
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub(crate) enum KimiK3LayerCacheCompact {
+    Mla(KimiK3MlaCacheCompact),
+    Kda(Vec<KimiDeltaHeadCacheCompact>),
+}
+
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub struct KimiK3MlaCacheCompact {
+    c_k_f16: Vec<u16>,
+    k_rope_f16: Vec<u16>,
+    n_positions: usize,
+    kv_lora_rank: usize,
+    qk_rope_head_dim: usize,
+}
+
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub struct KimiDeltaHeadCacheCompact {
+    state_f16: Vec<u16>,
+    conv_state_q_f16: Vec<u16>,
+    conv_state_k_f16: Vec<u16>,
+    conv_state_v_f16: Vec<u16>,
+    ring_pos_q: usize,
+    ring_pos_k: usize,
+    ring_pos_v: usize,
+    kernel_size: usize,
+    d_k: usize,
+    d_v: usize,
+}
+
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub struct KimiK3AttnResStateCompact {
+    d: usize,
+    block_size: usize,
+    banked_f16: Vec<Vec<u16>>,
+}
+
+// (Phase 12 note: snapshot_ring と snapshot_ring_compact を separate field で持つ設計を採用
+//  enum wrapper より feature gate 単純化)
 
 #[allow(dead_code)]
 impl<'a> KimiK3Model<'a> {
@@ -9539,7 +9694,13 @@ impl<'a> KimiK3Model<'a> {
             snapshot_ring: std::collections::VecDeque::with_capacity(
                 KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
             ),
+            #[cfg(feature = "dspark")]
+            snapshot_ring_compact: std::collections::VecDeque::with_capacity(
+                KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
+            ),
             max_snapshot_ring: KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
+            #[cfg(feature = "dspark")]
+            compact_snapshots: false,
         })
     }
 
@@ -9559,6 +9720,9 @@ impl<'a> KimiK3Model<'a> {
         // DSpark Phase 10: token_count + snapshot ring もクリア
         self.token_count = 0;
         self.snapshot_ring.clear();
+        // DSpark Phase 12: compact ring も同時にクリア
+        #[cfg(feature = "dspark")]
+        self.snapshot_ring_compact.clear();
     }
 
     /// Number of layers this model dispatches over (`config.num_layers`,
@@ -9575,9 +9739,14 @@ impl<'a> KimiK3Model<'a> {
     }
 
     /// DSpark Phase 10: snapshot ring buffer の現在サイズ
+    /// Phase 12: compact mode 有効時は compact ring のサイズを返す
     #[cfg(any(test, feature = "dspark"))]
     #[must_use]
     pub fn snapshot_ring_len(&self) -> usize {
+        #[cfg(feature = "dspark")]
+        if self.compact_snapshots {
+            return self.snapshot_ring_compact.len();
+        }
         self.snapshot_ring.len()
     }
 
@@ -9588,6 +9757,10 @@ impl<'a> KimiK3Model<'a> {
         self.max_snapshot_ring = new_max;
         while self.snapshot_ring.len() > new_max {
             self.snapshot_ring.pop_front();
+        }
+        #[cfg(feature = "dspark")]
+        while self.snapshot_ring_compact.len() > new_max {
+            self.snapshot_ring_compact.pop_front();
         }
     }
 
@@ -9613,6 +9786,194 @@ impl<'a> KimiK3Model<'a> {
         self.token_count = snap.token_count;
         // snapshot_ring は restore しない (rollback 後の新規 forward で ring が再構築される)
         self.snapshot_ring.clear();
+        #[cfg(feature = "dspark")]
+        self.snapshot_ring_compact.clear();
+    }
+
+    /// DSpark Phase 12: compact snapshot mode を有効/無効化
+    ///
+    /// mode 切替時は両方の snapshot ring がクリアされる
+    /// `true` にすると `forward_with_snapshot` は f16 圧縮 snapshot を push (~2× 削減)
+    /// `false` (default) は full precision snapshot
+    #[cfg(feature = "dspark")]
+    pub fn set_snapshot_compact_mode(&mut self, enable: bool) {
+        if self.compact_snapshots == enable {
+            return;
+        }
+        self.compact_snapshots = enable;
+        self.snapshot_ring.clear();
+        self.snapshot_ring_compact.clear();
+    }
+
+    /// DSpark Phase 12: 現在の compact mode 状態
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn is_snapshot_compact_mode(&self) -> bool {
+        self.compact_snapshots
+    }
+
+    /// DSpark Phase 12: 現状態を f16 圧縮 snapshot として clone
+    ///
+    /// KDA state / MLA c_k/k_rope / AttnResState.banked を f32 → f16 (u16 bits) に変換
+    /// メモリコスト: full snapshot の ~50% (K3 default で ~18MB per snapshot)
+    /// 精度 loss: f16 の 5-bit exp / 10-bit mant による丸め (~1e-3 order)
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn snapshot_compact(&self) -> KimiK3ModelSnapshotCompact {
+        let layer_caches: Vec<KimiK3LayerCacheCompact> = self
+            .layer_caches
+            .iter()
+            .map(|cache| match cache {
+                KimiK3LayerCache::Mla(m) => KimiK3LayerCacheCompact::Mla(KimiK3MlaCacheCompact {
+                    c_k_f16: f32_vec_to_f16_bits(&m.c_k),
+                    k_rope_f16: f32_vec_to_f16_bits(&m.k_rope),
+                    n_positions: m.n_positions,
+                    kv_lora_rank: m.kv_lora_rank,
+                    qk_rope_head_dim: m.qk_rope_head_dim,
+                }),
+                KimiK3LayerCache::Kda(heads) => KimiK3LayerCacheCompact::Kda(
+                    heads
+                        .iter()
+                        .map(|h| KimiDeltaHeadCacheCompact {
+                            state_f16: f32_vec_to_f16_bits(h.state.as_slice()),
+                            conv_state_q_f16: f32_vec_to_f16_bits(&h.conv_state_q),
+                            conv_state_k_f16: f32_vec_to_f16_bits(&h.conv_state_k),
+                            conv_state_v_f16: f32_vec_to_f16_bits(&h.conv_state_v),
+                            ring_pos_q: h.ring_pos_q,
+                            ring_pos_k: h.ring_pos_k,
+                            ring_pos_v: h.ring_pos_v,
+                            kernel_size: h.kernel_size,
+                            d_k: h.d_k,
+                            d_v: h.d_v,
+                        })
+                        .collect(),
+                ),
+            })
+            .collect();
+        let attn_res_state = KimiK3AttnResStateCompact {
+            d: self.attn_res_state.d,
+            block_size: self.attn_res_state.block_size,
+            banked_f16: self
+                .attn_res_state
+                .banked
+                .iter()
+                .map(|v| f32_vec_to_f16_bits(v))
+                .collect(),
+        };
+        KimiK3ModelSnapshotCompact {
+            layer_caches,
+            attn_res_state,
+            token_count: self.token_count,
+        }
+    }
+
+    /// DSpark Phase 12: f16 compact snapshot を復元
+    ///
+    /// f16 → f32 逆変換で state を上書きする 精度 loss は snapshot_compact 時と同じ
+    #[cfg(feature = "dspark")]
+    pub fn restore_compact(&mut self, snap: KimiK3ModelSnapshotCompact) {
+        let layer_caches: Vec<KimiK3LayerCache> = snap
+            .layer_caches
+            .into_iter()
+            .map(|cache| match cache {
+                KimiK3LayerCacheCompact::Mla(m) => KimiK3LayerCache::Mla(KimiK3MlaCache {
+                    c_k: f16_bits_to_f32_vec(&m.c_k_f16),
+                    k_rope: f16_bits_to_f32_vec(&m.k_rope_f16),
+                    n_positions: m.n_positions,
+                    kv_lora_rank: m.kv_lora_rank,
+                    qk_rope_head_dim: m.qk_rope_head_dim,
+                }),
+                KimiK3LayerCacheCompact::Kda(heads) => KimiK3LayerCache::Kda(
+                    heads
+                        .into_iter()
+                        .map(|h| {
+                            let mut state = KimiDeltaState::new(h.d_k, h.d_v);
+                            let restored = f16_bits_to_f32_vec(&h.state_f16);
+                            state.as_mut_slice().copy_from_slice(&restored);
+                            KimiDeltaHeadCache {
+                                state,
+                                conv_state_q: f16_bits_to_f32_vec(&h.conv_state_q_f16),
+                                conv_state_k: f16_bits_to_f32_vec(&h.conv_state_k_f16),
+                                conv_state_v: f16_bits_to_f32_vec(&h.conv_state_v_f16),
+                                ring_pos_q: h.ring_pos_q,
+                                ring_pos_k: h.ring_pos_k,
+                                ring_pos_v: h.ring_pos_v,
+                                kernel_size: h.kernel_size,
+                                d_k: h.d_k,
+                                d_v: h.d_v,
+                            }
+                        })
+                        .collect(),
+                ),
+            })
+            .collect();
+        self.layer_caches = layer_caches;
+        self.attn_res_state = KimiK3AttnResState {
+            d: snap.attn_res_state.d,
+            block_size: snap.attn_res_state.block_size,
+            banked: snap
+                .attn_res_state
+                .banked_f16
+                .into_iter()
+                .map(|v| f16_bits_to_f32_vec(&v))
+                .collect(),
+        };
+        self.token_count = snap.token_count;
+        // 両 ring 共クリア (restore 後は再構築される想定)
+        self.snapshot_ring.clear();
+        self.snapshot_ring_compact.clear();
+    }
+
+    /// DSpark Phase 12: 現 snapshot ring の推定メモリ使用量 (bytes)
+    ///
+    /// full ring: `snapshot_ring.len() × (state clone bytes)` ~推定
+    /// compact ring: `snapshot_ring_compact.len() × (state clone bytes / 2)` ~推定
+    /// state clone bytes は KDA layer cache 支配、per-snapshot は tiny model config で ~KB order
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn snapshot_ring_bytes_estimate(&self) -> usize {
+        let mut total = 0_usize;
+        for snap in &self.snapshot_ring {
+            for cache in &snap.layer_caches {
+                match cache {
+                    KimiK3LayerCache::Mla(m) => {
+                        total += m.c_k.len() * 4 + m.k_rope.len() * 4;
+                    }
+                    KimiK3LayerCache::Kda(heads) => {
+                        for h in heads {
+                            total += h.state.as_slice().len() * 4;
+                            total += h.conv_state_q.len() * 4;
+                            total += h.conv_state_k.len() * 4;
+                            total += h.conv_state_v.len() * 4;
+                        }
+                    }
+                }
+            }
+            for bank in &snap.attn_res_state.banked {
+                total += bank.len() * 4;
+            }
+        }
+        for snap in &self.snapshot_ring_compact {
+            for cache in &snap.layer_caches {
+                match cache {
+                    KimiK3LayerCacheCompact::Mla(m) => {
+                        total += m.c_k_f16.len() * 2 + m.k_rope_f16.len() * 2;
+                    }
+                    KimiK3LayerCacheCompact::Kda(heads) => {
+                        for h in heads {
+                            total += h.state_f16.len() * 2;
+                            total += h.conv_state_q_f16.len() * 2;
+                            total += h.conv_state_k_f16.len() * 2;
+                            total += h.conv_state_v_f16.len() * 2;
+                        }
+                    }
+                }
+            }
+            for bank in &snap.attn_res_state.banked_f16 {
+                total += bank.len() * 2;
+            }
+        }
+        total
     }
 
     /// DSpark Phase 10: 指定 position までの状態に rollback する
@@ -9634,6 +9995,26 @@ impl<'a> KimiK3Model<'a> {
             self.token_count
         );
         let distance = self.token_count - pos;
+        // Phase 12: compact ring から restore する branch
+        #[cfg(feature = "dspark")]
+        if self.compact_snapshots {
+            assert!(
+                distance <= self.snapshot_ring_compact.len(),
+                "KimiK3Model::rollback_to({pos}) distance {distance} exceeds \
+                 compact snapshot_ring size {} (max_snapshot_ring = {})",
+                self.snapshot_ring_compact.len(),
+                self.max_snapshot_ring
+            );
+            let target_idx = self.snapshot_ring_compact.len() - distance;
+            let snap = self
+                .snapshot_ring_compact
+                .get(target_idx)
+                .cloned()
+                .expect("target compact snapshot must exist (bounds checked)");
+            self.snapshot_ring_compact.truncate(target_idx);
+            self.restore_compact(snap);
+            return;
+        }
         assert!(
             distance <= self.snapshot_ring.len(),
             "KimiK3Model::rollback_to({pos}) distance {distance} exceeds snapshot_ring size {} \
@@ -9683,7 +10064,17 @@ impl<'a> KimiK3Model<'a> {
     }
 
     /// DSpark Phase 10 internal: snapshot を ring に push、bound 超過なら最古を drop
+    /// Phase 12: compact mode 有効時は f16 圧縮 snapshot を compact ring に push
     fn push_snapshot_bounded(&mut self) {
+        #[cfg(feature = "dspark")]
+        if self.compact_snapshots {
+            if self.snapshot_ring_compact.len() >= self.max_snapshot_ring {
+                self.snapshot_ring_compact.pop_front();
+            }
+            let snap = self.snapshot_compact();
+            self.snapshot_ring_compact.push_back(snap);
+            return;
+        }
         if self.snapshot_ring.len() >= self.max_snapshot_ring {
             self.snapshot_ring.pop_front();
         }
@@ -10617,6 +11008,192 @@ mod kimi_k3_model_tests {
         }
         // Rollback clears snapshot_ring (see restore semantics)
         assert_eq!(model.snapshot_ring_len(), 0);
+    }
+
+    // ---- DSpark Phase 12 tests (f16 quantized snapshot compression) ----
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_f16_roundtrip_precision_zero() {
+        for &v in &[0.0_f32, -0.0_f32] {
+            let bits = super::f32_to_f16_bits(v);
+            let back = super::f16_bits_to_f32(bits);
+            assert_eq!(back.to_bits(), v.to_bits(), "0 roundtrip preserves sign");
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_f16_roundtrip_precision_normal() {
+        // f16 の precision ~1e-3 order、normal range
+        for &v in &[1.0_f32, -1.0, 0.5, 3.14159, -2.71828, 100.0, -1000.0] {
+            let bits = super::f32_to_f16_bits(v);
+            let back = super::f16_bits_to_f32(bits);
+            let rel_err = ((back - v) / v).abs();
+            assert!(
+                rel_err < 1e-3,
+                "roundtrip precision {v} → {back}, rel_err = {rel_err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_f16_special_values() {
+        // Inf 保持
+        let inf_bits = super::f32_to_f16_bits(f32::INFINITY);
+        let inf_back = super::f16_bits_to_f32(inf_bits);
+        assert!(inf_back.is_infinite() && inf_back > 0.0);
+        // -Inf 保持
+        let ninf_bits = super::f32_to_f16_bits(f32::NEG_INFINITY);
+        let ninf_back = super::f16_bits_to_f32(ninf_bits);
+        assert!(ninf_back.is_infinite() && ninf_back < 0.0);
+        // NaN 保持
+        let nan_bits = super::f32_to_f16_bits(f32::NAN);
+        let nan_back = super::f16_bits_to_f32(nan_bits);
+        assert!(nan_back.is_nan());
+        // Overflow (large positive) → +Inf
+        let huge_bits = super::f32_to_f16_bits(1.0e30_f32);
+        let huge_back = super::f16_bits_to_f32(huge_bits);
+        assert!(huge_back.is_infinite() && huge_back > 0.0);
+        // Underflow (small positive) → 0 (denormal 対応なしのため)
+        let tiny_bits = super::f32_to_f16_bits(1.0e-10_f32);
+        let tiny_back = super::f16_bits_to_f32(tiny_bits);
+        assert_eq!(tiny_back, 0.0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_snapshot_compact_roundtrip_precision() {
+        let mut model = build_model_for_snapshot_tests();
+        // Muck up MLA cache に非自明な値
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![1.5_f32; 8], &vec![-2.75_f32; 4]);
+            c.append(&vec![3.125_f32; 8], &vec![0.0625_f32; 4]);
+        }
+        model
+            .attn_res_state
+            .bank(&vec![0.7_f32; model.config.hidden_dim]);
+        model.token_count = 5;
+
+        let compact_snap = model.snapshot_compact();
+        model.restore_compact(compact_snap);
+
+        assert_eq!(model.seq_len(), 5);
+        if let KimiK3LayerCache::Mla(c) = &model.layer_caches[3] {
+            assert_eq!(c.n_positions(), 2);
+            // Precision: f16 roundtrip で ~1e-3 rel_err、絶対値でも同 order 内
+            for (i, &v) in c.c_k.iter().enumerate() {
+                let expected = if i < 8 { 1.5 } else { 3.125 };
+                let diff = (v - expected).abs();
+                assert!(diff < 1e-2, "c_k[{i}] = {v} (expected {expected})");
+            }
+        } else {
+            panic!("layer 3 should be MLA");
+        }
+        // AttnRes banked も roundtrip 精度確認
+        assert_eq!(model.attn_res_state.banked.len(), 1);
+        for &v in &model.attn_res_state.banked[0] {
+            let diff = (v - 0.7_f32).abs();
+            assert!(diff < 1e-2, "banked value = {v} (expected 0.7)");
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_set_compact_mode_clears_both_rings() {
+        let mut model = build_model_for_snapshot_tests();
+        model.snapshot_ring.push_back(model.snapshot());
+        model
+            .snapshot_ring_compact
+            .push_back(model.snapshot_compact());
+        assert_eq!(model.snapshot_ring.len(), 1);
+        assert_eq!(model.snapshot_ring_compact.len(), 1);
+
+        model.set_snapshot_compact_mode(true);
+        assert!(model.is_snapshot_compact_mode());
+        assert_eq!(model.snapshot_ring.len(), 0);
+        assert_eq!(model.snapshot_ring_compact.len(), 0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_set_compact_mode_noop_when_unchanged() {
+        let mut model = build_model_for_snapshot_tests();
+        // default = false、false に set しても no-op
+        model.snapshot_ring.push_back(model.snapshot());
+        assert!(!model.is_snapshot_compact_mode());
+        model.set_snapshot_compact_mode(false);
+        // no clear happened
+        assert_eq!(model.snapshot_ring.len(), 1);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_snapshot_ring_len_reflects_active_ring() {
+        let mut model = build_model_for_snapshot_tests();
+        // Full mode
+        model.snapshot_ring.push_back(model.snapshot());
+        model.snapshot_ring.push_back(model.snapshot());
+        assert_eq!(model.snapshot_ring_len(), 2);
+
+        // Compact mode 切替 (ring クリア)
+        model.set_snapshot_compact_mode(true);
+        model
+            .snapshot_ring_compact
+            .push_back(model.snapshot_compact());
+        model
+            .snapshot_ring_compact
+            .push_back(model.snapshot_compact());
+        model
+            .snapshot_ring_compact
+            .push_back(model.snapshot_compact());
+        assert_eq!(model.snapshot_ring_len(), 3);
+        // full ring は 0
+        assert_eq!(model.snapshot_ring.len(), 0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_bytes_estimate_shows_compression() {
+        let mut model = build_model_for_snapshot_tests();
+        // まず full snapshot × 3 push
+        for _ in 0..3 {
+            model.snapshot_ring.push_back(model.snapshot());
+        }
+        let full_bytes = model.snapshot_ring_bytes_estimate();
+        model.snapshot_ring.clear();
+
+        // 同数 compact snapshot × 3 push
+        for _ in 0..3 {
+            model
+                .snapshot_ring_compact
+                .push_back(model.snapshot_compact());
+        }
+        let compact_bytes = model.snapshot_ring_bytes_estimate();
+
+        // compact は full の約半分 (~50%)
+        assert!(
+            compact_bytes * 2 <= full_bytes + full_bytes / 10,
+            "compact ({compact_bytes}) should be ~half of full ({full_bytes})"
+        );
+        assert!(compact_bytes > 0, "compact bytes should be > 0");
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12_push_snapshot_bounded_uses_compact_ring() {
+        let mut model = build_model_for_snapshot_tests();
+        model.set_snapshot_compact_mode(true);
+        // set_max_snapshot_ring を小さく
+        model.set_max_snapshot_ring(3);
+
+        // push_snapshot_bounded を 5 回呼び、bound 3 に truncate されることを確認
+        for _ in 0..5 {
+            model.push_snapshot_bounded();
+        }
+        assert_eq!(model.snapshot_ring_compact.len(), 3);
+        assert_eq!(model.snapshot_ring.len(), 0);
     }
 }
 
