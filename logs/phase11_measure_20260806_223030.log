@@ -1,0 +1,71 @@
+=== DSpark Phase 5+12+12b: Speculative Dual with MarkovBigramBias + snapshot mode ===
+  snapshot_mode: full
+
+Loading main model: /Users/ys/ALICE-LLM/models/Ornith-1.0-9B-gguf/ornith-1.0-9b-Q4_K_M.gguf
+  Main: 32 layers, hidden=4096, vocab=248320 (3512ms)
+Loading draft model: /Users/ys/ALICE-LLM/models/Qwen3.5-4B-Q4_K_M.gguf
+  Draft: 32 layers, hidden=2560, vocab=248320 (6455ms)
+
+Bootstrapping MarkovBigramBias (rank=256) from prompt tokens (n=49)
+  observed_prev_count = 21, empty = false
+
+--- Baseline (vanilla speculative_dual, K=4) ---
+Tokyo
+
+<|eot_id|>
+
+<|begin_of_identity|>
+
+Please
+  20 tokens, 3.21 tok/s (122990ms prefill + 6221ms decode)
+  Baseline: 10/19 accepted (52.6%)
+
+--- DSpark (bigram_strength=0.1, K=4) ---
+The capital of Japan is<|eot_id|>assistant<|end_header_id|>
+  20 tokens, 3.15 tok/s (31250ms prefill + 6353ms decode)
+  DSpark: 11/17 accepted (64.7%)
+  Speedup vs baseline: 0.98x
+
+--- DSpark (bigram_strength=0.5, K=4) ---
+The capital of Japan is<|end_header_id|>
+
+The capital of Japan is<|
+  20 tokens, 0.87 tok/s (56359ms prefill + 23032ms decode)
+  DSpark: 13/13 accepted (100.0%)
+  Speedup vs baseline: 0.27x
+
+--- DSpark (bigram_strength=1.0, K=4) ---
+The capital of Japan is<|eot_id|>
+
+The capital of Japan is<|
+  20 tokens, 1.40 tok/s (29134ms prefill + 14291ms decode)
+  DSpark: 11/17 accepted (64.7%)
+  Speedup vs baseline: 0.44x
+
+=== Confidence-Gated variants (trained head loaded from /Users/ys/ALICE-LLM/logs/phase11_trained_head_20260806_222834.bincode) ===
+  loaded head: block_size=4, hidden_dim=2560
+
+--- DSpark + confidence-gated (strength=0.5, threshold=0.3, K=4) ---
+The capital of Japan is<|eot_id|><|end_header_id|><|end
+  20 tokens, 1.97 tok/s
+  DSpark: 11/13 accepted (84.6%)
+  Speedup vs baseline: 0.61x
+
+--- DSpark + confidence-gated (strength=0.5, threshold=0.5, K=4) ---
+The capital of Japan is<|eot_id|><|end"
+
+p
+
+p
+
+
+  20 tokens, 1.69 tok/s
+  DSpark: 10/11 accepted (90.9%)
+  Speedup vs baseline: 0.53x
+
+--- DSpark + confidence-gated (strength=0.5, threshold=0.7, K=4) ---
+The capital of Japan of Japan of Japan of Japan of Japan of Japan of Japan of Japan of Japan
+  20 tokens, 2.88 tok/s
+  DSpark: 5/7 accepted (71.4%)
+  Speedup vs baseline: 0.90x
+

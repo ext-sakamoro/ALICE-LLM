@@ -1,0 +1,66 @@
+=== DSpark Phase 7: PositionConfidenceHead Training ===
+
+Loading main model: /Users/ys/ALICE-LLM/models/Ornith-1.0-9B-gguf/ornith-1.0-9b-Q4_K_M.gguf
+  Main: 32 layers, hidden=4096, vocab=248320 (3207ms)
+  Draft: 32 layers, hidden=2560, vocab=248320 (10822ms)
+
+--- Label collection: spec_k=4, max_tokens=50 ---
+Tokyo
+
+<|eot_id|>
+
+<|begin_of_identity|>
+
+Please provide the correct answer for the following question:
+
+What is the capital city of Russia?
+"
+
+<think>
+Thinking Process:
+
+1. 
+  50 tokens generated, 35 labels collected in 69375ms
+  Baseline speculation: 25/50 accepted (50.0%)
+
+--- Position-wise accept rate ---
+  pos 0: 11/13 accepted (84.6%)
+  pos 1: 8/11 accepted (72.7%)
+  pos 2: 4/7 accepted (57.1%)
+  pos 3: 2/4 accepted (50.0%)
+
+--- Training PositionConfidenceHead (block=4, hidden=2560, epochs=30, lr=0.05) ---
+  epoch   0: mean loss = 5.2032 (n=35)
+  epoch   1: mean loss = 2.0771 (n=35)
+  epoch   2: mean loss = 0.3126 (n=35)
+  epoch   3: mean loss = 0.4555 (n=35)
+  epoch   4: mean loss = 0.0000 (n=35)
+  epoch   5: mean loss = 0.0000 (n=35)
+  epoch   6: mean loss = 0.0000 (n=35)
+  epoch   7: mean loss = 0.0000 (n=35)
+  epoch   8: mean loss = 0.0000 (n=35)
+  epoch   9: mean loss = 0.0000 (n=35)
+  epoch  10: mean loss = 0.0000 (n=35)
+  epoch  11: mean loss = 0.0000 (n=35)
+  epoch  12: mean loss = 0.0000 (n=35)
+  epoch  13: mean loss = 0.0000 (n=35)
+  epoch  14: mean loss = 0.0000 (n=35)
+  epoch  15: mean loss = 0.0000 (n=35)
+  epoch  16: mean loss = 0.0000 (n=35)
+  epoch  17: mean loss = 0.0000 (n=35)
+  epoch  18: mean loss = 0.0000 (n=35)
+  epoch  19: mean loss = 0.0000 (n=35)
+  epoch  20: mean loss = 0.0000 (n=35)
+  epoch  21: mean loss = 0.0000 (n=35)
+  epoch  22: mean loss = 0.0000 (n=35)
+  epoch  23: mean loss = 0.0000 (n=35)
+  epoch  24: mean loss = 0.0000 (n=35)
+  epoch  25: mean loss = 0.0000 (n=35)
+  epoch  26: mean loss = 0.0000 (n=35)
+  epoch  27: mean loss = 0.0000 (n=35)
+  epoch  28: mean loss = 0.0000 (n=35)
+  epoch  29: mean loss = 0.0000 (n=35)
+  Training completed in 2ms
+
+--- Saved trained head to /Users/ys/ALICE-LLM/logs/phase11_trained_head_20260806_222834.bincode (41000 bytes) ---
+  Sanity: last sample position=1 was_accepted=true → predicted confidence=1.0000
