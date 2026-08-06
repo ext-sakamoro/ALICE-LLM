@@ -1997,6 +1997,97 @@ impl KimiDeltaHeadCache {
     pub const fn kernel_size(&self) -> usize {
         self.kernel_size
     }
+
+    /// DSpark Phase 12b: capture 済 update を apply して cache 状態を 1 step 進める
+    ///
+    /// 用途: rollback 用の delta snapshot 復元で「base state + updates 列」から
+    /// 現状態を再構築する 具体的な処理:
+    ///
+    /// 1. `update.q_pre` を `conv_state_q[ring_pos_q]` に書き込み、ring 進める
+    /// 2. `update.k_pre` を `conv_state_k[ring_pos_k]` に書き込み、ring 進める
+    /// 3. `update.v_pre` を `conv_state_v[ring_pos_v]` に書き込み、ring 進める
+    /// 4. `kimi_delta_step(state, k_conv, v_conv, alpha, beta)` を呼び state 更新
+    ///
+    /// これは `kimi_k3_kda_head_forward` の Step 1 (conv_state ring push) と
+    /// Step 7 (kimi_delta_step) 相当を再現する 中間の silu / l2norm / β 計算は
+    /// update tuple に既に反映済 (k_conv / v_conv / alpha / beta) 前提
+    ///
+    /// # Panics
+    ///
+    /// - `update.q_pre.len() != d_k` / `update.k_pre.len() != d_k` /
+    ///   `update.v_pre.len() != d_v` / `update.k_conv.len() != d_k` /
+    ///   `update.v_conv.len() != d_v` / `update.alpha.len() != d_k` の場合
+    pub fn apply_update(&mut self, update: &KimiDeltaHeadUpdate) {
+        assert_eq!(update.q_pre.len(), self.d_k, "q_pre length must equal d_k");
+        assert_eq!(update.k_pre.len(), self.d_k, "k_pre length must equal d_k");
+        assert_eq!(update.v_pre.len(), self.d_v, "v_pre length must equal d_v");
+        assert_eq!(
+            update.k_conv.len(),
+            self.d_k,
+            "k_conv length must equal d_k"
+        );
+        assert_eq!(
+            update.v_conv.len(),
+            self.d_v,
+            "v_conv length must equal d_v"
+        );
+        assert_eq!(update.alpha.len(), self.d_k, "alpha length must equal d_k");
+
+        let hist = self.kernel_size - 1;
+        // conv_state ring は hist 分しか保持しない (kernel_size - 1)
+        // Q ring push (d_k)
+        {
+            let off = self.ring_pos_q * self.d_k;
+            self.conv_state_q[off..off + self.d_k].copy_from_slice(&update.q_pre);
+            self.ring_pos_q = (self.ring_pos_q + 1) % hist;
+        }
+        // K ring push (d_k)
+        {
+            let off = self.ring_pos_k * self.d_k;
+            self.conv_state_k[off..off + self.d_k].copy_from_slice(&update.k_pre);
+            self.ring_pos_k = (self.ring_pos_k + 1) % hist;
+        }
+        // V ring push (d_v)
+        {
+            let off = self.ring_pos_v * self.d_v;
+            self.conv_state_v[off..off + self.d_v].copy_from_slice(&update.v_pre);
+            self.ring_pos_v = (self.ring_pos_v + 1) % hist;
+        }
+        // Step recurrence
+        kimi_delta_step(
+            &mut self.state,
+            &update.k_conv,
+            &update.v_conv,
+            &update.alpha,
+            update.beta,
+        );
+    }
+}
+
+/// DSpark Phase 12b: 1 step の KDA head update を rollback 再現するためのタプル
+///
+/// [`KimiDeltaHeadCache::apply_update`] で cache に replay する
+/// 実際の forward で capture するのは Phase 12b Part 3 (`kimi_k3_kda_head_forward`
+/// に `capture: Option<&mut KimiDeltaHeadUpdate>` 引数追加)
+///
+/// メモリ: `~3KB per head` (d_k=d_v=128 想定) = 全 KDA 層 552 head で **~1.6MB per step**
+/// full snapshot ~37MB (KDA 支配) との比較で **~23× 圧縮 per step**
+#[derive(Clone, Debug)]
+pub struct KimiDeltaHeadUpdate {
+    /// ShortConv 前 Q 入力 (d_k) `conv_state_q` ring buffer に push される
+    pub q_pre: Vec<f32>,
+    /// ShortConv 前 K 入力 (d_k)
+    pub k_pre: Vec<f32>,
+    /// ShortConv 前 V 入力 (d_v)
+    pub v_pre: Vec<f32>,
+    /// Step 1-4 通過後の Q (silu + l2norm 済) (d_k)、`kimi_delta_step` の `k` 引数相当
+    pub k_conv: Vec<f32>,
+    /// Step 1-4 通過後の V (silu 済) (d_v)、`kimi_delta_step` の `v` 引数相当
+    pub v_conv: Vec<f32>,
+    /// Step 6 で計算された decay α (d_k)
+    pub alpha: Vec<f32>,
+    /// Step 5 で計算された β (scalar)
+    pub beta: f32,
 }
 
 /// Borrowed per-head weight references for one KDA forward pass.
@@ -9594,6 +9685,38 @@ pub struct KimiK3AttnResStateCompact {
 // (Phase 12 note: snapshot_ring と snapshot_ring_compact を separate field で持つ設計を採用
 //  enum wrapper より feature gate 単純化)
 
+// ── DSpark Phase 12b (Y1c 派生): rank-1 delta encoding via update replay ─────
+//
+// Phase 12 の f16 圧縮は state を丸ごと格納 (~145MB)
+// Phase 12b では KDA state 更新の rank-1 性を活かし、
+// **1 base full snapshot + N update tuples** で表現する
+//
+// メモリ: base 37MB + N × 1.6MB (delta) vs full N × 37MB = ~23× 圧縮 per delta
+// ring 8 で 37MB + 7×1.6MB = 48MB (vs Phase 10 290MB = 6× 圧縮)
+//
+// **本 phase (Part 1+2) は primitive のみ**、実 forward 統合は Part 3
+// (`kimi_k3_kda_head_forward` に capture 引数追加) で完成する
+
+/// DSpark Phase 12b: 1 base full snapshot + per-step update tuples による rollback 用 delta snapshot
+///
+/// `base_snapshot` = 起点 [`KimiK3ModelSnapshot`]、`per_step_updates` = 各 forward step の
+/// KDA head update tuple 列 (layer × head の 2 次元)、`per_step_positions` = 各 step の
+/// position (base_snapshot.token_count + i)
+///
+/// 復元: [`KimiK3Model::restore_from_delta`] で base restore + updates を順次 replay
+#[cfg(feature = "dspark")]
+#[derive(Clone)]
+pub struct KimiK3ModelSnapshotDelta {
+    /// 起点 full snapshot (rollback の base)
+    pub base_snapshot: KimiK3ModelSnapshot,
+    /// 各 forward step の per-layer per-head updates (KDA 層のみ)
+    ///
+    /// `per_step_updates[step][layer_idx_in_kda_only]` = そのステップの当該 KDA 層の全 head updates
+    /// MLA 層は positional cache なので step 別 update は保持しない (base + n_positions で復元)
+    /// **Phase 12b Part 1+2 では step 数 = 0 の empty vec を許容** (primitive only、Part 3 で forward 統合)
+    pub per_step_updates: Vec<Vec<Vec<KimiDeltaHeadUpdate>>>,
+}
+
 #[allow(dead_code)]
 impl<'a> KimiK3Model<'a> {
     /// Allocate a Kimi K3 model from an already-loaded weight bundle.
@@ -9971,6 +10094,114 @@ impl<'a> KimiK3Model<'a> {
             }
             for bank in &snap.attn_res_state.banked_f16 {
                 total += bank.len() * 2;
+            }
+        }
+        total
+    }
+
+    /// DSpark Phase 12b: 現状態を base として空の delta snapshot を作る
+    ///
+    /// `per_step_updates` は空 vec で初期化される (Part 3 で forward 統合後、
+    /// step ごとに `push_delta_step` 相当で updates を追加していく想定)
+    ///
+    /// 用途: rollback base として現状態を pin する Part 3 で forward capture が
+    /// 入った後、`snapshot_ring_delta` に push する
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn snapshot_delta_from(&self) -> KimiK3ModelSnapshotDelta {
+        KimiK3ModelSnapshotDelta {
+            base_snapshot: self.snapshot(),
+            per_step_updates: Vec::new(),
+        }
+    }
+
+    /// DSpark Phase 12b: base + updates 列を順次 replay して状態復元
+    ///
+    /// 1. `base_snapshot` を restore (Phase 10 の `restore` と同じ、full clone)
+    /// 2. `per_step_updates[i]` を各 KDA 層の各 head に順次 `apply_update` で適用
+    /// 3. `token_count` を `base.token_count + per_step_updates.len()` に更新
+    ///
+    /// MLA 層は base_snapshot 内の positional cache がそのまま復元される (base + updates で十分)
+    ///
+    /// # Panics
+    ///
+    /// - `per_step_updates[step].len() != KDA layer count` の場合
+    /// - `per_step_updates[step][kda_layer_idx].len() != num_heads` の場合
+    /// - layer / head の [`KimiDeltaHeadCache`] shape と update tuple shape が不一致の場合
+    ///   (`apply_update` の panic 経由)
+    #[cfg(feature = "dspark")]
+    pub fn restore_from_delta(&mut self, delta: KimiK3ModelSnapshotDelta) {
+        // 1. Base restore
+        self.restore(delta.base_snapshot);
+        // 2. Apply each step's updates to KDA heads
+        for step_updates in &delta.per_step_updates {
+            let mut kda_layer_idx = 0_usize;
+            for layer_cache in &mut self.layer_caches {
+                if let KimiK3LayerCache::Kda(heads) = layer_cache {
+                    assert!(
+                        kda_layer_idx < step_updates.len(),
+                        "delta step_updates missing KDA layer at idx {kda_layer_idx}"
+                    );
+                    let head_updates = &step_updates[kda_layer_idx];
+                    assert_eq!(
+                        heads.len(),
+                        head_updates.len(),
+                        "delta step_updates[{kda_layer_idx}] has {} heads but cache has {}",
+                        head_updates.len(),
+                        heads.len(),
+                    );
+                    for (head, update) in heads.iter_mut().zip(head_updates.iter()) {
+                        head.apply_update(update);
+                    }
+                    kda_layer_idx += 1;
+                }
+            }
+            self.token_count += 1;
+        }
+        // ring クリア
+        self.snapshot_ring.clear();
+        self.snapshot_ring_compact.clear();
+    }
+
+    /// DSpark Phase 12b: 現状態から delta snapshot を作り、bytes 推定を返す
+    ///
+    /// full clone は 1 base + 0 updates なので base 分のバイト数のみカウント
+    /// Part 3 で updates が入った後は per-step 累計を加算する見込み
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn snapshot_delta_bytes_estimate(delta: &KimiK3ModelSnapshotDelta) -> usize {
+        let mut total = 0_usize;
+        // Base: full snapshot と同じ計算
+        for cache in &delta.base_snapshot.layer_caches {
+            match cache {
+                KimiK3LayerCache::Mla(m) => {
+                    total += m.c_k.len() * 4 + m.k_rope.len() * 4;
+                }
+                KimiK3LayerCache::Kda(heads) => {
+                    for h in heads {
+                        total += h.state.as_slice().len() * 4;
+                        total += h.conv_state_q.len() * 4;
+                        total += h.conv_state_k.len() * 4;
+                        total += h.conv_state_v.len() * 4;
+                    }
+                }
+            }
+        }
+        for bank in &delta.base_snapshot.attn_res_state.banked {
+            total += bank.len() * 4;
+        }
+        // Per-step updates: (q_pre + k_pre + v_pre + k_conv + v_conv + alpha) f32 + beta 1 f32
+        for step in &delta.per_step_updates {
+            for layer in step {
+                for u in layer {
+                    total += u.q_pre.len() * 4;
+                    total += u.k_pre.len() * 4;
+                    total += u.v_pre.len() * 4;
+                    total += u.k_conv.len() * 4;
+                    total += u.v_conv.len() * 4;
+                    total += u.alpha.len() * 4;
+                    total += 4; // beta
+                }
             }
         }
         total
@@ -11194,6 +11425,211 @@ mod kimi_k3_model_tests {
         }
         assert_eq!(model.snapshot_ring_compact.len(), 3);
         assert_eq!(model.snapshot_ring.len(), 0);
+    }
+
+    // ---- DSpark Phase 12b tests (rank-1 delta encoding primitives) ----
+
+    #[cfg(feature = "dspark")]
+    fn synth_head_update(d_k: usize, d_v: usize) -> super::KimiDeltaHeadUpdate {
+        super::KimiDeltaHeadUpdate {
+            q_pre: (0..d_k).map(|i| i as f32 * 0.01).collect(),
+            k_pre: (0..d_k).map(|i| i as f32 * 0.02).collect(),
+            v_pre: (0..d_v).map(|i| i as f32 * 0.03).collect(),
+            k_conv: (0..d_k).map(|i| (i as f32).sin() * 0.5).collect(),
+            v_conv: (0..d_v).map(|i| (i as f32).cos() * 0.7).collect(),
+            alpha: (0..d_k).map(|i| 0.9 + (i as f32) * 0.001).collect(),
+            beta: 0.3,
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_head_update_construction() {
+        let u = synth_head_update(8, 8);
+        assert_eq!(u.q_pre.len(), 8);
+        assert_eq!(u.k_pre.len(), 8);
+        assert_eq!(u.v_pre.len(), 8);
+        assert_eq!(u.k_conv.len(), 8);
+        assert_eq!(u.v_conv.len(), 8);
+        assert_eq!(u.alpha.len(), 8);
+        assert!((u.beta - 0.3).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_apply_update_state_matches_kimi_delta_step() {
+        // Baseline: create head cache A, call kimi_delta_step directly
+        let d_k = 8_usize;
+        let d_v = 8_usize;
+        let kernel_size = 4_usize;
+        let u = synth_head_update(d_k, d_v);
+
+        let mut cache_baseline = super::KimiDeltaHeadCache::new(d_k, d_v, kernel_size);
+        super::kimi_delta_step(
+            &mut cache_baseline.state,
+            &u.k_conv,
+            &u.v_conv,
+            &u.alpha,
+            u.beta,
+        );
+
+        // Test: fresh head cache B, call apply_update
+        let mut cache_replay = super::KimiDeltaHeadCache::new(d_k, d_v, kernel_size);
+        cache_replay.apply_update(&u);
+
+        // State should be bit-exact identical (both went through kimi_delta_step
+        // with the same inputs on zero-init state)
+        assert_eq!(
+            cache_baseline.state.as_slice(),
+            cache_replay.state.as_slice(),
+            "apply_update state result must match direct kimi_delta_step"
+        );
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_apply_update_advances_conv_state_rings() {
+        let d_k = 8_usize;
+        let d_v = 8_usize;
+        let kernel_size = 4_usize; // hist = 3
+        let u = synth_head_update(d_k, d_v);
+
+        let mut cache = super::KimiDeltaHeadCache::new(d_k, d_v, kernel_size);
+        assert_eq!(cache.ring_pos_q, 0);
+        assert_eq!(cache.ring_pos_k, 0);
+        assert_eq!(cache.ring_pos_v, 0);
+
+        cache.apply_update(&u);
+        assert_eq!(cache.ring_pos_q, 1);
+        assert_eq!(cache.ring_pos_k, 1);
+        assert_eq!(cache.ring_pos_v, 1);
+        // q_pre pushed to conv_state_q[0..d_k]
+        assert_eq!(&cache.conv_state_q[0..d_k], u.q_pre.as_slice());
+
+        cache.apply_update(&u);
+        assert_eq!(cache.ring_pos_q, 2);
+        cache.apply_update(&u);
+        assert_eq!(cache.ring_pos_q, 0); // hist=3 → wrap around
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_snapshot_delta_from_uses_current_state_as_base() {
+        let mut model = build_model_for_snapshot_tests();
+        // Muck up MLA cache
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![2.5_f32; 8], &vec![-1.25_f32; 4]);
+        }
+        model.token_count = 7;
+
+        let delta = model.snapshot_delta_from();
+        assert_eq!(delta.base_snapshot.token_count, 7);
+        assert!(delta.per_step_updates.is_empty());
+        if let KimiK3LayerCache::Mla(c) = &delta.base_snapshot.layer_caches[3] {
+            assert_eq!(c.n_positions(), 1);
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_restore_from_delta_empty_updates_is_base_restore() {
+        let mut model = build_model_for_snapshot_tests();
+        let baseline = model.snapshot_delta_from();
+
+        // Muck up state
+        if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
+            c.append(&vec![9.9_f32; 8], &vec![9.9_f32; 4]);
+        }
+        model.token_count = 99;
+
+        model.restore_from_delta(baseline);
+        assert_eq!(model.seq_len(), 0);
+        if let KimiK3LayerCache::Mla(c) = &model.layer_caches[3] {
+            assert_eq!(c.n_positions(), 0);
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_restore_from_delta_replays_updates_on_kda_layers() {
+        // tiny_kimi_k3_config: 8 layer, layers [0,1,2,4,5,6] = KDA (6 layers),
+        // [3, 7] = MLA. num_heads=8 per KDA layer.
+        let mut model = build_model_for_snapshot_tests();
+        let d_k = 8_usize;
+        let d_v = 8_usize;
+        let num_kda_layers = 6_usize;
+        let num_heads = 8_usize;
+
+        // Take base snapshot
+        let base_snap = model.snapshot_delta_from();
+
+        // Construct 2 steps of synthetic updates
+        let mut per_step_updates: Vec<Vec<Vec<super::KimiDeltaHeadUpdate>>> = Vec::new();
+        for _step in 0..2 {
+            let mut layers = Vec::new();
+            for _kda_layer in 0..num_kda_layers {
+                let mut heads = Vec::new();
+                for _h in 0..num_heads {
+                    heads.push(synth_head_update(d_k, d_v));
+                }
+                layers.push(heads);
+            }
+            per_step_updates.push(layers);
+        }
+
+        let delta = super::KimiK3ModelSnapshotDelta {
+            base_snapshot: base_snap.base_snapshot,
+            per_step_updates,
+        };
+
+        model.restore_from_delta(delta);
+        assert_eq!(model.seq_len(), 2, "token_count = base 0 + 2 steps");
+
+        // Verify: KDA layers 0/1/2/4/5/6 each had 2 apply_update calls
+        // conv_state_q ring_pos_q should be 2 (wrapped from 0 → 1 → 2, hist=3 for kernel=4)
+        for il in [0, 1, 2, 4, 5, 6] {
+            if let KimiK3LayerCache::Kda(heads) = &model.layer_caches[il] {
+                for head in heads {
+                    assert_eq!(
+                        head.ring_pos_q, 2,
+                        "layer {il} head ring_pos_q should be 2 after 2 apply_updates"
+                    );
+                }
+            } else {
+                panic!("layer {il} should be KDA");
+            }
+        }
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_snapshot_delta_bytes_estimate_grows_with_updates() {
+        let model = build_model_for_snapshot_tests();
+        let d_k = 8_usize;
+        let d_v = 8_usize;
+
+        let base_delta = model.snapshot_delta_from();
+        let base_bytes = super::KimiK3Model::snapshot_delta_bytes_estimate(&base_delta);
+
+        let mut with_step = base_delta.clone();
+        // Add 1 step with 6 KDA layers × 8 heads = 48 updates
+        let heads_per_layer: Vec<super::KimiDeltaHeadUpdate> =
+            (0..8).map(|_| synth_head_update(d_k, d_v)).collect();
+        let single_step: Vec<Vec<super::KimiDeltaHeadUpdate>> =
+            (0..6).map(|_| heads_per_layer.clone()).collect();
+        with_step.per_step_updates.push(single_step);
+        let with_step_bytes = super::KimiK3Model::snapshot_delta_bytes_estimate(&with_step);
+
+        assert!(
+            with_step_bytes > base_bytes,
+            "adding a step should increase bytes: base {base_bytes}, with_step {with_step_bytes}"
+        );
+        // Per-step: 6 KDA layers × 8 heads × (~200 bytes update per head, tiny config) ≈ 9-10 KB
+        let step_bytes = with_step_bytes - base_bytes;
+        assert!(
+            step_bytes > 0 && step_bytes < 20_000,
+            "per-step bytes reasonable range: {step_bytes}"
+        );
     }
 }
 

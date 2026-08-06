@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12b Part 1+2 — rank-1 delta encoding primitives**
+  (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の Phase 12b (Y1+Y2 scope) の
+  Part 1+2 完了 Part 3 (KDA forward 統合 + push/rollback delta mode) は
+  次 session (1) `KimiDeltaHeadUpdate` struct (q_pre/k_pre/v_pre/k_conv/
+  v_conv/alpha/beta) を追加、KDA 1 step の rollback 復元に必要な update
+  tuple を保持 メモリ ~3KB per head (d_k=d_v=128 想定) vs full snapshot
+  ~68KB per head = **~23× 圧縮 per delta** (2) `KimiDeltaHeadCache::apply_update(update)`
+  method 追加、conv_state ring push (q_pre/k_pre/v_pre 順) + `kimi_delta_step`
+  (state 更新) を実行して 1 step 進める (3) `KimiK3ModelSnapshotDelta {
+  base_snapshot, per_step_updates: Vec<Vec<Vec<KimiDeltaHeadUpdate>>> }`
+  新規 pub struct、`base_snapshot` は Phase 10 full snapshot、
+  `per_step_updates` は step × KDA layer × head の 3 次元 (4)
+  `KimiK3Model::{snapshot_delta_from(), restore_from_delta(delta),
+  snapshot_delta_bytes_estimate(delta)}` の 3 pub method 追加、
+  `restore_from_delta` は base restore → 各 step で全 KDA layer × head に
+  `apply_update` を順次適用 → token_count 進める (5) 7 追加 unit test
+  全 pass: `phase12b_head_update_construction` /
+  `phase12b_apply_update_state_matches_kimi_delta_step` (直接
+  kimi_delta_step 呼出との bit-exact 一致) /
+  `phase12b_apply_update_advances_conv_state_rings` (ring hist=3 wrap)
+  / `phase12b_snapshot_delta_from_uses_current_state_as_base` /
+  `phase12b_restore_from_delta_empty_updates_is_base_restore` /
+  `phase12b_restore_from_delta_replays_updates_on_kda_layers` (tiny
+  config で 2 step × 6 KDA × 8 head の synthetic update replay) /
+  `phase12b_snapshot_delta_bytes_estimate_grows_with_updates` default
+  lib test 568 pass (unchanged)、dspark feature 584 pass (+7)、
+  speculative_dspark 84 test unchanged、clippy pedantic+nursery 0 warn
+  新規範囲、fmt check pass **Part 1+2 単独では実メモリ削減効果ゼロ**
+  (Part 3 の forward 統合が入るまで snapshot ring は既存 Full/Compact
+  のまま) Part 3 完了で **6-10× 圧縮 (290MB → ~30-48MB)** が実現
+
 - **DSpark Phase 12 — f16 quantized snapshot compression (~2×
   memory reduction)** (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の
   Phase 12 (Y1a scope) として KimiK3Model snapshot の f16 quantized 圧縮版
