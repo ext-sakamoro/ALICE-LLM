@@ -10718,8 +10718,41 @@ impl<'a> KimiK3Model<'a> {
     ///
     /// [`DraftBackend::forward`] impl から呼ばれる
     /// 通常の `forward` は snapshot を保存しないため、非 speculative caller は影響を受けない
+    ///
+    /// Phase 12b Part 3c2: delta mode 有効時は `forward_capture_updates` を呼び、
+    /// updates を現 delta の `per_step_updates` に append する
+    /// Ring が空 or bound 超過なら rebase (現状態を新 base に snapshot)
     #[cfg(feature = "dspark")]
     pub fn forward_with_snapshot(&mut self, token_id: u32) -> Vec<f32> {
+        // Phase 12b Part 3c2: delta mode branch
+        if self.delta_snapshots {
+            let need_rebase = self.snapshot_ring_delta.is_empty()
+                || self
+                    .snapshot_ring_delta
+                    .back()
+                    .is_some_and(|d| d.per_step_updates.len() >= self.max_snapshot_ring);
+            if need_rebase {
+                let new_base = self.snapshot();
+                self.snapshot_ring_delta
+                    .push_back(KimiK3ModelSnapshotDelta {
+                        base_snapshot: new_base,
+                        per_step_updates: Vec::new(),
+                    });
+                // Ring は 2 chunks 最大保持 (base 2 個 → rollback depth 2 × max_snapshot_ring)
+                while self.snapshot_ring_delta.len() > 2 {
+                    self.snapshot_ring_delta.pop_front();
+                }
+            }
+            let (logits, updates) = self.forward_capture_updates(token_id);
+            self.snapshot_ring_delta
+                .back_mut()
+                .expect("just pushed base")
+                .per_step_updates
+                .push(updates);
+            self.token_count += 1;
+            return logits;
+        }
+        // Full / Compact mode (Phase 10 / Phase 12)
         self.push_snapshot_bounded();
         let logits = self.forward(token_id);
         self.token_count += 1;
@@ -10737,6 +10770,214 @@ impl<'a> KimiK3Model<'a> {
         let out = self.forward_capture_hidden(token_id, layer_idx);
         self.token_count += 1;
         out
+    }
+
+    /// DSpark Phase 12b Part 3c2: K3 forward + KDA layer capture
+    ///
+    /// [`Self::forward`] の 3rd duplicate (Phase 8 の Approach A duplicate と同 pattern)、
+    /// KDA layer 呼出で `capture_updates: Some(&mut Vec<KimiDeltaHeadUpdate>)` を渡し、
+    /// per-KDA-layer × per-head の updates を収集して返す
+    ///
+    /// 返り値 `(logits, per_layer_updates)`:
+    /// - `logits`: `[vocab_size]` (通常 forward と bit-exact 一致)
+    /// - `per_layer_updates`: `[kda_layer_idx][head_idx] = KimiDeltaHeadUpdate`
+    ///   KDA layer 順で並ぶ (MLA / Dense 層は含まれない)
+    ///
+    /// 用途: `forward_with_snapshot` の delta mode branch から呼ばれ、返り値の updates を
+    /// 現 `KimiK3ModelSnapshotDelta::per_step_updates` に append する
+    ///
+    /// # Panics
+    /// [`forward`] と同じ
+    #[cfg(feature = "dspark")]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn forward_capture_updates(
+        &mut self,
+        token_id: u32,
+    ) -> (Vec<f32>, Vec<Vec<KimiDeltaHeadUpdate>>) {
+        let vocab_size = self.config.vocab_size;
+        let hidden_dim = self.config.hidden_dim;
+        assert!(
+            (token_id as usize) < vocab_size,
+            "token_id {token_id} out of vocab range 0..{vocab_size}"
+        );
+        let row_start = token_id as usize;
+        let embed_row =
+            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id}"
+                    )
+                });
+        let x_full = weight_ref_row_dequant(&embed_row);
+        let mut x = vec![0.0_f32; hidden_dim];
+        let take = hidden_dim.min(x_full.len());
+        x[..take].copy_from_slice(&x_full[..take]);
+
+        let mla_config = kimi_k3_extract_mla_config(&self.config)
+            .expect("KimiK3Model was constructed but MLA sub-config no longer extractable");
+
+        // Phase 12b Part 3c2: per-KDA-layer capture buffer accumulator
+        let mut per_layer_updates: Vec<Vec<KimiDeltaHeadUpdate>> = Vec::new();
+
+        let trace = std::env::var("ALICE_K3_TRACE").ok().as_deref() == Some("1");
+        let layer_t0 = std::time::Instant::now();
+
+        for il in 0..self.config.num_layers {
+            let layer = &self.weights.layers[il];
+            let il_t0 = std::time::Instant::now();
+
+            let cur_attn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.attn_res_score,
+                self.config.norm_eps,
+            );
+            let banked = self.attn_res_state.is_checkpoint_layer(il);
+            if banked {
+                self.attn_res_state.bank(&x);
+            }
+
+            let attn_output: Vec<f32> = match (&mut self.layer_caches[il], &layer.attn) {
+                (KimiK3LayerCache::Mla(cache), KimiK3Attention::Mla(mla_attn)) => {
+                    kimi_k3_gated_mla_step(
+                        &cur_attn,
+                        &layer.attn_norm,
+                        &layer.attn_gate,
+                        &layer.attn_output,
+                        mla_attn,
+                        cache,
+                        &mla_config,
+                    )
+                }
+                (KimiK3LayerCache::Kda(head_caches), KimiK3Attention::Kda(kda_attn)) => {
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let head_dim = kd
+                        .kda_head_dim
+                        .expect("kda_head_dim missing from kimi_delta config");
+                    let num_kda_heads = kd.kda_num_heads.unwrap_or(self.config.num_heads);
+                    let g_min = kd.kda_gate_lower_bound.unwrap_or(-5.0);
+                    let alpha_rank = kda_attn.ssm_f_a.rows;
+                    // Pre-allocate capture buffer for this layer's heads
+                    let mut layer_capture: Vec<KimiDeltaHeadUpdate> = (0..num_kda_heads)
+                        .map(|_| KimiDeltaHeadUpdate {
+                            q_pre: Vec::new(),
+                            k_pre: Vec::new(),
+                            v_pre: Vec::new(),
+                            k_conv: Vec::new(),
+                            v_conv: Vec::new(),
+                            alpha: Vec::new(),
+                            beta: 0.0,
+                        })
+                        .collect();
+                    let out = kimi_k3_kda_layer_forward(
+                        &cur_attn,
+                        &layer.attn_norm,
+                        &layer.attn_output,
+                        kda_attn,
+                        head_caches,
+                        num_kda_heads,
+                        head_dim,
+                        alpha_rank,
+                        g_min,
+                        self.config.norm_eps,
+                        Some(&mut layer_capture),
+                    );
+                    // KDA 層は capture buffer を per_layer_updates に push
+                    per_layer_updates.push(layer_capture);
+                    out
+                }
+                _ => panic!("KimiK3Model layer {il}: cache/attn tag mismatch — invariant broken"),
+            };
+
+            if banked {
+                x.copy_from_slice(&attn_output);
+            } else {
+                for i in 0..hidden_dim {
+                    x[i] += attn_output[i];
+                }
+            }
+
+            let cur_ffn = kimi_k3_res_mix(
+                &self.attn_res_state,
+                &x,
+                &layer.ffn_res_score,
+                self.config.norm_eps,
+            );
+
+            let ffn_output: Vec<f32> = match &layer.ffn {
+                KimiK3Ffn::Dense { gate, up, down } => kimi_k3_dense_ffn_forward(
+                    &cur_ffn,
+                    &layer.ffn_norm,
+                    gate,
+                    up,
+                    down,
+                    self.config.norm_eps,
+                ),
+                KimiK3Ffn::LatentMoe(moe) => {
+                    let kd = self
+                        .config
+                        .kimi_delta
+                        .as_ref()
+                        .expect("kimi_delta config must be present at forward time");
+                    let top_k = kd.num_experts_per_tok.unwrap_or(16);
+                    let renormalize = kd.moe_renormalize.unwrap_or(true);
+                    kimi_k3_latent_moe_forward(
+                        &cur_ffn,
+                        &layer.ffn_norm,
+                        moe,
+                        top_k,
+                        renormalize,
+                        self.config.norm_eps,
+                    )
+                }
+            };
+
+            for i in 0..hidden_dim {
+                x[i] += ffn_output[i];
+            }
+
+            if trace {
+                let kind = if matches!(layer.attn, KimiK3Attention::Mla(_)) {
+                    "MLA"
+                } else {
+                    "KDA"
+                };
+                let ffn_kind = if matches!(layer.ffn, KimiK3Ffn::Dense { .. }) {
+                    "Dense"
+                } else {
+                    "MoE"
+                };
+                let ms = il_t0.elapsed().as_millis();
+                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
+                    self.config.num_layers
+                );
+            }
+        }
+
+        let x_after_final_mix = kimi_k3_res_mix(
+            &self.attn_res_state,
+            &x,
+            &self.weights.output_res_score,
+            self.config.norm_eps,
+        );
+
+        let mut x_norm = vec![0.0_f32; hidden_dim];
+        rms_norm(
+            &x_after_final_mix,
+            &self.weights.output_norm,
+            self.config.norm_eps,
+            &mut x_norm,
+        );
+
+        let mut logits = vec![0.0_f32; vocab_size];
+        self.weights.output.matvec(&x_norm, &mut logits);
+        (logits, per_layer_updates)
     }
 
     /// DSpark Phase 10 internal: snapshot を ring に push、bound 超過なら最古を drop
