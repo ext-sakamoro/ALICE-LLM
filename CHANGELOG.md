@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12 — f16 quantized snapshot compression (~2×
+  memory reduction)** (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の
+  Phase 12 (Y1a scope) として KimiK3Model snapshot の f16 quantized 圧縮版
+  を追加、~290MB → ~145MB の削減 (1) 手書き IEEE 754 binary16 変換
+  (`f32_to_f16_bits` / `f16_bits_to_f32`、`half` crate 追加なし) sign
+  1 bit + exp 5 bit (bias 15) + mant 10 bit、overflow は ±Inf、
+  underflow は ±0 (denormal 非対応、K3 state で影響なし) NaN/Inf 保持、
+  round-to-nearest-even (2) `KimiK3ModelSnapshotCompact` +
+  `KimiK3LayerCacheCompact` (`Mla` / `Kda`) + `KimiK3MlaCacheCompact` +
+  `KimiDeltaHeadCacheCompact` + `KimiK3AttnResStateCompact` の compact
+  struct 群、KDA state / conv_state / MLA c_k/k_rope / AttnResState.banked
+  を `Vec<u16>` (f16 bits) で格納 (3) `KimiK3Model` に `snapshot_ring_compact:
+  VecDeque<KimiK3ModelSnapshotCompact>` + `compact_snapshots: bool` field
+  追加 (feature-gated) (4) 新規 pub method: `snapshot_compact() ->
+  KimiK3ModelSnapshotCompact` (f32 → f16 変換 clone)、`restore_compact(snap)`
+  (f16 → f32 復元 + 両 ring クリア)、`set_snapshot_compact_mode(bool)`
+  (mode 切替 + 両 ring クリア)、`is_snapshot_compact_mode()` getter、
+  `snapshot_ring_bytes_estimate()` (memory 推定、full + compact 両方合算)
+  (5) `push_snapshot_bounded` / `rollback_to` / `snapshot_ring_len` を
+  compact mode 対応に拡張 (branch 追加、既存 full path は無変更) (6)
+  既存 `reset()` を compact ring もクリア対応 9 追加 unit test 全 pass
+  (`phase12_f16_roundtrip_precision_{zero,normal}` /
+  `phase12_f16_special_values` (Inf/-Inf/NaN/overflow/underflow) /
+  `phase12_snapshot_compact_roundtrip_precision` /
+  `phase12_set_compact_mode_{clears_both_rings, noop_when_unchanged}` /
+  `phase12_snapshot_ring_len_reflects_active_ring` /
+  `phase12_bytes_estimate_shows_compression` /
+  `phase12_push_snapshot_bounded_uses_compact_ring`)、default lib test
+  568 pass (unchanged)、dspark feature 577 pass (+9)、speculative_dspark
+  84 test unchanged、両 example compile pass、clippy pedantic+nursery 0
+  warn 新規範囲、fmt check pass Phase 12b (rank-1 delta encoding、10-65×
+  圧縮、深い KDA forward 改修) は multi-session 相当で次候補
+
 - **DSpark Phase 10 — KimiK3Model snapshot/rollback infrastructure +
   `impl DraftBackend for KimiK3Model`** (2026-08-01).
   RadixArk/Kimi-K3-DSpark 吸収の Phase 10 として K3 を speculative
