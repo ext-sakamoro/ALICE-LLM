@@ -9796,6 +9796,17 @@ pub struct KimiK3Model<'a> {
     /// mode 切替時は既存 ring はクリアされる
     #[cfg(feature = "dspark")]
     compact_snapshots: bool,
+    /// DSpark Phase 12b Part 3b: rank-1 delta encoding snapshot ring
+    /// `delta_snapshots = true` の時のみ使用、~6-10× メモリ削減 (要 Part 3c 完全 wiring)
+    /// 現状は infrastructure のみ ready、実 forward capture 統合は Part 3c
+    #[cfg(feature = "dspark")]
+    snapshot_ring_delta: std::collections::VecDeque<KimiK3ModelSnapshotDelta>,
+    /// DSpark Phase 12b Part 3b: delta snapshot mode flag
+    /// `true` の時 `push_snapshot_bounded` は delta snapshot を push (現状 Part 3c 待ち)、
+    /// `rollback_to` は base restore + updates replay で復元
+    /// mode 切替時は 3 ring 全てクリアされる (Full / Compact / Delta 排他)
+    #[cfg(feature = "dspark")]
+    delta_snapshots: bool,
 }
 
 /// DSpark Phase 10: [`KimiK3Model`] の rollback 用 snapshot
@@ -10102,6 +10113,10 @@ impl<'a> KimiK3Model<'a> {
             max_snapshot_ring: KIMI_K3_DEFAULT_MAX_SNAPSHOT_RING,
             #[cfg(feature = "dspark")]
             compact_snapshots: false,
+            #[cfg(feature = "dspark")]
+            snapshot_ring_delta: std::collections::VecDeque::with_capacity(2),
+            #[cfg(feature = "dspark")]
+            delta_snapshots: false,
         })
     }
 
@@ -10124,6 +10139,9 @@ impl<'a> KimiK3Model<'a> {
         // DSpark Phase 12: compact ring も同時にクリア
         #[cfg(feature = "dspark")]
         self.snapshot_ring_compact.clear();
+        // DSpark Phase 12b Part 3b: delta ring も同時にクリア
+        #[cfg(feature = "dspark")]
+        self.snapshot_ring_delta.clear();
     }
 
     /// Number of layers this model dispatches over (`config.num_layers`,
@@ -10141,9 +10159,14 @@ impl<'a> KimiK3Model<'a> {
 
     /// DSpark Phase 10: snapshot ring buffer の現在サイズ
     /// Phase 12: compact mode 有効時は compact ring のサイズを返す
+    /// Phase 12b Part 3b: delta mode 有効時は delta ring のサイズを返す
     #[cfg(any(test, feature = "dspark"))]
     #[must_use]
     pub fn snapshot_ring_len(&self) -> usize {
+        #[cfg(feature = "dspark")]
+        if self.delta_snapshots {
+            return self.snapshot_ring_delta.len();
+        }
         #[cfg(feature = "dspark")]
         if self.compact_snapshots {
             return self.snapshot_ring_compact.len();
@@ -10162,6 +10185,11 @@ impl<'a> KimiK3Model<'a> {
         #[cfg(feature = "dspark")]
         while self.snapshot_ring_compact.len() > new_max {
             self.snapshot_ring_compact.pop_front();
+        }
+        // Phase 12b Part 3b: delta ring は base 2 個保持を想定、bound で trim
+        #[cfg(feature = "dspark")]
+        while self.snapshot_ring_delta.len() > new_max {
+            self.snapshot_ring_delta.pop_front();
         }
     }
 
@@ -10189,6 +10217,9 @@ impl<'a> KimiK3Model<'a> {
         self.snapshot_ring.clear();
         #[cfg(feature = "dspark")]
         self.snapshot_ring_compact.clear();
+        // Phase 12b Part 3b: delta ring も同時にクリア (mode 排他 semantics 維持)
+        #[cfg(feature = "dspark")]
+        self.snapshot_ring_delta.clear();
     }
 
     /// DSpark Phase 12: compact snapshot mode を有効/無効化
@@ -10202,8 +10233,13 @@ impl<'a> KimiK3Model<'a> {
             return;
         }
         self.compact_snapshots = enable;
+        // Phase 12b Part 3b: 3 mode 排他 (Full / Compact / Delta)
+        if enable {
+            self.delta_snapshots = false;
+        }
         self.snapshot_ring.clear();
         self.snapshot_ring_compact.clear();
+        self.snapshot_ring_delta.clear();
     }
 
     /// DSpark Phase 12: 現在の compact mode 状態
@@ -10211,6 +10247,37 @@ impl<'a> KimiK3Model<'a> {
     #[must_use]
     pub fn is_snapshot_compact_mode(&self) -> bool {
         self.compact_snapshots
+    }
+
+    /// DSpark Phase 12b Part 3b: delta snapshot mode を有効/無効化
+    ///
+    /// mode 切替時は Full / Compact / Delta の 3 ring 全てクリアされる (3 mode 排他)
+    /// `true` にすると `push_snapshot_bounded` は delta snapshot を push、
+    /// `rollback_to` は base restore + updates replay で復元する
+    ///
+    /// **注意**: 現状は infrastructure のみ ready、実 forward capture 統合 (Part 3c) 完了まで
+    /// delta mode を有効化しても `forward_with_snapshot` は Full 経由で fallback する
+    #[cfg(feature = "dspark")]
+    pub fn set_snapshot_delta_mode(&mut self, enable: bool) {
+        if self.delta_snapshots == enable {
+            return;
+        }
+        // Full / Compact / Delta は排他 mode 切替時は他 mode の ring もクリア
+        self.delta_snapshots = enable;
+        if enable {
+            // Compact mode 併用不可 → 強制無効
+            self.compact_snapshots = false;
+        }
+        self.snapshot_ring.clear();
+        self.snapshot_ring_compact.clear();
+        self.snapshot_ring_delta.clear();
+    }
+
+    /// DSpark Phase 12b Part 3b: 現在の delta mode 状態
+    #[cfg(feature = "dspark")]
+    #[must_use]
+    pub fn is_snapshot_delta_mode(&self) -> bool {
+        self.delta_snapshots
     }
 
     /// DSpark Phase 12: 現状態を f16 圧縮 snapshot として clone
@@ -10374,6 +10441,10 @@ impl<'a> KimiK3Model<'a> {
                 total += bank.len() * 2;
             }
         }
+        // Phase 12b Part 3b: delta ring bytes
+        for delta in &self.snapshot_ring_delta {
+            total += Self::snapshot_delta_bytes_estimate(delta);
+        }
         total
     }
 
@@ -10504,6 +10575,36 @@ impl<'a> KimiK3Model<'a> {
             self.token_count
         );
         let distance = self.token_count - pos;
+        // Phase 12b Part 3b: delta ring から restore する branch (base + updates replay)
+        #[cfg(feature = "dspark")]
+        if self.delta_snapshots {
+            // 現 chunk (最新 delta) の updates を切り詰めて replay
+            let last = self.snapshot_ring_delta.back().cloned();
+            let delta = last.unwrap_or_else(|| {
+                panic!(
+                    "KimiK3Model::rollback_to({pos}) delta ring is empty (mode enabled but no snapshots pushed)"
+                )
+            });
+            let updates_len = delta.per_step_updates.len();
+            assert!(
+                distance <= updates_len,
+                "KimiK3Model::rollback_to({pos}) distance {distance} exceeds delta chunk updates {} \
+                 (base at position {})",
+                updates_len,
+                delta.base_snapshot.token_count
+            );
+            let mut truncated = delta.clone();
+            truncated.per_step_updates.truncate(updates_len - distance);
+            // Base restore + apply remaining updates
+            self.restore_from_delta(truncated);
+            // Ring は restore_from_delta 内で clear されるので新 base を push し直す
+            self.snapshot_ring_delta
+                .push_back(KimiK3ModelSnapshotDelta {
+                    base_snapshot: self.snapshot(),
+                    per_step_updates: Vec::new(),
+                });
+            return;
+        }
         // Phase 12: compact ring から restore する branch
         #[cfg(feature = "dspark")]
         if self.compact_snapshots {
@@ -11907,6 +12008,175 @@ mod kimi_k3_model_tests {
         assert!(
             step_bytes > 0 && step_bytes < 20_000,
             "per-step bytes reasonable range: {step_bytes}"
+        );
+    }
+
+    // ---- DSpark Phase 12b Part 3b tests (delta mode infrastructure) ----
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_set_delta_mode_clears_all_rings() {
+        let mut model = build_model_for_snapshot_tests();
+        model.snapshot_ring.push_back(model.snapshot());
+        model
+            .snapshot_ring_compact
+            .push_back(model.snapshot_compact());
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        assert_eq!(model.snapshot_ring.len(), 1);
+        assert_eq!(model.snapshot_ring_compact.len(), 1);
+        assert_eq!(model.snapshot_ring_delta.len(), 1);
+
+        model.set_snapshot_delta_mode(true);
+        assert!(model.is_snapshot_delta_mode());
+        assert_eq!(model.snapshot_ring.len(), 0);
+        assert_eq!(model.snapshot_ring_compact.len(), 0);
+        assert_eq!(model.snapshot_ring_delta.len(), 0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_set_delta_mode_disables_compact() {
+        let mut model = build_model_for_snapshot_tests();
+        model.set_snapshot_compact_mode(true);
+        assert!(model.is_snapshot_compact_mode());
+        model.set_snapshot_delta_mode(true);
+        assert!(model.is_snapshot_delta_mode());
+        assert!(
+            !model.is_snapshot_compact_mode(),
+            "delta mode enable should disable compact"
+        );
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_set_compact_mode_disables_delta() {
+        let mut model = build_model_for_snapshot_tests();
+        model.set_snapshot_delta_mode(true);
+        assert!(model.is_snapshot_delta_mode());
+        model.set_snapshot_compact_mode(true);
+        assert!(model.is_snapshot_compact_mode());
+        assert!(
+            !model.is_snapshot_delta_mode(),
+            "compact mode enable should disable delta"
+        );
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_set_delta_mode_noop_when_unchanged() {
+        let mut model = build_model_for_snapshot_tests();
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        assert!(!model.is_snapshot_delta_mode());
+        model.set_snapshot_delta_mode(false);
+        // no clear happened
+        assert_eq!(model.snapshot_ring_delta.len(), 1);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_snapshot_ring_len_reflects_delta_mode() {
+        let mut model = build_model_for_snapshot_tests();
+        model.set_snapshot_delta_mode(true);
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        assert_eq!(model.snapshot_ring_len(), 2);
+        // full ring は 0
+        assert_eq!(model.snapshot_ring.len(), 0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_reset_clears_delta_ring() {
+        let mut model = build_model_for_snapshot_tests();
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        assert_eq!(model.snapshot_ring_delta.len(), 1);
+        model.reset();
+        assert_eq!(model.snapshot_ring_delta.len(), 0);
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_snapshot_ring_bytes_estimate_includes_delta() {
+        let mut model = build_model_for_snapshot_tests();
+        // Baseline: no delta pushed
+        let base_bytes = model.snapshot_ring_bytes_estimate();
+
+        // Push delta snapshot
+        model
+            .snapshot_ring_delta
+            .push_back(model.snapshot_delta_from());
+        let with_delta_bytes = model.snapshot_ring_bytes_estimate();
+
+        assert!(
+            with_delta_bytes > base_bytes,
+            "adding delta to ring should increase bytes: base {base_bytes}, with_delta {with_delta_bytes}"
+        );
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3b_delta_rollback_via_synthetic_ring() {
+        // Synthetic scenario: manually populate delta ring with base + 2 synthetic steps,
+        // then rollback_to(1) should replay 1 update and restore state
+        let mut model = build_model_for_snapshot_tests();
+        model.set_snapshot_delta_mode(true);
+        let d_k = 8_usize;
+        let d_v = 8_usize;
+        let num_kda_layers = 6_usize;
+        let num_heads = 8_usize;
+
+        // Base at position 0
+        let base = model.snapshot();
+        model.token_count = 2; // pretend 2 forwards happened
+
+        // Construct 2 steps of synthetic updates
+        let synth_update = super::KimiDeltaHeadUpdate {
+            q_pre: vec![0.0; d_k],
+            k_pre: vec![0.0; d_k],
+            v_pre: vec![0.0; d_v],
+            k_conv: vec![0.0; d_k],
+            v_conv: vec![0.0; d_v],
+            alpha: vec![1.0; d_k],
+            beta: 0.0,
+        };
+        let mut per_step_updates = Vec::new();
+        for _step in 0..2 {
+            let mut layers = Vec::new();
+            for _kda_layer in 0..num_kda_layers {
+                let mut heads = Vec::new();
+                for _h in 0..num_heads {
+                    heads.push(synth_update.clone());
+                }
+                layers.push(heads);
+            }
+            per_step_updates.push(layers);
+        }
+        model
+            .snapshot_ring_delta
+            .push_back(super::KimiK3ModelSnapshotDelta {
+                base_snapshot: base,
+                per_step_updates,
+            });
+
+        // Rollback to position 1 (distance = 2 - 1 = 1, so 1 update replayed)
+        model.rollback_to(1);
+        assert_eq!(model.seq_len(), 1);
+        // After rollback, delta ring holds the new base (post-restore)
+        assert_eq!(model.snapshot_ring_delta.len(), 1);
+        let after_delta = &model.snapshot_ring_delta[0];
+        assert!(
+            after_delta.per_step_updates.is_empty(),
+            "new base has no updates"
         );
     }
 }
