@@ -60,8 +60,24 @@ fn main() {
         .position(|a| a == "--confidence-head")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str);
+    // Phase 12 + 12b: snapshot mode 選択 default = full
+    let snapshot_mode: &str = args
+        .iter()
+        .position(|a| a == "--snapshot-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or("full");
+    if !matches!(snapshot_mode, "full" | "compact" | "delta") {
+        eprintln!(
+            "error: --snapshot-mode must be one of: full, compact, delta (got: {snapshot_mode})"
+        );
+        std::process::exit(1);
+    }
 
-    println!("=== DSpark Phase 5: Speculative Dual with MarkovBigramBias ===");
+    println!(
+        "=== DSpark Phase 5+12+12b: Speculative Dual with MarkovBigramBias + snapshot mode ==="
+    );
+    println!("  snapshot_mode: {snapshot_mode}");
     println!();
 
     println!("Loading main model: {model_path}");
@@ -86,6 +102,16 @@ fn main() {
         "  Draft: {} layers, hidden={}, vocab={} ({draft_ms}ms)",
         draft_model.config.num_layers, draft_model.config.hidden_dim, draft_model.config.vocab_size
     );
+    // Phase 12+12b: snapshot mode 選択
+    // 注: 本 example の draft は Llama3Model (PagedKvCache) で、
+    // set_snapshot_{compact,delta}_mode は KimiK3Model 専用 (Phase 12+12b)
+    // 現状 Llama3Model draft では snapshot mode の切替は no-op、K3 draft 用に将来対応
+    if snapshot_mode != "full" {
+        eprintln!(
+            "warning: --snapshot-mode {snapshot_mode} は KimiK3Model draft 用 (Phase 12+12b)、\
+             本 example の Llama3Model draft では no-op で default full 動作"
+        );
+    }
     println!();
 
     let formatted = format!(

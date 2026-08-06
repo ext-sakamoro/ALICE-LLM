@@ -19,6 +19,13 @@
 #   DSPARK_DRAFT=/path/to/kimi-k3-dspark-2.2b.gguf \
 #   DSPARK_MAX_TOKENS=20 \
 #     ~/ALICE-LLM/scripts/phase11_measure.sh
+#
+#   # Phase 12+12b: snapshot mode 切替 (full / compact / delta)
+#   DSPARK_MAIN=... DSPARK_DRAFT=... \
+#   DSPARK_SNAPSHOT_MODE=compact \
+#     ~/ALICE-LLM/scripts/phase11_measure.sh
+#   # Delta mode = ~30-48MB overhead (Phase 12b Part 3c2 完成、KimiK3Model draft 用)
+#   DSPARK_SNAPSHOT_MODE=delta ...
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -45,6 +52,16 @@ BIGRAM_RANK="${DSPARK_BIGRAM_RANK:-256}"
 EPOCHS="${DSPARK_EPOCHS:-30}"
 LR="${DSPARK_LR:-0.05}"
 TEMPERATURE="${DSPARK_TEMPERATURE:-0.0}"
+# Phase 12+12b: snapshot mode 選択 (full / compact / delta)
+# full: default、~290MB、正確、O(1) rollback
+# compact: ~145MB、精度 loss ~1e-3 (f16)、O(1) rollback + f16 変換
+# delta: ~30-48MB、bit-exact、O(N) rollback (base + N updates replay)
+# 注: 現状 Llama3Model draft では no-op、KimiK3Model draft (Phase 13+) で actionable
+SNAPSHOT_MODE="${DSPARK_SNAPSHOT_MODE:-full}"
+if [[ ! "${SNAPSHOT_MODE}" =~ ^(full|compact|delta)$ ]]; then
+    echo "error: DSPARK_SNAPSHOT_MODE must be one of: full, compact, delta (got: ${SNAPSHOT_MODE})" >&2
+    exit 1
+fi
 
 # ---- 出力先 ----
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,6 +85,7 @@ echo "  bigram_rank:  ${BIGRAM_RANK}"
 echo "  epochs:       ${EPOCHS}"
 echo "  lr:           ${LR}"
 echo "  temperature:  ${TEMPERATURE}"
+echo "  snapshot mode: ${SNAPSHOT_MODE}"
 echo "  train log:    ${TRAIN_LOG}"
 echo "  measure log:  ${MEASURE_LOG}"
 echo "  head output:  ${HEAD_OUTPUT}"
@@ -115,7 +133,8 @@ cargo run --release --example speculative_dspark_dual \
     --temperature "${TEMPERATURE}" \
     --speculative-k "${SPEC_K}" \
     --bigram-rank "${BIGRAM_RANK}" \
-    --confidence-head "${HEAD_OUTPUT}" 2>&1 | tee "${MEASURE_LOG}"
+    --confidence-head "${HEAD_OUTPUT}" \
+    --snapshot-mode "${SNAPSHOT_MODE}" 2>&1 | tee "${MEASURE_LOG}"
 
 echo
 echo "=== Phase 11 完了 ==="
