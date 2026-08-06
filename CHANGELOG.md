@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12b Part 3c1 — KDA capture wire-up** (2026-08-06).
+  Phase 12b Part 3c の KDA forward capture wire-up、Part 3a の primitive
+  (`kimi_delta_forward_head_with_capture`) を KDA layer / head level に
+  threading `kimi_k3_kda_head_forward` に `capture: Option<&mut
+  KimiDeltaHeadUpdate>` 引数追加 (Some で `kimi_delta_forward_head_with_capture`
+  delegate、None で既存 `kimi_delta_forward_head`)、
+  `kimi_k3_kda_layer_forward` に `capture_updates: Option<&mut
+  [KimiDeltaHeadUpdate]>` 引数追加 (Some で serial iteration + per-head
+  slot、None で既存 parallel rayon path 維持)、既存 2 K3Model caller
+  (K3Model::forward + forward_with_layer_hook) は `None` 渡しに更新 既存
+  594 test 無破壊 pass (mechanical 変更、Part 3a の bit-exact 検証済
+  primitive を wire するだけ) **scope 削減**: 当初 Part 3c 全部
+  (~490 LOC) 予定だったが、K3Model 統合 + delta mode wiring は Part 3c2
+  次 session に分割 Part 3c1 は wire-up 基盤のみ (~250 LOC) を確実 ship
+  Part 3c2 完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
+
 - **DSpark Phase 12b Part 3b — delta ring infrastructure**
   (2026-08-06). Phase 12b Part 3b の delta mode 用 K3Model infrastructure
   を実装 (**forward wire-up は Part 3c 次 session**、Part 3a の primitive

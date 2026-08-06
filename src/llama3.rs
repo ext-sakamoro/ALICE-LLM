@@ -7852,6 +7852,11 @@ fn kimi_k3_slice_weight_ref_rows<'a>(
 /// than `num_heads × head_dim`, or if any weight is quantized (F32
 /// only for Phase X.4.c.3.3.b; see the slicer's `None` return path
 /// documentation).
+///
+/// **DSpark Phase 12b Part 3c1**: `capture_updates: Option<&mut [KimiDeltaHeadUpdate]>`
+/// で per-head capture 可能 slice 長は `num_heads` と一致必須 `None` の場合は
+/// 既存動作 (parallel rayon iteration)、`Some` の場合は serial iteration で
+/// per-head slot に update を書き込む
 #[allow(dead_code, clippy::too_many_arguments)]
 fn kimi_k3_kda_layer_forward(
     x: &[f32],
@@ -7864,6 +7869,7 @@ fn kimi_k3_kda_layer_forward(
     alpha_rank: usize,
     g_min: f32,
     rms_eps: f32,
+    capture_updates: Option<&mut [KimiDeltaHeadUpdate]>,
 ) -> Vec<f32> {
     let d = x.len();
     assert_eq!(attn_norm.len(), d, "attn_norm length must equal hidden dim");
@@ -7912,20 +7918,21 @@ fn kimi_k3_kda_layer_forward(
     // distinct slice of concat_out, only-read shared inputs (`x_norm`,
     // `ssm_f_a_f32`, etc.). Zip caches + concat_out chunks so rayon
     // handles the mutable split cleanly.
-    let head_iter = caches
-        .iter_mut()
-        .zip(concat_out.chunks_mut(v_head_dim))
-        .enumerate();
-
-    #[cfg(feature = "parallel")]
-    let head_iter = {
-        use rayon::iter::ParallelBridge;
-        head_iter.par_bridge()
-    };
-
-    #[cfg(feature = "parallel")]
-    let process_head =
-        |(head_idx, (cache, out_slice)): (usize, (&mut KimiDeltaHeadCache, &mut [f32]))| {
+    // Phase 12b Part 3c1: capture_updates が Some の場合は serial iteration + per-head slot
+    if let Some(caps) = capture_updates {
+        assert_eq!(
+            caps.len(),
+            num_heads,
+            "capture_updates slice length {} must equal num_heads {num_heads}",
+            caps.len()
+        );
+        // Serial 経路 (rayon 未使用) — capture slot への &mut split が rayon iterator と非互換
+        for ((head_idx, (cache, out_slice)), cap) in caches
+            .iter_mut()
+            .zip(concat_out.chunks_mut(v_head_dim))
+            .enumerate()
+            .zip(caps.iter_mut())
+        {
             kimi_k3_kda_head_forward(
                 head_idx,
                 &x_norm,
@@ -7942,34 +7949,72 @@ fn kimi_k3_kda_layer_forward(
                 &identity_out,
                 cache,
                 out_slice,
+                Some(cap),
             );
+        }
+    } else {
+        // 既存 (parallel rayon) 経路 — capture 無しの hot path
+        let head_iter = caches
+            .iter_mut()
+            .zip(concat_out.chunks_mut(v_head_dim))
+            .enumerate();
+
+        #[cfg(feature = "parallel")]
+        let head_iter = {
+            use rayon::iter::ParallelBridge;
+            head_iter.par_bridge()
         };
 
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::iter::ParallelIterator;
-        head_iter.for_each(process_head);
-    }
+        #[cfg(feature = "parallel")]
+        let process_head =
+            |(head_idx, (cache, out_slice)): (usize, (&mut KimiDeltaHeadCache, &mut [f32]))| {
+                kimi_k3_kda_head_forward(
+                    head_idx,
+                    &x_norm,
+                    head_dim,
+                    v_head_dim,
+                    alpha_rank,
+                    g_min,
+                    rms_eps,
+                    kda,
+                    &ssm_f_a_f32,
+                    &zero_bias,
+                    &b_alpha_zeros,
+                    &identity_gate,
+                    &identity_out,
+                    cache,
+                    out_slice,
+                    None,
+                );
+            };
 
-    #[cfg(not(feature = "parallel"))]
-    for (head_idx, (cache, out_slice)) in head_iter {
-        kimi_k3_kda_head_forward(
-            head_idx,
-            &x_norm,
-            head_dim,
-            v_head_dim,
-            alpha_rank,
-            g_min,
-            rms_eps,
-            kda,
-            &ssm_f_a_f32,
-            &zero_bias,
-            &b_alpha_zeros,
-            &identity_gate,
-            &identity_out,
-            cache,
-            out_slice,
-        );
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::iter::ParallelIterator;
+            head_iter.for_each(process_head);
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        for (head_idx, (cache, out_slice)) in head_iter {
+            kimi_k3_kda_head_forward(
+                head_idx,
+                &x_norm,
+                head_dim,
+                v_head_dim,
+                alpha_rank,
+                g_min,
+                rms_eps,
+                kda,
+                &ssm_f_a_f32,
+                &zero_bias,
+                &b_alpha_zeros,
+                &identity_gate,
+                &identity_out,
+                cache,
+                out_slice,
+                None,
+            );
+        }
     }
 
     // Shared output projection: [d_out, num_heads × v_head_dim].
@@ -8008,6 +8053,10 @@ fn kimi_k3_kda_head_forward(
     identity_out: &[f32],
     cache: &mut KimiDeltaHeadCache,
     out_slice: &mut [f32],
+    // Phase 12b Part 3c1: Some の場合は `kimi_delta_forward_head_with_capture` を使い、
+    // 生成された [`KimiDeltaHeadUpdate`] を slot に書き込む
+    // None の場合は既存 `kimi_delta_forward_head` を呼ぶ (同一動作)
+    capture: Option<&mut KimiDeltaHeadUpdate>,
 ) {
     let row_start = head_idx * head_dim;
     let row_end = row_start + head_dim;
@@ -8130,7 +8179,24 @@ fn kimi_k3_kda_head_forward(
         rms_eps,
     };
 
-    let head_out = kimi_delta_forward_head(x_norm, &params, cache, rms_eps);
+    // Phase 12b Part 3c1: capture 有指定なら `kimi_delta_forward_head_with_capture` に delegate
+    let head_out = if let Some(cap_slot) = capture {
+        #[cfg(feature = "dspark")]
+        {
+            let (out, update) =
+                kimi_delta_forward_head_with_capture(x_norm, &params, cache, rms_eps);
+            *cap_slot = update;
+            out
+        }
+        #[cfg(not(feature = "dspark"))]
+        {
+            // dspark feature 無効時は capture 不可、caller 側で保護すべき
+            let _ = cap_slot;
+            kimi_delta_forward_head(x_norm, &params, cache, rms_eps)
+        }
+    } else {
+        kimi_delta_forward_head(x_norm, &params, cache, rms_eps)
+    };
     out_slice.copy_from_slice(&head_out);
 }
 
@@ -10863,6 +10929,7 @@ impl<'a> KimiK3Model<'a> {
                         alpha_rank,
                         g_min,
                         self.config.norm_eps,
+                        None,
                     )
                 }
                 _ => panic!(
@@ -11070,6 +11137,7 @@ impl<'a> KimiK3Model<'a> {
                         alpha_rank,
                         g_min,
                         self.config.norm_eps,
+                        None,
                     )
                 }
                 _ => panic!(
