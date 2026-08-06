@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12b Part 3b — delta ring infrastructure**
+  (2026-08-06). Phase 12b Part 3b の delta mode 用 K3Model infrastructure
+  を実装 (**forward wire-up は Part 3c 次 session**、Part 3a の primitive
+  と Part 3b の ring 管理を組合わせて実 forward 統合)
+  (1) `KimiK3Model` に field 追加: `snapshot_ring_delta:
+  VecDeque<KimiK3ModelSnapshotDelta>` + `delta_snapshots: bool`
+  (feature-gated) (2) `set_snapshot_delta_mode(bool)` — Full/Compact/
+  Delta の 3 mode 排他 semantics、mode 切替時に 3 ring 全てクリア (3)
+  `is_snapshot_delta_mode()` getter (4) `set_snapshot_compact_mode` を
+  対称拡張 (compact 有効化で delta 自動無効化) (5) 既存 `restore()` /
+  `reset()` に delta ring クリア追加 (6) `set_max_snapshot_ring` を
+  delta ring trim 対応 (7) `snapshot_ring_len` に delta mode branch
+  追加 (delta mode 有効時は delta ring 長返却) (8)
+  `snapshot_ring_bytes_estimate` に delta ring bytes 加算 (9)
+  `rollback_to` に delta mode branch 追加: 現 chunk の updates を
+  `truncate(len - distance)` で切詰め、`restore_from_delta` で base
+  restore + remaining updates replay で復元、新 base を ring に push
+  8 追加 unit test 全 pass:
+  - `phase12b_part3b_set_delta_mode_clears_all_rings` (3 ring 全クリア)
+  - `phase12b_part3b_set_delta_mode_disables_compact` (mode 排他)
+  - `phase12b_part3b_set_compact_mode_disables_delta` (逆方向 mode 排他)
+  - `phase12b_part3b_set_delta_mode_noop_when_unchanged`
+  - `phase12b_part3b_snapshot_ring_len_reflects_delta_mode`
+  - `phase12b_part3b_reset_clears_delta_ring`
+  - `phase12b_part3b_snapshot_ring_bytes_estimate_includes_delta`
+  - `phase12b_part3b_delta_rollback_via_synthetic_ring` (synthetic
+    delta with 2 steps → rollback_to(1) → 1 update replayed + new base
+    pushed) default lib test 568 pass (unchanged)、dspark feature 594
+    pass (+8)、speculative_dspark 84 test unchanged、clippy pedantic+
+    nursery 0 warn 新規範囲、fmt check pass **注意**: Part 3b は
+    infrastructure のみ、実 forward 統合 (Part 3c) 完了まで delta mode
+    有効化しても `forward_with_snapshot` は Full 経由 fallback Part 3c
+    完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
+
 - **DSpark Phase 12b Part 3a — head-level capture function**
   (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の Phase 12b Part 3 の
   最重要 primitive: `kimi_delta_forward_head_with_capture(x, params,
