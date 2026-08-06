@@ -2352,6 +2352,141 @@ pub fn kimi_delta_forward_head(
     )
 }
 
+/// DSpark Phase 12b Part 3: [`kimi_delta_forward_head`] の capture 版
+///
+/// 動作は既存 [`kimi_delta_forward_head`] と bit-exact 同一 (state / conv_state の
+/// 進み方も同じ) 追加で `KimiDeltaHeadUpdate` を返却し、この update を
+/// [`KimiDeltaHeadCache::apply_update`] で replay すれば cache 状態を再現できる
+///
+/// capture タイミング: Step 7 (kimi_delta_step) の直前で確定した
+/// `(q_pre, k_pre, v_pre, k_conv, v_conv, alpha, beta)` を clone
+///
+/// 追加コスト: clone 6 個 (~3KB per head、d_k=d_v=128 で ~1.5KB)、KDA layer 実行時間の
+/// ~0.1% 未満想定 (state update / output gate matvec の cost に対して trivial)
+///
+/// # Panics
+///
+/// [`kimi_delta_forward_head`] と同じ
+#[cfg(feature = "dspark")]
+#[must_use]
+pub fn kimi_delta_forward_head_with_capture(
+    x: &[f32],
+    params: &KimiDeltaHeadParams<'_>,
+    cache: &mut KimiDeltaHeadCache,
+    l2_eps: f32,
+) -> (Vec<f32>, KimiDeltaHeadUpdate) {
+    let d = x.len();
+    let d_k = cache.d_k;
+    let d_v = cache.d_v;
+    let ks = cache.kernel_size;
+
+    // Step 1: linear projections. (q_pre, k_pre, v_pre をキャプチャ対象)
+    let q_pre = kimi_delta_matvec(params.w_q, x, d_k, d);
+    let k_pre = kimi_delta_matvec(params.w_k, x, d_k, d);
+    let v_pre = kimi_delta_matvec(params.w_v, x, d_v, d);
+    // Capture: pre-conv 値 (conv_state ring push 用)
+    let q_pre_captured = q_pre.clone();
+    let k_pre_captured = k_pre.clone();
+    let v_pre_captured = v_pre.clone();
+
+    // Step 2: ShortConv.
+    let mut q_conv = vec![0.0_f32; d_k];
+    let mut k_conv = vec![0.0_f32; d_k];
+    let mut v_conv = vec![0.0_f32; d_v];
+    causal_conv1d_step(
+        &q_pre,
+        &mut cache.conv_state_q,
+        &mut cache.ring_pos_q,
+        params.conv_kernel_q,
+        params.conv_bias_q,
+        &mut q_conv,
+        d_k,
+        ks,
+    );
+    causal_conv1d_step(
+        &k_pre,
+        &mut cache.conv_state_k,
+        &mut cache.ring_pos_k,
+        params.conv_kernel_k,
+        params.conv_bias_k,
+        &mut k_conv,
+        d_k,
+        ks,
+    );
+    causal_conv1d_step(
+        &v_pre,
+        &mut cache.conv_state_v,
+        &mut cache.ring_pos_v,
+        params.conv_kernel_v,
+        params.conv_bias_v,
+        &mut v_conv,
+        d_v,
+        ks,
+    );
+
+    // Step 3: Swish (silu) activation.
+    for v in &mut q_conv {
+        *v = silu(*v);
+    }
+    for v in &mut k_conv {
+        *v = silu(*v);
+    }
+    for v in &mut v_conv {
+        *v = silu(*v);
+    }
+
+    // Step 4: L2Norm on q, k.
+    kimi_delta_l2_norm_in_place(&mut q_conv, l2_eps);
+    kimi_delta_l2_norm_in_place(&mut k_conv, l2_eps);
+
+    // Step 5: β.
+    debug_assert_eq!(
+        params.w_beta.len(),
+        d,
+        "w_beta length must equal hidden dim"
+    );
+    let beta = sigmoid(kimi_delta_dot(params.w_beta, x));
+
+    // Step 6: α.
+    let z_mid = kimi_delta_matvec(params.w_alpha_down, x, params.alpha_rank, d);
+    let mut z = kimi_delta_matvec(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
+    debug_assert_eq!(params.b_alpha.len(), d_k, "b_alpha length must equal d_k");
+    for i in 0..d_k {
+        z[i] += params.b_alpha[i];
+    }
+    let alpha = kimi_delta_lower_bounded_decay(&z, params.a_h, params.g_min);
+
+    // Capture: kimi_delta_step 直前で確定した k_conv / v_conv / alpha / beta
+    let update = KimiDeltaHeadUpdate {
+        q_pre: q_pre_captured,
+        k_pre: k_pre_captured,
+        v_pre: v_pre_captured,
+        k_conv: k_conv.clone(),
+        v_conv: v_conv.clone(),
+        alpha: alpha.clone(),
+        beta,
+    };
+
+    // Step 7: recurrent update.
+    kimi_delta_step(&mut cache.state, &k_conv, &v_conv, &alpha, beta);
+
+    // Step 8: read.
+    let o_bar = kimi_delta_read(&cache.state, &q_conv);
+
+    // Step 9: output gate.
+    let gate_pre = kimi_delta_matvec(params.w_gate, x, d_v, d);
+    let out = kimi_delta_output_gate(
+        &o_bar,
+        &gate_pre,
+        params.rms_gamma,
+        params.rms_eps,
+        params.w_out,
+        params.d_out,
+    );
+
+    (out, update)
+}
+
 #[cfg(test)]
 mod kimi_delta_forward_tests {
     use super::{
@@ -2683,6 +2818,149 @@ mod kimi_delta_forward_tests {
                  (baseline sigmoid {s_x_j})",
             );
         }
+    }
+
+    // ---- DSpark Phase 12b Part 3 tests (head-level capture roundtrip) ----
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3_capture_output_matches_uncaptured() {
+        // kimi_delta_forward_head_with_capture の出力 (Vec<f32>) は
+        // 既存 kimi_delta_forward_head と bit-exact 同一である
+        let d = 3_usize;
+        let d_k = 2_usize;
+        let d_v = 2_usize;
+        let ks = 3_usize;
+        let alpha_rank = 2_usize;
+
+        // Weights (fixed values for reproducibility)
+        let w_q = vec![0.1, -0.2, 0.3, 0.15, -0.05, 0.25];
+        let w_k = vec![0.2, 0.1, -0.15, 0.3, 0.1, -0.25];
+        let w_v = vec![-0.1, 0.2, 0.05, 0.1, -0.2, 0.15];
+        let conv_kernel_q = vec![0.5, 0.3, 0.1, 0.4, 0.2, 0.05];
+        let conv_kernel_k = vec![0.3, 0.4, 0.1, 0.5, 0.2, 0.1];
+        let conv_kernel_v = vec![0.2, 0.3, 0.4, 0.1, 0.5, 0.3];
+        let conv_bias = vec![0.0; d_k];
+        let w_beta = vec![0.3, -0.2, 0.1];
+        let w_alpha_down = vec![0.1, 0.2, -0.1, 0.3, 0.15, 0.05];
+        let w_alpha_up = vec![0.5, 0.1, -0.2, 0.4];
+        let b_alpha = vec![0.0, 0.0];
+        let w_gate = vec![0.1, -0.1, 0.2, 0.3, 0.1, -0.15];
+        let w_out = vec![1.0, 0.0, 0.0, 1.0];
+        let rms_gamma = vec![1.0, 1.0];
+
+        let params = params_from_bufs(
+            &w_q,
+            &w_k,
+            &w_v,
+            &conv_kernel_q,
+            &conv_kernel_k,
+            &conv_kernel_v,
+            &conv_bias,
+            &conv_bias,
+            &conv_bias,
+            &w_beta,
+            &w_alpha_down,
+            &w_alpha_up,
+            &b_alpha,
+            0.0,
+            alpha_rank,
+            -5.0,
+            &w_gate,
+            &w_out,
+            d_v,
+            Some(&rms_gamma),
+            1e-6,
+        );
+
+        let x = vec![0.5, -0.3, 0.7];
+
+        let mut cache_a = KimiDeltaHeadCache::new(d_k, d_v, ks);
+        let mut cache_b = KimiDeltaHeadCache::new(d_k, d_v, ks);
+
+        let out_a = kimi_delta_forward_head(&x, &params, &mut cache_a, 1e-6);
+        let (out_b, _update) =
+            super::kimi_delta_forward_head_with_capture(&x, &params, &mut cache_b, 1e-6);
+
+        // Output bit-exact identical
+        assert_eq!(
+            out_a, out_b,
+            "kimi_delta_forward_head_with_capture output must match uncaptured version"
+        );
+        // State bit-exact identical
+        assert_eq!(cache_a.state.as_slice(), cache_b.state.as_slice());
+    }
+
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn phase12b_part3_captured_update_replays_state() {
+        // capture した update を fresh cache に apply_update すると state が復元される
+        let d = 3_usize;
+        let d_k = 2_usize;
+        let d_v = 2_usize;
+        let ks = 3_usize;
+        let alpha_rank = 2_usize;
+
+        let w_q = vec![0.1, -0.2, 0.3, 0.15, -0.05, 0.25];
+        let w_k = vec![0.2, 0.1, -0.15, 0.3, 0.1, -0.25];
+        let w_v = vec![-0.1, 0.2, 0.05, 0.1, -0.2, 0.15];
+        let conv_kernel_q = vec![0.5, 0.3, 0.1, 0.4, 0.2, 0.05];
+        let conv_kernel_k = vec![0.3, 0.4, 0.1, 0.5, 0.2, 0.1];
+        let conv_kernel_v = vec![0.2, 0.3, 0.4, 0.1, 0.5, 0.3];
+        let conv_bias = vec![0.0; d_k];
+        let w_beta = vec![0.3, -0.2, 0.1];
+        let w_alpha_down = vec![0.1, 0.2, -0.1, 0.3, 0.15, 0.05];
+        let w_alpha_up = vec![0.5, 0.1, -0.2, 0.4];
+        let b_alpha = vec![0.0, 0.0];
+        let w_gate = vec![0.1, -0.1, 0.2, 0.3, 0.1, -0.15];
+        let w_out = vec![1.0, 0.0, 0.0, 1.0];
+        let rms_gamma = vec![1.0, 1.0];
+
+        let params = params_from_bufs(
+            &w_q,
+            &w_k,
+            &w_v,
+            &conv_kernel_q,
+            &conv_kernel_k,
+            &conv_kernel_v,
+            &conv_bias,
+            &conv_bias,
+            &conv_bias,
+            &w_beta,
+            &w_alpha_down,
+            &w_alpha_up,
+            &b_alpha,
+            0.0,
+            alpha_rank,
+            -5.0,
+            &w_gate,
+            &w_out,
+            d_v,
+            Some(&rms_gamma),
+            1e-6,
+        );
+
+        let x = vec![0.5, -0.3, 0.7];
+
+        // Cache A: capture forward
+        let mut cache_a = KimiDeltaHeadCache::new(d_k, d_v, ks);
+        let (_out, update) =
+            super::kimi_delta_forward_head_with_capture(&x, &params, &mut cache_a, 1e-6);
+
+        // Cache B: fresh, apply_update from captured update
+        let mut cache_b = KimiDeltaHeadCache::new(d_k, d_v, ks);
+        cache_b.apply_update(&update);
+
+        // State bit-exact identical
+        assert_eq!(
+            cache_a.state.as_slice(),
+            cache_b.state.as_slice(),
+            "apply_update state must match forward capture state"
+        );
+        // conv_state ring positions match
+        assert_eq!(cache_a.ring_pos_q, cache_b.ring_pos_q);
+        assert_eq!(cache_a.ring_pos_k, cache_b.ring_pos_k);
+        assert_eq!(cache_a.ring_pos_v, cache_b.ring_pos_v);
     }
 }
 

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DSpark Phase 12b Part 3a — head-level capture function**
+  (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の Phase 12b Part 3 の
+  最重要 primitive: `kimi_delta_forward_head_with_capture(x, params,
+  cache, l2_eps) -> (Vec<f32>, KimiDeltaHeadUpdate)` 追加、既存
+  `kimi_delta_forward_head` と output/state bit-exact 一致で non-破壊、
+  capture した update を fresh cache に `apply_update` で replay すると
+  state bit-exact 復元されることを test で実証 実装ポイント: Step 1
+  linear projections で `(q_pre, k_pre, v_pre)` を clone、Step 6 α 計算
+  完了時点で `(k_conv, v_conv, alpha, beta)` を clone、Step 7 直前で
+  `KimiDeltaHeadUpdate` を build 追加 clone コスト ~3KB per head (d_k=
+  d_v=128 想定)、KDA layer 実行時間の 0.1% 未満 2 追加 unit test 全
+  pass: `phase12b_part3_capture_output_matches_uncaptured` (bit-exact
+  output vs 既存) / `phase12b_part3_captured_update_replays_state`
+  (apply_update state bit-exact vs forward capture) default lib test
+  568 pass (unchanged)、dspark feature 586 pass (+2)、
+  speculative_dspark 84 test unchanged、clippy pedantic+nursery 0 warn
+  新規範囲、fmt check pass **scope 削減**: 当初 Y1 (800 LOC full
+  Part 3) では K3 layer + K3Model 統合 + push/rollback delta mode まで
+  含む予定だったが、実装複雑度と単一 session の tightness を honest
+  評価して head-level capture 関数のみ (Part 3a、~200 LOC) を ship
+  Part 3b (K3 layer + K3Model 統合 + ring 統合) は次 session、Part 3b
+  完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
+
 - **DSpark Phase 12b Part 1+2 — rank-1 delta encoding primitives**
   (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の Phase 12b (Y1+Y2 scope) の
   Part 1+2 完了 Part 3 (KDA forward 統合 + push/rollback delta mode) は
