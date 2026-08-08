@@ -4166,11 +4166,16 @@ fn iq4_xs_q8k_dot(iq4_xs_block: &[u8], q8k: &BlockQ8K) -> f32 {
 /// Fused IQ4_XS matvec with pre-quantized Q8_K input.
 pub fn iq4_xs_matvec_preq(
     data: &[u8],
-    _rows: usize,
+    rows: usize,
     cols: usize,
     q8_blocks: &[BlockQ8K],
     output: &mut [f32],
 ) {
+    // `rows` is unused under `feature = "parallel"` (rayon path derives it
+    // from `output.par_iter_mut()`), used under `not(parallel)` — accept
+    // the compiler treating it as unused for the default build rather than
+    // renaming it to `_rows` (which would break the non-parallel path).
+    let _ = rows;
     let blocks_per_row = cols / QK_K;
     let block_bytes = 136;
     let row_bytes = blocks_per_row * block_bytes;
