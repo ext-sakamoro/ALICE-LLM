@@ -266,7 +266,7 @@ References:
         prev_logits = Some(logits);
         prev_variance = Some(captured_var);
 
-        if scored > 0 && scored % progress_every == 0 {
+        if scored > 0 && scored.is_multiple_of(progress_every) {
             let elapsed = t_run.elapsed().as_secs_f32();
             let tok_per_sec = scored as f32 / elapsed.max(1e-6);
             let ppl_running = (sum_nll / scored as f64).exp();

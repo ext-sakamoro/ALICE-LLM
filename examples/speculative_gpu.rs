@@ -81,6 +81,15 @@ fn main() {
             rope_theta: 500000.0,
             eps: 1e-5,
             max_seq_len: 2048,
+            full_attention_interval: None,
+            linear_num_kv_heads: None,
+            linear_qk_head_dim: None,
+            linear_kv_head_dim: None,
+            linear_num_v_heads: None,
+            linear_conv_kernel_dim: None,
+            // Llama-3 uses LLAMA-style RoPE (pair (i, i+1)).
+            neox_rope: false,
+            attention_only_load: false,
         };
 
         let engine = GpuEngine::new();
@@ -185,9 +194,7 @@ fn main() {
             // --- Verify phase: batch-4 forward ---
             // Pad to 4 tokens if k < 3
             let mut verify_input = [current_token, 0u32, 0, 0];
-            for i in 0..k {
-                verify_input[i + 1] = draft_tokens[i];
-            }
+            verify_input[1..=k].copy_from_slice(&draft_tokens[..k]);
             // Fill padding slots with last valid token (harmless, logits ignored)
             for i in (k + 1)..4 {
                 verify_input[i] = verify_input[k];

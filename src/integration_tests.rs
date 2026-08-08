@@ -15,9 +15,6 @@ use crate::quantization::*;
 use crate::rope::*;
 use crate::sampling::*;
 use crate::tokenizer::*;
-use std::collections::HashMap;
-
-use super::*;
 
 // ---- BPE Tokenizer tests ----
 

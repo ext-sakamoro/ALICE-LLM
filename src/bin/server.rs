@@ -52,6 +52,10 @@ enum ChatTemplate {
     Mistral,
     /// Gemma 2 / Gemma 3n: `<start_of_turn>role\n...<end_of_turn>\n` format.
     Gemma,
+    /// Fallback for architectures without a recognized chat template.
+    /// Reserved for future arch extension via `detect()`; the `format_messages`
+    /// / `stop_tokens` arms already cover this variant.
+    #[allow(dead_code)]
     Generic,
 }
 
@@ -317,7 +321,7 @@ struct HealthResponse {
 /// (3.6 GB × 2 = 7.2 GB) tight; CPU path uses 3.6 GB total. Also useful for
 /// Qwen 3.5-4B which exhibits GPU numerical drift (PAD248319).
 enum ModelBackend {
-    Gpu(GpuModel),
+    Gpu(Box<GpuModel>),
     /// CPU-path model — holds references into the mmap'd GGUF (leaked to
     /// `'static` in `main()` so the server context can pass it across await
     /// points; memory reclaim happens at process exit anyway).
@@ -925,7 +929,7 @@ fn main() {
         let engine = GpuEngine::new();
         let gpu_model = GpuModel::load(engine, gguf, config);
         let vocab_size = gpu_model.vocab_size();
-        (ModelBackend::Gpu(gpu_model), vocab_size)
+        (ModelBackend::Gpu(Box::new(gpu_model)), vocab_size)
     };
     println!(
         "Model ready: {}ms (vocab={vocab_size})",

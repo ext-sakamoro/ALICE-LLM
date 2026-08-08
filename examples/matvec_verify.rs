@@ -23,8 +23,8 @@ fn main() {
 
     // Create test input
     let mut input = vec![0.0f32; cols];
-    for i in 0..cols {
-        input[i] = ((i as f32) * 0.001).sin(); // non-trivial input
+    for (i, v) in input.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.001).sin(); // non-trivial input
     }
 
     // Method 1: Fused matvec

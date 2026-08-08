@@ -143,7 +143,9 @@ impl ExpertByteSource for memmap2::Mmap {
 }
 
 /// Advise the kernel that the given mmap region will be accessed randomly
-/// (Phase 4b.4). This disables the sequential-readahead heuristic — a win
+/// (Phase 4b.4).
+///
+/// This disables the sequential-readahead heuristic — a win
 /// for routed-expert bytes because the router picks 8 experts out of 256
 /// per token, so paging in *adjacent* experts is pure page-cache pollution.
 ///
@@ -167,7 +169,7 @@ pub fn advise_random(mmap_bytes: &[u8]) -> bool {
     // the range is valid. The Mmap outlives this call by construction.
     let ret = unsafe {
         libc::madvise(
-            mmap_bytes.as_ptr() as *mut libc::c_void,
+            mmap_bytes.as_ptr().cast::<libc::c_void>().cast_mut(),
             mmap_bytes.len(),
             libc::MADV_RANDOM,
         )
@@ -183,7 +185,9 @@ pub fn advise_random(_mmap_bytes: &[u8]) -> bool {
 }
 
 /// Hint the OS to prefetch a byte range into page cache (POSIX
-/// `madvise(MADV_WILLNEED)`). Kimi K3 MoE forward uses this to
+/// `madvise(MADV_WILLNEED)`).
+///
+/// Kimi K3 MoE forward uses this to
 /// overlap disk I/O with compute: right after the router picks the
 /// top-k experts for a layer, we call this on each of the 16 expert
 /// cube byte ranges so the OS starts paging them in while we're
@@ -206,7 +210,7 @@ pub fn advise_willneed(mmap_bytes: &[u8]) -> bool {
     // see docstring.
     let ret = unsafe {
         libc::madvise(
-            mmap_bytes.as_ptr() as *mut libc::c_void,
+            mmap_bytes.as_ptr().cast::<libc::c_void>().cast_mut(),
             mmap_bytes.len(),
             libc::MADV_WILLNEED,
         )
@@ -607,7 +611,9 @@ impl StreamingExpertPool {
 }
 
 /// Predict which routed-expert indices the next MoE layer will pick, given
-/// the current layer's raw router logits. Implementations may consume the
+/// the current layer's raw router logits.
+///
+/// Implementations may consume the
 /// logits as-is or apply arbitrary post-processing (sigmoid, softmax,
 /// noaux_tc bias, learned lookahead model, etc.).
 ///
@@ -625,7 +631,9 @@ pub trait NextLayerPredictor: Send + Sync {
 }
 
 /// The zero-training baseline predictor: **assume the next layer picks the
-/// same top-k routed experts as the current layer**. This is what colibri
+/// same top-k routed experts as the current layer**.
+///
+/// This is what colibri
 /// calls "persistence"; empirically it correctly predicts ~71.6% of the
 /// next layer's top-k routing on real DeepSeek-V3 traffic (Issue #34 body,
 /// PILOT=1 experiment). A one-line implementation that turns out to be
@@ -837,8 +845,8 @@ mod tests {
         // Gate slab starts at 0 * 4*32 = 0, so expert 1 gate offset = 32.
         // Up slab starts at 1 * 4*32 = 128, so expert 1 up offset = 160.
         // Down slab starts at 2 * 4*32 = 256, so expert 1 down offset = 288.
-        assert_eq!(gate[0], (32 % 251) as u8);
-        assert_eq!(up[0], (160 % 251) as u8);
+        assert_eq!(gate[0], 32_u8);
+        assert_eq!(up[0], 160_u8);
         assert_eq!(down[0], (288 % 251) as u8);
         assert_eq!(pool.cache_stats().entries, 3);
         assert_eq!(pool.cache_stats().misses, 3);
@@ -1004,7 +1012,7 @@ mod tests {
         let stats = pool.cache_stats();
         assert_eq!(stats.entries, 3, "all 3 pinned keys stay in cache");
         assert!(
-            stats.current_bytes > stats.entries * 0, // just >0
+            stats.current_bytes > 0,
             "pin overrides byte-budget lower bound"
         );
     }

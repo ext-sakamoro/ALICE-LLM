@@ -130,7 +130,7 @@ pub fn llama3_sparse_attention(
     tq: usize,
     cfg: &BridgeConfig,
 ) -> Result<Vec<f32>, SparseAttentionError> {
-    if cfg.hq == 0 || cfg.hkv == 0 || cfg.hq % cfg.hkv != 0 {
+    if cfg.hq == 0 || cfg.hkv == 0 || !cfg.hq.is_multiple_of(cfg.hkv) {
         return Err(SparseAttentionError::HeadCountMismatch {
             hq: cfg.hq,
             hkv: cfg.hkv,
@@ -142,7 +142,7 @@ pub fn llama3_sparse_attention(
             page_size: cfg.page_size,
         });
     }
-    if cfg.block_size % cfg.page_size != 0 {
+    if !cfg.block_size.is_multiple_of(cfg.page_size) {
         return Err(SparseAttentionError::BlockPageMismatch {
             block_size: cfg.block_size,
             page_size: cfg.page_size,
@@ -350,7 +350,9 @@ mod tests {
         out
     }
 
-    fn fixture_gqa() -> (
+    /// `(q, k, v, tq, hq, hkv, head_dim, seq_len)` GQA fixture used by the
+    /// test bridge to compare CPU vs sparse-attention outputs.
+    type GqaFixture = (
         Vec<f32>,
         Vec<f32>,
         Vec<f32>,
@@ -359,7 +361,9 @@ mod tests {
         usize,
         usize,
         usize,
-    ) {
+    );
+
+    fn fixture_gqa() -> GqaFixture {
         // tq=3, hq=4, hkv=2 (qhead=2), head_dim=8, seq_len=12.
         let tq = 3;
         let hq = 4;
@@ -489,7 +493,7 @@ mod tests {
             topk: 0,
         };
         // Correct q length would be 1 * 4 * 8 = 32; supply 30.
-        let err = llama3_sparse_attention(&vec![0.0f32; 30], &kv, 1, &cfg).unwrap_err();
+        let err = llama3_sparse_attention(&[0.0f32; 30], &kv, 1, &cfg).unwrap_err();
         matches!(err, SparseAttentionError::ShapeMismatch { .. });
     }
 
@@ -514,7 +518,7 @@ mod tests {
             causal: false,
             topk: 0,
         };
-        let err = llama3_sparse_attention(&vec![0.0f32; 1 * 4 * 16], &kv, 1, &cfg).unwrap_err();
+        let err = llama3_sparse_attention(&vec![0.0f32; 4 * 16], &kv, 1, &cfg).unwrap_err();
         matches!(err, SparseAttentionError::HeadDimMismatch);
     }
 }

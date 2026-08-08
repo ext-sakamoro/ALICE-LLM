@@ -60,7 +60,7 @@ pub fn build_kvouter_index(
             got: cu_seqlens_q.batch_size(),
         });
     }
-    if page_size == 0 || block_size == 0 || block_size % page_size != 0 {
+    if page_size == 0 || block_size == 0 || !block_size.is_multiple_of(page_size) {
         return Err(SparseAttentionError::BlockPageMismatch {
             block_size,
             page_size,

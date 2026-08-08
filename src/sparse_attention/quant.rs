@@ -22,7 +22,8 @@
 //! Gated on `feature = "quant"` so callers who don't need it don't pay the
 //! compile-time cost.
 
-#![cfg(feature = "quant")]
+// `#[cfg(feature = "quant")]` is applied on the `mod quant;` line in `mod.rs`;
+// duplicating it here would trip `clippy::duplicated_attributes`.
 
 use super::types::SparseAttentionError;
 
@@ -265,6 +266,30 @@ impl FpKvCache {
     }
 }
 
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Round half to even for a non-negative `f32`.
+#[inline]
+fn round_ties_even(x: f32) -> f32 {
+    // f32's `round_ties_even` was stabilized in 1.77; fall back to a manual
+    // implementation to keep MSRV flexible.
+    let floor = x.floor();
+    let frac = x - floor;
+    match frac.partial_cmp(&0.5) {
+        Some(std::cmp::Ordering::Less) => floor,
+        Some(std::cmp::Ordering::Greater) => floor + 1.0,
+        Some(std::cmp::Ordering::Equal) => {
+            if (floor as i64) & 1 == 0 {
+                floor
+            } else {
+                floor + 1.0
+            }
+        }
+        None => floor,
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -471,29 +496,5 @@ mod tests {
         // test still catches gross regressions.
         assert!(rms < 0.10, "RMS rel err {rms} exceeds 10%");
         assert!(max_rel < 0.50, "max rel err {max_rel} exceeds 50%");
-    }
-}
-
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Round half to even for a non-negative `f32`.
-#[inline]
-fn round_ties_even(x: f32) -> f32 {
-    // f32's `round_ties_even` was stabilized in 1.77; fall back to a manual
-    // implementation to keep MSRV flexible.
-    let floor = x.floor();
-    let frac = x - floor;
-    match frac.partial_cmp(&0.5) {
-        Some(std::cmp::Ordering::Less) => floor,
-        Some(std::cmp::Ordering::Greater) => floor + 1.0,
-        Some(std::cmp::Ordering::Equal) => {
-            if (floor as i64) & 1 == 0 {
-                floor
-            } else {
-                floor + 1.0
-            }
-        }
-        None => floor,
     }
 }

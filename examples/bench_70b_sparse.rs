@@ -22,7 +22,7 @@ const VOCAB_SIZE: usize = 128_256;
 const N_KEEP: usize = 8; // 8:16 = 50% sparsity
 
 fn make_sparse_matrix(rows: usize, cols: usize, n_keep: usize) -> SparseTernaryMatrix {
-    let num_blocks = (cols + SPARSE_BLOCK - 1) / SPARSE_BLOCK;
+    let num_blocks = cols.div_ceil(SPARSE_BLOCK);
     let mut mat_rows = Vec::with_capacity(rows);
 
     for r in 0..rows {

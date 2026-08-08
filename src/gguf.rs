@@ -3482,7 +3482,6 @@ pub fn q2k_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3532,7 +3531,6 @@ pub fn q5k_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3582,7 +3580,6 @@ pub fn q3k_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3675,7 +3672,6 @@ pub fn q4k_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4110,7 +4106,6 @@ pub fn q6k_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4171,7 +4166,7 @@ fn iq4_xs_q8k_dot(iq4_xs_block: &[u8], q8k: &BlockQ8K) -> f32 {
 /// Fused IQ4_XS matvec with pre-quantized Q8_K input.
 pub fn iq4_xs_matvec_preq(
     data: &[u8],
-    rows: usize,
+    _rows: usize,
     cols: usize,
     q8_blocks: &[BlockQ8K],
     output: &mut [f32],
@@ -4194,7 +4189,6 @@ pub fn iq4_xs_matvec_preq(
             }
             *out = sumf;
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4539,7 +4533,6 @@ fn iq1_s_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, o
             let row_data = &data[r * row_bytes..(r + 1) * row_bytes];
             *out = iq1_s_row_fused_dot(row_data, input, cols);
         });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -7220,9 +7213,7 @@ mod tests {
         for (i, &v) in out[128..256].iter().enumerate() {
             assert!(
                 (v - 0.5).abs() < 1e-4,
-                "b1 elem {}: got {}, expected +0.5",
-                i,
-                v
+                "b1 elem {i}: got {v}, expected +0.5"
             );
         }
     }
@@ -7252,10 +7243,7 @@ mod tests {
             let want = expected[i % 4];
             assert!(
                 (v - want).abs() < 1e-4,
-                "q2_0 elem {}: got {}, expected {}",
-                i,
-                v,
-                want
+                "q2_0 elem {i}: got {v}, expected {want}"
             );
         }
     }
@@ -8321,7 +8309,7 @@ mod tests {
                 }
             }
             let input: Vec<f32> = (0..COLS)
-                .map(|i| ((i as f32 * 0.017 + seed as f32).sin() * 0.5))
+                .map(|i| (i as f32 * 0.017 + seed as f32).sin() * 0.5)
                 .collect();
 
             // Scalar reference.

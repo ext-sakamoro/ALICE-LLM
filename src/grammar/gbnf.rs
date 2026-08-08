@@ -576,7 +576,7 @@ mod tests {
                 assert!(cc.matches('5'));
                 assert!(!cc.matches('a'));
             }
-            other => panic!("expected CharClass, got {:?}", other),
+            other => panic!("expected CharClass, got {other:?}"),
         }
     }
 
@@ -592,7 +592,7 @@ mod tests {
                 assert!(!cc.matches('7'));
                 assert!(cc.matches('!'));
             }
-            other => panic!("expected CharClass, got {:?}", other),
+            other => panic!("expected CharClass, got {other:?}"),
         }
     }
 
@@ -627,9 +627,9 @@ mod tests {
         match &g.rules["root"][0].0[0] {
             Symbol::Plus(inner) => match inner.as_ref() {
                 Symbol::Group(alts) => assert_eq!(alts.len(), 2),
-                other => panic!("expected Group inside Plus, got {:?}", other),
+                other => panic!("expected Group inside Plus, got {other:?}"),
             },
-            other => panic!("expected Plus, got {:?}", other),
+            other => panic!("expected Plus, got {other:?}"),
         }
     }
 
@@ -727,8 +727,7 @@ mod tests {
         for name in ["expr", "sphere", "box3d", "union-expr", "number", "ws"] {
             assert!(
                 g.rules.contains_key(name),
-                "expected rule `{}` to be present",
-                name,
+                "expected rule `{name}` to be present",
             );
         }
         // `number` should start with an optional "-"

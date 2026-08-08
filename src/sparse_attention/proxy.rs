@@ -51,7 +51,7 @@ pub fn compute_proxy_block_max_scores(
     if tq == 0 || hkv == 0 || head_dim == 0 {
         return Err(SparseAttentionError::EmptyInput);
     }
-    if page_size == 0 || block_size == 0 || block_size % page_size != 0 {
+    if page_size == 0 || block_size == 0 || !block_size.is_multiple_of(page_size) {
         return Err(SparseAttentionError::BlockPageMismatch {
             block_size,
             page_size,
@@ -75,7 +75,7 @@ pub fn compute_proxy_block_max_scores(
     }
     // `num_pages` is inferred from k_pages length.
     let page_stride = hkv * page_size * head_dim;
-    if k_pages.len() % page_stride != 0 {
+    if !k_pages.len().is_multiple_of(page_stride) {
         return Err(SparseAttentionError::ShapeMismatch {
             what: "k_pages (not a whole number of pages)",
             expected: page_stride,
@@ -123,9 +123,7 @@ pub fn compute_proxy_block_max_scores(
 
     let fill_row = |i: usize, row: &mut [f32]| -> Result<(), SparseAttentionError> {
         let b = batch_of_tq[i];
-        let lk = used_kv_lens
-            .map(|u| u[b].max(0) as usize)
-            .unwrap_or(msb * block_size);
+        let lk = used_kv_lens.map_or(msb * block_size, |u| u[b].max(0) as usize);
         let valid_slots = lk.div_ceil(block_size).min(msb);
         for h in 0..hkv {
             let q_base = (i * hkv + h) * head_dim;
