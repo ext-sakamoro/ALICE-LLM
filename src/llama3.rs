@@ -9,9 +9,12 @@ use crate::gguf::{
     ternary_matvec, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, SparseTernaryMatrix,
     TernaryMatrix,
 };
+use std::fmt::Write;
 use std::time::Instant;
 
-/// Issue #40 diagnostic. Emits one JSONL line to stderr summarising the
+/// Issue #40 diagnostic.
+///
+/// Emits one JSONL line to stderr summarising the
 /// post-final-RMSNorm hidden state (the buffer that feeds output_proj). The
 /// GPU path uses an identical schema so the two can be diffed offline.
 ///
@@ -32,21 +35,22 @@ pub fn dump_hidden_jsonl_stderr(backend: &str, hidden: &[f32]) {
     let dim = hidden.len();
     // Pre-size for full vector + header. ~10 chars per float on avg.
     let mut line = String::with_capacity(dim * 10 + 256);
-    line.push_str(&format!(
+    let _ = write!(
+        line,
         "{{\"backend\":\"{backend}\",\"kind\":\"pre_output_hidden\",\"dim\":{dim},\"l2\":{l2:.6},\"top8\":["
-    ));
+    );
     for (k, (i, v)) in idxs.iter().take(8).enumerate() {
         if k > 0 {
             line.push(',');
         }
-        line.push_str(&format!("[{i},{v:.6}]"));
+        let _ = write!(line, "[{i},{v:.6}]");
     }
     line.push_str("],\"full\":[");
     for (k, v) in hidden.iter().enumerate() {
         if k > 0 {
             line.push(',');
         }
-        line.push_str(&format!("{v:.6}"));
+        let _ = write!(line, "{v:.6}");
     }
     line.push_str("]}");
     eprintln!("{line}");
@@ -122,10 +126,10 @@ pub enum ModelArch {
     /// llama.cpp support settles and the actual GGUF metadata prefix
     /// stabilises (best guesses right now are `hunyuan` /
     /// `hunyuanmoe` / `hy3`, all covered by `from_gguf`). Once weights
-    /// + GGUF land, the CPU forward is expected to inherit ~90% from
+    /// and GGUF land, the CPU forward is expected to inherit ~90% from
     /// the Bonsai / Qwen 3.6 `gated_deltanet` path (top-K sparse
     /// routing over 192 experts is the main net-new implementation,
-    /// GQA + MoE scaffolding is already reused across Kimi K3 /
+    /// GQA and MoE scaffolding is already reused across Kimi K3 /
     /// DeepSeek V3).
     ///
     /// `forward()` immediately `todo!()` on `Hy3` — silent garbage on
@@ -1212,7 +1216,7 @@ mod kimi_k3_gguf_loader_tests {
         // future refactor keeps the boundary at layer 0 for K3.
         let first_k = kd.first_k_dense_replace.unwrap();
         assert!(0 < first_k, "layer 0 must be Dense");
-        assert!(!(1 < first_k), "layer 1 must be LatentMoE (not Dense)");
+        assert!((1 >= first_k), "layer 1 must be LatentMoE (not Dense)");
     }
 }
 
@@ -2827,7 +2831,6 @@ mod kimi_delta_forward_tests {
     fn phase12b_part3_capture_output_matches_uncaptured() {
         // kimi_delta_forward_head_with_capture の出力 (Vec<f32>) は
         // 既存 kimi_delta_forward_head と bit-exact 同一である
-        let d = 3_usize;
         let d_k = 2_usize;
         let d_v = 2_usize;
         let ks = 3_usize;
@@ -2895,7 +2898,6 @@ mod kimi_delta_forward_tests {
     #[test]
     fn phase12b_part3_captured_update_replays_state() {
         // capture した update を fresh cache に apply_update すると state が復元される
-        let d = 3_usize;
         let d_k = 2_usize;
         let d_v = 2_usize;
         let ks = 3_usize;
@@ -5779,7 +5781,7 @@ fn softplus(x: f32) -> f32 {
     } else if x < -20.0 {
         x.exp()
     } else {
-        (1.0 + x.exp()).ln()
+        x.exp().ln_1p()
     }
 }
 
@@ -6654,6 +6656,11 @@ struct KimiK3KdaAttn<'a> {
 /// Attention-side dispatch per layer. Layer `il` is MLA iff `il ∈
 /// KimiDeltaConfig::full_attn_layers` (see `is_mla_layer`).
 #[allow(dead_code)]
+// Variant size mismatch (Mla ≈248 B, Kda ≈472 B) is intentional: each layer
+// stores at most one instance and both variants are matched in ~30 hot forward
+// paths. Boxing would require unwrapping across those sites for a ~224 B
+// stack-slot saving per layer — not worth the churn.
+#[allow(clippy::large_enum_variant)]
 enum KimiK3Attention<'a> {
     Mla(KimiK3MlaAttn<'a>),
     Kda(KimiK3KdaAttn<'a>),
@@ -8456,6 +8463,7 @@ fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
 /// - `w.qtype` is quantized AND `dim0 * dim1 % elements_per_block != 0`
 ///   (plane splits mid-block), or
 /// - `cube.data.len()` is too small for `num_experts` planes.
+///
 /// Per-expert row count for a K3 3-D expert cube.
 ///
 /// Real GrEarl K3 GGUF stores expert cubes as 3-D
@@ -8925,8 +8933,8 @@ mod kimi_k3_latent_moe_tests {
         // Expert 1 plane: 6 F32 values [10, 20, 30, 40, 50, 60].
         let e0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let e1: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
-        let mut cube_vals = e0.clone();
-        cube_vals.extend(e1.clone());
+        let mut cube_vals = e0;
+        cube_vals.extend(e1);
         let cube_bytes = f32_bytes(&cube_vals);
         let cube = WeightRef {
             data: &cube_bytes,
@@ -10659,7 +10667,7 @@ impl<'a> KimiK3Model<'a> {
                 updates_len,
                 delta.base_snapshot.token_count
             );
-            let mut truncated = delta.clone();
+            let mut truncated = delta;
             truncated.per_step_updates.truncate(updates_len - distance);
             // Base restore + apply remaining updates
             self.restore_from_delta(truncated);
@@ -11573,8 +11581,8 @@ fn dequantize_row_to_f32(bytes: &[u8], qtype: GgmlType, out: &mut [f32]) {
 #[cfg(test)]
 mod kimi_k3_model_tests {
     use super::{
-        BlockAttnResState, GgmlType, KimiDeltaConfig, KimiK3LayerCache, KimiK3Model,
-        KimiK3ModelWeights, Llama3Config, ModelArch, WeightRef,
+        GgmlType, KimiDeltaConfig, KimiK3LayerCache, KimiK3Model, KimiK3ModelWeights, Llama3Config,
+        ModelArch, WeightRef,
     };
 
     /// Build a minimal `Llama3Config` with a populated `KimiDeltaConfig`
@@ -11642,12 +11650,6 @@ mod kimi_k3_model_tests {
     /// data. Not usable for real forward but sufficient for
     /// construction-path tests.
     fn dummy_weights(hidden_dim: usize, vocab_size: usize, buf: &[u8]) -> KimiK3ModelWeights<'_> {
-        let empty_ref = || WeightRef {
-            data: buf,
-            qtype: GgmlType::F32,
-            rows: 1,
-            cols: 1,
-        };
         KimiK3ModelWeights {
             token_embd: WeightRef {
                 data: buf,
@@ -11721,8 +11723,8 @@ mod kimi_k3_model_tests {
         let mut model = KimiK3Model::new(weights, config).expect("construct");
         // Muck with the MLA cache manually to prove reset works.
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![0.0; 8], &vec![0.0; 4]);
-            c.append(&vec![0.0; 8], &vec![0.0; 4]);
+            c.append(&[0.0; 8], &[0.0; 4]);
+            c.append(&[0.0; 8], &[0.0; 4]);
             assert_eq!(c.n_positions(), 2);
         }
         // Bank a fake ckpt into the AttnRes state to observe reset.
@@ -11800,7 +11802,7 @@ mod kimi_k3_model_tests {
         let mut model = build_model_for_snapshot_tests();
         // Muck with MLA cache to make state non-trivial
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![1.5; 8], &vec![2.5; 4]);
+            c.append(&[1.5; 8], &[2.5; 4]);
         }
         model
             .attn_res_state
@@ -11825,7 +11827,7 @@ mod kimi_k3_model_tests {
 
         // Muck up state
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![9.9; 8], &vec![9.9; 4]);
+            c.append(&[9.9; 8], &[9.9; 4]);
         }
         model.token_count = 42;
 
@@ -11907,7 +11909,7 @@ mod kimi_k3_model_tests {
         model.snapshot_ring.push_back(snap0);
         // "Forward 1": muck state
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![1.0; 8], &vec![1.0; 4]);
+            c.append(&[1.0; 8], &[1.0; 4]);
         }
         model.token_count = 1;
         // Snapshot 1 (position 1)
@@ -11915,7 +11917,7 @@ mod kimi_k3_model_tests {
         model.snapshot_ring.push_back(snap1);
         // "Forward 2": more muck
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![2.0; 8], &vec![2.0; 4]);
+            c.append(&[2.0; 8], &[2.0; 4]);
         }
         model.token_count = 2;
 
@@ -11987,8 +11989,8 @@ mod kimi_k3_model_tests {
         let mut model = build_model_for_snapshot_tests();
         // Muck up MLA cache に非自明な値
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![1.5_f32; 8], &vec![-2.75_f32; 4]);
-            c.append(&vec![3.125_f32; 8], &vec![0.0625_f32; 4]);
+            c.append(&[1.5_f32; 8], &[-2.75_f32; 4]);
+            c.append(&[3.125_f32; 8], &[0.0625_f32; 4]);
         }
         model
             .attn_res_state
@@ -12206,7 +12208,7 @@ mod kimi_k3_model_tests {
         let mut model = build_model_for_snapshot_tests();
         // Muck up MLA cache
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![2.5_f32; 8], &vec![-1.25_f32; 4]);
+            c.append(&[2.5_f32; 8], &[-1.25_f32; 4]);
         }
         model.token_count = 7;
 
@@ -12226,7 +12228,7 @@ mod kimi_k3_model_tests {
 
         // Muck up state
         if let KimiK3LayerCache::Mla(c) = &mut model.layer_caches[3] {
-            c.append(&vec![9.9_f32; 8], &vec![9.9_f32; 4]);
+            c.append(&[9.9_f32; 8], &[9.9_f32; 4]);
         }
         model.token_count = 99;
 
@@ -12299,7 +12301,7 @@ mod kimi_k3_model_tests {
         let base_delta = model.snapshot_delta_from();
         let base_bytes = super::KimiK3Model::snapshot_delta_bytes_estimate(&base_delta);
 
-        let mut with_step = base_delta.clone();
+        let mut with_step = base_delta;
         // Add 1 step with 6 KDA layers × 8 heads = 48 updates
         let heads_per_layer: Vec<super::KimiDeltaHeadUpdate> =
             (0..8).map(|_| synth_head_update(d_k, d_v)).collect();
@@ -13689,7 +13691,7 @@ impl<'a> Llama3Model<'a> {
             ONCE_EMB.call_once(|| fire = true);
             if fire {
                 dump_slice("input_embed", &hidden, 3);
-                eprintln!("DN0 token_id={}", token_id);
+                eprintln!("DN0 token_id={token_id}");
             }
         }
         // Gemma-2: scale embeddings by sqrt(hidden_dim) (no-op for others).
@@ -13874,7 +13876,7 @@ impl<'a> Llama3Model<'a> {
                         let mut per_head_z = String::from("DN0 z_pre_per_head_sum=[");
                         for h in 0..dn_num_v_heads {
                             let s: f32 = z_slice[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
-                            per_head_z.push_str(&format!("{s:.4},"));
+                            let _ = write!(per_head_z, "{s:.4},");
                         }
                         per_head_z.push(']');
                         eprintln!("{per_head_z}");
@@ -13960,7 +13962,7 @@ impl<'a> Llama3Model<'a> {
                         dump_slice("conv_out_raw", &dn_conv_out[..qkv_len], 3);
                     }
                     if is_bonsai_path {
-                        for val in dn_conv_out[..qkv_len].iter_mut() {
+                        for val in &mut dn_conv_out[..qkv_len] {
                             *val = silu(*val);
                         }
                     }
@@ -13975,8 +13977,8 @@ impl<'a> Llama3Model<'a> {
                             let q_last = &dn_conv_out[q_off + dn_qk_dim - 3..q_off + dn_qk_dim];
                             let k_first = &dn_conv_out[k_off..k_off + 3];
                             let k_last = &dn_conv_out[k_off + dn_qk_dim - 3..k_off + dn_qk_dim];
-                            eprintln!("DN0 q_kv{kv}: first3={:?} last3={:?}", q_first, q_last);
-                            eprintln!("DN0 k_kv{kv}: first3={:?} last3={:?}", k_first, k_last);
+                            eprintln!("DN0 q_kv{kv}: first3={q_first:?} last3={q_last:?}");
+                            eprintln!("DN0 k_kv{kv}: first3={k_first:?} last3={k_last:?}");
                             // Also compute dot product q · k for this KV-h
                             let dot: f32 = (0..dn_qk_dim)
                                 .map(|i| dn_conv_out[q_off + i] * dn_conv_out[k_off + i])
@@ -13989,10 +13991,10 @@ impl<'a> Llama3Model<'a> {
                         for h in 0..dn_num_kv_heads {
                             let q_off = h * dn_qk_dim;
                             let qs: f32 = dn_conv_out[q_off..q_off + dn_qk_dim].iter().sum();
-                            q_sums.push_str(&format!("{qs:.4},"));
+                            let _ = write!(q_sums, "{qs:.4},");
                             let k_off = dn_qk_dim * dn_num_kv_heads + h * dn_qk_dim;
                             let ks: f32 = dn_conv_out[k_off..k_off + dn_qk_dim].iter().sum();
-                            k_sums.push_str(&format!("{ks:.4},"));
+                            let _ = write!(k_sums, "{ks:.4},");
                         }
                         q_sums.push(']');
                         k_sums.push(']');
@@ -14002,7 +14004,7 @@ impl<'a> Llama3Model<'a> {
                         for h in 0..dn_num_v_heads {
                             let v_off = v_base + h * dn_v_dim;
                             let vs: f32 = dn_conv_out[v_off..v_off + dn_v_dim].iter().sum();
-                            v_sums.push_str(&format!("{vs:.4},"));
+                            let _ = write!(v_sums, "{vs:.4},");
                         }
                         v_sums.push(']');
                         eprintln!("{v_sums}");
@@ -14046,7 +14048,7 @@ impl<'a> Llama3Model<'a> {
                         for h in 0..dn_num_v_heads {
                             let s: f32 =
                                 dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
-                            ao_sums.push_str(&format!("{s:.6},"));
+                            let _ = write!(ao_sums, "{s:.6},");
                         }
                         ao_sums.push(']');
                         eprintln!("{ao_sums}");
@@ -14070,7 +14072,7 @@ impl<'a> Llama3Model<'a> {
                         for h in 0..dn_num_v_heads {
                             let s: f32 =
                                 dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
-                            n51_sums.push_str(&format!("{s:.4},"));
+                            let _ = write!(n51_sums, "{s:.4},");
                         }
                         n51_sums.push(']');
                         eprintln!("{n51_sums}");
@@ -14119,7 +14121,7 @@ impl<'a> Llama3Model<'a> {
                         for h in 0..dn_num_v_heads {
                             let s: f32 =
                                 dn_delta_out[h * dn_v_dim..(h + 1) * dn_v_dim].iter().sum();
-                            per_head.push_str(&format!("{s:.4},"));
+                            let _ = write!(per_head, "{s:.4},");
                         }
                         per_head.push(']');
                         eprintln!("{per_head}");
@@ -14190,7 +14192,7 @@ impl<'a> Llama3Model<'a> {
                     .unwrap_or(2);
                 let cur = POS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if cur < max_pos {
-                    eprintln!("DN0 L0_pos_marker pos={}", cur);
+                    eprintln!("DN0 L0_pos_marker pos={cur}");
                     true
                 } else {
                     false
@@ -14482,10 +14484,7 @@ impl<'a> Llama3Model<'a> {
                     let ss: f64 = hidden.iter().map(|&v| (v as f64) * (v as f64)).sum();
                     let mean_sq = ss / hidden.len() as f64;
                     let scale = 1.0_f64 / (mean_sq + 1e-6_f64).sqrt();
-                    eprintln!(
-                        "DN0 gated3_pre_ffnnorm_rms: mean_sq={:.6} scale={:.4}",
-                        mean_sq, scale
-                    );
+                    eprintln!("DN0 gated3_pre_ffnnorm_rms: mean_sq={mean_sq:.6} scale={scale:.4}");
                     // Manual output[0] = hidden[0] * scale * weight[0]
                     let manual_out_0 = hidden[0] as f64 * scale * layer.ffn_norm[0] as f64;
                     eprintln!(
@@ -18314,6 +18313,7 @@ fn load_weight_ref_any_rows<'a>(
 ///    - `up   = ffn_up_exps[e]   @ norm_buf`
 ///    - `expert_out = ffn_down_exps[e] @ (SiLU(gate) * up)`
 /// 6. Sum weighted `expert_out` into `output`.
+///
 /// DeepSeek-V3 MoE routing (pure math, Phase 3).
 ///
 /// Splits out steps 3-7 of `forward_deepseek_moe_layer` so the routing
@@ -18927,7 +18927,9 @@ impl Default for SpeculativeConfig {
 }
 
 /// DeepSeek-V3 MTP speculative-decoding adaptive-guard policy (Phase 5a.2,
-/// Issue #35). Colibri reports that MTP accept rate is bimodal on real V3
+/// Issue #35).
+///
+/// Colibri reports that MTP accept rate is bimodal on real V3
 /// traffic — around 40-60% during coherent generation, dropping to 0-5%
 /// when the model transitions into a different distribution (e.g. hitting
 /// a code block, structured output). Running MTP unconditionally in the
@@ -19712,34 +19714,27 @@ fn build_deepseek_streaming_pool(
     if std::env::var("ALICE_LLM_MOE_STREAMING").ok().as_deref() != Some("1") {
         return None;
     }
-    let path = match std::env::var("ALICE_LLM_MOE_STREAMING_FILE") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!(
-                "[alice-llm] ALICE_LLM_MOE_STREAMING=1 but ALICE_LLM_MOE_STREAMING_FILE not set; \
-                 falling back to InMemory routed experts."
-            );
-            return None;
-        }
+    let Ok(path) = std::env::var("ALICE_LLM_MOE_STREAMING_FILE") else {
+        eprintln!(
+            "[alice-llm] ALICE_LLM_MOE_STREAMING=1 but ALICE_LLM_MOE_STREAMING_FILE not set; \
+             falling back to InMemory routed experts."
+        );
+        return None;
     };
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
+    let file = std::fs::File::open(&path)
+        .map_err(|e| {
             eprintln!("[alice-llm] streaming pool disabled: cannot open '{path}': {e}");
-            return None;
-        }
-    };
+        })
+        .ok()?;
     // SAFETY: mmap of a read-only file we opened above. The Mmap owns its
     // mapping and lives for the pool's lifetime (Arc-shared into every MoE
     // layer's Streaming variant); it is not observed by any other process
     // in a mutating way.
-    let mmap = match unsafe { memmap2::Mmap::map(&file) } {
-        Ok(m) => m,
-        Err(e) => {
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| {
             eprintln!("[alice-llm] streaming pool disabled: mmap failed: {e}");
-            return None;
-        }
-    };
+        })
+        .ok()?;
 
     // Phase 4b.4: Tell the kernel this region will be accessed randomly
     // so its sequential-readahead heuristic does NOT thrash — the router
@@ -20044,9 +20039,7 @@ fn load_deepseek_v3_mtp_weights<'a>(
 ) -> Option<DeepSeekV3MtpWeights<'a>> {
     // Only look for MTP tensors when the config declares an MTP layer.
     // V2 quants and pre-MTP V3 variants leave this field None.
-    if config.deepseek_mtp_layer().is_none() {
-        return None;
-    }
+    config.deepseek_mtp_layer()?;
 
     // Entry projections. Every subsequent `?` returns None if any single
     // tensor is missing — the intended failure mode: "not all MTP tensors
@@ -21914,7 +21907,7 @@ mod tests {
     fn ssm_alpha_transformation_matches_reference() {
         // Anchor 1: alpha=0, dt_bias=0, ssm_a=-1
         //   biased = 0, softplus(0) = ln(2), gate = -ln(2), decay = exp(-ln(2)) = 1/2
-        let decay = (softplus(0.0 + 0.0) * -1.0_f32).exp();
+        let decay = (-softplus(0.0 + 0.0)).exp();
         assert!(
             (decay - 0.5_f32).abs() < 1e-6,
             "anchor 1: decay = {decay}, expected 0.5",
@@ -21929,7 +21922,7 @@ mod tests {
         );
 
         // Anchor 3: alpha=large negative → softplus ≈ 0, gate ≈ 0, decay ≈ 1
-        let decay3 = (softplus(-30.0) * -1.0_f32).exp();
+        let decay3 = (-softplus(-30.0)).exp();
         assert!(
             (decay3 - 1.0_f32).abs() < 1e-6,
             "anchor 3: decay = {decay3}, expected 1",
@@ -22002,7 +21995,7 @@ mod tests {
     fn ssm_beta_sigmoid_applied_per_v_head() {
         let num_v_heads = 5;
         // Raw beta values covering large negative → large positive.
-        let mut dn_beta = vec![-8.0_f32, -1.0, 0.0, 2.5, 10.0];
+        let mut dn_beta = [-8.0_f32, -1.0, 0.0, 2.5, 10.0];
 
         // Apply the transformation (mirrors forward-path Step 2d).
         for h in 0..num_v_heads {
@@ -22668,7 +22661,7 @@ mod tests {
     /// behind an enum instead of a separate forward path.
     #[test]
     fn deepseek_moe_forward_streaming_matches_in_memory() {
-        use crate::deepseek_streaming::{ExpertKind, ExpertLayerInfo, StreamingExpertPool};
+        use crate::deepseek_streaming::{ExpertLayerInfo, StreamingExpertPool};
         use crate::gguf::GgmlType;
         use std::sync::Arc;
 
@@ -22845,9 +22838,9 @@ mod tests {
             1024 * 1024, // 1 MiB budget, plenty for 3 * 128 = 384 bytes/expert
         ));
         let streaming = DeepSeekMoeWeights {
-            ffn_norm: ffn_norm.clone(),
-            ffn_gate_inp: ffn_gate_inp.clone(),
-            exp_probs_b: Some(exp_probs_b.clone()),
+            ffn_norm,
+            ffn_gate_inp,
+            exp_probs_b: Some(exp_probs_b),
             routed: RoutedExpertStorage::Streaming {
                 pool: pool.clone(),
                 layer_idx: 0,
@@ -23294,8 +23287,8 @@ mod tests {
     #[test]
     fn gated_attention_sigmoid_math_matches_reference() {
         // 6 attention output values with 6 gate values.
-        let mut attn_out = vec![1.0f32, 2.0, -1.0, 0.5, -0.5, 3.0];
-        let gate = vec![0.0f32, 1.0, -1.0, 10.0, -10.0, 0.5];
+        let mut attn_out = [1.0f32, 2.0, -1.0, 0.5, -0.5, 3.0];
+        let gate = [0.0f32, 1.0, -1.0, 10.0, -10.0, 0.5];
         let q_dim = attn_out.len();
 
         // Reference: each output multiplied by sigmoid(gate).

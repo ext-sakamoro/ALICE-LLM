@@ -36,7 +36,7 @@ pub fn lse_combine(
     idx: &KvOuterIndex,
     hq: usize,
 ) -> Result<Vec<f32>, SparseAttentionError> {
-    if hq == 0 || hq % idx.hkv != 0 {
+    if hq == 0 || !hq.is_multiple_of(idx.hkv) {
         return Err(SparseAttentionError::HeadCountMismatch { hq, hkv: idx.hkv });
     }
     let qhead_expected = hq / idx.hkv;

@@ -178,9 +178,9 @@ fn main() {
 
     let vocab = 128256;
     let mut logits = vec![0.0f32; vocab];
-    for row in 0..vocab {
+    for (row, out) in logits.iter_mut().enumerate() {
         let off = row * h;
-        logits[row] = emb_all[off..off + h]
+        *out = emb_all[off..off + h]
             .iter()
             .zip(&out_normed)
             .map(|(w, x)| w * x)

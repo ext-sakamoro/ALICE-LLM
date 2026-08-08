@@ -1489,7 +1489,7 @@ mod tests {
         // bias を大きくして z ≈ +1e5
         head.biases[0] = 1.0e5;
         let conf = head.predict(0, &[0.0]).expect("valid");
-        assert!(conf >= 0.0 && conf <= 1.0);
+        assert!((0.0..=1.0).contains(&conf));
         assert!(conf > 0.999);
     }
 
@@ -1498,7 +1498,7 @@ mod tests {
         let mut head = PositionConfidenceHead::new(1, 1).expect("valid");
         head.biases[0] = -1.0e5;
         let conf = head.predict(0, &[0.0]).expect("valid");
-        assert!(conf >= 0.0 && conf <= 1.0);
+        assert!((0.0..=1.0).contains(&conf));
         assert!(conf < 1.0e-3);
     }
 

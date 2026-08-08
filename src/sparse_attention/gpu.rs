@@ -18,7 +18,8 @@
 //! Everything is gated on `feature = "gpu"` (which pulls in `wgpu`,
 //! `pollster`, and `bytemuck`, matching the rest of the crate).
 
-#![cfg(feature = "gpu")]
+// `#[cfg(feature = "gpu")]` is applied on the `mod gpu;` line in `mod.rs`;
+// duplicating it here would trip `clippy::duplicated_attributes`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -151,11 +152,15 @@ impl SparseAttentionGpu {
         softmax_scale: f32,
     ) -> Result<ForwardPartials, SparseAttentionError> {
         // --- Argument sanity (mirrors the CPU forward) --------------------
-        if hkv == 0 || hq == 0 || hq % hkv != 0 {
+        if hkv == 0 || hq == 0 || !hq.is_multiple_of(hkv) {
             return Err(SparseAttentionError::HeadCountMismatch { hq, hkv });
         }
         let qhead = hq / hkv;
-        if head_dim == 0 || block_size == 0 || page_size == 0 || block_size % page_size != 0 {
+        if head_dim == 0
+            || block_size == 0
+            || page_size == 0
+            || !block_size.is_multiple_of(page_size)
+        {
             return Err(SparseAttentionError::BlockPageMismatch {
                 block_size,
                 page_size,
@@ -184,7 +189,7 @@ impl SparseAttentionGpu {
             });
         }
         let page_stride = hkv * page_size * head_dim;
-        if k_pages.len() % page_stride != 0 || v_pages.len() != k_pages.len() {
+        if !k_pages.len().is_multiple_of(page_stride) || v_pages.len() != k_pages.len() {
             return Err(SparseAttentionError::ShapeMismatch {
                 what: "k_pages / v_pages page stride",
                 expected: page_stride,
@@ -209,9 +214,10 @@ impl SparseAttentionGpu {
 
         // --- Resolve used_kv_lens on the host (default = full msb range) --
         let default_lk = (idx.msb * block_size) as i32;
-        let used: Vec<i32> = used_kv_lens
-            .map(<[i32]>::to_vec)
-            .unwrap_or_else(|| vec![default_lk; cu_seqlens_q.batch_size()]);
+        let used: Vec<i32> = used_kv_lens.map_or_else(
+            || vec![default_lk; cu_seqlens_q.batch_size()],
+            <[i32]>::to_vec,
+        );
         if used.len() != cu_seqlens_q.batch_size() {
             return Err(SparseAttentionError::ShapeMismatch {
                 what: "used_kv_lens",

@@ -287,10 +287,7 @@ fn run_hybrid_per_layer(
     let interval = config.full_attention_interval();
     let num_layers = config.num_layers;
     let is_attention_layer: Vec<bool> = (0..num_layers)
-        .map(|i| match interval {
-            Some(iv) if (i + 1) % iv != 0 => false,
-            _ => true,
-        })
+        .map(|i| !matches!(interval, Some(iv) if (i + 1) % iv != 0))
         .collect();
 
     let formatted = format!(

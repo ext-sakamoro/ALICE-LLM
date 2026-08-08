@@ -203,7 +203,7 @@ pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f
         } else if a_biased < -20.0 {
             a_biased.exp()
         } else {
-            (1.0 + a_biased.exp()).ln()
+            a_biased.exp().ln_1p()
         };
         let gate = a_softplus * ssm_a[h];
         alpha[h] = gate.exp();
@@ -422,6 +422,12 @@ pub struct GpuPass<'a> {
 
 // --- GpuEngine implementation ---
 
+impl Default for GpuEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuEngine {
     /// Initialize GPU engine (blocking). Selects high-performance adapter.
     #[must_use]
@@ -491,7 +497,7 @@ impl GpuEngine {
                 layout: None,
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
         };
@@ -558,7 +564,7 @@ impl GpuEngine {
                 ),
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
         };
@@ -1002,12 +1008,12 @@ fn matvec_dispatch(rows: u32) -> (u32, u32, u32) {
         (rows, 1, rows)
     } else {
         let grid_x = 65535u32;
-        let grid_y = (rows + grid_x - 1) / grid_x;
+        let grid_y = rows.div_ceil(grid_x);
         (grid_x, grid_y, grid_x)
     }
 }
 
-impl<'a> GpuPass<'a> {
+impl GpuPass<'_> {
     /// Q4_K matvec: output = weights × input (GPU buffers, no readback).
     /// PrismML `Q1_0` (Bonsai 27B binary g128) GPU matvec — one workgroup per
     /// output row, workgroup_size 128 = one thread per element in a Q1_0 block.
@@ -1517,7 +1523,7 @@ impl<'a> GpuPass<'a> {
                     },
                 ],
             });
-        let dispatch_x = ((gate.len as u32) + 255) / 256;
+        let dispatch_x = (gate.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1550,7 +1556,7 @@ impl<'a> GpuPass<'a> {
                     resource: buf.buffer.as_entire_binding(),
                 }],
             });
-        let dispatch_x = ((buf.len as u32) + 255) / 256;
+        let dispatch_x = (buf.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1585,7 +1591,7 @@ impl<'a> GpuPass<'a> {
                     resource: beta.buffer.as_entire_binding(),
                 }],
             });
-        let dispatch_x = ((beta.len as u32) + 255) / 256;
+        let dispatch_x = (beta.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1641,7 +1647,7 @@ impl<'a> GpuPass<'a> {
                     },
                 ],
             });
-        let dispatch_x = ((alpha.len as u32) + 255) / 256;
+        let dispatch_x = (alpha.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1688,7 +1694,7 @@ impl<'a> GpuPass<'a> {
                     },
                 ],
             });
-        let dispatch_x = ((attn_out.len as u32) + 255) / 256;
+        let dispatch_x = (attn_out.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1719,7 +1725,7 @@ impl<'a> GpuPass<'a> {
                     },
                 ],
             });
-        let dispatch_x = ((inout.len as u32) + 255) / 256;
+        let dispatch_x = (inout.len as u32).div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -1772,7 +1778,7 @@ impl<'a> GpuPass<'a> {
                 ],
             });
         let total_pairs = num_heads * head_dim / 2;
-        let dispatch_x = (total_pairs + 255) / 256;
+        let dispatch_x = total_pairs.div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -2066,7 +2072,7 @@ impl<'a> GpuPass<'a> {
                     },
                 ],
             });
-        let dispatch_x = (kv_dim + 255) / 256;
+        let dispatch_x = kv_dim.div_ceil(256);
         {
             let mut pass = self
                 .encoder
@@ -3090,8 +3096,7 @@ impl GpuModel {
                     let attn_q_name = format!("blk.{i}.attn_q.weight");
                     let attn_q_actual_rows = gguf
                         .tensor_info(&attn_q_name)
-                        .map(|info| info.dims[1] as usize)
-                        .unwrap_or(config.hidden_dim);
+                        .map_or(config.hidden_dim, |info| info.dims[1] as usize);
                     // Phase X.3.e.3.19 fix: gated attention layer detection uses
                     // q_dim = num_heads * head_dim (NOT hidden_dim). For Qwen
                     // 3.5-4B, hidden_dim=2560 but q_dim=16*256=4096, and
@@ -3475,7 +3480,7 @@ impl GpuModel {
         // (4096 bytes/token). Without this max the layer-load bind group
         // creation panicked with `Buffer bound range 16384..40960 overflows
         // its size (32768)` (Phase X.3.e.3.26 Bonsai 27B verification).
-        let dn_conv_dim_usize = dn_conv_dim as usize;
+        let dn_conv_dim_usize = dn_conv_dim;
         let dn_v_out = dn_v_dim * dn_num_v_heads;
         let k_buf_dim = kv_dim.max(dn_conv_dim_usize);
         let v_buf_dim = kv_dim.max(dn_v_out);
@@ -3949,7 +3954,7 @@ impl GpuModel {
                     // borrow from the Vec so the buffer outlives the bind
                     // group creation.
                     if dlw.conv1d_bias.is_none() {
-                        let zero = vec![0.0f32; dn_conv_dim as usize];
+                        let zero = vec![0.0f32; dn_conv_dim];
                         bonsai_conv1d_bias_zero_buffers.push(engine.upload_f32(&zero));
                     }
                     let conv1d_bias_buf = dlw
@@ -4276,13 +4281,13 @@ impl GpuModel {
         }
 
         // Dispatch constants
-        let residual_dispatch_x = ((config.hidden_dim as u32) + 255) / 256;
-        let rope_q_dispatch_x = (config.num_heads * config.head_dim / 2 + 255) / 256;
-        let rope_k_dispatch_x = (config.num_kv_heads * config.head_dim / 2 + 255) / 256;
-        let kv_dispatch_x = ((kv_dim as u32) + 255) / 256;
+        let residual_dispatch_x = (config.hidden_dim as u32).div_ceil(256);
+        let rope_q_dispatch_x = (config.num_heads * config.head_dim / 2).div_ceil(256);
+        let rope_k_dispatch_x = (config.num_kv_heads * config.head_dim / 2).div_ceil(256);
+        let kv_dispatch_x = (kv_dim as u32).div_ceil(256);
         // Q bias is added over hidden_dim elements; K/V bias over kv_dim.
-        let q_bias_dispatch_x = ((config.hidden_dim as u32) + 255) / 256;
-        let kv_bias_dispatch_x = ((kv_dim as u32) + 255) / 256;
+        let q_bias_dispatch_x = (config.hidden_dim as u32).div_ceil(256);
+        let kv_bias_dispatch_x = (kv_dim as u32).div_ceil(256);
 
         let total_bgs = layer_bgs.len() * 10 + 7;
         eprintln!("[GpuModel] {total_bgs} BGs pre-cached (fused SwiGLU), 4 persistent UBs");
@@ -4504,7 +4509,7 @@ impl GpuModel {
                         cp.set_pipeline(&self.engine.sigmoid_gate_apply_pipeline);
                         cp.set_bind_group(0, bg, &[]);
                         let attn_out_len = self.config.num_heads * self.config.head_dim;
-                        cp.dispatch_workgroups((attn_out_len + 255) / 256, 1, 1);
+                        cp.dispatch_workgroups(attn_out_len.div_ceil(256), 1, 1);
                     }
 
                     Self::dispatch_mv(&self.engine, &mut cp, &lbg.o_proj);
@@ -4559,7 +4564,7 @@ impl GpuModel {
                             .config
                             .linear_num_v_heads
                             .unwrap_or(self.config.num_heads);
-                        cp.dispatch_workgroups((dn_num_v_heads + 255) / 256, 1, 1);
+                        cp.dispatch_workgroups(dn_num_v_heads.div_ceil(256), 1, 1);
                     }
 
                     // 2d. (Bonsai only) ssm_discretisation: alpha_buf =
@@ -4572,7 +4577,7 @@ impl GpuModel {
                             .config
                             .linear_num_v_heads
                             .unwrap_or(self.config.num_heads);
-                        cp.dispatch_workgroups((dn_num_v_heads + 255) / 256, 1, 1);
+                        cp.dispatch_workgroups(dn_num_v_heads.div_ceil(256), 1, 1);
                     }
 
                     // 3. Causal conv1d: q_buf → k_buf (preprocessed q, k, v)
@@ -4587,7 +4592,7 @@ impl GpuModel {
                                 .config
                                 .linear_num_v_heads
                                 .unwrap_or(self.config.num_heads);
-                    let conv1d_dispatch = (dn_conv_dim + 255) / 256;
+                    let conv1d_dispatch = dn_conv_dim.div_ceil(256);
                     cp.set_pipeline(&self.engine.conv1d_causal_pipeline);
                     cp.set_bind_group(0, &dbg.conv1d_bg, &[]);
                     cp.dispatch_workgroups(conv1d_dispatch, 1, 1);
@@ -4642,7 +4647,7 @@ impl GpuModel {
                             .unwrap_or(self.config.num_heads);
                         let attn_out_len =
                             dn_num_v_heads * self.config.linear_kv_head_dim.unwrap_or(128);
-                        cp.dispatch_workgroups((attn_out_len + 255) / 256, 1, 1);
+                        cp.dispatch_workgroups(attn_out_len.div_ceil(256), 1, 1);
                     }
 
                     // Compile-check: silence unused warning when Bonsai path is
@@ -5904,7 +5909,7 @@ impl GpuModel {
     fn encode_forward_batch4(&self, encoder: &mut wgpu::CommandEncoder) {
         let bs: u32 = 4;
         let hidden_dim = self.config.hidden_dim as u32;
-        let res_batch_dispatch = (bs * hidden_dim + 255) / 256;
+        let res_batch_dispatch = (bs * hidden_dim).div_ceil(256);
 
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
 
@@ -6829,7 +6834,7 @@ mod tests {
         ssm_norm_per_head_cpu(&mut input_gpu_ref, &weight, v_dim, eps);
 
         // Compute via llama3::apply_qk_norm-equivalent f64 accumulation
-        let mut input_llama3_ref = input.clone();
+        let mut input_llama3_ref = input;
         for h in 0..num_heads {
             let start = h * v_dim;
             let slice = &mut input_llama3_ref[start..start + v_dim];
@@ -7060,7 +7065,7 @@ mod tests {
     fn build_q8_0_block(d: f32, qs: &[i8; 32]) -> Vec<u8> {
         let mut block = Vec::with_capacity(34);
         block.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-        for &q in qs.iter() {
+        for &q in qs {
             block.push(q as u8);
         }
         assert_eq!(block.len(), 34);
@@ -7075,9 +7080,8 @@ mod tests {
     /// `gguf.rs`).
     #[test]
     fn q5k_matvec_matches_cpu_dequant_reference() {
-        let engine = match try_gpu_engine() {
-            Some(e) => e,
-            None => return,
+        let Some(engine) = try_gpu_engine() else {
+            return;
         };
 
         let rows = 8usize;
@@ -7141,9 +7145,8 @@ mod tests {
     /// 9-word block layout and int8 sign extension against `dequantize_q8_0`.
     #[test]
     fn q8_0_matvec_matches_cpu_dequant_reference() {
-        let engine = match try_gpu_engine() {
-            Some(e) => e,
-            None => return,
+        let Some(engine) = try_gpu_engine() else {
+            return;
         };
 
         // Q8_0 blocks: 32 elements each. Use 8 blocks/row = cols=256, rows=8.

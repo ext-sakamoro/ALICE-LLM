@@ -11,17 +11,15 @@
 //!
 //! # Pipeline (implemented in phases)
 //!
-//! * `types`           — tensor contracts (`SparseSelection`, `BlockTables`,
-//!                       `CuSeqlensQ`, `KvOuterIndex`) and error type.
-//! * `index`           — `build_kvouter_index`: KV-outer CSR inverse index
-//!                       (Phase MSA.1).
-//! * `topk` / `proxy`  — top-K KV-block selector + dense proxy pass
-//!                       (Phase MSA.2, not yet present).
-//! * `scheduler` /
-//!   `forward` /
-//!   `combine`         — load-balance scheduler, KV-outer forward
-//!                       (partial output + online softmax), and LSE
-//!                       combine (Phase MSA.3, not yet present).
+//! * `types` — tensor contracts (`SparseSelection`, `BlockTables`,
+//!   `CuSeqlensQ`, `KvOuterIndex`) and error type.
+//! * `index` — `build_kvouter_index`: KV-outer CSR inverse index
+//!   (Phase MSA.1).
+//! * `topk` / `proxy` — top-K KV-block selector + dense proxy pass
+//!   (Phase MSA.2, not yet present).
+//! * `scheduler` / `forward` / `combine` — load-balance scheduler, KV-outer
+//!   forward (partial output + online softmax), and LSE combine
+//!   (Phase MSA.3, not yet present).
 
 pub mod combine;
 pub mod forward;
@@ -136,7 +134,7 @@ mod api_tests {
         let sel = SparseSelection::new(vec![0, 1], tq, hkv, 2).unwrap();
         let tbl = BlockTables::new(vec![0, 1], 1, 2).unwrap();
         let cu = CuSeqlensQ::new(vec![0, tq as i64]).unwrap();
-        let used = vec![num_pages as i32 * page_size as i32];
+        let used = vec![num_pages * page_size as i32];
 
         let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
 

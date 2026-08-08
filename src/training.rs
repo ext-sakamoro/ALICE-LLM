@@ -537,7 +537,7 @@ mod tests {
     fn test_l1_grad_adds_sign() {
         let weights = vec![1.0, -2.0]; // 1x2
         let mut layer = QatLinear::new(weights, 1, 2, 0.3);
-        let mut opt = AdamW::new(2, 0.01);
+        let _opt = AdamW::new(2, 0.01);
         let input = vec![1.0, 1.0];
         let target = vec![0.0];
 

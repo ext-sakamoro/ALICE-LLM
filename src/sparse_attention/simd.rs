@@ -172,7 +172,7 @@ mod tests {
             let mut dst_ref = dst_simd.clone();
             let scale = 0.42f32;
             scale_in_place(&mut dst_simd, scale);
-            for v in dst_ref.iter_mut() {
+            for v in &mut dst_ref {
                 *v *= scale;
             }
             for (i, (a, b)) in dst_simd.iter().zip(&dst_ref).enumerate() {

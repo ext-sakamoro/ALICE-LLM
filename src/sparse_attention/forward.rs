@@ -21,6 +21,10 @@ use super::scheduler::{enumerate_work_units, WorkSplit};
 use super::simd;
 use super::types::{BlockTables, CuSeqlensQ, KvOuterIndex, SparseAttentionError};
 
+/// Per-unit tuple bundled into the work-unit task vector: the split spec plus
+/// disjoint mutable slices into `o_partial` / `m_partial` / `l_partial`.
+type WorkUnitTask<'a> = (WorkSplit, &'a mut [f32], &'a mut [f32], &'a mut [f32]);
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -68,7 +72,6 @@ struct WorkCtx<'a> {
     block_tables: &'a BlockTables,
     cu_seqlens_q: &'a CuSeqlensQ,
     used_kv_lens: Option<&'a [i32]>,
-    batch_of_tq: &'a [usize],
     q_local_pos: &'a [usize],
     hq: usize,
     qhead: usize,
@@ -121,11 +124,11 @@ pub fn kvouter_forward(
     causal: bool,
 ) -> Result<ForwardPartials, SparseAttentionError> {
     // Argument sanity.
-    if hkv == 0 || hq == 0 || hq % hkv != 0 {
+    if hkv == 0 || hq == 0 || !hq.is_multiple_of(hkv) {
         return Err(SparseAttentionError::HeadCountMismatch { hq, hkv });
     }
     let qhead = hq / hkv;
-    if head_dim == 0 || block_size == 0 || page_size == 0 || block_size % page_size != 0 {
+    if head_dim == 0 || block_size == 0 || page_size == 0 || !block_size.is_multiple_of(page_size) {
         return Err(SparseAttentionError::BlockPageMismatch {
             block_size,
             page_size,
@@ -148,7 +151,7 @@ pub fn kvouter_forward(
         });
     }
     let page_stride = hkv * page_size * head_dim;
-    if k_pages.len() % page_stride != 0 || v_pages.len() != k_pages.len() {
+    if !k_pages.len().is_multiple_of(page_stride) || v_pages.len() != k_pages.len() {
         return Err(SparseAttentionError::ShapeMismatch {
             what: "k_pages / v_pages page stride",
             expected: page_stride,
@@ -157,9 +160,8 @@ pub fn kvouter_forward(
     }
     let num_pages = k_pages.len() / page_stride;
 
-    // Precompute per-query batch + local query position (needed for causal).
+    // Precompute per-query local position (needed for causal).
     let batch_size = cu_seqlens_q.batch_size();
-    let mut batch_of_tq: Vec<usize> = vec![0; tq];
     let mut q_local_pos: Vec<usize> = vec![0; tq];
     {
         let mut b = 0usize;
@@ -167,7 +169,6 @@ pub fn kvouter_forward(
             while b + 1 < batch_size && (i as i64) >= cu_seqlens_q.prefix[b + 1] {
                 b += 1;
             }
-            batch_of_tq[i] = b;
             q_local_pos[i] = i - cu_seqlens_q.prefix[b] as usize;
         }
     }
@@ -186,8 +187,7 @@ pub fn kvouter_forward(
     let mut o_rest: &mut [f32] = o_partial.as_mut_slice();
     let mut m_rest: &mut [f32] = m_partial.as_mut_slice();
     let mut l_rest: &mut [f32] = l_partial.as_mut_slice();
-    let mut tasks: Vec<(WorkSplit, &mut [f32], &mut [f32], &mut [f32])> =
-        Vec::with_capacity(work_units.len());
+    let mut tasks: Vec<WorkUnitTask<'_>> = Vec::with_capacity(work_units.len());
     for unit in &work_units {
         let n = unit.edge_end - unit.edge_start;
         let (o_head, o_tail) = std::mem::take(&mut o_rest).split_at_mut(n * qhead * head_dim);
@@ -207,7 +207,6 @@ pub fn kvouter_forward(
         block_tables,
         cu_seqlens_q,
         used_kv_lens,
-        batch_of_tq: &batch_of_tq,
         q_local_pos: &q_local_pos,
         hq,
         qhead,
@@ -265,8 +264,7 @@ fn process_work_unit(
 
     let lk = ctx
         .used_kv_lens
-        .map(|u| u[b].max(0) as usize)
-        .unwrap_or(ctx.idx.msb * ctx.block_size);
+        .map_or(ctx.idx.msb * ctx.block_size, |u| u[b].max(0) as usize);
     let block_start = blk * ctx.block_size;
     let block_end = ((blk + 1) * ctx.block_size).min(lk);
     if block_end <= block_start {
