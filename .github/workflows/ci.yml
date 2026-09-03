@@ -14,7 +14,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -25,7 +25,7 @@ jobs:
     name: actionlint (workflow YAML validation)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run actionlint
         uses: reviewdog/action-actionlint@v1
         with:
@@ -36,7 +36,7 @@ jobs:
     name: Clippy (lib, warn level)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -53,7 +53,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         features: [default, simd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (default features)
@@ -88,7 +88,7 @@ jobs:
         # gracefully (compile-check + adapter-absence path).
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --features gpu (pipeline smoke test)
@@ -100,7 +100,7 @@ jobs:
     name: Build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
@@ -119,7 +119,7 @@ jobs:
     name: Examples & server compile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --example lol_gen --features "grammar gguf"

@@ -1,0 +1,43 @@
+[package]
+name = "alice-llm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.alice-llm]
+path = ".."
+# gguf feature を有効にして GgufFile::parse を fuzz 可能に
+features = ["gguf", "grammar"]
+
+# cargo-machete false-positive 予防 (canonical [[reference_alice_ci_canonical_template]] 罠 #3)
+[package.metadata.cargo-machete]
+ignored = ["libfuzzer-sys"]
+
+# GGUF binary parser を任意 byte 列で fuzz (panic-free / OOM-free 検証)
+[[bin]]
+name = "fuzz_gguf_parse"
+path = "fuzz_targets/fuzz_gguf_parse.rs"
+doc = false
+
+# GBNF grammar text parser を任意 UTF-8 で fuzz (constrained decoding の入口)
+[[bin]]
+name = "fuzz_gbnf_parse"
+path = "fuzz_targets/fuzz_gbnf_parse.rs"
+doc = false
+
+# top_k / top_p / temperature / softmax の logits post-processing を fuzz
+# (NaN / Inf / 極値配列で panic / index-out-of-bounds しないこと)
+[[bin]]
+name = "fuzz_sampling"
+path = "fuzz_targets/fuzz_sampling.rs"
+doc = false
+
+[workspace]
+members = ["."]
