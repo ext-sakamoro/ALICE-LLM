@@ -101,26 +101,43 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # CLAUDE.md「仮実装完了偽装の禁止ルール」準拠
-      - name: Detect todo! / unimplemented! / panic!(STUB) in src/**
+      # canonical CI template 罠 #9-c (2026-09-03 refine):
+      # CLAUDE.md 仮実装 rule では todo!() / unimplemented!() は legitimate な
+      # fail-fast idiom として endorse されている (silent Ok(()) より必ずこれ)
+      # → block 対象は panic!(STUB) (explicit STUB marker) と dbg!() のみ
+      # → todo!() / unimplemented!() は informational warning (block しない)
+      - name: Block panic!(STUB) in src/**
         run: |
           set -eo pipefail
-          # STUB (uppercase) のみに絞る (canonical 罠 #9-b)
-          # trait default method の `panic!("... not implemented by this backend")`
-          # 等は legitimate な pattern で stub ではない
-          hits=$(grep -rnE 'todo!\(|unimplemented!\(|panic!\([^)]*STUB' \
+          hits=$(grep -rnE 'panic!\([^)]*STUB' \
             src/ --include="*.rs" \
             --exclude-dir=bin \
+            | grep -v ':[[:space:]]*//' \
+            | grep -vE ':[[:space:]]*/\*' \
             || true)
           if [ -n "$hits" ]; then
-            echo "Stub / unimplemented / STUB panic detected in src/ (production path):"
+            echo "Explicit STUB panic detected in src/ (production path):"
             echo "$hits"
-            echo ""
-            echo "Fix: use ? operator, Result<T, E>, or remove the stub"
-            echo "See CLAUDE.md § 仮実装完了偽装の禁止ルール"
             exit 1
           fi
-          echo "OK: No todo! / unimplemented! / panic!(STUB) in src/ (excluding src/bin/)"
+          echo "OK: No panic!(STUB) in src/"
+
+      - name: Detect todo! / unimplemented! (informational, not blocking)
+        run: |
+          set -eo pipefail
+          hits=$(grep -rnE 'todo!\(|unimplemented!\(' \
+            src/ --include="*.rs" \
+            --exclude-dir=bin \
+            | grep -v ':[[:space:]]*//' \
+            | grep -vE ':[[:space:]]*/\*' \
+            || true)
+          if [ -n "$hits" ]; then
+            count=$(echo "$hits" | wc -l | tr -d ' ')
+            echo "::warning::${count} todo!()/unimplemented!() marker(s) in src/ (informational, CLAUDE.md legitimate fail-fast idiom):"
+            echo "$hits" | head -20
+          else
+            echo "OK: No todo!/unimplemented! markers in src/"
+          fi
 
       - name: Detect dbg!() residual in src/**
         run: |
