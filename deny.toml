@@ -26,10 +26,10 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "deny"
 ignore = [
-    # 現時点で個別 ignore 対象なし
-    # 追加が必要になった場合は理由 comment 付きで列挙する
-    # 例:
-    # "RUSTSEC-YYYY-NNNN",  # <crate> <version> <理由>
+    # bincode 1.x unmaintained (transitive dep、canonical 罠 #6 の with_limit 適用済)
+    "RUSTSEC-2025-0141",
+    # paste unmaintained (pyo3-macros 経由 transitive、除去不能)
+    "RUSTSEC-2024-0436",
 ]
 
 # ---------------------------------------------------------------------------
