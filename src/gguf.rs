@@ -3471,17 +3471,26 @@ pub fn q2k_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += q2k_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "q2k_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += q2k_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3520,17 +3529,26 @@ pub fn q5k_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += q5k_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "q5k_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += q5k_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3569,17 +3587,26 @@ pub fn q3k_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += q3k_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "q3k_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += q3k_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -3661,17 +3688,26 @@ pub fn q4k_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += q4k_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "q4k_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += q4k_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4095,17 +4131,26 @@ pub fn q6k_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += q6k_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "q6k_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += q6k_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4171,11 +4216,13 @@ pub fn iq4_xs_matvec_preq(
     q8_blocks: &[BlockQ8K],
     output: &mut [f32],
 ) {
-    // `rows` is unused under `feature = "parallel"` (rayon path derives it
-    // from `output.par_iter_mut()`), used under `not(parallel)` — accept
-    // the compiler treating it as unused for the default build rather than
-    // renaming it to `_rows` (which would break the non-parallel path).
-    let _ = rows;
+    // Historical comment (pre-fix): `rows` was unused under `feature =
+    // "parallel"` because rayon iterated `output.par_iter_mut()` directly.
+    // 2026-09-12: parallel path now iterates `output[..rows]` explicitly to
+    // match the non-parallel path and prevent OOB panics when callers pass
+    // an oversized output buffer (see llama3.rs `q_buf = vec![0; q_dim * 2]`
+    // for gated_output arch shared with standard Llama arch). `rows` is now
+    // used in both paths — no more unused-variable dance needed.
     let blocks_per_row = cols / QK_K;
     let block_bytes = 136;
     let row_bytes = blocks_per_row * block_bytes;
@@ -4183,17 +4230,26 @@ pub fn iq4_xs_matvec_preq(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        output.par_iter_mut().enumerate().for_each(|(row, out)| {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let mut sumf = 0.0f32;
-            for bi in 0..blocks_per_row {
-                sumf += iq4_xs_q8k_dot(
-                    &row_data[bi * block_bytes..(bi + 1) * block_bytes],
-                    &q8_blocks[bi],
-                );
-            }
-            *out = sumf;
-        });
+        debug_assert!(
+            output.len() >= rows,
+            "iq4_xs_matvec_preq: output.len()={} < rows={}",
+            output.len(),
+            rows
+        );
+        output[..rows]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, out)| {
+                let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+                let mut sumf = 0.0f32;
+                for bi in 0..blocks_per_row {
+                    sumf += iq4_xs_q8k_dot(
+                        &row_data[bi * block_bytes..(bi + 1) * block_bytes],
+                        &q8_blocks[bi],
+                    );
+                }
+                *out = sumf;
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4586,11 +4642,19 @@ pub fn quantized_matvec_preq(
         GgmlType::Q5_K => q5k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::Q6_K => q6k_matvec_preq(data, rows, cols, q8_blocks, output),
         GgmlType::IQ4_XS => iq4_xs_matvec_preq(data, rows, cols, q8_blocks, output),
-        // Bonsai / PrismML ternary formats: no native `_preq` path exists
-        // yet, so dequantise the pre-quantised Q8_K activations back to f32
-        // and delegate to the standard `quantized_matvec` dispatcher, which
-        // hits the Q1_0 / Q2_0 fallback implementations added in Phase X.1.
-        GgmlType::Q1_0 | GgmlType::Q2_0 => {
+        // Bonsai / PrismML ternary formats + Q8_0 weights: no native `_preq`
+        // path exists yet, so dequantise the pre-quantised Q8_K activations
+        // back to f32 and delegate to the standard `quantized_matvec`
+        // dispatcher, which hits the Q1_0 / Q2_0 fallback implementations
+        // added in Phase X.1 and the SIMD-accelerated `q8_0_matvec` path.
+        //
+        // 2026-09-12: Q8_0 fallback added to unblock MiniCPM5-2B-Q8_0 (all
+        // 296 linear weights are Q8_0-quantised) sidecar E2E via
+        // `alice-llm-server --model MiniCPM5-2B-Q8_0.gguf`. Perf: dequant
+        // adds a small overhead (`cols` × f32 conversion per matvec) but
+        // Q8_0 × f32 matvec is already the fastest quant path, so end-to-end
+        // stays competitive. Native Q8_0 × Q8_K int dot preq is future work.
+        GgmlType::Q1_0 | GgmlType::Q2_0 | GgmlType::Q8_0 => {
             let mut input_f32 = vec![0.0f32; cols];
             for (b, block) in q8_blocks.iter().enumerate() {
                 let base = b * QK_K;
@@ -4603,7 +4667,9 @@ pub fn quantized_matvec_preq(
             }
             quantized_matvec(&input_f32, data, qtype, rows, cols, output);
         }
-        _ => panic!("quantized_matvec_preq only supports Q2_K-Q6_K and IQ4_XS, got {qtype:?}"),
+        _ => panic!(
+            "quantized_matvec_preq only supports Q2_K-Q6_K, IQ4_XS, Q8_0 and Bonsai Q1_0/Q2_0, got {qtype:?}"
+        ),
     }
 }
 
