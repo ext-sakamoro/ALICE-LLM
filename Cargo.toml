@@ -28,6 +28,11 @@ server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:async-str
 hf-config = ["dep:serde", "dep:serde_json"]
 dspark-serde = ["dep:serde"]
 dspark = []
+# Phase I.0 + I.3: ALICE-Dynamic-v1 tier-decision CLI.
+# Emits `layer_assignments.json` from a GGUF using the Unsloth-baseline
+# heuristics (no calibration data required). See
+# `memory/success_unsloth_v3_sensitivity_oracle_2026_09_12.md`.
+imatrix = ["gguf", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
@@ -172,6 +177,12 @@ required-features = ["dspark", "dspark-serde", "gguf"]
 name = "alice-llm-server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+# Phase I.0 + I.3: ALICE-Dynamic-v1 tier-decision CLI.
+[[bin]]
+name = "alice-llm-imatrix"
+path = "src/bin/imatrix.rs"
+required-features = ["imatrix"]
 
 # DSpark Phase 4 serde roundtrip test 用 (dspark-serde feature 有効時のみ使用)
 [dev-dependencies]
