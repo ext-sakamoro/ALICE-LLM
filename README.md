@@ -6,7 +6,7 @@
 
 Pure Rust LLM inference engine focused on understanding and optimizing every layer of inference—from GGUF parsing to SIMD, GPU kernels, speculative decoding, and hybrid architectures. Built as a research and engineering project rather than a wrapper around existing ML frameworks.
 
-GGUF quantized models, zero external ML dependencies, 326 tests.
+GGUF quantized models, zero external ML dependencies, 568 lib tests (default; 594 with `dspark`).
 
 **GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
@@ -28,7 +28,7 @@ GGUF quantized models, zero external ML dependencies, 326 tests.
 
 **Jetson multi-model support (2026-07-21 verified on Yahboom Orin Nano 8GB)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
 
-**crates.io: `alice-llm` 1.3.0 published (2026-07-23)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps.
+**crates.io: `alice-llm` published (Cargo.toml v1.6.0)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps.
 
 **Phase X.8 LOL Bridge (2026-07-23, B-plan 10/10)** — natural-language → SDF: the model emits `Sphere { radius: 1.5 }` etc. under a GBNF-subset grammar for the [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL, then compiles to an `SdfNode`. Verified end-to-end on Mac (M3 Metal) and Jetson Orin Nano 8GB. See `examples/lol_gen.rs`.
 
@@ -64,7 +64,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ### As a library dependency
 
 ```bash
-cargo add alice-llm  # 1.3.0 on crates.io
+cargo add alice-llm  # Cargo.toml v1.6.0
 ```
 
 See `src/lib.rs` for the public API (GGUF parser, tokenizer, model loading, KV cache, sampling) and the `examples/` directory for concrete usage patterns.
@@ -713,10 +713,17 @@ curl http://localhost:8090/v1/models
 
 | Feature | Description |
 |---|---|
-| `gguf` | GGUF file loading and multi-arch inference |
-| `gpu` | wgpu GPU compute (Metal/Vulkan/DX12), requires `gguf` |
-| `server` | HTTP inference server (axum), includes `gpu` + `gguf` |
+| `gguf` | GGUF file loading and multi-arch inference (memmap2 + libc) |
+| `gpu` | wgpu GPU compute (Metal / Vulkan / DX12), requires `gguf` |
+| `simd` | Portable SIMD dot product via `wide` (AVX2 / NEON) |
 | `parallel` | Rayon-based multi-threaded CPU matvec |
+| `grammar` | GBNF grammar-constrained sampling (Phase X.8 LOL Bridge, JSON-mode) |
+| `quant` | FP8 E4M3 KV cache path used by sparse attention |
+| `hf-config` | HuggingFace `config.json` parser (serde) |
+| `dspark` | DSpark snapshot / rollback path — Kimi K3 delta compression (Phase 12b, 6-10× state memory reduction on real K3 weights) |
+| `dspark-serde` | Serde serialization for DSpark snapshots |
+| `imatrix` | ALICE-Dynamic-v1 tier-decision CLI (`layer_assignments.json` emitter, Phase I.0 + I.3, Unsloth-baseline heuristics) |
+| `server` | HTTP inference server (axum), includes `gpu` + `gguf` + `grammar` |
 
 ## License
 

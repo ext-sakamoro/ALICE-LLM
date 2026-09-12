@@ -4,7 +4,7 @@
 
 推論の全レイヤー (GGUF パーサから SIMD、GPU カーネル、投機的デコード、ハイブリッドアーキテクチャまで) を理解して最適化することにフォーカスした Pure Rust LLM 推論エンジン。既存 ML フレームワークのラッパーではなく、研究 + エンジニアリングプロジェクトとして構築。
 
-GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、326 テスト。
+GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、lib テスト 568 pass (default、`dspark` feature 有効時は 594)。
 
 **GPU (wgpu/Metal): 125ms → 71ms/トークン (1B)、バッチ4投機的デコード: 1Bドラフト + 8B検証 = 5.89倍高速化、受理率90%。**
 
@@ -24,7 +24,7 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、326 テスト�
 
 **Jetson マルチモデル対応 (2026-07-21 Yahboom Orin Nano 8GB で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
 
-**crates.io に `alice-llm` 1.3.0 公開 (2026-07-23)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めるようになりました。
+**crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。
 
 **Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と Jetson Orin Nano 8GB の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。
 
@@ -56,7 +56,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ### ライブラリとして利用
 
 ```bash
-cargo add alice-llm  # 1.3.0 (crates.io)
+cargo add alice-llm  # Cargo.toml v1.6.0
 ```
 
 公開 API は `src/lib.rs` を参照 (GGUF パーサ、トークナイザ、モデルロード、KV キャッシュ、サンプリング)。具体的な使用例は `examples/` ディレクトリを参照してください。
@@ -675,10 +675,17 @@ curl http://localhost:8090/v1/models
 
 | Feature | 説明 |
 |---|---|
-| `gguf` | GGUFファイル読み込みとマルチアーキテクチャ推論 |
-| `gpu` | wgpu GPUコンピュート（Metal/Vulkan/DX12）、`gguf` 必須 |
-| `server` | HTTP推論サーバー（axum）、`gpu` + `gguf` を含む |
+| `gguf` | GGUFファイル読み込みとマルチアーキテクチャ推論（memmap2 + libc） |
+| `gpu` | wgpu GPUコンピュート（Metal / Vulkan / DX12）、`gguf` 必須 |
+| `simd` | `wide` 経由の portable SIMD 内積（AVX2 / NEON） |
 | `parallel` | RayonベースのマルチスレッドCPU matvec |
+| `grammar` | GBNF 文法制約サンプリング（Phase X.8 LOL Bridge / JSON モード） |
+| `quant` | Sparse attention 用 FP8 E4M3 KV キャッシュ経路 |
+| `hf-config` | HuggingFace `config.json` パーサ（serde） |
+| `dspark` | DSpark スナップショット / rollback 経路 — Kimi K3 デルタ圧縮（Phase 12b、実 K3 重みで 6-10× ステートメモリ削減） |
+| `dspark-serde` | DSpark スナップショット用 serde シリアライズ |
+| `imatrix` | ALICE-Dynamic-v1 tier-decision CLI（`layer_assignments.json` 生成、Phase I.0 + I.3、Unsloth ベースライン heuristics） |
+| `server` | HTTP 推論サーバー（axum）、`gpu` + `gguf` + `grammar` を含む |
 
 ## ライセンス
 
