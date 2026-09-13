@@ -24,7 +24,7 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、lib テスト 
 
 **Jetson マルチモデル対応 (2026-07-21 Yahboom Orin Nano 8GB で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
 
-**crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。
+**crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。自動 publish 稼働 (2026-09-13): tag push `v*.*.*` で `.github/workflows/release.yml` の `publish-crates-io` job が発火、GitHub Release + crates.io 同時 sync。
 
 **Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と Jetson Orin Nano 8GB の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI/CD
+
+- **crates.io auto-publish workflow added (2026-09-13)** — `.github/workflows/release.yml` に `publish-crates-io` job を append 既存 build job (matrix 5 target + GitHub Release upload) と並列で `cargo publish --dry-run` → `cargo publish` を実行、tag push `v*.*.*` で自動発火 GitHub Secret `CARGO_REGISTRY_TOKEN` は設定済 次 tag push (e.g., `v1.6.1` / `v1.7.0`) から GitHub Release + crates.io 同時 publish が有効
+
 ### Added
 
 - **DSpark Phase 12b Part 3c2 — K3Model integration + delta mode full

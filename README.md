@@ -28,7 +28,7 @@ GGUF quantized models, zero external ML dependencies, 568 lib tests (default; 59
 
 **Jetson multi-model support (2026-07-21 verified on Yahboom Orin Nano 8GB)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
 
-**crates.io: `alice-llm` published (Cargo.toml v1.6.0)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps.
+**crates.io: `alice-llm` published (Cargo.toml v1.6.0)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps. Auto-publish enabled (2026-09-13): tag push `v*.*.*` triggers `.github/workflows/release.yml` `publish-crates-io` job for GitHub Release + crates.io sync.
 
 **Phase X.8 LOL Bridge (2026-07-23, B-plan 10/10)** — natural-language → SDF: the model emits `Sphere { radius: 1.5 }` etc. under a GBNF-subset grammar for the [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL, then compiles to an `SdfNode`. Verified end-to-end on Mac (M3 Metal) and Jetson Orin Nano 8GB. See `examples/lol_gen.rs`.
 
