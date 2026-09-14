@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Two-phase generation: free think prefix → grammar (Phase X.8 B-11, 2026-09-14)** — `Llama3Model::generate_grammar_prefixed(tokenizer, prompt, &GrammarPrefix { stop_marker, max_prefix_tokens }, …) -> GrammarGenResult` think-first model (MiniCPM5 / Qwen 3 thinking) が `<think>…</think>` を **grammar の外で** 書けるようにし、marker 検出 (token id 列一致 → decode suffix 一致 fallback) 後に同じ KV cache から FSM root + trie mask で decode budget / EOS で marker 未出現なら marker token を context に注入して強制 close (思考の途中で grammar に入ると `arc_shape(0,0,0,0)` 等の garbage になる実測を回避) `GrammarGenResult` は `prefix_text` / `prefix_tokens` / `prefix_marker_hit` / `prefix_ms` と grammar 側 `text` / `tokens_generated` を分離 既存 `generate_grammar` は共通 `grammar_decode_loop` に refactor (挙動不変) `examples/lol_gen.rs` に `--think [MARKER]` / `--prefix-budget N`
+  - 実測 (MiniCPM5-2B Q4_K_M、ChatML prompt + canonical example、budget 2000): think 2000 token (231 s、context 増で 8.7 tok/s) → 強制 close → `union(cylinder(25,50), translate(25,0,50, rotate(0,90,0, torus(12,4))))` = mug 完全正解 (直径 50 / 高さ 100 / 側面 handle) grammar のみ (think なし) では `cylinder(50,100)` で handle 省略 evidence `~/claude-config/evidence_b10_trie_mask/05_*.log` (no think) / `08_*.log` (think) chat model は ChatML (`<|im_start|>user … <|im_start|>assistant\n`) で包まないと `<think>` を出さず文書の続きを書く (`06_*.log`)
+
 ### Performance
 
 - **Grammar-constrained decoding: token trie mask (Phase X.8 B-10, 2026-09-14)** — `grammar::TokenTrie` (vocab 全 token text を文字 trie に 1 回構築、130k vocab で 68 ms / 231k node) + `sampling::mask_logits_by_grammar_trie` (FSM 状態から trie を DFS、拒否 edge で subtree 枝刈り、受理 edge でのみ FSM clone) を追加し `Llama3Model::generate_grammar` をこちらに切替 従来の `mask_logits_by_grammar` は vocab 全 token を独立に probe (`text_of` String alloc + `Fsm::accepts_str` の FSM clone) しており、MiniCPM5-2B (vocab 130,560) × `lol.gbnf` の実測で **1 step 6.7-8.1 s、end-to-end の 95-98 %** を占めていた trie 版は同条件で **avg 377 ms/step、comment 状態を除けば 0-6 ms/step**、生成 token 列は naive 版と 16/16 一致 (evidence `~/claude-config/evidence_b10_trie_mask/`) 副次効果で alloc 圧が消え forward も 153-388 → 35-57 ms/token に安定 `Fsm::accepts` を alloc-free の head-only probe に変更 (`accepts_str` / `advance` の意味は不変) naive 版は parity test の reference として残置
