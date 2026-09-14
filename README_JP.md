@@ -31,7 +31,7 @@ GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、lib テスト 
 
 **crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。自動 publish 稼働 (2026-09-13): tag push `v*.*.*` で `.github/workflows/release.yml` の `publish-crates-io` job が発火、GitHub Release + crates.io 同時 sync。
 
-**Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と Jetson Orin Nano 8GB の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。
+**Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と Jetson Orin Nano 8GB の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。**B-10 (2026-09-14): token trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) で per-token FSM probe を置換、MiniCPM5-2B (vocab 130k) で grammar mask が 1 step ~8 s → comment 状態以外 ~1 ms になり生成は forward 律速 (CPU ~25 tok/s) に。**
 
 **Perplexity 測定サンプル (`examples/perplexity.rs`、2026-07-24)** — WikiText-2 test で CPU forward + sliding-window log-probability を用いた PPL 測定、500 トークン: **Qwen 3.5-4B Q4_K_M = 16.38**、**Bonsai 27B Q1_0 = 18.12**。**注意事項**: llama.cpp は同じ Qwen 3.5-4B Q4_K_M を 1 chunk / 512 context 条件で PPL 6.09 ± 1.05 と報告しており、ALICE-LLM の forward path とは **2.68 倍の乖離**があります。BOS 処理が原因ではありません (Qwen 3.5 GGUF に `bos_token_id` が無いため両実装とも BOS 未挿入)。根本原因の調査は **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV レイアウトの instrumentation) として追跡中です。上記数値は llama.cpp との一致が確認できるまで ALICE-LLM 独自のベースラインとして扱ってください。
 

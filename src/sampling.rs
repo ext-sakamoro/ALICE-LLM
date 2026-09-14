@@ -1,7 +1,7 @@
 //! sampling.
 
 #[cfg(feature = "grammar")]
-use crate::grammar::{Fsm, FsmError};
+use crate::grammar::{Fsm, FsmError, TokenTrie};
 
 // Sampling
 // ---------------------------------------------------------------------------
@@ -168,9 +168,10 @@ impl GrammarTokenizer for crate::gguf::GgufTokenizer {
 /// # Complexity
 ///
 /// O(vocab_size × cost(accepts_str)). `accepts_str` clones the FSM per
-/// call, which is bounded by the number of live cursors. Adequate for
-/// small grammars (JSON, LOL DSL) and MVP; heavy grammars may need a
-/// pre-computed token → grammar-legal cache in a future revision.
+/// call, which is bounded by the number of live cursors. Measured at
+/// ~8 s/step for a 130 k vocab against the LOL grammar root — kept as the
+/// reference implementation for parity tests; production decoding uses
+/// [`mask_logits_by_grammar_trie`].
 #[cfg(feature = "grammar")]
 pub fn mask_logits_by_grammar<T: GrammarTokenizer + ?Sized>(
     fsm: &Fsm<'_>,
@@ -200,6 +201,59 @@ pub fn mask_logits_by_grammar<T: GrammarTokenizer + ?Sized>(
             *logit = f32::NEG_INFINITY;
         }
     }
+}
+
+/// Trie-backed equivalent of [`mask_logits_by_grammar`].
+///
+/// Produces the identical mask (same admitted set, same EOS rule, same
+/// treatment of already non-finite logits) but computes the admitted set
+/// once per step via [`TokenTrie::allowed_tokens`], sharing FSM work across
+/// every token with a common prefix. `scratch` is reused between calls to
+/// avoid per-step allocation; pass any `Vec` (it is cleared).
+///
+/// Returns the number of FSM advances the trie walk performed.
+///
+/// # Panics
+///
+/// Panics if `logits.len() != trie.vocab_size()` — the trie must be built
+/// for the same tokenizer that produced `logits`.
+#[cfg(feature = "grammar")]
+pub fn mask_logits_by_grammar_trie<T: GrammarTokenizer + ?Sized>(
+    fsm: &Fsm<'_>,
+    trie: &TokenTrie,
+    tokenizer: &T,
+    logits: &mut [f32],
+    scratch: &mut Vec<u32>,
+) -> usize {
+    assert_eq!(
+        logits.len(),
+        trie.vocab_size(),
+        "logits length must match the trie vocabulary"
+    );
+    let advances = trie.allowed_tokens(fsm, scratch);
+    // Mark admitted ids, then sweep. A bitmap over the vocab is cheaper
+    // than sorting `scratch` and merging.
+    let mut allowed = vec![false; logits.len()];
+    for &id in scratch.iter() {
+        allowed[id as usize] = true;
+    }
+    let eos = tokenizer.eos_id() as usize;
+    let final_state = fsm.is_final();
+    for (id, logit) in logits.iter_mut().enumerate() {
+        if !logit.is_finite() {
+            continue;
+        }
+        if id == eos {
+            if !final_state {
+                *logit = f32::NEG_INFINITY;
+            }
+            continue;
+        }
+        if !allowed[id] {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+    advances
 }
 
 /// Feed the text of the just-sampled `token_id` into the FSM so its

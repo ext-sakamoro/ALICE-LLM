@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Grammar-constrained decoding: token trie mask (Phase X.8 B-10, 2026-09-14)** — `grammar::TokenTrie` (vocab 全 token text を文字 trie に 1 回構築、130k vocab で 68 ms / 231k node) + `sampling::mask_logits_by_grammar_trie` (FSM 状態から trie を DFS、拒否 edge で subtree 枝刈り、受理 edge でのみ FSM clone) を追加し `Llama3Model::generate_grammar` をこちらに切替 従来の `mask_logits_by_grammar` は vocab 全 token を独立に probe (`text_of` String alloc + `Fsm::accepts_str` の FSM clone) しており、MiniCPM5-2B (vocab 130,560) × `lol.gbnf` の実測で **1 step 6.7-8.1 s、end-to-end の 95-98 %** を占めていた trie 版は同条件で **avg 377 ms/step、comment 状態を除けば 0-6 ms/step**、生成 token 列は naive 版と 16/16 一致 (evidence `~/claude-config/evidence_b10_trie_mask/`) 副次効果で alloc 圧が消え forward も 153-388 → 35-57 ms/token に安定 `Fsm::accepts` を alloc-free の head-only probe に変更 (`accepts_str` / `advance` の意味は不変) naive 版は parity test の reference として残置
+  - 残る重さ: `//` line comment 内 (`noteol*` = ほぼ全 char 受理) では trie 全走査で 0.5-1 s/step、model も comment に「考え事」を書き続けて本体を出さないため LLM 向け grammar から comment rule を外す対応は ALICE-LOL 側で別途
+  - `examples/bench_grammar_mask.rs` — step ごとの mask / forward 時間分離計測 (`--naive` で reference 版)
+
 ### CI/CD
 
 - **crates.io auto-publish workflow added (2026-09-13)** — `.github/workflows/release.yml` に `publish-crates-io` job を append 既存 build job (matrix 5 target + GitHub Release upload) と並列で `cargo publish --dry-run` → `cargo publish` を実行、tag push `v*.*.*` で自動発火 GitHub Secret `CARGO_REGISTRY_TOKEN` は設定済 次 tag push (e.g., `v1.6.1` / `v1.7.0`) から GitHub Release + crates.io 同時 publish が有効

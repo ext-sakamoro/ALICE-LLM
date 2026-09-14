@@ -10,15 +10,16 @@
 //! - [`gbnf`] (B-1) — llama.cpp-compatible GBNF parser (subset).
 //! - [`fsm`] (B-2) — `Grammar` → finite-state machine driving constrained
 //!   decoding.
-//!
-//! Planned:
-//!
-//! - Sampling integration (B-3) — `mask_logits_by_grammar(&fsm, tokenizer,
-//!   logits)` that zero-masks tokens which cannot advance the current parse
-//!   state.
+//! - Sampling integration (B-3) — [`crate::sampling::mask_logits_by_grammar`]
+//!   (naïve, per-token probe; reference implementation).
+//! - [`trie`] (B-10) — [`TokenTrie`] sharing FSM work across tokens with a
+//!   common prefix; [`crate::sampling::mask_logits_by_grammar_trie`] is the
+//!   production mask and what `generate_grammar` uses.
 
 pub mod fsm;
 pub mod gbnf;
+pub mod trie;
 
 pub use fsm::{CharSet, Fsm, FsmError, DEFAULT_MAX_DEPTH};
 pub use gbnf::{parse_gbnf, Alternative, CharClass, GbnfError, Grammar, Symbol};
+pub use trie::TokenTrie;

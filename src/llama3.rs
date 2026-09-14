@@ -17867,8 +17867,8 @@ impl<'a> Llama3Model<'a> {
         temperature: f32,
         top_k: usize,
     ) -> Result<GenerateResult, GrammarGenError> {
-        use crate::grammar::Fsm;
-        use crate::sampling::{advance_fsm_on_emit, mask_logits_by_grammar};
+        use crate::grammar::{Fsm, TokenTrie};
+        use crate::sampling::{advance_fsm_on_emit, mask_logits_by_grammar_trie};
 
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
@@ -17889,6 +17889,11 @@ impl<'a> Llama3Model<'a> {
 
         // Init FSM from grammar's root rule.
         let mut fsm = Fsm::start(grammar)?;
+        // Token trie (B-10): built once per call, shared by every step.
+        // Replaces the per-token FSM probe that dominated latency (95 %
+        // of end-to-end time on a 130 k vocab).
+        let trie = TokenTrie::build(tokenizer, self.config.vocab_size);
+        let mut allowed_scratch: Vec<u32> = Vec::new();
 
         // Decode
         let decode_start = Instant::now();
@@ -17897,7 +17902,7 @@ impl<'a> Llama3Model<'a> {
         for step in 0..max_new_tokens {
             // Apply the grammar mask *before* temperature so masking is
             // preserved through the linear scale.
-            mask_logits_by_grammar(&fsm, tokenizer, &mut logits);
+            mask_logits_by_grammar_trie(&fsm, &trie, tokenizer, &mut logits, &mut allowed_scratch);
 
             if !logits.iter().any(|l| l.is_finite()) {
                 return Err(GrammarGenError::NoValidToken { step });
