@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI: `rust-toolchain.toml` pin → 1.98.1 (6 release 遅れで `cargo-semver-checks@latest` MSRV 1.93 に追い抜かれ semver job が赤、2026-09-14) + `cargo-semver-checks` を 0.50.0 に明示 pin 1.98.1 の新規 lint 修正 (gguf sort_by_key / chunks_exact 3 件)
+
 ### Added
 
 - **Two-phase generation: free think prefix → grammar (Phase X.8 B-11, 2026-09-14)** — `Llama3Model::generate_grammar_prefixed(tokenizer, prompt, &GrammarPrefix { stop_marker, max_prefix_tokens }, …) -> GrammarGenResult` think-first model (MiniCPM5 / Qwen 3 thinking) が `<think>…</think>` を **grammar の外で** 書けるようにし、marker 検出 (token id 列一致 → decode suffix 一致 fallback) 後に同じ KV cache から FSM root + trie mask で decode budget / EOS で marker 未出現なら marker token を context に注入して強制 close (思考の途中で grammar に入ると `arc_shape(0,0,0,0)` 等の garbage になる実測を回避) `GrammarGenResult` は `prefix_text` / `prefix_tokens` / `prefix_marker_hit` / `prefix_ms` と grammar 側 `text` / `tokens_generated` を分離 既存 `generate_grammar` は共通 `grammar_decode_loop` に refactor (挙動不変) `examples/lol_gen.rs` に `--think [MARKER]` / `--prefix-budget N`

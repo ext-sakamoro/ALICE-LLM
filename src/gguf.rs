@@ -4504,7 +4504,7 @@ fn q1_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, ou
         // instruction count.
         let n_blocks = cols / 128;
         let mut block_sums = vec![0.0f32; n_blocks];
-        for (b, chunk) in input[..cols].chunks_exact(128).enumerate() {
+        for (b, chunk) in input[..cols].as_chunks::<128>().0.iter().enumerate() {
             block_sums[b] = chunk.iter().sum();
         }
         for r in 0..rows {
@@ -4901,7 +4901,7 @@ impl GgufTokenizer {
         }
 
         // Sort special tokens by length descending for greedy matching
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        special_tokens.sort_by_key(|t| core::cmp::Reverse(t.0.len()));
 
         let merges = if let Some(merges_meta) = gguf.meta("tokenizer.ggml.merges") {
             if let Some(merge_strs) = merges_meta.as_str_array() {
