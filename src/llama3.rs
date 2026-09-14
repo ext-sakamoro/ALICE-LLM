@@ -17867,9 +17867,6 @@ impl<'a> Llama3Model<'a> {
         temperature: f32,
         top_k: usize,
     ) -> Result<GenerateResult, GrammarGenError> {
-        use crate::grammar::{Fsm, TokenTrie};
-        use crate::sampling::{advance_fsm_on_emit, mask_logits_by_grammar_trie};
-
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         if tokenizer.add_bos_token && (tokens.is_empty() || tokens[0] != tokenizer.bos_id) {
@@ -17887,69 +17884,16 @@ impl<'a> Llama3Model<'a> {
         }
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
-        // Init FSM from grammar's root rule.
-        let mut fsm = Fsm::start(grammar)?;
-        // Token trie (B-10): built once per call, shared by every step.
-        // Replaces the per-token FSM probe that dominated latency (95 %
-        // of end-to-end time on a 130 k vocab).
-        let trie = TokenTrie::build(tokenizer, self.config.vocab_size);
-        let mut allowed_scratch: Vec<u32> = Vec::new();
-
         // Decode
         let decode_start = Instant::now();
-        let mut generated = Vec::with_capacity(max_new_tokens);
-
-        for step in 0..max_new_tokens {
-            // Apply the grammar mask *before* temperature so masking is
-            // preserved through the linear scale.
-            mask_logits_by_grammar_trie(&fsm, &trie, tokenizer, &mut logits, &mut allowed_scratch);
-
-            if !logits.iter().any(|l| l.is_finite()) {
-                return Err(GrammarGenError::NoValidToken { step });
-            }
-
-            // Temperature
-            if temperature > 0.0 && temperature != 1.0 {
-                let inv_t = 1.0 / temperature;
-                for l in &mut logits {
-                    *l *= inv_t;
-                }
-            }
-
-            // Argmax within top-k on the finite subset.
-            let next_token = if top_k > 0 && top_k < logits.len() {
-                let mut indexed: Vec<(usize, f32)> = logits
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter(|(_, l)| l.is_finite())
-                    .collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                indexed.truncate(top_k);
-                indexed.first().map_or(0u32, |(idx, _)| *idx as u32)
-            } else {
-                logits
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.is_finite())
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map_or(0u32, |(idx, _)| idx as u32)
-            };
-
-            if next_token == tokenizer.eos_id {
-                break;
-            }
-
-            // Feed the emitted token back to the FSM. If the driver ever
-            // slips (e.g. skipped the mask) the FSM refuses and we bail.
-            advance_fsm_on_emit(&mut fsm, tokenizer, next_token)?;
-
-            tokens.push(next_token);
-            generated.push(next_token);
-
-            logits = self.forward(next_token);
-        }
-
+        let generated = self.grammar_decode_loop(
+            tokenizer,
+            logits,
+            max_new_tokens,
+            grammar,
+            temperature,
+            top_k,
+        )?;
         let decode_ms = decode_start.elapsed().as_millis() as u64;
         let total_ms = start.elapsed().as_millis() as u64;
         let gen_count = generated.len();
@@ -17971,6 +17915,208 @@ impl<'a> Llama3Model<'a> {
             tokens_per_sec: tok_per_sec,
             spec_stats: None,
         })
+    }
+
+    /// Two-phase generation: a free (unconstrained) prefix, then
+    /// grammar-constrained decoding from the same KV state (Phase X.8 B-11).
+    ///
+    /// Think-first models (MiniCPM5, Qwen 3 in thinking mode) emit a
+    /// `<think>…</think>` block before the answer. Applying the grammar
+    /// mask from token 0 forbids that block, and under constraint the
+    /// model tends to answer greedily and shallowly. This variant lets the
+    /// model reason in plain text until `prefix.stop_marker` appears (or
+    /// `prefix.max_prefix_tokens` / EOS), then starts the FSM at the
+    /// grammar root and continues exactly like
+    /// [`generate_grammar`](Self::generate_grammar) — no re-prefill, the
+    /// reasoning stays in context.
+    ///
+    /// Marker detection compares token ids first (`encode(stop_marker)`),
+    /// falling back to a suffix match on the decoded text so a marker
+    /// that is a single special token which decodes to `""` is still
+    /// caught by ids, and a marker split across ordinary tokens is caught
+    /// by text.
+    ///
+    /// If the prefix budget runs out (or EOS arrives) without the marker,
+    /// the marker tokens are injected into the context first — a think
+    /// model continuing mid-thought under a grammar emits garbage — and
+    /// phase 2 then runs: the result is always a grammar-conforming
+    /// `text`, with `prefix_marker_hit == false` flagging the forced close.
+    ///
+    /// Errors are the same as [`generate_grammar`](Self::generate_grammar).
+    #[cfg(feature = "grammar")]
+    pub fn generate_grammar_prefixed(
+        &mut self,
+        tokenizer: &GgufTokenizer,
+        prompt: &str,
+        prefix: &GrammarPrefix<'_>,
+        max_new_tokens: usize,
+        grammar: &crate::grammar::Grammar,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<GrammarGenResult, GrammarGenError> {
+        let start = Instant::now();
+        let mut tokens = tokenizer.encode(prompt);
+        if tokenizer.add_bos_token && (tokens.is_empty() || tokens[0] != tokenizer.bos_id) {
+            tokens.insert(0, tokenizer.bos_id);
+        }
+
+        self.clear_cache();
+        let prompt_token_count = tokens.len();
+
+        // Prefill
+        let prefill_start = Instant::now();
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for &tok in &tokens {
+            logits = self.forward(tok);
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+        // Phase 1: free prefix until marker / EOS / budget.
+        let prefix_start = Instant::now();
+        let marker_ids = tokenizer.encode(prefix.stop_marker);
+        let mut prefix_tokens: Vec<u32> = Vec::new();
+        let mut marker_hit = false;
+        for _ in 0..prefix.max_prefix_tokens {
+            let next = Self::pick_token(&logits, temperature, top_k);
+            if next == tokenizer.eos_id {
+                break;
+            }
+            prefix_tokens.push(next);
+            logits = self.forward(next);
+            let by_ids = !marker_ids.is_empty()
+                && prefix_tokens.len() >= marker_ids.len()
+                && prefix_tokens[prefix_tokens.len() - marker_ids.len()..] == marker_ids[..];
+            let by_text = !prefix.stop_marker.is_empty()
+                && tokenizer
+                    .decode(&prefix_tokens[prefix_tokens.len().saturating_sub(8)..])
+                    .ends_with(prefix.stop_marker);
+            if by_ids || by_text {
+                marker_hit = true;
+                break;
+            }
+        }
+        // Budget exhausted (or EOS) without the marker: inject the marker
+        // so the model transitions into answer mode instead of continuing
+        // mid-thought under the grammar. Reported via `prefix_marker_hit`.
+        if !marker_hit && !marker_ids.is_empty() {
+            for &tok in &marker_ids {
+                logits = self.forward(tok);
+            }
+            prefix_tokens.extend_from_slice(&marker_ids);
+        }
+        let prefix_ms = prefix_start.elapsed().as_millis() as u64;
+
+        // Phase 2: grammar-constrained, continuing from the current cache.
+        let decode_start = Instant::now();
+        let generated = self.grammar_decode_loop(
+            tokenizer,
+            logits,
+            max_new_tokens,
+            grammar,
+            temperature,
+            top_k,
+        )?;
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        let total_ms = start.elapsed().as_millis() as u64;
+        let gen_count = generated.len();
+        let tok_per_sec = if decode_ms > 0 {
+            gen_count as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        Ok(GrammarGenResult {
+            prefix_text: tokenizer.decode(&prefix_tokens),
+            prefix_tokens: prefix_tokens.len(),
+            prefix_marker_hit: marker_hit,
+            prefix_ms,
+            text: tokenizer.decode(&generated),
+            tokens_generated: gen_count,
+            prompt_tokens: prompt_token_count,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec: tok_per_sec,
+        })
+    }
+
+    /// Greedy pick within `top_k` after temperature, over the finite
+    /// subset of `logits` (masked entries are `-inf`). Returns 0 if
+    /// nothing is finite — callers that need to distinguish check
+    /// finiteness first.
+    #[cfg(feature = "grammar")]
+    fn pick_token(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
+        let scale = if temperature > 0.0 && temperature != 1.0 {
+            1.0 / temperature
+        } else {
+            1.0
+        };
+        if top_k > 0 && top_k < logits.len() {
+            let mut indexed: Vec<(usize, f32)> = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, l)| l.is_finite())
+                .map(|(i, l)| (i, l * scale))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.truncate(top_k);
+            indexed.first().map_or(0u32, |(idx, _)| *idx as u32)
+        } else {
+            logits
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.is_finite())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(0u32, |(idx, _)| idx as u32)
+        }
+    }
+
+    /// Shared grammar-constrained decode loop: FSM at grammar root, token
+    /// trie mask (B-10) every step, EOS only in a final state. `logits`
+    /// are the logits for the *next* token given the current cache.
+    #[cfg(feature = "grammar")]
+    fn grammar_decode_loop(
+        &mut self,
+        tokenizer: &GgufTokenizer,
+        mut logits: Vec<f32>,
+        max_new_tokens: usize,
+        grammar: &crate::grammar::Grammar,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<Vec<u32>, GrammarGenError> {
+        use crate::grammar::{Fsm, TokenTrie};
+        use crate::sampling::{advance_fsm_on_emit, mask_logits_by_grammar_trie};
+
+        let mut fsm = Fsm::start(grammar)?;
+        // Token trie (B-10): built once per call, shared by every step.
+        let trie = TokenTrie::build(tokenizer, self.config.vocab_size);
+        let mut allowed_scratch: Vec<u32> = Vec::new();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for step in 0..max_new_tokens {
+            // Apply the grammar mask *before* temperature so masking is
+            // preserved through the linear scale.
+            mask_logits_by_grammar_trie(&fsm, &trie, tokenizer, &mut logits, &mut allowed_scratch);
+
+            if !logits.iter().any(|l| l.is_finite()) {
+                return Err(GrammarGenError::NoValidToken { step });
+            }
+
+            let next_token = Self::pick_token(&logits, temperature, top_k);
+
+            if next_token == tokenizer.eos_id {
+                break;
+            }
+
+            // Feed the emitted token back to the FSM. If the driver ever
+            // slips (e.g. skipped the mask) the FSM refuses and we bail.
+            advance_fsm_on_emit(&mut fsm, tokenizer, next_token)?;
+            generated.push(next_token);
+
+            logits = self.forward(next_token);
+        }
+        Ok(generated)
     }
 }
 
@@ -18181,6 +18327,48 @@ pub enum GrammarGenError {
     /// (e.g. prompt already emitted invalid text) or the grammar is
     /// under-specified for the model's vocabulary.
     NoValidToken { step: usize },
+}
+
+/// Free-prefix settings for [`Llama3Model::generate_grammar_prefixed`].
+#[cfg(feature = "grammar")]
+#[derive(Debug, Clone, Copy)]
+pub struct GrammarPrefix<'a> {
+    /// Text that ends the free phase (e.g. `"</think>"`). Detected by
+    /// token ids first, then by decoded-text suffix.
+    pub stop_marker: &'a str,
+    /// Upper bound on free-phase tokens; when exhausted without the
+    /// marker, grammar decoding starts anyway.
+    pub max_prefix_tokens: usize,
+}
+
+/// Result of [`Llama3Model::generate_grammar_prefixed`]: the free prefix
+/// and the grammar-conforming answer, reported separately.
+#[cfg(feature = "grammar")]
+#[derive(Debug, Clone)]
+pub struct GrammarGenResult {
+    /// Decoded free-phase text (reasoning), marker included (emitted by
+    /// the model, or injected on a forced close).
+    pub prefix_text: String,
+    /// Tokens spent in the free phase.
+    pub prefix_tokens: usize,
+    /// Whether the free phase ended on `stop_marker` (vs EOS / budget).
+    pub prefix_marker_hit: bool,
+    /// Wall time of the free phase.
+    pub prefix_ms: u64,
+    /// Grammar-constrained output (what to hand to the DSL parser).
+    pub text: String,
+    /// Tokens in `text`.
+    pub tokens_generated: usize,
+    /// Prompt tokens (BOS included when prepended).
+    pub prompt_tokens: usize,
+    /// Prefill wall time.
+    pub prefill_ms: u64,
+    /// Grammar-phase wall time.
+    pub decode_ms: u64,
+    /// Total wall time.
+    pub total_ms: u64,
+    /// Grammar-phase throughput.
+    pub tokens_per_sec: f64,
 }
 
 #[cfg(feature = "grammar")]

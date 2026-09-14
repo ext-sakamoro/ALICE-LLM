@@ -14,7 +14,7 @@
 //!     --model  path/to/model.gguf \
 //!     --grammar path/to/lol.gbnf \
 //!     --prompt "a chess knight for 3D print" \
-//!     [--max-tokens 128]
+//!     [--max-tokens 128] [--think [</think>]] [--prefix-budget 1024]
 //! ```
 //!
 //! The GGUF file is not shipped; download separately (e.g.
@@ -23,7 +23,7 @@
 
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
 use alice_llm::grammar::parse_gbnf;
-use alice_llm::llama3::Llama3Model;
+use alice_llm::llama3::{GrammarPrefix, Llama3Model};
 use std::env;
 use std::fs;
 use std::process;
@@ -52,6 +52,7 @@ fn usage_and_exit(msg: &str) -> ! {
     process::exit(2);
 }
 
+#[allow(clippy::too_many_lines)] // CLI arg parsing + 2 generation modes
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -61,6 +62,15 @@ fn main() {
         arg_after(&args, "--grammar").unwrap_or_else(|| usage_and_exit("--grammar missing"));
     let prompt = arg_after(&args, "--prompt").unwrap_or_else(|| usage_and_exit("--prompt missing"));
     let max_new_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(128);
+    // `--think [MARKER]`: let the model reason freely until MARKER (default
+    // `</think>`) before the grammar kicks in (B-11 two-phase generation).
+    let think: Option<&str> = args.iter().position(|a| a == "--think").map(|i| {
+        args.get(i + 1)
+            .map(String::as_str)
+            .filter(|m| !m.starts_with("--"))
+            .unwrap_or("</think>")
+    });
+    let prefix_budget: usize = parse_arg(&args, "--prefix-budget").unwrap_or(1024);
 
     // --- Model + tokenizer ---
     println!("Loading GGUF: {model_path}");
@@ -106,6 +116,48 @@ fn main() {
     println!("max_new_tokens: {max_new_tokens}");
     println!("Generating (greedy, temperature=1.0 top_k=1)...");
     println!();
+
+    if let Some(marker) = think {
+        let prefix = GrammarPrefix {
+            stop_marker: marker,
+            max_prefix_tokens: prefix_budget,
+        };
+        let result = model
+            .generate_grammar_prefixed(
+                &tokenizer,
+                prompt,
+                &prefix,
+                max_new_tokens,
+                &grammar,
+                1.0,
+                1,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("generate_grammar_prefixed failed: {e}");
+                process::exit(1);
+            });
+        println!(
+            "--- prefix (free, marker_hit={}) ---",
+            result.prefix_marker_hit
+        );
+        println!("{}", result.prefix_text);
+        println!("--- generated (grammar) ---");
+        println!("{}", result.text);
+        println!("--- /generated ---");
+        println!();
+        println!(
+            "prompt_tokens={} prefix_tokens={} ({}ms) generated={} prefill={}ms decode={}ms total={}ms {:.2} tok/s",
+            result.prompt_tokens,
+            result.prefix_tokens,
+            result.prefix_ms,
+            result.tokens_generated,
+            result.prefill_ms,
+            result.decode_ms,
+            result.total_ms,
+            result.tokens_per_sec,
+        );
+        return;
+    }
 
     let result = model
         .generate_grammar(&tokenizer, prompt, max_new_tokens, &grammar, 1.0, 1)
