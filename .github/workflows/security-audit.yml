@@ -205,8 +205,13 @@ jobs:
       - name: Create ALICE optional bridge stubs
         uses: ./.github/actions/alice-stubs
 
+      # version 明示 pin: `@latest` は rustc MSRV を追いかける (0.50.0 = 1.93+) ので、
+      # rust-toolchain.toml の pin が遅れると赤になる (2026-09-14 事案) toolchain と
+      # 一緒に月次で bump する
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.50.0
 
       # crates.io 未 publish のため --baseline-rev で git 経由の比較
       # main の直前 commit と比較 (informational、break あっても block しない)
