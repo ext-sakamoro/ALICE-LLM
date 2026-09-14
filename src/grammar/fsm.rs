@@ -264,7 +264,19 @@ impl<'g> Fsm<'g> {
     /// Does not mutate the FSM.
     #[must_use]
     pub fn accepts(&self, ch: char) -> bool {
-        self.active.iter().any(|c| Self::step(c, ch).is_some())
+        self.active.iter().any(|c| Self::head_accepts(c, ch))
+    }
+
+    /// Allocation-free check of whether `c`'s head symbol consumes `ch`.
+    /// Mirrors the accept condition of [`Self::step`] without building the
+    /// successor pending list — used by the token-trie mask, which probes
+    /// far more chars than it commits.
+    fn head_accepts(c: &Cursor, ch: char) -> bool {
+        match c.pending.first() {
+            Some(Symbol::Terminal(s)) => s.starts_with(ch),
+            Some(Symbol::CharClass(cc)) => cc.matches(ch),
+            _ => false,
+        }
     }
 
     /// True iff every char of `s` would be consumed in sequence starting
