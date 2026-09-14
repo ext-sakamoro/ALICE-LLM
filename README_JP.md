@@ -1,5 +1,10 @@
 # ALICE-LLM
 
+[![crates.io](https://img.shields.io/crates/v/alice-llm.svg)](https://crates.io/crates/alice-llm)
+[![docs.rs](https://img.shields.io/docsrs/alice-llm)](https://docs.rs/alice-llm)
+[![License: AGPL-3.0-or-later](https://img.shields.io/crates/l/alice-llm.svg)](#license)
+[![CI](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml)
+
 [English](README.md) | **日本語**
 
 推論の全レイヤー (GGUF パーサから SIMD、GPU カーネル、投機的デコード、ハイブリッドアーキテクチャまで) を理解して最適化することにフォーカスした Pure Rust LLM 推論エンジン。既存 ML フレームワークのラッパーではなく、研究 + エンジニアリングプロジェクトとして構築。
