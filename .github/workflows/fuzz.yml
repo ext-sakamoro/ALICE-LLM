@@ -48,7 +48,6 @@ jobs:
   fuzz:
     name: Fuzz — ${{ matrix.target }}
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +72,14 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # build は blocking: compile error を continue-on-error で隠さない
+      # (canonical 罠 #22: job-level continue-on-error だと fuzz target の
+      #  compile error が green 表示で silent になる)
+      - name: Build fuzz target
+        run: |
+          cd fuzz
+          cargo +nightly fuzz build "${{ matrix.target }}"
+
       - name: Set fuzz duration
         id: dur
         run: |
@@ -82,17 +89,24 @@ jobs:
           fi
           echo "seconds=$DURATION" >> "$GITHUB_OUTPUT"
 
+      # run は informational: crash 発見は block せず artifact で triage
       - name: Run fuzz target (time-boxed)
+        id: run
+        continue-on-error: true
         run: |
           cd fuzz
           cargo +nightly fuzz run "${{ matrix.target }}" -- \
             -max_total_time=${{ steps.dur.outputs.seconds }}
 
       - name: Upload crash artifacts (if any)
-        if: failure()
+        if: steps.run.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Report crash (informational)
+        if: steps.run.outcome == 'failure'
+        run: echo "::warning::fuzz target ${{ matrix.target }} found a crash — see fuzz-crash-${{ matrix.target }} artifact"
