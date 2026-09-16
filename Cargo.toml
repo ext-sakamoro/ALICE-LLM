@@ -52,6 +52,10 @@ async-stream = { version = "0.3", optional = true }
 name = "sparse_attention_demo"
 
 [[example]]
+name = "bench_grammar_mask"
+required-features = ["gguf", "grammar"]
+
+[[example]]
 name = "elyza_gguf"
 required-features = ["gguf"]
 

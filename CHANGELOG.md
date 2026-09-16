@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `tests/analytic_oracle.rs` — 11 closed-form tests: `dot_flat` exact on integer inputs for every length 0..=70; RMSNorm unit rms / scale invariance / eps independence; LayerNorm mean 0 / var 1 / affine invariance; SiLU points (σ(ln 3) = 3/4, odd part = x); RoPE norm preservation, exact rotation of the frequency-1 pair by `position` radians, relative-position property ⟨q(m), k(n)⟩ = ⟨q(m+d), k(n+d)⟩; softmax Σ = 1 / shift invariance / two-element formula; temperature scaling with the T → 0 (argmax) and T → ∞ (uniform) limits; top-k keeps exactly k, top-p the smallest nucleus (0.5 / 0.3 / 0.2 example); `sample_with_random` inverts the CDF; attention with a dominant key returns that value, identical keys average, causal mask shape; Q8_K quantisation `d = max / 128`, reconstruction error ≤ d/2 (≤ d for the clamped signed extreme), block sums (2026-09-16)
+- CI `doc` job (`RUSTDOCFLAGS=-D warnings`, docs.rs feature set); the test job now runs the oracle file and the doc tests (which had never run: `cargo test --lib` skips them, 0 doctests existed)
+
 ### Changed
+- CI clippy job is a hard gate: `-D warnings`, `--all-targets`, three feature sets (default / `simd` / full incl. `gpu`, `server`); it ran `-W clippy::all` on `--lib` only, which cannot fail — 13 findings in tests / examples had accumulated (`chunks_exact(8)` → `as_chunks::<8>()` in the SIMD kernels, `Option::filter`, decimal literals in bitwise tests, redundant references in example `println!`) `bench_grammar_mask` declares `required-features = ["gguf", "grammar"]` (it did not compile in a default build)
+- README 70B sparse-ternary table re-measured with `examples/bench_70b_sparse.rs` (Apple M3, 2026-09-16: 3.9 ms / layer, 314 ms / token → 3.18 tok/s; the M1 Pro 2026-03 row kept for reference) and marked `<!-- perf-measured -->`; the 1B / 8B rows are annotated as hand-measured with a local model, not reproduced by CI
+- The two `ignore` doctests are a compiled `no_run` example (`KimiK3Model::new`) and a `text` excerpt (`llama3_bridge` module doc); `# Panics` docs on `Matrix::get` / `set` / `GpuEngine::upload_weights_q8_0`
 - CI: `rust-toolchain.toml` pin → 1.98.1 (6 release 遅れで `cargo-semver-checks@latest` MSRV 1.93 に追い抜かれ semver job が赤、2026-09-14) + `cargo-semver-checks` を 0.50.0 に明示 pin 1.98.1 の新規 lint 修正 (gguf sort_by_key / chunks_exact 3 件)
 
 ### Added

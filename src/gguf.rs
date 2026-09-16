@@ -7266,7 +7266,7 @@ mod tests {
         dequantize_q1_0(&data, &mut out);
 
         // Block 0 alternating {−1, +1, −1, +1, ...}
-        for (i, chunk) in out[0..128].chunks_exact(2).enumerate() {
+        for (i, chunk) in out[0..128].as_chunks::<2>().0.iter().enumerate() {
             assert!(
                 (chunk[0] - -1.0).abs() < 1e-4,
                 "b0 elem {}: got {}, expected -1",
@@ -7516,12 +7516,12 @@ mod tests {
 
         // j < 4: sc = scales[j] & 63, m = scales[j+4] & 63
         let (sc, m) = get_scale_min_k4(0, &scales);
-        assert_eq!(sc, 10 & 63);
-        assert_eq!(m, 50 & 63);
+        assert_eq!(sc, 10); // 10 & 63
+        assert_eq!(m, 50); // 50 & 63
 
         let (sc, m) = get_scale_min_k4(3, &scales);
-        assert_eq!(sc, 40 & 63);
-        assert_eq!(m, 80 & 63);
+        assert_eq!(sc, 40); // 40 & 63
+        assert_eq!(m, 16); // 80 & 63
     }
 
     #[test]

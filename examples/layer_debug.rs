@@ -25,7 +25,7 @@ fn main() {
     let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     let encoded = tokenizer.encode(prompt);
     println!("BOS ID: {}", tokenizer.bos_id);
-    println!("Encoded prompt: {:?}", &encoded);
+    println!("Encoded prompt: {:?}", encoded);
     println!(
         "First token == BOS? {}",
         encoded.first() == Some(&tokenizer.bos_id)

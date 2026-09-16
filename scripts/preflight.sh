@@ -44,9 +44,20 @@ step "ci.yml / fmt: Check formatting"
 step "ci.yml / actionlint: actionlint"
 actionlint .github/workflows/*.yml
 
-step "ci.yml / clippy: cargo clippy"
+step "ci.yml / clippy: cargo clippy (default features, all targets)"
 relint
-( export CARGO_TERM_COLOR="always"; cargo clippy --lib -- -W clippy::all )
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets -- -D warnings )
+
+step "ci.yml / clippy: cargo clippy (simd, all targets)"
+relint
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features simd -- -D warnings )
+
+step "ci.yml / clippy: cargo clippy (full feature set, all targets)"
+relint
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings )
+
+step "ci.yml / doc: cargo doc"
+( export CARGO_TERM_COLOR="always" RUSTDOCFLAGS="-D warnings"; cargo doc --no-deps --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )
 
 step "ci.yml / build_release: cargo build --release"
 ( export CARGO_TERM_COLOR="always"; cargo build --release --lib )
@@ -142,6 +153,12 @@ step "ci.yml / test: cargo test (default features)"
 
 step "ci.yml / test: cargo test (--features simd)"
 ( export CARGO_TERM_COLOR="always"; cargo test --lib --features simd )
+
+step "ci.yml / test: Analytic oracle tests (closed-form laws)"
+( export CARGO_TERM_COLOR="always"; cargo test --test analytic_oracle )
+
+step "ci.yml / test: Doc tests"
+( export CARGO_TERM_COLOR="always"; cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )
 
 step "ci.yml / gpu_pipeline_smoke: cargo test --features gpu (pipeline smoke test)"
 ( export CARGO_TERM_COLOR="always"; cargo test --lib --features gpu smoke_test_gpu_pipeline_creation )

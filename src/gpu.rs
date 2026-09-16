@@ -715,6 +715,9 @@ impl GpuEngine {
     /// zero bytes after `d`) so the WGSL shader can read the block layout as
     /// 9 u32 words. Overhead: 5.88 % memory per Q8_0 tensor (negligible for
     /// small projection matrices like `ssm_alpha` / `ssm_beta`).
+    ///
+    /// # Panics
+    /// Panics when `cols` is not a multiple of 32 (the Q8_0 block width)
     pub fn upload_weights_q8_0(&self, data: &[u8], rows: usize, cols: usize) -> GpuWeightBuffer {
         const RAW_BLOCK_BYTES: usize = 34;
         const PADDED_BLOCK_BYTES: usize = 36;

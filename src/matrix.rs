@@ -99,12 +99,20 @@ impl<T> Matrix<T> {
 }
 
 impl<T: Copy + Default> Matrix<T> {
+    /// Element `(i, j)`
+    ///
+    /// # Panics
+    /// Panics when `i >= rows` or `j >= cols` (same contract as slice indexing)
     #[must_use]
     pub fn get(&self, i: usize, j: usize) -> T {
         assert!(i < self.rows && j < self.cols, "index out of bounds");
         self.data[i * self.cols + j]
     }
 
+    /// Write element `(i, j)`
+    ///
+    /// # Panics
+    /// Panics when `i >= rows` or `j >= cols` (same contract as slice indexing)
     pub fn set(&mut self, i: usize, j: usize, v: T) {
         assert!(i < self.rows && j < self.cols, "index out of bounds");
         self.data[i * self.cols + j] = v;

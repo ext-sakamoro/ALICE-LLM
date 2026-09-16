@@ -17,7 +17,7 @@ fn main() {
 
     // Check if single-byte tokens exist
     println!("\n--- Single byte tokens ---");
-    for b in [b'H', b'e', b'l', b'o', b' ', b'\n'] {
+    for b in *b"Helo \n" {
         let encoded = tokenizer.encode(&String::from(b as char));
         println!("  byte 0x{:02X} '{}' → encode={:?}", b, b as char, encoded);
     }

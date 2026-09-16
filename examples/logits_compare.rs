@@ -53,7 +53,7 @@ fn print_stats(label: &str, v: &[f32]) {
     if v.len() >= 10 {
         print!(
             ", [0:10]={:.4?}",
-            &v[0..10]
+            v[0..10]
                 .iter()
                 .map(|x| format!("{x:.4}"))
                 .collect::<Vec<_>>()
@@ -314,7 +314,7 @@ fn main() {
     println!("  logits: sum={sum:.2}, min={min:.4}, max={max:.4}, L2={l2:.2}");
     println!(
         "  logits[0:10] (ours):  {:?}",
-        &logits[0..10]
+        logits[0..10]
             .iter()
             .map(|x| format!("{x:.4}"))
             .collect::<Vec<_>>()
@@ -376,7 +376,7 @@ fn main() {
     println!("  1-layer logits: sum={sum1:.2}, min={min1:.4}, max={max1:.4}, L2={l2_1:.2}");
     println!(
         "  1-layer logits[0:10]: {:?}",
-        &logits_1layer[0..10]
+        logits_1layer[0..10]
             .iter()
             .map(|x| format!("{x:.4}"))
             .collect::<Vec<_>>()
@@ -544,7 +544,7 @@ fn main() {
     println!("  2-layer logits: sum={sum2:.2}, max={max2:.4}");
     println!(
         "  2-layer logits[0:10]: {:?}",
-        &logits_1layer[0..10]
+        logits_1layer[0..10]
             .iter()
             .map(|x| format!("{x:.4}"))
             .collect::<Vec<_>>()
@@ -724,14 +724,14 @@ fn main() {
     println!("\n  Manual 32-layer logits: sum={sf:.2}, max={mxf:.4}");
     println!(
         "  Manual logits[0:10]: {:?}",
-        &logits_1layer[0..10]
+        logits_1layer[0..10]
             .iter()
             .map(|x| format!("{x:.4}"))
             .collect::<Vec<_>>()
     );
     println!(
         "  Model  logits[0:10]: {:?}",
-        &logits[0..10]
+        logits[0..10]
             .iter()
             .map(|x| format!("{x:.4}"))
             .collect::<Vec<_>>()

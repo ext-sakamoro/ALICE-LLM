@@ -1741,9 +1741,7 @@ mod tests {
             .draft(&prefix, None, &head, |_p, bs| {
                 let mut ps = mock_positions(bs);
                 for p in &mut ps {
-                    for v in &mut p.logits {
-                        *v = f32::NAN;
-                    }
+                    p.logits.fill(f32::NAN);
                 }
                 Ok(ps)
             })

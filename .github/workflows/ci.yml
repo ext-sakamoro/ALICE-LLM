@@ -33,16 +33,32 @@ jobs:
           reporter: github-check
 
   clippy:
-    name: Clippy (lib, warn level)
+    # Hard gate (`-D warnings`, `--all-targets`) over three feature sets:
+    # default, `simd` (the wide kernels in sparse_attention/simd.rs) and the
+    # full set including gpu / server (wgpu / axum code is otherwise never linted)
+    # Until 2026-09-16 this job ran `-W clippy::all` on `--lib` only, which
+    # cannot fail; 13 findings in tests / examples had accumulated
+    name: Clippy (-D warnings, ${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, simd, full]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
-        run: cargo clippy --lib -- -W clippy::all
+      - name: cargo clippy (default features, all targets)
+        if: matrix.features == 'default'
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (simd, all targets)
+        if: matrix.features == 'simd'
+        run: cargo clippy --all-targets --features simd -- -D warnings
+      - name: cargo clippy (full feature set, all targets)
+        if: matrix.features == 'full'
+        run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings
 
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.features }})
@@ -66,6 +82,24 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
         run: cargo test --lib --features simd
+      - name: Analytic oracle tests (closed-form laws)
+        if: matrix.features == 'default'
+        run: cargo test --test analytic_oracle
+      - name: Doc tests
+        if: matrix.features == 'default'
+        run: cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
+
+  doc:
+    name: rustdoc (-D warnings, docs.rs feature set)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
 
   gpu_pipeline_smoke:
     # Phase 2 Step 6: catches shader / pipeline compilation regressions that
@@ -143,6 +177,7 @@ jobs:
       - actionlint
       - clippy
       - test
+      - doc
       - gpu_pipeline_smoke
       - build_release
       - examples_build
