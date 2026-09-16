@@ -1,0 +1,8 @@
+# cargo-mutants configuration (quality-deep.yml)
+#
+# Excluded from mutation (documented, not hidden):
+# - src/gpu.rs — needs a wgpu adapter (Metal / Vulkan); the CI runner has none,
+#   so every mutant there would "survive" without being executed. The GPU
+#   pipeline is covered by the `gpu_pipeline_smoke` CI job on macos-latest
+# - src/bin/server.rs — the axum binary (network I/O), no unit-level tests
+exclude_globs = ["src/gpu.rs", "src/bin/**"]

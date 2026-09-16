@@ -535,8 +535,18 @@ fn main() {
 
             // Phase X.3.e.3.23: full layer 0 DeltaNet pipeline dump.
             model.reset();
-            let (norm, q, k, v, alpha, beta, attn_out, attn_normed, o_buf, hidden) =
-                model.debug_dump_layer0_deltanet_stages(token);
+            let alice_llm::gpu::DeltaNetLayer0Stages {
+                norm,
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                attn_out,
+                attn_out_normed: attn_normed,
+                o_buf,
+                hidden,
+            } = model.debug_dump_layer0_deltanet_stages(token);
             eprintln!("[debug-dn0] norm_buf head 5      = {norm:?}");
             eprintln!("[debug-dn0] q_buf head 5 (pre-conv1d) = {q:?}");
             eprintln!("[debug-dn0] k_buf head 5 (post-conv1d, Q slice) = {k:?}");
