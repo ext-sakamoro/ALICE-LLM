@@ -7,7 +7,7 @@
 
 use alice_llm::attention::{causal_mask, scaled_dot_product_attention};
 use alice_llm::gguf::quantize_row_q8_k;
-use alice_llm::linalg::{layer_norm, rms_norm, silu};
+use alice_llm::linalg::{gelu, layer_norm, rms_norm, silu};
 use alice_llm::matrix::dot_flat as dot;
 use alice_llm::rope::apply_rope;
 use alice_llm::sampling::{
@@ -56,7 +56,31 @@ fn rms_norm_has_unit_rms_and_is_scale_invariant() {
                 assert!((a - b).abs() < 1e-4, "n={n} eps={eps}: {a} vs {b}");
             }
         }
+        // a large eps shrinks by sqrt(ms / (ms + eps))
+        let ms = v.iter().map(|x| x * x).sum::<f32>() / n as f32;
+        for (a, b) in rms_norm(&v, 2.0).iter().zip(&out) {
+            assert!(
+                (a - b * (ms / (ms + 2.0)).sqrt()).abs() < 1e-5,
+                "n={n} eps=2: {a} vs {b}"
+            );
+        }
     }
+}
+
+#[test]
+fn gelu_closed_form_points() {
+    // tanh approximation: gelu(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
+    assert_eq!(gelu(0.0), 0.0);
+    for x in [0.5f32, 1.0, 2.0, -1.5, 3.0] {
+        let c = (2.0 / std::f32::consts::PI).sqrt();
+        let expected = 0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh());
+        assert!((gelu(x) - expected).abs() < 1e-6, "{x}");
+        // odd part: gelu(x) − gelu(−x) = x
+        assert!((gelu(x) - gelu(-x) - x).abs() < 1e-5, "{x}");
+    }
+    assert!((gelu(1.0) - 0.841_192).abs() < 1e-5);
+    assert!((gelu(10.0) - 10.0).abs() < 1e-4);
+    assert!(gelu(-10.0).abs() < 1e-6);
 }
 
 #[test]
@@ -119,6 +143,21 @@ fn rope_preserves_norm_rotates_first_pair_by_position_and_is_relative() {
         }
         // position 0 is the identity
         assert_eq!(apply_rope(&v, 0, base), v);
+        // pair i rotates by pos · base^(−2i/dim): check pair 1 at pos 1000
+        if dim >= 4 {
+            let half = dim / 2;
+            let r = apply_rope(&v, 1000, base);
+            let angle = 1000.0 * base.powf(-2.0 / dim as f32);
+            let (c, s) = (angle.cos(), angle.sin());
+            assert!(
+                (r[1] - (v[1] * c - v[1 + half] * s)).abs() < 1e-2,
+                "dim={dim} pair 1"
+            );
+            assert!(
+                (r[1 + half] - (v[1] * s + v[1 + half] * c)).abs() < 1e-2,
+                "dim={dim} pair 1"
+            );
+        }
     }
     // relative property: <rope(q, m), rope(k, n)> = <rope(q, m + d), rope(k, n + d)>
     let dim = 16;
@@ -181,10 +220,14 @@ fn temperature_scales_logits_and_the_limits_are_argmax_and_uniform() {
     for q in softmax(&hot) {
         assert!((q - 0.25).abs() < 1e-4, "{q}");
     }
-    // temperature 0 is a no-op (documented guard), not a division by zero
+    // temperature 0 is a no-op (documented guard), not a division by zero; the
+    // guard is strict: exactly f32::EPSILON still scales
     let mut zero = l;
     apply_temperature(&mut zero, 0.0);
     assert_eq!(zero, l);
+    let mut tiny = l;
+    apply_temperature(&mut tiny, f32::EPSILON);
+    assert_eq!(tiny, l.map(|x| x / f32::EPSILON));
 }
 
 #[test]
@@ -242,6 +285,8 @@ fn sample_with_random_inverts_the_cdf() {
     assert_eq!(sample_with_random(&probs, 0.5999), 2);
     assert_eq!(sample_with_random(&probs, 0.6001), 3);
     assert_eq!(sample_with_random(&probs, 0.9999), 3);
+    // the boundary itself belongs to the next bin (r < cumsum is strict)
+    assert_eq!(sample_with_random(&probs, 0.1), 1);
     // r ≥ Σp (rounding) → last index, never out of range
     assert_eq!(sample_with_random(&probs, 1.0), 3);
     assert_eq!(sample_with_random(&[], 0.5), 0);
@@ -282,6 +327,10 @@ fn attention_with_a_dominant_key_returns_that_value_and_uniform_keys_average() {
     for (o, m) in out[0].iter().zip(&mean) {
         assert!((o - m).abs() < 1e-5, "{out:?}");
     }
+    // any empty operand → empty result (each check on its own)
+    assert!(scaled_dot_product_attention(&[], &key, &value, None).is_empty());
+    assert!(scaled_dot_product_attention(&[vec![0.0; d]], &[], &value, None).is_empty());
+    assert!(scaled_dot_product_attention(&[vec![0.0; d]], &key, &[], None).is_empty());
     // causal mask: 0 on and below the diagonal, −inf above
     let m = causal_mask(4);
     for (i, row) in m.iter().enumerate() {
