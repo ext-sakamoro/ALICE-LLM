@@ -56,6 +56,14 @@ step "ci.yml / clippy: cargo clippy (full feature set, all targets)"
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings )
 
+# Hand-added (kept across regeneration): the CI clippy runner is x86_64, this
+# Mac is aarch64 — arch-gated bodies (AVX2 / AVX-512 kernels in gguf.rs) only
+# lint against the x86_64 target (2026-09-16: 5 findings reached CI this way)
+step "clippy: x86_64 target (Linux runner arch, full feature set)"
+rustup target list --installed | grep -q x86_64-unknown-linux-gnu || rustup target add x86_64-unknown-linux-gnu
+relint
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --target x86_64-unknown-linux-gnu --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings )
+
 step "ci.yml / doc: cargo doc"
 ( export CARGO_TERM_COLOR="always" RUSTDOCFLAGS="-D warnings"; cargo doc --no-deps --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )
 
