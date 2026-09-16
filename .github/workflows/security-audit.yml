@@ -51,9 +51,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Create ALICE optional bridge stubs
-        uses: ./.github/actions/alice-stubs
-
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
@@ -70,9 +67,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Create ALICE optional bridge stubs
-        uses: ./.github/actions/alice-stubs
-
       # EmbarkStudios/cargo-deny-action@v2 は Docker container 内で稼働し、
       # /github/workspace のみ mount するため sibling path dep が見えず fail する
       # 直接 install で回避 (canonical [[reference_alice_ci_canonical_template]] 罠 #1)
@@ -88,9 +82,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Create ALICE optional bridge stubs
-        uses: ./.github/actions/alice-stubs
 
       # false-positive は Cargo.toml の [package.metadata.cargo-machete] ignored で除外
       - uses: bnjbvr/cargo-machete@main
@@ -172,9 +163,6 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
 
-      - name: Create ALICE optional bridge stubs
-        uses: ./.github/actions/alice-stubs
-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
@@ -201,9 +189,6 @@ jobs:
           fetch-depth: 0  # baseline-rev 比較のため full history 必要
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      - name: Create ALICE optional bridge stubs
-        uses: ./.github/actions/alice-stubs
 
       # version 明示 pin: `@latest` は rustc MSRV を追いかける (0.50.0 = 1.93+) ので、
       # rust-toolchain.toml の pin が遅れると赤になる (2026-09-14 事案) toolchain と
