@@ -2425,6 +2425,9 @@ mod avx2_dot {
             let col_base = bi * super::QK8_0;
             // 4 × 8-lane iterations = 32 elements per block.
             for k in 0..4 {
+                // `_mm_loadl_epi64` is an unaligned 8-byte load; the pointer
+                // cast is only needed for the intrinsic's signature
+                #[allow(clippy::cast_ptr_alignment)]
                 let q8 = _mm_loadl_epi64(qs_ptr.add(k * 8).cast::<__m128i>());
                 let q32 = _mm256_cvtepi8_epi32(q8);
                 let qf = _mm256_cvtepi32_ps(q32);
@@ -2831,7 +2834,6 @@ mod avx512_dot {
         // positions.
         let qh256 = _mm256_loadu_si256(qh.as_ptr().cast());
         let qh_v = _mm512_broadcast_i32x8(qh256);
-        let mask_lo4 = _mm512_set1_epi8(0x0F);
         let mask_bit0 = _mm512_set1_epi8(1);
 
         let mut sumf = 0.0f32;
@@ -2912,6 +2914,9 @@ mod avx512_dot {
             let col_base = bi * super::QK8_0;
             // 2 × 16-lane iterations = 32 elements per block.
             for k in 0..2 {
+                // `_mm_loadu_si128` is the unaligned 16-byte load; the pointer
+                // cast is only needed for the intrinsic's signature
+                #[allow(clippy::cast_ptr_alignment)]
                 let q8 = _mm_loadu_si128(qs_ptr.add(k * 16).cast::<__m128i>());
                 let q32 = _mm512_cvtepi8_epi32(q8);
                 let qf = _mm512_cvtepi32_ps(q32);
@@ -5769,6 +5774,8 @@ impl SparseTernaryMatrix {
 /// Quantize f32 activation vector to i8 with a single global scale.
 /// Returns (quantized_i8, scale) where original ≈ quantized * scale.
 /// On aarch64: NEON-accelerated abs-max search and narrowing conversion.
+/// Only the aarch64 sparse matvec consumes it (the x86_64 path works on f32).
+#[cfg(target_arch = "aarch64")]
 fn quantize_activation_i8(input: &[f32]) -> (Vec<i8>, f32) {
     let n = input.len();
     let padded_len = n.div_ceil(SPARSE_BLOCK) * SPARSE_BLOCK;
@@ -8076,8 +8083,8 @@ mod tests {
         for seed in [0u8, 1, 7, 128, 200, 255] {
             let data = make_q8_0_row_bytes(seed, COLS);
             let input = make_q8_0_input(seed.wrapping_mul(3), COLS);
-            let mut scalar_out = vec![0.0f32];
-            let mut simd_out = vec![0.0f32];
+            let mut scalar_out = [0.0f32];
+            let mut simd_out = [0.0f32];
             // Scalar baseline uses the pre-existing dispatch (before the
             // AVX2 branch it was the only implementation), so we call the
             // dispatched entry twice with matching inputs and compare the
