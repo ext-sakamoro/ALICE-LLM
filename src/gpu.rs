@@ -2594,6 +2594,35 @@ pub fn estimate_gpu_load_memory(
     }
 }
 
+/// First-token head-5 snapshot of every layer-0 DeltaNet stage.
+///
+/// Fields are in pipeline order (`GpuModel::debug_dump_layer0_deltanet_stages`).
+/// A struct rather than a tuple: ten `Vec<f32>` return slots made cargo-mutants
+/// enumerate 4^10 replacement candidates for the function
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeltaNetLayer0Stages {
+    /// `norm_buf` (RMSNorm output)
+    pub norm: Vec<f32>,
+    /// `q_buf` after `attn_qkv`, before conv1d
+    pub q: Vec<f32>,
+    /// `k_buf` after conv1d (DeltaNet Q slice)
+    pub k: Vec<f32>,
+    /// `v_buf` (`attn_gate` output = z)
+    pub v: Vec<f32>,
+    /// `alpha_buf`
+    pub alpha: Vec<f32>,
+    /// `beta_buf`
+    pub beta: Vec<f32>,
+    /// `attn_out` after gated DeltaNet
+    pub attn_out: Vec<f32>,
+    /// `attn_out_normed` after `ssm_norm` + silu(z)
+    pub attn_out_normed: Vec<f32>,
+    /// `o_buf` after `ssm_out_proj`
+    pub o_buf: Vec<f32>,
+    /// hidden after the layer-0 residual add
+    pub hidden: Vec<f32>,
+}
+
 impl GpuModel {
     // --- Static helpers for bind group construction ---
 
@@ -4915,33 +4944,14 @@ impl GpuModel {
     /// Returned in stage order so a caller can eyeball where amplification
     /// starts:
     ///
-    ///   (norm_buf, q_buf_head_after_qkv, k_buf_head_after_conv1d,
-    ///    v_buf_head, alpha_buf, beta_buf,
-    ///    attn_out_head_after_deltanet, o_buf_head_after_ssm_out,
-    ///    hidden_after_residual)
-    ///
-    /// Each Vec<f32> has 5 elements. Executes the full first-token forward
+    /// see the fields of [`DeltaNetLayer0Stages`] (each holds the first 5
+    /// values of its buffer). Executes the full first-token forward
     /// (not just stage-by-stage) then reads back — accurate for a healthy
     /// pipeline, useful signal even for a broken one.
     ///
     /// **Not thread-safe** and mutates `seq_len`. Reset before running any
     /// subsequent forward.
-    #[allow(clippy::type_complexity)]
-    pub fn debug_dump_layer0_deltanet_stages(
-        &mut self,
-        token_id: u32,
-    ) -> (
-        Vec<f32>, // norm_buf head 5
-        Vec<f32>, // q_buf head 5 (after attn_qkv, pre-conv1d)
-        Vec<f32>, // k_buf head 5 (after conv1d, DeltaNet Q slice)
-        Vec<f32>, // v_buf head 5 (attn_gate output = z)
-        Vec<f32>, // alpha_buf head 5
-        Vec<f32>, // beta_buf head 5
-        Vec<f32>, // attn_out head 5 (post gated_deltanet)
-        Vec<f32>, // attn_out_normed head 5 (post ssm_norm + silu(z))
-        Vec<f32>, // o_buf head 5 (post ssm_out_proj)
-        Vec<f32>, // hidden head 5 (post residual add for layer 0)
-    ) {
+    pub fn debug_dump_layer0_deltanet_stages(&mut self, token_id: u32) -> DeltaNetLayer0Stages {
         // Run one full layer 0 forward.
         let hidden0 = self.forward_stop_after_layer_and_read_hidden(token_id, 0);
         // Now read the various scratch buffers that were populated in the
@@ -4960,7 +4970,7 @@ impl GpuModel {
         // The `hidden0` return of `forward_stop_after_layer_and_read_hidden`
         // is the entire hidden vector — take the first 5.
         let hidden_head = hidden0.into_iter().take(5).collect();
-        (
+        DeltaNetLayer0Stages {
             norm,
             q,
             k,
@@ -4969,9 +4979,9 @@ impl GpuModel {
             beta,
             attn_out,
             attn_out_normed,
-            o_buf_head,
-            hidden_head,
-        )
+            o_buf: o_buf_head,
+            hidden: hidden_head,
+        }
     }
 
     /// Phase X.3.e.3.21 diagnostic: run RMSNorm + attn_qkv projection,
