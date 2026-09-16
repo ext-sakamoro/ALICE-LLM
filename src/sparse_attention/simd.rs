@@ -25,17 +25,13 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "simd")]
     {
         let mut acc = f32x8::splat(0.0);
-        let mut a_chunks = a.chunks_exact(8);
-        let mut b_chunks = b.chunks_exact(8);
-        for (av, bv) in (&mut a_chunks).zip(&mut b_chunks) {
-            let a_arr: [f32; 8] = av.try_into().expect("chunks_exact(8) yields 8 elems");
-            let b_arr: [f32; 8] = bv.try_into().expect("chunks_exact(8) yields 8 elems");
-            let av = f32x8::from(a_arr);
-            let bv = f32x8::from(b_arr);
-            acc += av * bv;
+        let (a_chunks, a_rem) = a.as_chunks::<8>();
+        let (b_chunks, b_rem) = b.as_chunks::<8>();
+        for (av, bv) in a_chunks.iter().zip(b_chunks) {
+            acc += f32x8::from(*av) * f32x8::from(*bv);
         }
         let mut s = acc.reduce_add();
-        for (a, b) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        for (a, b) in a_rem.iter().zip(b_rem) {
             s += a * b;
         }
         s
@@ -60,24 +56,12 @@ pub fn axpy(dst: &mut [f32], scale: f32, src: &[f32]) {
     #[cfg(feature = "simd")]
     {
         let sc = f32x8::splat(scale);
-        let mut dst_chunks = dst.chunks_exact_mut(8);
-        let mut src_chunks = src.chunks_exact(8);
-        for (dc, sc_chunk) in (&mut dst_chunks).zip(&mut src_chunks) {
-            let d_arr: [f32; 8] = (&*dc)
-                .try_into()
-                .expect("chunks_exact_mut(8) yields 8 elems");
-            let s_arr: [f32; 8] = sc_chunk.try_into().expect("chunks_exact(8) yields 8 elems");
-            let dv = f32x8::from(d_arr);
-            let sv = f32x8::from(s_arr);
-            let out = dv + sv * sc;
-            let arr = out.to_array();
-            dc.copy_from_slice(&arr);
+        let (dst_chunks, dst_rem) = dst.as_chunks_mut::<8>();
+        let (src_chunks, src_rem) = src.as_chunks::<8>();
+        for (dc, sv) in dst_chunks.iter_mut().zip(src_chunks) {
+            *dc = (f32x8::from(*dc) + f32x8::from(*sv) * sc).to_array();
         }
-        for (d, s) in dst_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(src_chunks.remainder())
-        {
+        for (d, s) in dst_rem.iter_mut().zip(src_rem) {
             *d += scale * *s;
         }
     }
@@ -98,15 +82,11 @@ pub fn scale_in_place(dst: &mut [f32], scale: f32) {
     #[cfg(feature = "simd")]
     {
         let sc = f32x8::splat(scale);
-        let mut chunks = dst.chunks_exact_mut(8);
-        for chunk in &mut chunks {
-            let arr_in: [f32; 8] = (&*chunk)
-                .try_into()
-                .expect("chunks_exact_mut(8) yields 8 elems");
-            let out = f32x8::from(arr_in) * sc;
-            chunk.copy_from_slice(&out.to_array());
+        let (chunks, rem) = dst.as_chunks_mut::<8>();
+        for chunk in chunks.iter_mut() {
+            *chunk = (f32x8::from(*chunk) * sc).to_array();
         }
-        for v in chunks.into_remainder() {
+        for v in rem {
             *v *= scale;
         }
     }

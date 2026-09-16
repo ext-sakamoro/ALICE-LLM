@@ -205,7 +205,7 @@ impl ModelArch {
             // lookups (`kimi-k3.embedding_length`, etc.), so it must be
             // the full hyphenated string.
             Self::KimiK3 => "kimi-k3",
-            // Same TODO as KimiK3 — the eventual `general.architecture`
+            // Same open question as KimiK3 — the eventual `general.architecture`
             // string for Hy3 GGUF is not yet fixed by the community.
             // `hunyuan` is the working guess based on the HuggingFace
             // model ids (`tencent/Hy3` under the Hunyuan org).
@@ -6987,7 +6987,7 @@ fn load_kimi_k3_layer_weights<'a, G: crate::gguf::GgufSource<'a>>(
 /// Load the K3 full-model weight bundle from GGUF (Phase X.4.b.2).
 ///
 /// Walks the 5 Global tensors then delegates to
-/// [`load_kimi_k3_layer_weights`] for each of the `config.num_layers`
+/// `load_kimi_k3_layer_weights` for each of the `config.num_layers`
 /// per-layer bundles. Returns a descriptive `Err` on the first
 /// missing tensor.
 #[allow(dead_code)]
@@ -10084,12 +10084,22 @@ pub struct KimiK3ModelSnapshotDelta {
 impl<'a> KimiK3Model<'a> {
     /// Allocate a Kimi K3 model from an already-loaded weight bundle.
     ///
-    /// The typical construction path is:
+    /// The typical construction path (a real GGUF file is needed, so the
+    /// example compiles but does not run):
     ///
-    /// ```ignore
-    /// let config = Llama3Config::from_gguf(&gguf).expect("K3 config");
+    /// ```no_run
+    /// use alice_llm::gguf::GgufFile;
+    /// use alice_llm::llama3::{load_kimi_k3_model_weights, KimiK3Model, Llama3Config};
+    ///
+    /// # fn main() -> Result<(), String> {
+    /// let bytes = std::fs::read("kimi-k3.gguf").map_err(|e| e.to_string())?;
+    /// let gguf = GgufFile::parse(&bytes).ok_or("not a GGUF file")?;
+    /// let config = Llama3Config::from_gguf(&gguf).ok_or("K3 config")?;
     /// let weights = load_kimi_k3_model_weights(&gguf, &config)?;
     /// let model = KimiK3Model::new(weights, config)?;
+    /// # let _ = model;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// Per-layer caches are allocated eagerly at K3 default sizes
@@ -11023,7 +11033,7 @@ impl<'a> KimiK3Model<'a> {
     ///
     /// 1. **Token embedding lookup** — `x = token_embd[token_id]`.
     /// 2. **Per-layer dispatch loop** — MLA branch calls the
-    ///    [`kimi_k3_gated_mla_step`] primitive; KDA and LatentMoE
+    ///    `kimi_k3_gated_mla_step` primitive; KDA and LatentMoE
     ///    branches still `todo!()` pending Phase X.4.c.3.3 which
     ///    lands the per-head KDA aggregation (needs per-head weight
     ///    slicing from the fused `attn_q/k/v` tensors) and the
@@ -11509,7 +11519,7 @@ impl<'a> KimiK3Model<'a> {
     ) -> (Vec<f32>, Vec<f32>) {
         let num_layers = self.config.num_layers;
         let target = layer_idx
-            .and_then(|n| if n < num_layers { Some(n) } else { None })
+            .filter(|&n| n < num_layers)
             .unwrap_or(num_layers.saturating_sub(1));
         let mut captured: Vec<f32> = Vec::new();
         let logits = self.forward_with_layer_hook(token_id, |idx, hidden| {
@@ -13528,7 +13538,7 @@ impl<'a> Llama3Model<'a> {
         }
         let num_layers = self.config.num_layers;
         let target = layer_idx
-            .and_then(|n| if n < num_layers { Some(n) } else { None })
+            .filter(|&n| n < num_layers)
             .unwrap_or(num_layers.saturating_sub(1));
         let mut captured: Vec<f32> = Vec::new();
         let logits = self.forward_with_layer_hook(token_id, |idx, hidden| {

@@ -43,7 +43,7 @@
 //! re-association (the parity guarantee tested below). Larger values pick
 //! only the top-K KV blocks per query.
 //!
-//! ```ignore
+//! ```text
 //! // Actual code in llama3.rs::gqa_attention (roughly):
 //! if let Some(topk) = std::env::var("ALICE_SPARSE_TOPK")
 //!     .ok().and_then(|s| s.parse::<usize>().ok())
