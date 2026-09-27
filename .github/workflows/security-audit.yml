@@ -171,7 +171,7 @@ jobs:
           cargo llvm-cov --lib --summary-only 2>&1 | tee coverage-summary.txt
 
       - name: Upload coverage summary as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-summary
           path: coverage-summary.txt
