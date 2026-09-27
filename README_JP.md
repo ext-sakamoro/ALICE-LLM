@@ -694,11 +694,15 @@ curl http://localhost:8090/v1/models
 
 ## ライセンス
 
-**デュアルライセンス: AGPL-3.0+ または商用**
+`AGPL-3.0-or-later OR LicenseRef-Commercial` — デュアルライセンス どちらかを選べる
 
-ALICE-LLMは **GNU Affero General Public License v3.0以降 (AGPL-3.0+)** の下でオープンソースかつ無償で利用できます。これにより、このエンジンを使用した変更やネットワークベースのSaaSデプロイメントがオープンソースコミュニティに還元されることが保証されます。
+| 選択肢 | 条文 | こういう時 |
+|--------|------|-----------|
+| **AGPL-3.0-or-later** | [LICENSE-AGPL](LICENSE-AGPL) — 無償、報告義務なし | 自分の project も AGPL 互換の OSS、または社内利用のみ |
+| **商用ライセンス** | [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — 有償、コピーレフト義務を解除 | クローズドソース製品 / 商用 SaaS / エッジ・ファームウェア配布 / plugin 再配布 / ソース開示を禁じるプラットフォーム NDA |
 
-**商用ライセンス**
-ALICE-LLMをプロプライエタリSaaS環境、クラウドインフラ、またはクローズドソース商用製品でバックエンドソースコードを開示せずに使用する場合は、**商用ライセンス**の取得が必要です。
+AGPL は強いコピーレフト: `alice-llm` を link して配布 / 提供する製品・ファームウェア・
+サービスは AGPL で公開する義務がある これはオープンなエコシステムのための意図的な
+選択で、それが実行できない場合のために商用ライセンスを用意している
 
-商用ライセンスのお問い合わせとエンタープライズサポート: licensing@alicelaw.net
+商用ライセンスの問い合わせ: <contact@extoria.co.jp>
