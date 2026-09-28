@@ -470,6 +470,17 @@ Per-quantization NEON matvec kernels on Apple M3 (Mac) and NVIDIA Tegra Orin Nan
 
 Bench harness: `cargo run --release --example bench_simd_matvec --features gguf`
 
+`target-cpu=native` is deliberately **not** set in `.cargo/config.toml`: it makes rustc itself abort with SIGILL on CI runners whose CPU generation differs, which flips CI red/green independently of any commit. Only the micro-benchmarks want it, so opt in per invocation:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_simd_matvec --features gguf
+# or, without touching the environment:
+cargo run --release --example bench_simd_matvec --features gguf \
+  --config 'build.rustflags=["-C","target-cpu=native"]'
+```
+
+Note that `.cargo/config.local.toml` is **not** read by cargo — a file placed there is silently ignored.
+
 ---
 
 ## Speculative Decoding

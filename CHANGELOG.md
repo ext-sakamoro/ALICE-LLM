@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### CI/CD
 
+- **`.cargo/config.toml` から `target-cpu=native` を外した (2026-09-29)** — CI runner の CPU 世代に依存して rustc 自身が SIGILL で落ちる (run 36431060432 の `rustdoc (-D warnings, docs.rs feature set)` job: `error: rustc interrupted by SIGILL` / `signal: 4, SIGILL: illegal instruction`、rustc の引数末尾が `-C target-cpu=native`) commit と無関係に red / green が揺れるため、直前に push した人の変更が疑われて原因究明が逸れる native が要るのは microbench だけで test / clippy / rustdoc には不要 local の opt-in 経路は `RUSTFLAGS="-C target-cpu=native" cargo …` と `cargo … --config 'build.rustflags=["-C","target-cpu=native"]'` の 2 つ (どちらも実測、README / README_JP に記載) `.cargo/config.local.toml` は cargo が自動では読まないので使えない (2026-09-29 実測) 同じ方針を ALICE-Text / ALICE-View と揃えた
 - **crates.io auto-publish workflow added (2026-09-13)** — `.github/workflows/release.yml` に `publish-crates-io` job を append 既存 build job (matrix 5 target + GitHub Release upload) と並列で `cargo publish --dry-run` → `cargo publish` を実行、tag push `v*.*.*` で自動発火 GitHub Secret `CARGO_REGISTRY_TOKEN` は設定済 次 tag push (e.g., `v1.6.1` / `v1.7.0`) から GitHub Release + crates.io 同時 publish が有効
 
 ### Added
