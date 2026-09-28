@@ -577,6 +577,17 @@ BitNet b1.58 スタイルの学習時量子化:
 cargo run --release --example bench_70b_sparse --features "gguf,parallel"
 ```
 
+`target-cpu=native` は意図的に `.cargo/config.toml` に置いていない CPU 世代の違う CI runner では rustc 自身が SIGILL で落ち、commit と無関係に CI の red / green が揺れるため native が要るのはマイクロベンチだけなので、実行時に opt-in する:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_70b_sparse --features "gguf,parallel"
+# 環境変数を触らない場合:
+cargo run --release --example bench_70b_sparse --features "gguf,parallel" \
+  --config 'build.rustflags=["-C","target-cpu=native"]'
+```
+
+なお `.cargo/config.local.toml` は cargo が読まない 置いても無言で無視される
+
 | 射影 | サイズ | 時間/反復 |
 |---|---|---|
 | Q proj | 8192×8192 | 0.54 ms |

@@ -1,2 +1,20 @@
+# Cargo build profile
+#
+# 注: `target-cpu=native` はここに置かない
+#
+# 理由: CI runner の CPU 世代に依存して rustc 自身が SIGILL で落ちる
+#       (2026-09-28 実測、run 36431060432 の rustdoc job:
+#        `error: rustc interrupted by SIGILL` / `signal: 4, SIGILL: illegal instruction`)
+#       commit と無関係に red / green が揺れるため、直前に push した人の
+#       変更が疑われて原因究明が逸れる native が要るのは microbench だけで
+#       test / clippy / rustdoc には不要
+#
+# local で native を効かせたい時の入口 (どちらも 2026-09-29 実測):
+#   RUSTFLAGS="-C target-cpu=native" cargo bench
+#   cargo bench --config 'build.rustflags=["-C","target-cpu=native"]'
+#
+# ⚠️ `.cargo/config.local.toml` は cargo が自動では読まない (2026-09-29 実測、
+#    置いても無言で無視される) 上の 2 経路のどちらかを使う
+
 [build]
-rustflags = ["-C", "target-cpu=native"]
+# rustflags = ["-C", "target-cpu=native"]
