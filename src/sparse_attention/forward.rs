@@ -246,7 +246,7 @@ pub fn kvouter_forward(
     })
 }
 
-// Per-unit process
+// Per-unit compute
 // ---------------------------------------------------------------------------
 
 fn process_work_unit(

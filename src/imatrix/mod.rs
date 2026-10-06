@@ -17,8 +17,7 @@
 //!
 //! # Heuristic source
 //!
-//! The tier-decision rules are the Unsloth-baseline heuristics extracted in
-//! `notes/a note.md` from a
+//! The tier-decision rules are the Unsloth-baseline heuristics extracted from a
 //! metadata-only analysis of Unsloth Dynamic v3.0 Qwen3.8-27B GGUFs. See
 //! [`heuristic`] for the eight rules and their derivation.
 //!

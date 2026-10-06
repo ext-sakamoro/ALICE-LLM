@@ -1,4 +1,4 @@
-# Dependabot 設定 (a note 準拠)
+# Dependabot 設定
 version: 2
 updates:
   - package-ecosystem: cargo

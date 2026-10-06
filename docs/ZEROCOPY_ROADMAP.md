@@ -1,6 +1,6 @@
 # ALICE-LLM wgpu Vulkan unified memory zero-copy 実装 roadmap (v1.0.2 candidate)
 
-**Why**: 2026-07-10 セッションで a note の問題を根本解決する D2 (wgpu-hal + `VK_KHR_external_memory_fd`) を実装しようとしたところ **wgpu-hal 24.0.4 が Linux fd import を native support していない**技術 blocker に遭遇 覚悟して着手 (A3) しても本段階 では完遂不可能と判明 v1.0.1 の OOM prevention warning (a note) で緩和した先の、真の zero-copy 実装への段階的 roadmap を記録
+**Why**: 2026-07-10 に、ARM64 組込みボードの wgpu Vulkan で weight が 2 重に確保され silent OOM になる問題を根本解決する D2 (wgpu-hal + `VK_KHR_external_memory_fd`) を実装しようとしたところ **wgpu-hal 24.0.4 が Linux fd import を native support していない**技術 blocker に遭遇 着手 (A3) しても現時点では完遂不可能と判明 v1.0.1 の OOM prevention warning (PR #7) で緩和した先の、真の zero-copy 実装への段階的 roadmap を記録
 
 ## 現状の壁 (2026-07-10 時点)
 
@@ -99,24 +99,24 @@ grep -rn "external_memory_win32" ~/.cargo/registry/src/index.crates.io-*/wgpu-ha
 
 ### Stage 3: 検証 + release (~1 日)
 
-1. arm64 8 GiB board で Qwen2.5-Coder-7B Q4_K の weight upload 完走確認
+1. ARM64 組込みボード (8 GB) で Qwen2.5-Coder-7B Q4_K の weight upload 完走確認
 2. 生成品質 CPU 版と bit-identical (or 極めて近似) 確認
 3. memory peak が weight size × 1.0 (± 300MB overhead) に収まる実測
 4. Apple Silicon (Metal) で regression 0 確認
 5. ALICE-LLM v1.0.2 tag + CHANGELOG 更新
 
 **成功条件**:
-- arm64 8 GiB board で Qwen2.5-Coder-7B Q4_K が動く (~5-15 tok/s 期待)
-- arm64 board で ALICE-LLM が真の unified memory zero-copy を実現、Metal と feature parity
-- ALICE-LLM が local coding LLM (the CLI 代替) として arm64 board で実用に耐える
+- ARM64 組込みボード (8 GB) で Qwen2.5-Coder-7B Q4_K が動く (~5-15 tok/s 期待)
+- ARM64 組込みボード で ALICE-LLM が真の unified memory zero-copy を実現、Metal と feature parity
+- ALICE-LLM が local coding LLM として ARM64 組込みボード で実用に耐える
 
 ## 中間 workaround (v1.0.1 で既に対応済)
 
 Stage 1-3 の upstream 依存を待つ間、user は以下で緩和可能:
 
-1. **v1.0.1 の OOM warning** (a note) で silent OOM Kill 回避、pre-load で peak memory 予測 + 3 案代替提示
-2. **CPU inference** (`Llama3Model::from_gguf`): arm64 board で 7B 動作 (2.4 tok/s、mmap zero-copy)
-3. **llama.cpp Vulkan backend**: 既に Linux fd import 実装済、arm64 board で 7B 動く
+1. **v1.0.1 の OOM warning** (PR #7) で silent OOM Kill 回避、pre-load で peak memory 予測 + 3 案代替提示
+2. **CPU inference** (`Llama3Model::from_gguf`): ARM64 組込みボード で 7B 動作 (2.4 tok/s、mmap zero-copy)
+3. **llama.cpp Vulkan backend**: 既に Linux fd import 実装済、ARM64 組込みボード で 7B 動く
 
 ## Blocker 解除の signal
 
@@ -126,14 +126,13 @@ Stage 1-3 の upstream 依存を待つ間、user は以下で緩和可能:
 
 ## 判断軸
 
-- **今すぐ arm64 board で 7B が必要**: llama.cpp を並行運用、ALICE-LLM は 1.5B / CPU 経路
+- **今すぐ ARM64 組込みボード で 7B が必要**: llama.cpp を並行運用、ALICE-LLM は 1.5B / CPU 経路
 - **v1.0.2 として ALICE-LLM で完結したい**: Stage 1 の upstream PR に投資、~1-3 ヶ月 wait
-- **skip**: v1.0.1 の warning + 方針で運用継続、D2 は future work として塩漬け
+- **skip**: v1.0.1 の warning + 利用側の判断で運用継続、D2 は future work として塩漬け
 
-## 関連メモ
+## 関連
 
-- a note: 元問題 (silent OOM)
-- a note: v1.0.1 の緩和策 (PR #7)
-- a note: v1.0.1 の Qwen 2 bias fix (PR #6)
+- 元問題: wgpu Vulkan の weight 2 重確保による silent OOM
+- v1.0.1 の緩和策 (PR #7) / Qwen 2 bias fix (PR #6)
 - ALICE-LLM PR #6 (fix/gpu-qkv-bias-qwen2)、PR #7 (feat/oom-prevention)、PR #8 (feat/qwen3-qk-norm)
-- 検証機体: arm64 board (arm64 8 GiB board、the embedded SDK、nvgpu Vulkan)
+- 検証機体: ARM64 組込みボード (8 GB unified memory、Vulkan)
