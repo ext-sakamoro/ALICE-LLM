@@ -1,9 +1,9 @@
 # Bonsai / Qwen 3.6-27B GPU Forward Support Scope
 
-**Status**: **Coherent generation on Mac Metal (Phase X.3.e.3.27, 2026-07-17)**; Jetson Orin Nano 8GB still hits the `wgpu-hal` Vulkan 2× duplication ceiling.
+**Status**: **Coherent generation on Mac Metal (Phase X.3.e.3.27, 2026-07-17)**; ARM64 embedded board (8 GB) still hits the `wgpu-hal` Vulkan 2× duplication ceiling.
 **Current path**:
-- Mac M3 Metal: `GpuModel::load` + `qwen_gpu` example generates coherent English + LaTeX at 1.1 tok/s using the Q1_0 fused SwiGLU shader (`swiglu_fused_q1_0.wgsl`), Q5_K / Q8_0 dequant kernels, and the per-head interleaved `attn_q` de-interleave in `upload_w_bonsai_split` (Phase X.3.e.3.22-3.27).
-- Jetson Orin Nano 8GB: `--hybrid` (CPU delegate MVP, Phase X.3.e.3.17) generates `"The capital of Japan is Tokyo."` at ~0.09 tok/s. Attempts to use `--hybrid-per-layer` with `attention_only_load` (Phase X.3.e.3.29) still exceed the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication = 11+ GB; llama.cpp Vulkan with unified-memory zero-copy is the recommended path until `wgpu-hal` upstream ships zero-copy on Vulkan.
+- arm64 laptop Metal: `GpuModel::load` + `qwen_gpu` example generates coherent English + LaTeX at 1.1 tok/s using the Q1_0 fused SwiGLU shader (`swiglu_fused_q1_0.wgsl`), Q5_K / Q8_0 dequant kernels, and the per-head interleaved `attn_q` de-interleave in `upload_w_bonsai_split` (Phase X.3.e.3.22-3.27).
+- ARM64 embedded board (8 GB): `--hybrid` (CPU delegate MVP, Phase X.3.e.3.17) generates `"The capital of Japan is Tokyo."` at ~0.09 tok/s. Attempts to use `--hybrid-per-layer` with `attention_only_load` (Phase X.3.e.3.29) still exceed the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication = 11+ GB; llama.cpp Vulkan with unified-memory zero-copy is the recommended path until `wgpu-hal` upstream ships zero-copy on Vulkan.
 
 Historical note: earlier versions of `GpuModel::load` panicked on Bonsai GGUFs. That block has been removed as of Phase X.3.e.3.23; the loader now flows through the same DeltaNet + Attention path used by Qwen 3.5-4B and reports layout details up front instead of failing early.
 
@@ -75,7 +75,7 @@ Rough size estimate: **5-10 person-days** of shader + Rust work.
 
 ### 5. End-to-end validation (~1-2 days)
 
-- Load Bonsai 27B Q1_0 GGUF via `GpuModel::load` on Jetson (8GB tight, may need weight sharding)
+- Load Bonsai 27B Q1_0 GGUF via `GpuModel::load` on an ARM64 embedded board (8GB tight, may need weight sharding)
 - Compare per-layer output vs CPU reference (bit-exact within FP summation noise, L2_rel < 1e-4)
 - Compare final logits distribution (top-K overlap > 90% at temperature 0)
 - Measure end-to-end tok/s vs CPU baseline (target: 5-10× improvement given Q1_0 GPU 8.4× vs CPU)
@@ -91,14 +91,14 @@ Rough size estimate: **5-10 person-days** of shader + Rust work.
 - **Phase X.1** — Q1_0 / Q2_0 GGUF parser (PR #59, landed)
 - **Phase X.3.a-e** — DeltaNet CPU forward path (PR #61-#66, all landed)
 - **Phase X.3.e.3.1-3.4** — SSM refinements (Gap A-C + §Q/K + §silu(z), commits `146ee22` / `005b3d0` / `6d43602` / `2d55f2b` / `c342f10`, all landed)
-- **Phase X.5** — Bonsai 27B Jetson load-and-run demo (PR #67, landed, CPU forward)
+- **Phase X.5** — Bonsai 27B ARM64 embedded board load-and-run demo (PR #67, landed, CPU forward)
 - **Q1_0 wgpu Step 1-6** — matvec kernels (PR #70-#74, all landed, in GpuModel via `dispatch_mv` for any Q1_0 tensor)
 - **Q1_0 wgpu integration** — GpuModel::dispatch_mv Q1_0 → row4 default (PR #76, landed)
 - **Bonsai numerical validation** — `docs/PHASE_X_3_E_3_3_VALIDATION.md` (blocked on Mac disk space for GGUF DL)
 
 ## Priorities
 
-Given the CPU forward path already runs Bonsai end-to-end on Jetson 8GB at
+Given the CPU forward path already runs Bonsai end-to-end on an ARM64 embedded board (8 GB) at
 ~10 s / token, GPU forward is a **speedup effort, not a correctness blocker**.
 Priority ordering:
 
@@ -109,4 +109,4 @@ Priority ordering:
    effort. (See `docs/QGPU_CI_SMOKE.md` — TBD.)
 3. **Bonsai GPU forward implementation** — 5-10 days, deferred until CPU
    forward speed becomes a hard product blocker. Target: ~1 s / token on
-   Jetson (matches Apple Foundation Models edge target).
+   ARM64 embedded board (matches Apple Foundation Models edge target).

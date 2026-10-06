@@ -5530,7 +5530,7 @@ fn gqa_attention(
                         );
                     // `ALICE_SPARSE_DEBUG=1` emits per-layer hit / reject
                     // lines to stderr — useful when triaging why the hook
-                    // isn't activating for a given arch. Extoria-Jetson
+                    // isn't activating for a given arch. ARM64 embedded board
                     // Llama 3.2-1B smoke (2026-08-01) exercised both
                     // branches.
                     match bridge_result {
@@ -6007,7 +6007,7 @@ fn gated_deltanet_step(
 
 /// Rayon-parallel driver for [`gated_deltanet_step`] (`num_v_heads >= 8`).
 ///
-/// Chunks the per-V-head slices of the mutable buffers so each worker owns a
+/// Chunks the per-V-head slices of the mutable buffers so each rayon task owns a
 /// disjoint `[qk_dim * v_dim]` state slab and a disjoint `[v_dim]` output
 /// slab — the recurrence is intrinsically embarrassingly parallel across V
 /// heads because there is no cross-head coupling. Q / K live at `kv_head`
@@ -13636,7 +13636,7 @@ impl<'a> Llama3Model<'a> {
     ///
     /// This is the primary entry point used by the `run_hybrid_per_layer`
     /// path in `examples/qwen_gpu.rs`, which orchestrates CPU DeltaNet
-    /// layers + GPU attention layers to bypass Jetson's `wgpu-hal` Vulkan
+    /// layers + GPU attention layers to bypass an ARM64 embedded board's `wgpu-hal` Vulkan
     /// weight duplication while keeping DeltaNet math on the CPU where
     /// the recurrent state and Bonsai Gap-B refinement already work.
     pub fn forward_with_layer_hook<F>(&mut self, token_id: u32, hook: F) -> Vec<f32>
@@ -15318,8 +15318,8 @@ impl<'a> Llama3Model<'a> {
     ///
     /// # Panics
     ///
-    /// Always — this is a fail-fast stub, per CLAUDE.md's
-    /// "仮実装完了偽装の禁止" rule (no silent Ok on unimplemented paths).
+    /// Always — this is a fail-fast stub: unimplemented paths panic
+    /// instead of returning a silent `Ok`.
     // `&mut self` is intentional: the real Phase X.4.c implementation will
     // mutate `self.kv_cache` on every forward, mirroring
     // `forward_deepseek_v3` and `forward_gemma3n`. Keeping the signature
@@ -15355,7 +15355,7 @@ impl<'a> Llama3Model<'a> {
     ///
     /// # Panics
     ///
-    /// Always — fail-fast stub (CLAUDE.md "仮実装完了偽装の禁止" rule).
+    /// Always — fail-fast stub (unimplemented paths panic, never return silently).
     #[allow(clippy::needless_pass_by_ref_mut)]
     fn forward_hy3(&mut self, _token_id: u32) -> Vec<f32> {
         todo!(
@@ -23523,7 +23523,7 @@ mod tests {
 
     // ─── generate_grammar (Phase X.8 B-4) ────────────────────────────────
     // Method-level end-to-end tests need a real GGUF model and are handled
-    // in Phase X.8 B-9 (Mac Metal / Jetson Vulkan smoke run). The unit
+    // in Phase X.8 B-9 (Mac Metal / ARM64 embedded board Vulkan smoke run). The unit
     // tests below cover only the error type surface — enough to guarantee
     // Display / Debug / From conversion contracts.
 

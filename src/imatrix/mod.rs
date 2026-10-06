@@ -17,8 +17,7 @@
 //!
 //! # Heuristic source
 //!
-//! The tier-decision rules are the Unsloth-baseline heuristics extracted in
-//! `memory/success_unsloth_v3_sensitivity_oracle_2026_09_12.md` from a
+//! The tier-decision rules are the Unsloth-baseline heuristics extracted from a
 //! metadata-only analysis of Unsloth Dynamic v3.0 Qwen3.8-27B GGUFs. See
 //! [`heuristic`] for the eight rules and their derivation.
 //!

@@ -194,7 +194,7 @@ fn main() {
     println!("=== Bandwidth Analysis ===");
     println!("  Data read per token: {:.1} GB", bytes_per_token / 1e9);
     println!("  Effective bandwidth: {bandwidth_gb_s:.1} GB/s");
-    println!("  M1 Pro theoretical:  200 GB/s");
+    println!("  reference SoC theoretical:  200 GB/s");
     println!(
         "  Utilization:         {:.0}%",
         bandwidth_gb_s / 200.0 * 100.0
@@ -205,11 +205,11 @@ fn main() {
     println!("=== Device Projections (bandwidth-limited) ===");
     let data_per_token_gb = bytes_per_token / 1e9;
     let devices = [
-        ("Raspberry Pi 5 (LPDDR4X)", 34.1),
-        ("Mac Mini M4 (LPDDR5)", 120.0),
-        ("M1 Pro (measured)", bandwidth_gb_s.min(200.0)),
-        ("Mac Mini M4 Pro", 273.0),
-        ("Mac Studio M4 Ultra", 800.0),
+        ("arm64 SBC (LPDDR4X)", 34.1),
+        ("arm64 desktop (LPDDR5)", 120.0),
+        ("this host (measured)", bandwidth_gb_s.min(200.0)),
+        ("arm64 desktop (LPDDR5X)", 273.0),
+        ("arm64 workstation (high-bandwidth)", 800.0),
     ];
     println!("  {:30} {:>10} {:>10}", "Device", "Bandwidth", "Est. tok/s");
     println!("  {:30} {:>10} {:>10}", "------", "---------", "----------");

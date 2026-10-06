@@ -30,8 +30,7 @@ dspark-serde = ["dep:serde"]
 dspark = []
 # Phase I.0 + I.3: ALICE-Dynamic-v1 tier-decision CLI.
 # Emits `layer_assignments.json` from a GGUF using the Unsloth-baseline
-# heuristics (no calibration data required). See
-# `memory/success_unsloth_v3_sensitivity_oracle_2026_09_12.md`.
+# heuristics (no calibration data required); see `src/imatrix/heuristic.rs`.
 imatrix = ["gguf", "dep:serde", "dep:serde_json"]
 
 [dependencies]

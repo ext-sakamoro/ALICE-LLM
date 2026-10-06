@@ -1,15 +1,15 @@
-# quality-deep — PR 差分 / 手動指定 file の深い品質検査 (karikari-review §13、2026-09-16)
+# quality-deep — PR 差分 / 手動指定 file の深い品質検査 (2026-09-16)
 #
 # mutants : cargo-mutants (test が bug を検出できるかの逆検査) PR では --in-diff で差分のみ、
 #           手動 dispatch では `paths` 入力の file だけ (`cargo mutants -f <path>`)
 #           crate 全体は 10,500 mutant (llama3.rs 4,000 / gguf.rs 3,300) で GH runner 16 shard でも
 #           1 shard 3-4 h = 週次には重いので schedule は置かない (ALICE-Zip / libasp / ML は 16 shard 週次)
-#           test set は `--lib --test analytic_oracle` (解析解 oracle を外すと法則が未測定に見える、罠 #44)
+#           test set は `--lib --test analytic_oracle` (解析解 oracle を外すと法則が未測定に見える)
 #
 # 除外 (.cargo/mutants.toml): src/gpu.rs (wgpu adapter 必要、runner に無い) と src/bin/** (axum binary)
 # 2026-09-16: gpu.rs の 10 要素 tuple 戻り値 `debug_dump_layer0_deltanet_stages` が 4^10 = 1,048,576 mutant を
-# 列挙していた (罠 #46) → `DeltaNetLayer0Stages` struct に置換して 10,679 件 / list 20 s
-# 罠 #22 (continue-on-error は compile error も green に潰す) に従い continue-on-error は使わない
+# 列挙していた → `DeltaNetLayer0Stages` struct に置換して 10,679 件 / list 20 s
+# continue-on-error は compile error も green に潰すので continue-on-error は使わない
 # informational な結果は Job Summary に書く (exit code 0 / 2 / 3 = 走った、それ以外 = 壊れている)
 name: Quality Deep
 

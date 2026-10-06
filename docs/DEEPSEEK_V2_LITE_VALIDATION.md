@@ -11,7 +11,7 @@ remains blocked on 370 GB GGUF disk + 40-80 GB GPU host.
 | Oracle host | Paperspace Free A6000 (48 GB VRAM), torch 2.1.1+cu121, bfloat16 |
 | Oracle attention | `attn_implementation="eager"` (flash_attn stub, no CUDA kernel) |
 | Test engine | ALICE-LLM commit `8b10f26` (V2-Lite dense Q + advance() fix landed) |
-| Test host | Mac M3 CPU, `examples/elyza_gguf.rs --logits-dump 10` |
+| Test host | arm64 laptop CPU, `examples/elyza_gguf.rs --logits-dump 10` |
 | Model file | `DeepSeek-V2-Lite-Chat.Q4_K_M.gguf` (mradermacher, 9.7 GB) |
 | Prompt | `"The capital of Japan is"` |
 | Template | `"User: {prompt}\n\nAssistant:"` (both engines applied identically) |

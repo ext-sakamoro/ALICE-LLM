@@ -16,8 +16,7 @@
 //! KV that gets decompressed on the fly per attention step. A separate
 //! `mla_bridge` would be needed to sparse-attend over MLA's latent
 //! representation; keeping K3's compression advantage while sparsifying
-//! is a redesign problem, not an adapter problem. See
-//! `memory/project_alice_llm_sparse_attention.md` for the rationale.
+//! is a redesign problem, not an adapter problem.
 //!
 //! ## Why this exists (Phase MSA.5.5 / 5.6)
 //!

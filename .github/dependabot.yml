@@ -1,4 +1,4 @@
-# Dependabot 設定 (feedback_dependabot_major_bump_initial_wave 準拠)
+# Dependabot 設定
 version: 2
 updates:
   - package-ecosystem: cargo

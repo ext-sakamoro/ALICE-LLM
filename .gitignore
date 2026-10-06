@@ -1,7 +1,8 @@
 /target
-CLAUDE.md
 *.py
+!/scripts/*.py
 /models/
 /data/*
 !/data/README.md
 .DS_Store
+__pycache__/

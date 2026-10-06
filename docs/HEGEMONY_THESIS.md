@@ -4,9 +4,7 @@
 + Phase X.11 (MoE generalization) and all subsequent architecture
 decisions.
 
-**Rationale author**: user (2026-07-24 conversation)
-**Editorial capture**: Claude Code + ALICE-LLM maintainer
-**Related memory**: `~/.claude/projects/-Users-ys/memory/alice_llm_transformer_hybrid_hegemony_thesis.md`
+**Author**: ALICE-LLM maintainer (2026-07-24)
 **Related docs**: `docs/KIMI_K3_INTEGRATION.md`, `docs/MXFP4_INTEGRATION_PLAN.md`
 
 ## Context
@@ -15,7 +13,7 @@ On 2026-07-24, Kimi K3 (2.8 trillion parameters, 896-expert MoE, MXFP4
 weights, 1M context, Kimi Delta Attention) went live and, within 48
 hours, its inference cluster hit compute saturation. Moonshot AI
 suspended new subscriptions. Similar patterns had already played out
-for GPT-5.6 Sol and Claude Fable 5.
+for GPT-5.6 Sol and Anthropic Fable 5.
 
 The mainstream reading is: "these models are too big; more GPUs would
 fix it." The load-bearing framing behind this ADR is different:
@@ -43,11 +41,10 @@ Autoregressive generation re-reads the entire KV cache on every token.
 Compute units (ALUs) idle while memory bandwidth saturates. This is
 the Memory Wall (Wulf & McKee 1995) hitting inference directly.
 
-Concrete evidence from ALICE-Train: on M1 Pro the theoretical bandwidth
+Concrete evidence from ALICE-Train: on a 200 GB/s arm64 SoC the theoretical bandwidth
 is 200 GB/s, but Ternary QAT could only extract 45% of it. Reaching a
 usable throughput required a hand-crafted TLB miss elimination + huge
-page + cache-line-aware layout hack (see
-`memory/alice-train-tuning-playbook.md`). If ALICE-Train's dense compute
+page + cache-line-aware layout hack. If ALICE-Train's dense compute
 kernel already lives at the bandwidth ceiling, Transformer inference —
 whose only workload *is* KV sweeps — is pinned to it.
 
@@ -83,7 +80,7 @@ layers) and Kimi K3's KDA family do:
 
 Combined with 4-bit KV cache, effective KV footprint drops to ~12.5% of
 a pure Transformer. That is the mechanical reason **Bonsai 27B fits and
-runs on a Jetson USB Orin 8 GB** — an outcome that pure-Transformer
+runs on an ARM64 embedded board (8 GB)** — an outcome that pure-Transformer
 lineage cannot reach on any consumer device today.
 
 ## ALICE-LLM's position
@@ -97,14 +94,14 @@ infrastructure needed to exploit this architectural gap:
 - Hybrid layer routing (`layer_kind_map` — 16:48 for Bonsai, 8:24 for
   Qwen 3.5, extensible to KDA once weights land)
 - `--hybrid` CPU+GPU dispatch (`qwen_gpu --hybrid`, commit `b5d08d8`),
-  giving Jetson USB Orin 8 GB a 3.3× speedup on Bonsai 27B vs pure CPU
+  giving an ARM64 embedded board (8 GB) a 3.3× speedup on Bonsai 27B vs pure CPU
 - 4-bit KV cache scaffolding (`src/kv_cache.rs`)
 - Quantization matrix (Q1_0 – Q8_0 + BitNet Ternary + IQ4_XS),
   quant-agnostic across shaders
 - DeepSeek V3 routed-expert LRU streaming (`src/deepseek_streaming.rs`,
   971 lines), directly reusable as the 896-expert extension for Kimi K3
 - MoE inference base (`src/llama3.rs:forward_moe_layer`, ~130 lines) —
-  Qwen3 MoE 4×0.6B Q4_K_M at 32.9 tok/s on Mac M2 (2026-07-09
+  Qwen3 MoE 4×0.6B Q4_K_M at 32.9 tok/s on an arm64 desktop (2026-07-09
   `e395eb4`)
 
 The measured "physical reversal" (small hardware running large models
@@ -112,11 +109,11 @@ that industry-consensus says cannot fit) is the empirical validation:
 
 | Model | Hardware | Baseline expectation | ALICE-LLM measured |
 |---|---|---|---|
-| Bonsai 27B Q1_0 | Jetson USB Orin 8 GB | OOM | **0.3 tok/s** (via `--hybrid`) |
-| Bonsai 27B Q1_0 | Mac M3 CPU | 0.05–0.1 tok/s | **0.2 tok/s** |
-| Bonsai 27B Q1_0 | Mac M3 Metal | 0.3–0.5 tok/s | **1.1 tok/s** |
-| Qwen 3.5-4B Q4_K_M | Mac M3 Metal | — | 2.9 tok/s |
-| Ornith-1.0-9B (Qwen 3.5 f-tune) | Mac / Jetson zero-config | — | 1.8 / 2.1 / 2.3 tok/s |
+| Bonsai 27B Q1_0 | ARM64 embedded board (8 GB) | OOM | **0.3 tok/s** (via `--hybrid`) |
+| Bonsai 27B Q1_0 | arm64 laptop CPU | 0.05–0.1 tok/s | **0.2 tok/s** |
+| Bonsai 27B Q1_0 | arm64 laptop Metal | 0.3–0.5 tok/s | **1.1 tok/s** |
+| Qwen 3.5-4B Q4_K_M | arm64 laptop Metal | — | 2.9 tok/s |
+| Ornith-1.0-9B (Qwen 3.5 f-tune) | Mac / ARM64 embedded board zero-config | — | 1.8 / 2.1 / 2.3 tok/s |
 
 These are already the "reversal" outcomes the thesis claims. Kimi K3
 extends them by an order of magnitude.
@@ -125,17 +122,17 @@ extends them by an order of magnitude.
 
 Kimi K3's architectural choices are exactly the Bonsai hybrid strategy
 scaled 10× (2.8T total / 896 experts / top-16 / KDA / 1M context /
-MXFP4). If ALICE-LLM can run Bonsai 27B on Jetson 8 GB via its hybrid
-+ streaming stack, running Kimi K3 on Mac M3 Max consumer hardware is
+MXFP4). If ALICE-LLM can run Bonsai 27B on an ARM64 embedded board (8 GB) via its hybrid
++ streaming stack, running Kimi K3 on an arm64 laptop consumer hardware is
 a logical necessity — not a wish. The 896/16 sparsity (1.79%) means
-per-token active weights are ~24 GB Q4, which is Mac M3 Max tier
+per-token active weights are ~24 GB Q4, which is arm64 laptop tier
 memory territory with NVMe expert streaming picking up the tail.
 
 Successfully landing Phase X.4 shifts the industry framing:
 
 | Before Phase X.4 | After Phase X.4 completion |
 |---|---|
-| Kimi K3 only accessible via Moonshot API ($3/$15 per M tokens) | Kimi K3 runs on Mac M3 Max 128 GB with expert streaming (free, private) |
+| Kimi K3 only accessible via Moonshot API ($3/$15 per M tokens) | Kimi K3 runs on an arm64 laptop 128 GB with expert streaming (free, private) |
 | Kimi K3 requires 64+ accelerator supernodes | Full MXFP4 fits on H100 8× (640 GB > 594 GB native) |
 | "2.8T MoE is only for hyperscalers" | Individual developers can inspect, benchmark, and integrate it |
 | MoE support fragmented across Qwen / Mixtral / Gemma / DeepSeek / Kimi / Hy3 / LongCat forks | ALICE-LLM provides one loader + one forward for all seven |
@@ -150,7 +147,7 @@ these four criteria before it is committed.
 the answer is none, the feature is deprioritized regardless of demand.
 
 ### B. Consumer-hardware invariant
-"Does Jetson 8 GB / Mac M3 Max consumer hardware still work after this
+"Does an ARM64 embedded board (8 GB) / arm64 laptop consumer hardware still work after this
 change?" If not, the change is rolled back. The invariant that
 'consumer hardware runs frontier models' is not an accident — it is
 the thesis.

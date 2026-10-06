@@ -12,9 +12,8 @@
 //! MTP-drop heuristic fires for the given size budget.
 //!
 //! Phase I.0 + I.3 only. The `decide-heuristic` subcommand does NOT require
-//! calibration data — it applies the Unsloth-baseline heuristics extracted
-//! by `memory/success_unsloth_v3_sensitivity_oracle_2026_09_12.md` directly
-//! to the tensor layout of any input GGUF. Later phases add activation
+//! calibration data — it applies the Unsloth-baseline heuristics (extracted from a metadata-only analysis of Unsloth
+//! Dynamic v3.0 GGUFs) directly to the tensor layout of any input GGUF. Later phases add activation
 //! capture (`collect`), imatrix-tuned assignment (`decide`), and repack.
 
 use std::fs::File;

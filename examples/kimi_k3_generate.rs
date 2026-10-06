@@ -11,8 +11,8 @@
 //! token is decoded immediately and printed to stdout with `print!` +
 //! flush, so long-running generations produce visible streaming output.
 //!
-//! Note on Kimi K3 performance: single-token forward is ~23 min on Mac
-//! mini M2 Pro + USB 2.0 external SSD (I/O bound on ~3 GB of expert
+//! Note on Kimi K3 performance: single-token forward is ~23 min on an
+//! arm64 desktop + USB 2.0 external SSD (I/O bound on ~3 GB of expert
 //! cube data per token). Setting `max_new_tokens = 1` for baseline
 //! validation is recommended; longer runs require faster storage.
 

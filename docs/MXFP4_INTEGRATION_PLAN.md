@@ -25,7 +25,7 @@ implementations exist (`microsoft/microxcaling`, llama.cpp/ik_llama.cpp).
 >
 > The docs commit `c81bc51` was made under the fallback author identity
 > `ext-sakamoro <ext-sakamoro@example.com>` instead of the intended
-> `Moroya Sakamoto <sakamoro@alicelaw.net>` (a session-time author-flag
+> `Moroya Sakamoto <sakamoro@alicelaw.net>` (an author-flag
 > omission). Since amending would require a force-push to `main` and the
 > author string is a plain-text convention rather than a load-bearing
 > field, the mislabel is left in place and this note captures the intent.
@@ -46,7 +46,7 @@ implementations exist (`microsoft/microxcaling`, llama.cpp/ik_llama.cpp).
   `mxfp4_matvec_fallback` (correctness-first dequant + f32_matvec)
 - ✅ Free function `mxfp4_matvec()` is `todo!()` fail-fast pointing to
   this document, so callers who reach the fused-kernel API prematurely
-  get an explicit panic (compliant with CLAUDE.md 「仮実装完了偽装の禁止」)
+  get an explicit panic (no stub ever returns a silent success)
 - ✅ 11 unit tests: E2M1 table bit-exact + no-NaN/Inf, E8M0 endpoints +
   NaN reserved, block dequant identity/scale/signed-symmetric, row
   dequant multi-block, struct roundtrip, `GgmlType::Mxfp4` metadata,
@@ -79,7 +79,7 @@ stage onward**. This means:
 
 MXFP4 support is therefore the enabling factor for the H100 8× target
 and, on the consumer side, keeps the ~594 GB stream size within reach
-of a 2 TB NVMe on Mac M3 Max.
+of a 2 TB NVMe on an arm64 laptop.
 
 Same logic applies to MXFP8 for activations (see §MXFP8 note below).
 
@@ -243,7 +243,7 @@ oracle for a fixed prompt. Same methodology as Phase X.3.e.3.30 V2-Lite.
 | llama.cpp MXFP4 kernel has subtle bug ALICE-LLM inherits | Wrong outputs, hard to detect | Independent validation via `microxcaling` PyTorch oracle (Step 1) |
 | GGUF tensor type numeric value for MXFP4 changes | Load fails post-release | Wait for community GGUF conversion + inspect actual byte pattern before hardcoding |
 | MXFP8 activation compute needed for full efficiency (not just weights) | Slower than expected on GPU | First-pass: dequant to F32 in shader; Phase X.4.g.2 for MXFP8-native kernels if profiling shows bottleneck |
-| E2M1 does not represent common weight values well → QAT-time accuracy loss | Would show up in Moonshot's own benchmarks; if their model is competitive with Claude Fable 5, E2M1 is sufficient | Trust Moonshot's QAT; validate against their reported benchmarks in Step 4 |
+| E2M1 does not represent common weight values well → QAT-time accuracy loss | Would show up in Moonshot's own benchmarks; if their model is competitive with Anthropic Fable 5, E2M1 is sufficient | Trust Moonshot's QAT; validate against their reported benchmarks in Step 4 |
 | Consumer NVMe cannot sustain 24 GB/token streaming | Below 0.5 tok/s target | Phase X.4.e expert LRU cache (96 GB hot residency of top-64 experts) covers >90% of forwards without disk hit |
 
 ## Success criteria (Phase X.4.f / X.4.g exit)
@@ -253,14 +253,14 @@ oracle for a fixed prompt. Same methodology as Phase X.3.e.3.30 V2-Lite.
 - [ ] SIMD paths (NEON on Mac, AVX2/AVX-512 on x86_64) match scalar path byte-exact
 - [ ] GPU `matvec_mxfp4` matches CPU implementation within F32 rounding tolerance
 - [ ] End-to-end Kimi K3 forward on a real prompt matches Moonshot API output at top-1 argmax
-- [ ] Throughput: Mac M3 Max full MXFP4 in-memory ≥ 1 tok/s for a small prompt
+- [ ] Throughput: arm64 laptop full MXFP4 in-memory ≥ 1 tok/s for a small prompt
 - [ ] Zero regression on existing Q1_0 / Q4_K_M / Q8_0 / BitNet paths (all existing tests pass)
 
 ## Timing
 
 | Phase | Earliest start | Blockers | Estimated landing |
 |---|---|---|---|
-| ✅ Skeleton (`GgmlType::Mxfp4` variant + `QK_MXFP4` const + `E2M1_DECODE_TABLE` + `decode_e8m0_scale` + `dequantize_mxfp4_block` + `dequantize_row_mxfp4` + `MxfP4Row/Matrix` + `mxfp4_matvec_fallback` correctness-first path + 11 tests) | Landed **2026-07-24** | None — spec is public | Same session |
+| ✅ Skeleton (`GgmlType::Mxfp4` variant + `QK_MXFP4` const + `E2M1_DECODE_TABLE` + `decode_e8m0_scale` + `dequantize_mxfp4_block` + `dequantize_row_mxfp4` + `MxfP4Row/Matrix` + `mxfp4_matvec_fallback` correctness-first path + 11 tests) | Landed **2026-07-24** | None — spec is public | Same day |
 | Scalar fused `mxfp4_matvec` (replaces `todo!()`) | 2026-07-27 (first real weights) | Weight release + PyTorch oracle | 2-3 days |
 | CPU SIMD paths (NEON + AVX2 + AVX-512) | After scalar landing | — | 2-3 days |
 | GPU shader + pipeline (Metal + wgpu) | 2026-07-27 (first real weights) | Weight release | 7-10 days |

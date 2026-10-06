@@ -13,7 +13,7 @@
 // row-decodes per block), but the *total* weight decode work across the
 // dispatch stays constant. In exchange for that extra register / decode
 // activity per workgroup, we buy 4× fewer input reads (the dominant memory
-// traffic bottleneck at 11% bandwidth utilization on Jetson Vulkan).
+// traffic bottleneck at 11% bandwidth utilization on an ARM64 embedded board Vulkan).
 //
 // Layout: 16 scalar accumulators (4 rows × 4 batches) in registers, 16
 // subgroup reduction slots, single thread-0 writes 16 outputs.

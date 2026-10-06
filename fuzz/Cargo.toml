@@ -16,7 +16,7 @@ path = ".."
 # gguf feature を有効にして GgufFile::parse を fuzz 可能に
 features = ["gguf", "grammar"]
 
-# cargo-machete false-positive 予防 (canonical [[reference_alice_ci_canonical_template]] 罠 #3)
+# cargo-machete false-positive 予防 (libfuzzer-sys は fuzz_target! macro 経由でのみ使われる)
 [package.metadata.cargo-machete]
 ignored = ["libfuzzer-sys"]
 

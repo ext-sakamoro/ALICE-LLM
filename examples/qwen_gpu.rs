@@ -112,8 +112,8 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
 ///
 /// Loads the model via `Llama3Model::from_gguf` (CPU-only, no GPU allocation),
 /// applies Qwen ChatML template, runs autoregressive generation. Purpose is
-/// to avoid the wgpu-hal Vulkan weight 2× duplication on Jetson unified
-/// memory (Bonsai 27B Q1_0: 3.6 GB weight × 2 = 7.2 GB, tight in Jetson 8 GB;
+/// to avoid the wgpu-hal Vulkan weight 2× duplication on an ARM64 embedded board unified
+/// memory (Bonsai 27B Q1_0: 3.6 GB weight × 2 = 7.2 GB, tight in an ARM64 embedded board (8 GB);
 /// hybrid mode uses 3.6 GB total).
 ///
 /// True per-layer hybrid (DeltaNet on CPU + Attention on GPU) requires
@@ -221,11 +221,11 @@ fn run_hybrid_cpu_delegate(
 /// Phase A2 per-layer hybrid: CPU processes DeltaNet layers, GPU
 /// processes attention layers. Uses `Llama3Model::forward_with_layer_hook`
 /// on the CPU side and `GpuModel::run_attention_layer_only` on the GPU
-/// side. Intended for Jetson (Cortex-A78AE 6-core + Tegra Orin iGPU)
+/// side. Intended for an ARM64 embedded board (6-core ARM64 + embedded iGPU)
 /// where full GPU forward OOMs due to `wgpu-hal` Vulkan weight
 /// duplication.
 ///
-/// Memory footprint (Bonsai 27B Q1_0 on 8 GB unified Jetson):
+/// Memory footprint (Bonsai 27B Q1_0 on 8 GB unified ARM64 embedded board):
 ///   - CPU: full model via mmap (kernel page cache), effectively free
 ///   - GPU: attention layer weights (~16/64 layers) + KV cache with
 ///     `--max-seq-len 512` = ~2 GB with `x2` duplication, fits in ~2.5 GB
@@ -274,7 +274,7 @@ fn run_hybrid_per_layer(
     }
     // Phase X.3.e.3.29: per-layer hybrid only ever touches Attention layers
     // on the GPU, so tell the loader to skip DeltaNet weights entirely.
-    // This is what makes hybrid-per-layer fit under Jetson's ~2-3 GB usable
+    // This is what makes hybrid-per-layer fit under an ARM64 embedded board's ~2-3 GB usable
     // GPU budget after `wgpu-hal` Vulkan 2× duplication.
     gpu_cfg.attention_only_load = true;
     let t_gpu = Instant::now();
@@ -380,7 +380,7 @@ fn main() {
     let temperature: f32 = parse_arg(&args, "--temperature").unwrap_or(0.0);
     let top_k: usize = parse_arg(&args, "--top-k").unwrap_or(40);
     // Override the GGUF-provided `context_length` to shrink the KV cache
-    // allocation. Useful on memory-constrained targets (Jetson 8 GB
+    // allocation. Useful on memory-constrained targets (ARM64 embedded board (8 GB)
     // unified) where the default 8192 causes OOM at load time.
     let max_seq_len_override: Option<usize> = parse_arg(&args, "--max-seq-len");
     // Issue #40 diagnostic: dump top-5 logits per position (JSONL to stderr) for
@@ -398,9 +398,9 @@ fn main() {
     let layer_bisect = args.iter().any(|a| a == "--layer-bisect");
     let debug_nan = args.iter().any(|a| a == "--debug-nan");
     // Phase X.3.e.3.17 Option C MVP: `--hybrid` skips GPU entirely and falls
-    // back to CPU-only `Llama3Model::forward()`. This delivers the Jetson OOM
+    // back to CPU-only `Llama3Model::forward()`. This delivers the ARM64 embedded board OOM
     // fix (no GPU weight allocation) at the cost of speed (~0.05-0.1 tok/s on
-    // Jetson Cortex-A78AE for Bonsai 27B Q1_0).
+    // ARM64 embedded board CPU for Bonsai 27B Q1_0).
     let hybrid_mode = args.iter().any(|a| a == "--hybrid");
     // Phase A2 per-layer hybrid: CPU processes DeltaNet layers, GPU
     // processes attention layers, hidden state is shuttled between them
@@ -412,7 +412,7 @@ fn main() {
     {
         // Phase X.3.e.3.17 Option C MVP: `--hybrid` bypasses GPU entirely and
         // uses `Llama3Model::forward()` (CPU) so weights are not duplicated on
-        // GPU. Delivers Jetson OOM fix (no GPU weight allocation) at speed cost.
+        // GPU. Delivers ARM64 embedded board OOM fix (no GPU weight allocation) at speed cost.
         if hybrid_mode {
             run_hybrid_cpu_delegate(
                 &model_path,

@@ -14,7 +14,7 @@
 //!
 //! Real benchmark harness (criterion + comparison table) is tracked as
 //! Issue #25. This example is the zero-dependency stopgap so the
-//! numbers are available today on Mac aarch64 / Jetson without waiting
+//! numbers are available today on Mac aarch64 / ARM64 embedded board without waiting
 //! for an x86_64 machine allocation.
 //!
 //! Usage:

@@ -1,50 +1,90 @@
 # ALICE-LLM
 
+量子化 GGUF 言語モデルのための Pure Rust 推論エンジン。外部 ML フレームワークを使わずに、CPU (NEON、AVX2、AVX-512) と wgpu 経由の GPU (Metal、Vulkan、DX12) で実行する。
+
+[English](README.md) | **日本語**
+
 [![crates.io](https://img.shields.io/crates/v/alice-llm.svg)](https://crates.io/crates/alice-llm)
 [![docs.rs](https://img.shields.io/docsrs/alice-llm)](https://docs.rs/alice-llm)
 [![License: AGPL-3.0-or-later](https://img.shields.io/crates/l/alice-llm.svg)](#license)
 [![CI](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml)
 
-[English](README.md) | **日本語**
+> **[ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System)** の一部 — 260+ crate の Edge-to-Cloud データパイプライン (SDF / Physics / LLM / Motion / Font / TTS)
 
 推論の全レイヤー (GGUF パーサから SIMD、GPU カーネル、投機的デコード、ハイブリッドアーキテクチャまで) を理解して最適化することにフォーカスした Pure Rust LLM 推論エンジン。既存 ML フレームワークのラッパーではなく、研究 + エンジニアリングプロジェクトとして構築。
 
 GGUF 量子化モデル、外部 ML ライブラリ依存ゼロ、lib テスト 568 pass (default、`dspark` feature 有効時は 594)。
 
-**GPU (wgpu/Metal): 125ms → 71ms/トークン (1B)、バッチ4投機的デコード: 1Bドラフト + 8B検証 = 5.89倍高速化、受理率90%。**
+研究 + エンジニアリング用のコードベースであり、llama.cpp の置き換えではない。一部の経路は明示的に fail-fast する未実装 (Kimi K3 forward、fused MXFP4 カーネル) で、Qwen 3.5 の forward は perplexity が llama.cpp とまだ一致しない ([ハイライト](#ハイライト) 参照)。
 
-**Bonsai 27B Q1_0 (1.125 bpw binary、3.6 GB GGUF) が Apple M3 Metal で coherent 生成 1.1 tok/s (Phase X.3.e.3.27、Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix)。**
+## 目次
 
-**Qwen 3.5-4B ハイブリッド (DeltaNet + フルアテンション) が Apple M3 Metal で coherent 生成 2.9 tok/s (Q4_K_M 混合量子化を Q5_K/Q8_0 shader でカバー)。**
+- [インストール](#インストール)
+- [使用例](#使用例)
+- [ハイライト](#ハイライト)
+- [機能一覧](#機能一覧)
+- [アーキテクチャ](#アーキテクチャ)
+- [デスクトップアプリ — ALICE-LLM Studio](#デスクトップアプリ--alice-llm-studio)
+- [GPU推論 (wgpu / Metal)](#gpu推論-wgpu--metal)
+- [CPU最適化の軌跡 (70Bスパースターナリ)](#cpu最適化の軌跡-70bスパースターナリ)
+- [aarch64 NEON 量子化 matvec ベンチ (Issue #30)](#aarch64-neon-量子化-matvec-ベンチ-issue-30)
+- [投機的デコード](#投機的デコード)
+- [計算パス (Q4_K)](#計算パス-q4_k)
+- [マルチアーキテクチャサポート](#マルチアーキテクチャサポート)
+- [スパースターナリ量子化](#スパースターナリ量子化)
+- [Ternary QAT（量子化再学習）](#ternary-qat量子化再学習)
+- [推論サーバー（OpenAI互換API）](#推論サーバーopenai互換api)
+- [CLIオプション](#cliオプション)
+- [Cargo features](#cargo-features)
+- [性能](#性能)
+- [Minimum supported Rust version](#minimum-supported-rust-version)
+- [ビルドとテスト](#ビルドとテスト)
+- [関連 crate](#関連-crate)
+- [ライセンス](#ライセンス)
 
-**Phase X.3.e.3.37 (2026-07-21): Qwen 3.5+ ハイブリッド arch (q_dim = num_heads × head_dim ≠ hidden_dim) 向けの o_proj cols 次元 fix。従来 `upload_w` に hardcode されていた hidden_dim では Qwen 3.5-4B の o_proj 出力が cos 0.118 でほぼ直交していた。1 行 fix で L3 pos 17 hidden cos 0.7057 → 0.9970、全 position で cross-arch coherence 復元。**
-
-**CPU: 0.16 → 1.76 tok/s (11倍) 70Bスパースターナリ — M1 Proメモリ帯域の45%に到達。**
-
-**Per-layer hybrid (`--hybrid-per-layer`): CPU が DeltaNet 層、GPU が Attention 層を分担、hidden state を per-token でやり取り。フル GPU アロケーションを避けつつ pure GPU と pure CPU の中間速度を実現。**
-
-**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.4 tok/s で "The capital of Japan is Tokyo. It is the country's capital, largest city," を回答 — Phase X.3.e.3.37 o_proj weight upload cols 次元 fix により qwen35 ハイブリッド arch の cross-arch 動作が復元 (従来は o_proj を [hidden_dim, hidden_dim] で load していたが、正しくは [hidden_dim, q_dim]、q_dim ≠ hidden_dim なモデルで Q4_K weight bytes の 37.5% が欠損していた)。`attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
-
-**Ornith-1.0-9B (DeepReinforce 製、MIT、Qwen 3.5 fine-tune で agentic coding 特化): Apple M3 CPU (1.8 tok/s) / Apple M3 Metal iGPU (2.1 tok/s) / Jetson Orin Nano 8GB CPU (2.3 tok/s) の 3 環境で zero-config load-and-run 確認 — `general.architecture = qwen35` で自動検出、Phase X.3.e.3.14-29 の CPU/GPU fix が fine-tune にも cascade 適用。**
-
-**Jetson マルチモデル対応 (2026-07-21 Yahboom Orin Nano 8GB で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
-
-**crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。自動 publish 稼働 (2026-09-13): tag push `v*.*.*` で `.github/workflows/release.yml` の `publish-crates-io` job が発火、GitHub Release + crates.io 同時 sync。
-
-**Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (M3 Metal) と Jetson Orin Nano 8GB の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。**B-10 (2026-09-14): token trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) で per-token FSM probe を置換、MiniCPM5-2B (vocab 130k) で grammar mask が 1 step ~8 s → comment 状態以外 ~1 ms になり生成は forward 律速 (CPU ~25 tok/s) に。**
-
-**Perplexity 測定サンプル (`examples/perplexity.rs`、2026-07-24)** — WikiText-2 test で CPU forward + sliding-window log-probability を用いた PPL 測定、500 トークン: **Qwen 3.5-4B Q4_K_M = 16.38**、**Bonsai 27B Q1_0 = 18.12**。**注意事項**: llama.cpp は同じ Qwen 3.5-4B Q4_K_M を 1 chunk / 512 context 条件で PPL 6.09 ± 1.05 と報告しており、ALICE-LLM の forward path とは **2.68 倍の乖離**があります。BOS 処理が原因ではありません (Qwen 3.5 GGUF に `bos_token_id` が無いため両実装とも BOS 未挿入)。根本原因の調査は **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV レイアウトの instrumentation) として追跡中です。上記数値は llama.cpp との一致が確認できるまで ALICE-LLM 独自のベースラインとして扱ってください。
-
-**診断ツール (Phase X.3.e.3.30+)** — 深さルーティング分析用の新規サンプル 3 つ: `examples/entropy_mod_qwen35.rs` (entropy 駆動 Mixture-of-Depths 観測)、`examples/early_exit_qwen35.rs` (early-exit ablation)、`examples/entropy_ppl_correlation_qwen35.rs` (層ごとの entropy と最終位置 PPL の相関検証)。
-
-## クイックスタート
+## インストール
 
 ```bash
-# モデルダウンロード
+cargo add alice-llm
+```
+
+エンジンの大半は Cargo feature の背後にある ([Cargo features](#cargo-features) 参照)。GGUF を読み全コアを使う CPU ビルド:
+
+```toml
+[dependencies]
+alice-llm = { version = "1.6", features = ["gguf", "parallel"] }
+```
+
+モデルは GGUF ファイル。例:
+
+```bash
 huggingface-cli download elyza/Llama-3-ELYZA-JP-8B-GGUF \
   Llama-3-ELYZA-JP-8B-q4_k_m.gguf --local-dir models/
+```
 
-# 推論実行
+## 使用例
+
+GGUF モデルを読み込んでテキストを生成する (`features = ["gguf"]`):
+
+```rust
+use alice_llm::gguf::{GgufFile, GgufTokenizer};
+use alice_llm::llama3::Llama3Model;
+
+fn main() {
+    let data = std::fs::read("models/Llama-3-ELYZA-JP-8B-q4_k_m.gguf").expect("read the GGUF file");
+    let gguf = GgufFile::parse(&data).expect("parse GGUF");
+    let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("load the tokenizer");
+    let mut model = Llama3Model::from_gguf(&gguf).expect("load the model");
+
+    // greedy decoding (temperature 0), top-k 40, at most 64 new tokens
+    let result = model.generate(&tokenizer, "日本の首都は", 64, 0.0, 40);
+    println!("{} ({:.1} tok/s)", result.text, result.tokens_per_sec);
+}
+```
+
+同じことを同梱 example でコマンドラインから:
+
+```bash
 cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
   --model models/Llama-3-ELYZA-JP-8B-q4_k_m.gguf \
   --prompt "日本の首都は" \
@@ -58,49 +98,41 @@ Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
 
-### ライブラリとして利用
-
-```bash
-cargo add alice-llm  # Cargo.toml v1.6.0
-```
-
 公開 API は `src/lib.rs` を参照 (GGUF パーサ、トークナイザ、モデルロード、KV キャッシュ、サンプリング)。具体的な使用例は `examples/` ディレクトリを参照してください。
 
-### Qwen 3.5 / Bonsai 27B ハイブリッド
+## ハイライト
 
-```bash
-# Qwen 3.5-4B または Bonsai 27B のフル GPU forward
-cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
-  --model models/Qwen3.5-4B-Q4_K_M.gguf \
-  --prompt "The capital of Japan is" --max-tokens 40
+**GPU (wgpu/Metal): 125ms → 71ms/トークン (1B)、バッチ4投機的デコード: 1Bドラフト + 8B検証 = 5.89倍高速化、受理率90%。**
 
-# Per-layer hybrid (CPU DeltaNet + GPU Attention) — Phase A2
-# Jetson で GPU 加速化 (attention_only_load 自動 ON)
-cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
-  --model models/Bonsai-27B-Q1_0.gguf \
-  --prompt "The capital of Japan is" --max-tokens 40 \
-  --hybrid-per-layer --max-seq-len 512
+**Bonsai 27B Q1_0 (1.125 bpw binary、3.6 GB GGUF) が arm64 laptop (Metal) で coherent 生成 1.1 tok/s (Phase X.3.e.3.27、Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix)。**
 
-# CPU delegate hybrid (GPU 完全 skip、mmap zero-copy) — Jetson フレンドリー
-cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
-  --model models/Bonsai-27B-Q1_0.gguf \
-  --prompt "The capital of Japan is" --max-tokens 40 --hybrid
-```
+**Qwen 3.5-4B ハイブリッド (DeltaNet + フルアテンション) が arm64 laptop (Metal) で coherent 生成 2.9 tok/s (Q4_K_M 混合量子化を Q5_K/Q8_0 shader でカバー)。**
 
-## デスクトップアプリ — ALICE-LLM Studio
+**Phase X.3.e.3.37 (2026-07-21): Qwen 3.5+ ハイブリッド arch (q_dim = num_heads × head_dim ≠ hidden_dim) 向けの o_proj cols 次元 fix。従来 `upload_w` に hardcode されていた hidden_dim では Qwen 3.5-4B の o_proj 出力が cos 0.118 でほぼ直交していた。1 行 fix で L3 pos 17 hidden cos 0.7057 → 0.9970、全 position で cross-arch coherence 復元。**
 
-[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) は本エンジンを Tauri GUI で wrap したコンパニオンアプリ。組み込み `alice-llm-server` サイドカー、HuggingFace GGUF ブラウザ（ファイル単位のストリーミングダウンロード + ハードウェア適合度ヒント: 🟢 余裕 / 🟡 タイト / 🟠 ハイブリッド / 🔴 サイズ超過）、Ollama 風チャット UI (`max_tokens` / `temperature` 制御) を備える。ローカルモデルは `~/.alice-llm-studio/models/` 配下に保存。
+**CPU: 0.16 → 1.76 tok/s (11倍) 70Bスパースターナリ — 200 GB/s arm64 SoC のメモリ帯域の45%に到達。**
 
-**最新リリース: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22、ALICE-LLM v1.2.1 を組み込み)。署名済みインストーラは未提供のため、初回起動時に Gatekeeper / SmartScreen の許可が必要になる場合がある。
+**x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary の全てに AVX2 と AVX-512BW/F カーネルを追加し実行時 dispatch、Apple Silicon の既存 NEON と同等の対応範囲に。**
 
-| プラットフォーム | ダウンロード |
-|---|---|
-| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
-| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
-| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
-| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+**Per-layer hybrid (`--hybrid-per-layer`): CPU が DeltaNet 層、GPU が Attention 層を分担、hidden state を per-token でやり取り。フル GPU アロケーションを避けつつ pure GPU と pure CPU の中間速度を実現。**
 
-本 alpha ではチャットは非ストリーミング (組み込み済みサイドカーが OpenAI SSE サーフェスより前のビルドのため)、ハードウェア適合度ヒントは advisory (`alice-llm-server` 側が GUI からの `--hybrid` / `--hybrid-per-layer` をまだ受け付けないため実行系には反映されない)。両者とも upstream で追従予定。現時点のフル機能面は下記 CLI 例で網羅している。
+**ARM64 組込みボード (8 GB) (Vulkan iGPU): Qwen 3.5-4B ハイブリッドが 0.4 tok/s で "The capital of Japan is Tokyo. It is the country's capital, largest city," を回答 — Phase X.3.e.3.37 o_proj weight upload cols 次元 fix により qwen35 ハイブリッド arch の cross-arch 動作が復元 (従来は o_proj を [hidden_dim, hidden_dim] で load していたが、正しくは [hidden_dim, q_dim]、q_dim ≠ hidden_dim なモデルで Q4_K weight bytes の 37.5% が欠損していた)。`attention_only_load` で DeltaNet weight の GPU アップロードを skip、Vulkan の 2× 重複コピー制約下でも全体が収まる (Phase X.3.e.3.29)。**
+
+**Ornith-1.0-9B (DeepReinforce 製、MIT、Qwen 3.5 fine-tune で agentic coding 特化): arm64 laptop CPU (1.8 tok/s) / arm64 laptop Metal iGPU (2.1 tok/s) / ARM64 組込みボード (8 GB) CPU (2.3 tok/s) の 3 環境で zero-config load-and-run 確認 — `general.architecture = qwen35` で自動検出、Phase X.3.e.3.14-29 の CPU/GPU fix が fine-tune にも cascade 適用。**
+
+**ARM64 組込みボード マルチモデル対応 (2026-07-21 ARM64 組込みボード (8 GB) で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
+
+**crates.io 公開済 (Cargo.toml v1.6.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。自動 publish 稼働 (2026-09-13): tag push `v*.*.*` で `.github/workflows/release.yml` の `publish-crates-io` job が発火、GitHub Release + crates.io 同時 sync。
+
+**Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (arm64 laptop Metal) と ARM64 組込みボード (8 GB) の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。**B-10 (2026-09-14): token trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) で per-token FSM probe を置換、MiniCPM5-2B (vocab 130k) で grammar mask が 1 step ~8 s → comment 状態以外 ~1 ms になり生成は forward 律速 (CPU ~25 tok/s) に。**
+
+**Perplexity 測定サンプル (`examples/perplexity.rs`、2026-07-24)** — WikiText-2 test で CPU forward + sliding-window log-probability を用いた PPL 測定、500 トークン: **Qwen 3.5-4B Q4_K_M = 16.38**、**Bonsai 27B Q1_0 = 18.12**。**注意事項**: llama.cpp は同じ Qwen 3.5-4B Q4_K_M を 1 chunk / 512 context 条件で PPL 6.09 ± 1.05 と報告しており、ALICE-LLM の forward path とは **2.68 倍の乖離**があります。BOS 処理が原因ではありません (Qwen 3.5 GGUF に `bos_token_id` が無いため両実装とも BOS 未挿入)。根本原因の調査は **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV レイアウトの instrumentation) として追跡中です。上記数値は llama.cpp との一致が確認できるまで ALICE-LLM 独自のベースラインとして扱ってください。
+
+**診断ツール (Phase X.3.e.3.30+)** — 深さルーティング分析用の新規サンプル 3 つ: `examples/entropy_mod_qwen35.rs` (entropy 駆動 Mixture-of-Depths 観測)、`examples/early_exit_qwen35.rs` (early-exit ablation)、`examples/entropy_ppl_correlation_qwen35.rs` (層ごとの entropy と最終位置 PPL の相関検証)。
+
+**Sparse attention (KV-outer、`src/sparse_attention/`、2026-07-31)** — MiniMax Sparse Attention (`MiniMax-AI/MSA`、MIT) と M3 KV-outer sparse (`fw-ai/minimax-kernels`、Apache-2.0) のアルゴリズムを Pure Rust に移植: CSR 逆引き index builder、top-K KV block selector、dense proxy pass、load-balance scheduler、GQA row-packing + online-softmax の KV-outer forward、標準 FlashAttention の LSE combine。一括 API は `kvouter_attention(...)`。全 block 選択時に素朴な dense 参照実装 (no-causal / GQA / causal) と相対誤差 < 1e-4 で一致。Feature: `parallel` (rayon)、`simd` (`wide` f32x8)、`gpu` (wgpu compute shader、Metal で CPU parity 確認済)、`quant` (FP8 E4M3 KV cache)。`examples/sparse_attention_demo.rs` と上流の帰属表示 `NOTICE` を参照。
+
+**Sparse attention 環境変数フック (Phase MSA.5.6、2026-07-31)** — `llama3.rs` の `gqa_attention` (Qwen 3.5 / Llama 3 / Bonsai / Elyza / Gemma / 標準 GQA arch 全般) は環境変数 `ALICE_SPARSE_TOPK` を読み、設定時は `sparse_attention::llama3_bridge::llama3_sparse_attention` に dispatch する。`ALICE_SPARSE_TOPK=0` は全 block 選択 (FP の結合順を除き dense と等価)、大きい値は query ごとに top-K KV block だけを選ぶ。環境変数を設定した状態で lib テスト 558 本が全 pass。K3 は**対象外** (Kimi K3 は LoRA 圧縮 KV の MLA — Multi-head Latent Attention — を使うため MLA 対応の別 bridge が必要、`sparse_attention::llama3_bridge` の module doc 参照)。
 
 ## 機能一覧
 
@@ -119,7 +151,7 @@ cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
 - **x86_64 SIMD（AVX2 + AVX-512BW/F）** — Q4_K / Q5_K / Q6_K / Q8_0 / Ternary の内積カーネル、runtime CPU-feature dispatch（`is_x86_feature_detected!` を `OnceLock` で cache）、AVX-512 は Ternary bitmask path で `__mmask16` 使用
 - **スパースターナリ** — N:M構造化スパース性、2-bitパック、LUT+SDOT最適化、ブロックパックレイアウト
 - **GPU推論 (wgpu)** — Metal/Vulkan/DX12コンピュートシェーダー、Q4_K / **Q5_K** / Q6_K / **Q8_0** / **Q1_0** 脱量子化融合matvec、**融合 SwiGLU（Q4_K と Q1_0 の 2 variant）**、バッチ4投機的デコード、トークン単位メモリ確保ゼロ、サブグループSIMDリダクション、**DeltaNet SSM path（alpha / beta / conv1d / gated delta rule with Bonsai Gap-B refinement）を Qwen 3.5 / Qwen 3.6 / Bonsai 27B ハイブリッドで動作**
-- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) が DeltaNet 層を CPU、Attention 層を GPU に分割、hidden state を `write_f32` / `read_f32` 経由で per-token 交換。将来の attention-only load path と組合わせれば Jetson-class の unified-memory 環境で wgpu-hal Vulkan の 2× 重複コピーを回避可能
+- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) が DeltaNet 層を CPU、Attention 層を GPU に分割、hidden state を `write_f32` / `read_f32` 経由で per-token 交換。将来の attention-only load path と組合わせれば embedded-board-class の unified-memory 環境で wgpu-hal Vulkan の 2× 重複コピーを回避可能
 - **Ternary QAT** — STE、L1正則化、AdamW、レイヤー単位混合精度
 - **God-object-free config** — `Llama3Config`（38 → 16 fields）と `LayerWeights`（33 → 17 fields）を凝集性の高い sub-struct（`AttentionExtrasConfig`、`SsmDeltaNetConfig`、`MoeConfig`、`Gemma3nConfig`、`Gemma4Config`、`QwenAttentionBiases`、`QwenAttentionNorms`、`Gemma3nLayerAugmentations`、`MoeExpertWeights`）に分割、backward-compat な accessor method 経由でアクセス
 - **フラットキャッシュアラインド `Matrix<T>`** — 単一連続 `Vec<T>` の row-major レイアウトが `Vec<Vec<T>>` を置き換え、`matmul_flat` は FMA `mul_add` を `j` 連続 inner loop で使用しキャッシュラインを coalescing
@@ -142,10 +174,25 @@ src/
 └── training.rs  — Ternary QAT: STE、QatLinear、L1正則化、AdamW、MSE損失
 
 .cargo/
-└── config.toml  — rustflags: target-cpu=native（LLVM SDOT自動ベクトル化有効化）
+└── config.toml  — target-cpu=native は置かない (実行時に opt-in、NEON ベンチの節を参照)
 ```
 
 ---
+
+## デスクトップアプリ — ALICE-LLM Studio
+
+[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) は本エンジンを Tauri GUI で wrap したコンパニオンアプリ。組み込み `alice-llm-server` サイドカー、HuggingFace GGUF ブラウザ（ファイル単位のストリーミングダウンロード + ハードウェア適合度ヒント: 🟢 余裕 / 🟡 タイト / 🟠 ハイブリッド / 🔴 サイズ超過）、Ollama 風チャット UI (`max_tokens` / `temperature` 制御) を備える。ローカルモデルは `~/.alice-llm-studio/models/` 配下に保存。
+
+**最新リリース: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22、ALICE-LLM v1.2.1 を組み込み)。署名済みインストーラは未提供のため、初回起動時に Gatekeeper / SmartScreen の許可が必要になる場合がある。
+
+| プラットフォーム | ダウンロード |
+|---|---|
+| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
+| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
+| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
+| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+
+本 alpha ではチャットは非ストリーミング (組み込み済みサイドカーが OpenAI SSE サーフェスより前のビルドのため)、ハードウェア適合度ヒントは advisory (`alice-llm-server` 側が GUI からの `--hybrid` / `--hybrid-per-layer` をまだ受け付けないため実行系には反映されない)。両者とも upstream で追従予定。現時点のフル機能面は下記 CLI 例で網羅している。
 
 ## GPU推論 (wgpu / Metal)
 
@@ -161,9 +208,26 @@ cargo run --example generate_gpu --features gpu,gguf --release -- \
 # デュアルモデル投機的デコード（1Bドラフト + 8B検証）
 cargo run --example speculative_dual_gpu --features gpu,gguf --release -- \
   --prompt "What is the capital of Japan?" --max-tokens 64
+
+# Qwen 3.5-4B または Bonsai 27B のフル GPU forward
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Qwen3.5-4B-Q4_K_M.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40
+
+# Per-layer hybrid (CPU DeltaNet + GPU Attention) — Phase A2
+# ARM64 組込みボード で GPU 加速化 (attention_only_load 自動 ON)
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 \
+  --hybrid-per-layer --max-seq-len 512
+
+# CPU delegate hybrid (GPU 完全 skip、mmap zero-copy) — ARM64 組込みボード フレンドリー
+cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
+  --model models/Bonsai-27B-Q1_0.gguf \
+  --prompt "The capital of Japan is" --max-tokens 40 --hybrid
 ```
 
-### GPU最適化の軌跡 (Apple M3 Metal, Llama-3.2-1B Q4_K_M)
+### GPU最適化の軌跡 (arm64 laptop (Metal), Llama-3.2-1B Q4_K_M)
 
 ```
                         ┌─────────────────────────────────────────┐
@@ -214,7 +278,14 @@ K=4 (バッチ):   101 ms/4トークン (25.3 ms/トークン, 39.5 tok/s)
 
 両モデルは単一の `GpuEngine`（`Rc<GpuEngine>`）を共有 — 同一のwgpu Device/Queue、独立したKVキャッシュ。
 
-### Bonsai 27B Q1_0 を Jetson Orin Nano 8GB で動かす (Vulkan iGPU)
+### Bonsai 27B Q1_0 を ARM64 組込みボード (8 GB) で動かす (Vulkan iGPU)
+
+**End-to-end の状況 (Phase X.3.e.3.22-3.29、2026-07-17)**
+
+- **arm64 laptop Metal**: フル GPU forward で Bonsai 27B Q1_0 が 1.1 tok/s で end-to-end に動作し、coherent な英文 + LaTeX を生成。Q1_0 fused SwiGLU (`swiglu_fused_q1_0.wgsl`)、`upload_w_bonsai_split` での attn_q per-head interleaved layout の de-interleave、Qwen 3.5-4B の混合量子化 weight 向け Q5_K/Q8_0 dequant カーネルで修正
+- **ARM64 組込みボード、8 GB (Vulkan iGPU) — Qwen 3.5-4B**: **`--hybrid-per-layer` + `attention_only_load` で coherent 生成 0.3 tok/s** (Phase X.3.e.3.29)。CPU が DeltaNet 24 層、GPU が Attention 8 層を処理し、DeltaNet weight は GPU アップロードを skip するので全体が Vulkan の 2× 重複制約に収まる。`"I'm not sure what the user is asking about, and I'm not"` を 50 s / 15 token で生成
+- **ARM64 組込みボード、8 GB (Vulkan iGPU) — Bonsai 27B**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) で `"The capital of Japan is **Tokyo**."` を ~0.09 tok/s で生成。`--hybrid-per-layer` は 3.6 GB の CPU モデル + 3.8 GB の attention-only GPU × 2 重複 (7.6 GB) で余裕が残らず、まだメモリ制約を超える。現時点で ARM64 組込みボード上の Bonsai 27B には unified-memory zero-copy の llama.cpp Vulkan を推奨、または `wgpu-hal` Vulkan zero-copy の upstream 対応待ち
+- **arm64 laptop Metal での per-layer hybrid**: 1.2 tok/s で coherent。DeltaNet weight の skip で weight アップロードが 2338 ms → 1059 ms (Phase X.3.e.3.29)
 
 PrismML の Bonsai 27B は 3.6 GB の Q1_0 GGUF (post-training 1.125 bpw binary quantization、per-block 128 elements、18 bytes/block = 2 byte f16 scale `d` + 16 byte packed 1-bit weights、value = ±d) で出荷される。ALICE-LLM の Q1_0 wgpu path は最大レイヤーの matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) を CPU NEON 20 ms から GPU Vulkan sub-ms まで持っていく:
 
@@ -252,7 +323,7 @@ Row-batching の考え方: 1 workgroup で N 個の出力行を生成し、入�
 
 ## CPU最適化の軌跡 (70Bスパースターナリ)
 
-70Bモデルのスパースターナリ matvec を、スカラー実装から M1 Pro メモリ帯域の物理限界まで最適化した全記録。
+70Bモデルのスパースターナリ matvec を、スカラー実装から 200 GB/s arm64 SoC のメモリ帯域の物理限界まで最適化した全記録。
 
 ### 壁
 
@@ -406,9 +477,9 @@ let w3 = expand_packed_2bit_lut(blk_base.add(3 * bytes_per_block)); // 行3
 
 **27% → 45%。TLBミスの除去だけで帯域利用率が 1.67x。**
 
-### 天井: 45% = M1 Pro CPUの物理限界
+### 天井: 45% = CPUの物理限界 (200 GB/s arm64 SoC)
 
-M1 Pro の SoC 帯域 200 GB/s は GPU/NPU/Media Engine と共有。CPU が単独で使える帯域は約 90 GB/s（45%）。これは OS カーネルとメモリコントローラのアービトレーションによるハード制約であり、ソフトウェアでは突破できない。
+SoC 帯域 200 GB/s は GPU/NPU/Media Engine と共有。CPU が単独で使える帯域は約 90 GB/s（45%）。これは OS カーネルとメモリコントローラのアービトレーションによるハード制約であり、ソフトウェアでは突破できない。
 
 ### まとめ
 
@@ -425,12 +496,51 @@ M1 Pro の SoC 帯域 200 GB/s は GPU/NPU/Media Engine と共有。CPU が単�
 
 | 試み | 結果 | 根本原因 |
 |---|---|---|
-| ソフトウェアプリフェッチ (`prfm`) | **−10%** | M1 Pro HWプリフェッチャーが既に最適。`prfm` はL1キャッシュを汚染 |
+| ソフトウェアプリフェッチ (`prfm`) | **−10%** | この SoC の HW プリフェッチャーが既に最適。`prfm` はL1キャッシュを汚染 |
 | E-core除外（P-core 4スレッドのみ） | **−14%** | Apple UMA: E-coreは個別には遅くても帯域に貢献 |
-| チャンクサイズ 8→16行 | **−16%** | Rayonワークスティーリングの不均衡。8 = M1 Pro L1ジオメトリに最適 |
+| チャンクサイズ 8→16行 | **−16%** | Rayonワークスティーリングの不均衡。8 = この SoC の L1 ジオメトリに最適 |
 | 2倍ブロックアンローリング | **−3%** | acc0–acc3は既に独立。追加ループオーバーヘッドのみ |
 
-**失敗の教訓**: M1 Pro は HW プリフェッチャーが極めて優秀で、ソフトウェアの介入は cache pollution を引き起こす。Apple UMA では E-core を除外すると帯域の一部を捨てることになる。これらの実験が「27% の壁」の真因が TLB ミスであることの**消去法的証明**となった。
+**失敗の教訓**: この SoC は HW プリフェッチャーが極めて優秀で、ソフトウェアの介入は cache pollution を引き起こす。Apple UMA では E-core を除外すると帯域の一部を捨てることになる。これらの実験が「27% の壁」の真因が TLB ミスであることの**消去法的証明**となった。
+
+---
+
+## aarch64 NEON 量子化 matvec ベンチ (Issue #30)
+
+arm64 laptop と ARM64 組込みボード (8 GB) での量子化別 NEON matvec カーネル。128 × 4096 の f32 出力 matvec、200 回の中央値 (µs/matvec):
+
+| 量子化 | arm64 laptop scalar | arm64 laptop NEON | 高速化 | ARM64 組込みボード scalar | ARM64 組込みボード NEON | 高速化 |
+|:---|---:|---:|---:|---:|---:|---:|
+| Q4_K | (既に NEON) | **32.3** | — | (既に NEON) | **172.7** | — |
+| Q5_K | (scalar + SDOT 自動ベクトル化) | **42.9** | — | (scalar + SDOT 自動ベクトル化) | **282.7** | — |
+| Q6_K | 89.6 (旧 NEON) | **35.3** | 2.54× | 344.9 (旧 NEON) | **165.2** | 2.09× |
+| Q8_0 | 398.5 | **130.1** | 3.06× | 951.2 | **250.8** | 3.79× |
+| Ternary | 344.7 | **68.9** | 5.00× | 967.2 | **190.4** | 5.08× |
+
+**設計メモ** (全カーネルが scalar 参照実装と bit-exact または `rel_err < 1e-5`、`q*_neon_matches_scalar_*` unit test 参照):
+
+- **Q4_K / Q6_K**: `vmull_s8` の widening dot と `vpaddlq_s16` による reduction。Q6_K は 6-bit の ql + qh レイアウトも `((qh << 4) & 0x30)` / `((qh << 2) & 0x30)` / `(qh & 0x30)` / `((qh >> 2) & 0x30)` の shift-mask で 4 象限を並列に展開し、要素ごとの scalar packing を不要にした
+- **Q8_0**: i8 → i16 → i32 → f32 の widening 連鎖 (`vmovl` × 2、`vcvtq_f32_s32`) の後、行の f32 入力と `vfmaq_f32` で FMA。1.06 bytes/element でメモリ帯域律速
+- **Ternary**: `vdupq_n_u32(byte)` の broadcast → `[1,2,4,8]` / `[16,32,64,128]` との `vandq_u32` → `vceqq_u32` → reinterpret した f32 入力との `vandq_u32` による bitmask 展開。lane ごとの乗算なしの branchless select
+
+**観察**:
+
+- ARM64 組込みボードでは qh packing のオーバーヘッドが消えたため **Q6_K NEON (165.2 µs) が Q4_K NEON (172.7 µs) より速い**。2 つの K-quant カーネルは実質メモリ帯域の床にある
+- Q8_0 は両プラットフォームで Q4_K の約 4 倍: Q8_0 は 1 要素 1 byte、Q4_K は 0.56 bytes/element なので、出力あたりの読み出し量がほぼ 2 倍
+- arm64 laptop の ARM64 組込みボードに対する高速化 (2.4–6.6×) は LPDDR5X と LPDDR5 の帯域比 (~5.8×) と相関し、計算量の多い量子化ほどその上限に近づく
+
+ベンチ: `cargo run --release --example bench_simd_matvec --features gguf`
+
+`target-cpu=native` は意図的に `.cargo/config.toml` に置いていない CPU 世代の違う CI runner では rustc 自身が SIGILL で落ち、commit と無関係に CI の red / green が揺れるため native が要るのはマイクロベンチだけなので、実行時に opt-in する:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_simd_matvec --features gguf
+# 環境変数を触らない場合:
+cargo run --release --example bench_simd_matvec --features gguf \
+  --config 'build.rustflags=["-C","target-cpu=native"]'
+```
+
+なお `.cargo/config.local.toml` は cargo が読まない 置いても無言で無視される
 
 ---
 
@@ -554,103 +664,6 @@ BitNet b1.58 スタイルの学習時量子化:
   → 全体平均:      ~1.1 bit/param → 70B ≈ 9.6 GB
 ```
 
-## 性能
-
-### 1B モデル (Llama-3.2-1B-Instruct Q4_K_M, M1 Pro)
-
-| 構成 | デコード速度 |
-|---|---|
-| 全16層推論 | **20.2 tok/s** |
-| llama.cppとのlogit精度 | ±0.09 (top-1トークン一致) |
-
-### 8B モデル (ELYZA-JP Q4_K_M, M1 Pro)
-
-| フェーズ | 構成 | デコード速度 | プリフィル (16トークン) |
-|---|---|---|---|
-| Phase 1 | バグ修正（脱量子化→整数内積） | 1.2 tok/s | 14.2s |
-| Phase 2 | + Q8_K再利用、自動ベクトル化、Rayon | 5.1 tok/s | 4.1s |
-| Phase 3 | + Contiguous KVキャッシュ | **5.9 tok/s** | **3.3s** |
-
-### 70B スパースターナリ（シミュレーション、M1 Pro）
-
-```bash
-cargo run --release --example bench_70b_sparse --features "gguf,parallel"
-```
-
-`target-cpu=native` は意図的に `.cargo/config.toml` に置いていない CPU 世代の違う CI runner では rustc 自身が SIGILL で落ち、commit と無関係に CI の red / green が揺れるため native が要るのはマイクロベンチだけなので、実行時に opt-in する:
-
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_70b_sparse --features "gguf,parallel"
-# 環境変数を触らない場合:
-cargo run --release --example bench_70b_sparse --features "gguf,parallel" \
-  --config 'build.rustflags=["-C","target-cpu=native"]'
-```
-
-なお `.cargo/config.local.toml` は cargo が読まない 置いても無言で無視される
-
-| 射影 | サイズ | 時間/反復 |
-|---|---|---|
-| Q proj | 8192×8192 | 0.54 ms |
-| K proj | 1024×8192 | 0.10 ms |
-| V proj | 1024×8192 | 0.10 ms |
-| O proj | 8192×8192 | 0.53 ms |
-| Gate (FFN) | 28672×8192 | 1.70 ms |
-| Up (FFN) | 28672×8192 | 2.00 ms |
-| Down (FFN) | 8192×28672 | 2.17 ms |
-| **1レイヤー** | | **7.1 ms** |
-| **1トークン (80レイヤー)** | | **569 ms → 1.76 tok/s** |
-
-### デバイス別推定性能（帯域律速）
-
-| デバイス | メモリ帯域 | 推定 tok/s |
-|---|---|---|
-| Raspberry Pi 5 | 34 GB/s | 0.7 |
-| Mac Mini M4 | 120 GB/s | 2.3 |
-| M1 Pro (実測) | 91 GB/s | 1.8 |
-| Mac Mini M4 Pro | 273 GB/s | 5.3 |
-| Mac Studio M4 Ultra | 800 GB/s | 15.6 |
-
-### 量子化ブロック仕様
-
-| 型 | ブロックサイズ | バイト/ブロック | bpw | レイアウト |
-|---|---|---|---|---|
-| Q2_K | 256 | 84 | 2.625 | scales[16] + qs[64] + d(f16) + dmin(f16) |
-| Q3_K | 256 | 110 | 3.4375 | hmask[32] + qs[64] + scales[12] + d(f16) |
-| Q4_K | 256 | 144 | 4.5 | d(f16) + dmin(f16) + scales[12] + qs[128] |
-| Q5_K | 256 | 176 | 5.5 | d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] |
-| Q6_K | 256 | 210 | 6.5625 | ql[128] + qh[64] + scales[16] + d(f16) |
-| Q8_0 | 32 | 34 | 8.5 | d(f16) + qs[32] |
-
-混合量子化バリアント（`_S`, `_M`, `_L`）はレイヤーごとに異なる型を使用 — 例: アテンションにQ3_K、FFNにQ4_K/Q5_K、embeddingsにQ6_K、normにF32 — そのため実効bpwはベース型より高くなる。
-
-### 30B / 70B モデルサイズ推定
-
-| 量子化 | bpw (実効) | 30B | 70B |
-|---|---|---|---|
-| F16 | 16.0 | 60.0 GB | 140.0 GB |
-| Q8_0 | 8.5 | 31.9 GB | 74.4 GB |
-| Q6_K | 6.56 | 24.6 GB | 57.4 GB |
-| Q5_K_M | ~5.7 | ~21.4 GB | ~49.9 GB |
-| Q4_K_M | ~4.8 | ~18.0 GB | ~42.0 GB |
-| Q3_K_L | ~4.0 | ~15.0 GB | ~35.0 GB |
-| Q3_K_M | ~3.9 | ~14.6 GB | ~34.1 GB |
-| Q3_K_S | ~3.5 | ~13.1 GB | ~30.6 GB |
-| Q2_K | ~3.2 | ~12.0 GB | ~28.0 GB |
-
-### デバイスメモリ別推奨量子化
-
-| メモリ | 30B モデル | 70B モデル |
-|---|---|---|
-| **16 GB** (MBA M3) | Q2_K (12GB) ○ / Q3_K_S (13GB) △ | × |
-| **24 GB** (M3 Pro) | Q4_K_M (18GB) ○ | × |
-| **32 GB** (M3 Max) | Q6_K (25GB) ○ | Q2_K (28GB) △ |
-| **36 GB** (M3 Pro) | Q6_K (25GB) ○ | Q3_K_S (31GB) △ |
-| **48 GB** (M4 Max) | Q8_0 (32GB) ○ | Q3_K_M (34GB) ○ |
-| **64 GB** (M2 Ultra) | F16 (60GB) △ | Q4_K_M (42GB) ○ |
-| **128 GB** (M4 Ultra) | F16 (60GB) ○ | Q8_0 (74GB) ○ |
-
-○ = 快適（モデル + OS + KVキャッシュがRAMに収まる）、△ = スワップ圧力あり
-
 ## 推論サーバー（OpenAI互換API）
 
 ```bash
@@ -687,7 +700,7 @@ curl http://localhost:8090/v1/models
 --ternary-threshold <f>   ターナリスパース性閾値（デフォルト: 0.7）
 ```
 
-## Cargo Features
+## Cargo features
 
 | Feature | 説明 |
 |---|---|
@@ -702,6 +715,128 @@ curl http://localhost:8090/v1/models
 | `dspark-serde` | DSpark スナップショット用 serde シリアライズ |
 | `imatrix` | ALICE-Dynamic-v1 tier-decision CLI（`layer_assignments.json` 生成、Phase I.0 + I.3、Unsloth ベースライン heuristics） |
 | `server` | HTTP 推論サーバー（axum）、`gpu` + `gguf` + `grammar` を含む |
+
+## 性能
+
+<!-- 以下の 1B / 8B の行はローカルの GGUF モデルが必要で、手作業で計測した値
+     (200 GB/s arm64 SoC、2026-03)。CI では再現しない。70B スパースターナリの表は
+     合成データ (モデルファイル不要) で、表の下に書いた example で再生成でき、
+     perf-measured marker が付いている -->
+
+### 1B モデル (Llama-3.2-1B-Instruct Q4_K_M, 200 GB/s arm64 SoC)
+
+| 構成 | デコード速度 |
+|---|---|
+| 全16層推論 | **20.2 tok/s** |
+| llama.cppとのlogit精度 | ±0.09 (top-1トークン一致) |
+
+### 8B モデル (ELYZA-JP Q4_K_M, 200 GB/s arm64 SoC)
+
+| フェーズ | 構成 | デコード速度 | プリフィル (16トークン) |
+|---|---|---|---|
+| Phase 1 | バグ修正（脱量子化→整数内積） | 1.2 tok/s | 14.2s |
+| Phase 2 | + Q8_K再利用、自動ベクトル化、Rayon | 5.1 tok/s | 4.1s |
+| Phase 3 | + Contiguous KVキャッシュ | **5.9 tok/s** | **3.3s** |
+
+### 70B スパースターナリ（シミュレーション、arm64 laptop）
+
+```bash
+cargo run --release --example bench_70b_sparse --features "gguf,parallel"
+```
+
+<!-- perf-measured: 2026-09-16 examples/bench_70b_sparse.rs (arm64 laptop, release; a second run on the same
+     machine under load gave 2.78 tok/s, so treat the last digit as noise) -->
+
+| 射影 | サイズ | 時間/反復 |
+|---|---|---|
+| Q proj | 8192×8192 | 0.39 ms |
+| K proj | 1024×8192 | 0.06 ms |
+| V proj | 1024×8192 | 0.07 ms |
+| O proj | 8192×8192 | 0.31 ms |
+| Gate (FFN) | 28672×8192 | 1.02 ms |
+| Up (FFN) | 28672×8192 | 1.04 ms |
+| Down (FFN) | 8192×28672 | 1.04 ms |
+| **1レイヤー** | | **3.9 ms** |
+| **1トークン (80レイヤー)** | | **314 ms → 3.18 tok/s** |
+
+(200 GB/s arm64 SoC、2026-03: 7.1 ms / レイヤー、569 ms / トークン → 1.76 tok/s)
+
+### デバイス別推定性能（帯域律速）
+
+| デバイス | メモリ帯域 | 推定 tok/s |
+|---|---|---|
+| arm64 SBC | 34 GB/s | 0.7 |
+| arm64 desktop (LPDDR5) | 120 GB/s | 2.3 |
+| 200 GB/s arm64 SoC (実測) | 91 GB/s | 1.8 |
+| arm64 desktop (LPDDR5X) | 273 GB/s | 5.3 |
+| arm64 workstation (高帯域) | 800 GB/s | 15.6 |
+
+### 量子化ブロック仕様
+
+| 型 | ブロックサイズ | バイト/ブロック | bpw | レイアウト |
+|---|---|---|---|---|
+| Q2_K | 256 | 84 | 2.625 | scales[16] + qs[64] + d(f16) + dmin(f16) |
+| Q3_K | 256 | 110 | 3.4375 | hmask[32] + qs[64] + scales[12] + d(f16) |
+| Q4_K | 256 | 144 | 4.5 | d(f16) + dmin(f16) + scales[12] + qs[128] |
+| Q5_K | 256 | 176 | 5.5 | d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] |
+| Q6_K | 256 | 210 | 6.5625 | ql[128] + qh[64] + scales[16] + d(f16) |
+| Q8_0 | 32 | 34 | 8.5 | d(f16) + qs[32] |
+
+混合量子化バリアント（`_S`, `_M`, `_L`）はレイヤーごとに異なる型を使用 — 例: アテンションにQ3_K、FFNにQ4_K/Q5_K、embeddingsにQ6_K、normにF32 — そのため実効bpwはベース型より高くなる。
+
+### 30B / 70B モデルサイズ推定
+
+| 量子化 | bpw (実効) | 30B | 70B |
+|---|---|---|---|
+| F16 | 16.0 | 60.0 GB | 140.0 GB |
+| Q8_0 | 8.5 | 31.9 GB | 74.4 GB |
+| Q6_K | 6.56 | 24.6 GB | 57.4 GB |
+| Q5_K_M | ~5.7 | ~21.4 GB | ~49.9 GB |
+| Q4_K_M | ~4.8 | ~18.0 GB | ~42.0 GB |
+| Q3_K_L | ~4.0 | ~15.0 GB | ~35.0 GB |
+| Q3_K_M | ~3.9 | ~14.6 GB | ~34.1 GB |
+| Q3_K_S | ~3.5 | ~13.1 GB | ~30.6 GB |
+| Q2_K | ~3.2 | ~12.0 GB | ~28.0 GB |
+
+### デバイスメモリ別推奨量子化
+
+| メモリ | 30B モデル | 70B モデル |
+|---|---|---|
+| **16 GB** (MBA M3) | Q2_K (12GB) ○ / Q3_K_S (13GB) △ | × |
+| **24 GB** | Q4_K_M (18GB) ○ | × |
+| **32 GB** (arm64 laptop) | Q6_K (25GB) ○ | Q2_K (28GB) △ |
+| **36 GB** | Q6_K (25GB) ○ | Q3_K_S (31GB) △ |
+| **48 GB** | Q8_0 (32GB) ○ | Q3_K_M (34GB) ○ |
+| **64 GB** | F16 (60GB) △ | Q4_K_M (42GB) ○ |
+| **128 GB** | F16 (60GB) ○ | Q8_0 (74GB) ○ |
+
+○ = 快適（モデル + OS + KVキャッシュがRAMに収まる）、△ = スワップ圧力あり
+
+## Minimum supported Rust version
+
+`Cargo.toml` は `rust-version` を宣言していない。toolchain は `rust-toolchain.toml` で固定しており (現在 1.98.1)、CI と `scripts/preflight.sh` はこの版でビルドする。それより古い toolchain は検証していない。
+
+## ビルドとテスト
+
+```bash
+cargo build --release --features "gguf,parallel"
+cargo test --lib                                # unit test、default feature
+cargo test --lib --features simd
+cargo test --test analytic_oracle               # 解析解 oracle test
+python3 scripts/docs_lint.py --check            # 公開文書の語彙、CHANGELOG の構造
+```
+
+`scripts/preflight.sh` は CI の検査をローカルで再現する。`--quick` は format、actionlint、docs lint、clippy (x86_64 target を含む)、rustdoc、release / example ビルド、cargo-deny、cargo-machete、stub guard を実行し、test と audit は省く。GPU の test は wgpu adapter が要るので、CI は pipeline の生成 (`smoke_test_gpu_pipeline_creation`) だけを確認する。
+
+## 関連 crate
+
+| Crate | 役割 |
+|-------|------|
+| [ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) | `alice-llm-server` を組み込んだデスクトップアプリ (Tauri) |
+| [ALICE-LOL](https://github.com/ext-sakamoro/ALICE-LOL) | 文法制約付き LOL bridge が出力する SDF 記述言語 |
+| [ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System) | ALICE crate 群の索引 |
+
+リリース履歴は [`CHANGELOG.md`](CHANGELOG.md)、設計メモと検証記録は [`docs/`](docs/) にある。
 
 ## ライセンス
 

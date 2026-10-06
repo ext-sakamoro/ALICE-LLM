@@ -4,8 +4,7 @@
 //! となり得るため、GgufFile::parse は panic-free / OOM-free / bounded-memory であること
 //! が必須
 //!
-//! canonical CI template [[reference_alice_ci_canonical_template]] 罠 catalog #6 準拠
-//! (length prefix 上限なしで capacity overflow panic → DoS 脆弱性)
+//! 狙い: length prefix 上限なしで capacity overflow panic → DoS 脆弱性 の検出
 //!
 //! 起こり得る危険:
 //! - malformed header で `Vec::with_capacity(huge)` → capacity overflow panic

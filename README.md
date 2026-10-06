@@ -1,11 +1,15 @@
 # ALICE-LLM
 
+A pure-Rust inference engine for quantised GGUF language models. It runs them on
+the CPU (NEON, AVX2, AVX-512) and on the GPU through wgpu (Metal, Vulkan, DX12)
+without an external ML framework.
+
+**English** | [日本語](README_JP.md)
+
 [![crates.io](https://img.shields.io/crates/v/alice-llm.svg)](https://crates.io/crates/alice-llm)
 [![docs.rs](https://img.shields.io/docsrs/alice-llm)](https://docs.rs/alice-llm)
 [![License: AGPL-3.0-or-later](https://img.shields.io/crates/l/alice-llm.svg)](#license)
 [![CI](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml)
-
-**English** | [日本語](README_JP.md)
 
 > Part of **[ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System)** — 260+ crate Edge-to-Cloud data pipeline (SDF / Physics / LLM / Motion / Font / TTS)
 
@@ -13,46 +17,80 @@ Pure Rust LLM inference engine focused on understanding and optimizing every lay
 
 GGUF quantized models, zero external ML dependencies, 568 lib tests (default; 594 with `dspark`).
 
-**GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
+It is a research and engineering codebase, not a drop-in replacement for
+llama.cpp: some paths are explicit fail-fast stubs (the Kimi K3 forward, the
+fused MXFP4 kernels), and the Qwen 3.5 forward path still differs from
+llama.cpp in perplexity (see [Highlights](#highlights)).
 
-**Bonsai 27B Q1_0 (1.125 bpw binary, 3.6 GB GGUF) on Apple M3 Metal: coherent generation at 1.1 tok/s (Phase X.3.e.3.27 Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix).**
+## Contents
 
-**Qwen 3.5-4B hybrid (DeltaNet + Full Attention) on Apple M3 Metal: coherent generation at 2.9 tok/s (Q4_K_M mixed quant with Q5_K/Q8_0 shader coverage).**
+- [Installation](#installation)
+- [Example](#example)
+- [Highlights](#highlights)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Desktop App — ALICE-LLM Studio](#desktop-app--alice-llm-studio)
+- [GPU Inference (wgpu / Metal)](#gpu-inference-wgpu--metal)
+- [The CPU Optimization Journey (70B Sparse Ternary)](#the-cpu-optimization-journey-70b-sparse-ternary)
+- [aarch64 NEON Quantized Matvec Bench (Issue #30)](#aarch64-neon-quantized-matvec-bench-issue-30)
+- [Speculative Decoding](#speculative-decoding)
+- [Computation Path (Q4_K)](#computation-path-q4_k)
+- [Multi-Architecture Support](#multi-architecture-support)
+- [Sparse Ternary Quantization](#sparse-ternary-quantization)
+- [Ternary QAT (Quantization-Aware Training)](#ternary-qat-quantization-aware-training)
+- [Inference Server (OpenAI-compatible API)](#inference-server-openai-compatible-api)
+- [CLI Options](#cli-options)
+- [Cargo features](#cargo-features)
+- [Performance](#performance)
+- [Minimum supported Rust version](#minimum-supported-rust-version)
+- [Building and testing](#building-and-testing)
+- [Related crates](#related-crates)
+- [License](#license)
 
-**Phase X.3.e.3.37 (2026-07-21): o_proj cols dimension fix for Qwen 3.5+ hybrid architectures where q_dim = num_heads × head_dim ≠ hidden_dim. Previous hardcoded hidden_dim in `upload_w` produced near-orthogonal o_proj output (cos 0.118) for Qwen 3.5-4B. One-line fix restored cross-arch coherence: L3 pos 17 hidden cos 0.7057 → 0.9970 across all positions.**
-
-**CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on M1 Pro.**
-
-**x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary all get AVX2 and AVX-512BW/F kernels with runtime dispatch, matching the existing NEON parity on Apple Silicon.**
-
-**Per-layer hybrid (`--hybrid-per-layer`): CPU processes DeltaNet layers + GPU processes Attention layers with per-token hidden-state shuttle. Intermediate speed between pure GPU and pure CPU while bypassing full-model GPU allocation.**
-
-**Jetson Orin Nano 8GB (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.4 tok/s answering "The capital of Japan is Tokyo. It is the country's capital, largest city," — Phase X.3.e.3.37 o_proj weight upload cols dim fix restored the qwen35 hybrid arch (previously loaded o_proj as [hidden_dim, hidden_dim] instead of [hidden_dim, q_dim], truncating 37.5% of Q4_K weight bytes for models where q_dim ≠ hidden_dim). `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
-
-**Ornith-1.0-9B (DeepReinforce, MIT, Qwen 3.5 fine-tune for agentic coding): verified load-and-run across Apple M3 CPU (1.8 tok/s), Apple M3 Metal iGPU (2.1 tok/s), and Jetson Orin Nano 8GB CPU (2.3 tok/s) with zero config — arch auto-detected from `general.architecture = qwen35`, all Phase X.3.e.3.14-29 CPU/GPU fixes cascade cleanly to the fine-tune.**
-
-**Jetson multi-model support (2026-07-21 verified on Yahboom Orin Nano 8GB)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
-
-**crates.io: `alice-llm` published (Cargo.toml v1.6.0)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps. Auto-publish enabled (2026-09-13): tag push `v*.*.*` triggers `.github/workflows/release.yml` `publish-crates-io` job for GitHub Release + crates.io sync.
-
-**Phase X.8 LOL Bridge (2026-07-23, B-plan 10/10)** — natural-language → SDF: the model emits `Sphere { radius: 1.5 }` etc. under a GBNF-subset grammar for the [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL, then compiles to an `SdfNode`. Verified end-to-end on Mac (M3 Metal) and Jetson Orin Nano 8GB. See `examples/lol_gen.rs`. **B-10 (2026-09-14): token-trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) replaces the per-token FSM probe — grammar masking dropped from ~8 s to ~1 ms per step outside comment states on MiniCPM5-2B (vocab 130k), leaving generation forward-bound (~25 tok/s CPU).**
-
-**Perplexity example (`examples/perplexity.rs`, 2026-07-24)** — WikiText-2 test PPL via CPU forward + sliding-window log-probability, 500 tokens: **Qwen 3.5-4B Q4_K_M = 16.38**, **Bonsai 27B Q1_0 = 18.12**. Caveat: llama.cpp reports PPL 6.09 ± 1.05 on the same Qwen 3.5-4B Q4_K_M with 1 chunk / 512 context — a **2.68× divergence** with ALICE-LLM's forward path. BOS is not the cause (Qwen 3.5 GGUF has no `bos_token_id`, both implementations omit BOS). Root-cause tracked as **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV-layout instrumentation). Treat these numbers as ALICE-LLM's own baseline until llama.cpp parity is reached.
-
-**Diagnostic tooling (Phase X.3.e.3.30+)** — new examples for depth-routing analysis: `examples/entropy_mod_qwen35.rs` (entropy-driven Mixture-of-Depths observation), `examples/early_exit_qwen35.rs` (early-exit ablation), `examples/entropy_ppl_correlation_qwen35.rs` (correlation validation between per-layer entropy and end-position PPL).
-
-**Sparse attention (KV-outer, `src/sparse_attention/`, 2026-07-31)** — pure-Rust port of the MiniMax Sparse Attention (`MiniMax-AI/MSA`, MIT) + M3 KV-outer sparse (`fw-ai/minimax-kernels`, Apache-2.0) algorithms: CSR inverse-index builder, top-K KV-block selector, dense proxy pass, load-balance scheduler, KV-outer forward with GQA row-packing + online-softmax, and standard FlashAttention LSE combine. One-shot API `kvouter_attention(...)`. Verified against a naïve dense reference (no-causal / GQA / causal) with relative error < 1e-4 when every block is selected. Feature flags: `parallel` (rayon), `simd` (`wide` f32x8), `gpu` (wgpu compute shader with Metal-verified CPU-parity), `quant` (FP8 E4M3 KV cache). See `examples/sparse_attention_demo.rs` and `NOTICE` for upstream attribution.
-
-**Sparse attention env hook (Phase MSA.5.6, 2026-07-31)** — `gqa_attention` in `llama3.rs` (Qwen 3.5 / Llama 3 / Bonsai / Elyza / Gemma / every standard GQA arch) reads the `ALICE_SPARSE_TOPK` environment variable and, when set, dispatches to `sparse_attention::llama3_bridge::llama3_sparse_attention`. `ALICE_SPARSE_TOPK=0` selects every block (dense-equivalent modulo FP re-association); larger values select only the top-K KV blocks per query. Full 558-test lib suite passes with the env set. Does **not** cover K3 (Kimi K3 uses MLA — Multi-head Latent Attention — with LoRA-compressed KV, which needs a separate MLA-aware bridge; see `sparse_attention::llama3_bridge` module doc).
-
-## Quick Start
+## Installation
 
 ```bash
-# Download model
+cargo add alice-llm
+```
+
+Most of the engine sits behind Cargo features (see [Cargo features](#cargo-features)).
+A CPU build that loads GGUF files and uses all cores:
+
+```toml
+[dependencies]
+alice-llm = { version = "1.6", features = ["gguf", "parallel"] }
+```
+
+Models are GGUF files, for example:
+
+```bash
 huggingface-cli download elyza/Llama-3-ELYZA-JP-8B-GGUF \
   Llama-3-ELYZA-JP-8B-q4_k_m.gguf --local-dir models/
+```
 
-# Run inference
+## Example
+
+Load a GGUF model and generate text (`features = ["gguf"]`):
+
+```rust
+use alice_llm::gguf::{GgufFile, GgufTokenizer};
+use alice_llm::llama3::Llama3Model;
+
+fn main() {
+    let data = std::fs::read("models/Llama-3-ELYZA-JP-8B-q4_k_m.gguf").expect("read the GGUF file");
+    let gguf = GgufFile::parse(&data).expect("parse GGUF");
+    let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("load the tokenizer");
+    let mut model = Llama3Model::from_gguf(&gguf).expect("load the model");
+
+    // greedy decoding (temperature 0), top-k 40, at most 64 new tokens
+    let result = model.generate(&tokenizer, "日本の首都は", 64, 0.0, 40);
+    println!("{} ({:.1} tok/s)", result.text, result.tokens_per_sec);
+}
+```
+
+The same from the command line, with the bundled example:
+
+```bash
 cargo run --release --example elyza_gguf --features "gguf,parallel" -- \
   --model models/Llama-3-ELYZA-JP-8B-q4_k_m.gguf \
   --prompt "日本の首都は" \
@@ -66,28 +104,41 @@ Tokens: 8 generated, 16 prompt
 Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 ```
 
-### As a library dependency
-
-```bash
-cargo add alice-llm  # Cargo.toml v1.6.0
-```
-
 See `src/lib.rs` for the public API (GGUF parser, tokenizer, model loading, KV cache, sampling) and the `examples/` directory for concrete usage patterns.
 
-## Desktop App — ALICE-LLM Studio
+## Highlights
 
-[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) is a companion desktop app that wraps this engine in a Tauri GUI: an embedded `alice-llm-server` sidecar, a HuggingFace GGUF browser with per-file streaming download and hardware-fit hints (🟢 comfortable / 🟡 tight / 🟠 hybrid / 🔴 oversized), and an Ollama-style chat pane with `max_tokens` / `temperature` controls. Local models live under `~/.alice-llm-studio/models/`.
+**GPU (wgpu/Metal): 125ms → 71ms/token (1B), batch-4 speculative: 1B draft + 8B verify = 5.89× speedup, 90% accept rate.**
 
-**Latest release: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22, embeds ALICE-LLM v1.2.1). Signed installers are not shipped yet, so the first launch may need a Gatekeeper / SmartScreen bypass.
+**Bonsai 27B Q1_0 (1.125 bpw binary, 3.6 GB GGUF) on an arm64 laptop (Metal): coherent generation at 1.1 tok/s (Phase X.3.e.3.27 Q1_0 fused SwiGLU + attn_q per-head interleaved layout fix).**
 
-| Platform | Download |
-|---|---|
-| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
-| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
-| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
-| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+**Qwen 3.5-4B hybrid (DeltaNet + Full Attention) on an arm64 laptop (Metal): coherent generation at 2.9 tok/s (Q4_K_M mixed quant with Q5_K/Q8_0 shader coverage).**
 
-Chat is non-streaming in this alpha because the embedded sidecar predates the OpenAI SSE surface — the hardware-fit hints are advisory since the shipped `alice-llm-server` doesn't yet accept `--hybrid` / `--hybrid-per-layer` from the GUI. Both gaps are tracked upstream; the CLI examples below expose the full feature surface today.
+**Phase X.3.e.3.37 (2026-07-21): o_proj cols dimension fix for Qwen 3.5+ hybrid architectures where q_dim = num_heads × head_dim ≠ hidden_dim. Previous hardcoded hidden_dim in `upload_w` produced near-orthogonal o_proj output (cos 0.118) for Qwen 3.5-4B. One-line fix restored cross-arch coherence: L3 pos 17 hidden cos 0.7057 → 0.9970 across all positions.**
+
+**CPU: 0.16 → 1.76 tok/s (11x) on 70B sparse ternary — hitting 45% memory bandwidth on a 200 GB/s arm64 SoC.**
+
+**x86_64 SIMD (2026-07): Q4_K / Q5_K / Q6_K / Q8_0 / Ternary all get AVX2 and AVX-512BW/F kernels with runtime dispatch, matching the existing NEON parity on Apple Silicon.**
+
+**Per-layer hybrid (`--hybrid-per-layer`): CPU processes DeltaNet layers + GPU processes Attention layers with per-token hidden-state shuttle. Intermediate speed between pure GPU and pure CPU while bypassing full-model GPU allocation.**
+
+**ARM64 embedded board (8 GB) (Vulkan iGPU): Qwen 3.5-4B hybrid at 0.4 tok/s answering "The capital of Japan is Tokyo. It is the country's capital, largest city," — Phase X.3.e.3.37 o_proj weight upload cols dim fix restored the qwen35 hybrid arch (previously loaded o_proj as [hidden_dim, hidden_dim] instead of [hidden_dim, q_dim], truncating 37.5% of Q4_K weight bytes for models where q_dim ≠ hidden_dim). `attention_only_load` skips DeltaNet weight upload so the whole hybrid fits under the Vulkan 2×-duplication budget (Phase X.3.e.3.29).**
+
+**Ornith-1.0-9B (DeepReinforce, MIT, Qwen 3.5 fine-tune for agentic coding): verified load-and-run across an arm64 laptop CPU (1.8 tok/s), arm64 laptop Metal iGPU (2.1 tok/s), and ARM64 embedded board (8 GB) CPU (2.3 tok/s) with zero config — arch auto-detected from `general.architecture = qwen35`, all Phase X.3.e.3.14-29 CPU/GPU fixes cascade cleanly to the fine-tune.**
+
+**ARM64 embedded board multi-model support (2026-07-21 verified on an ARM64 embedded board (8 GB))**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s, Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s, DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B–27B model class runs on 8GB unified memory via CPU delegate path when full GPU allocation exceeds the wgpu-hal Vulkan 2×-duplication budget.**
+
+**crates.io: `alice-llm` published (Cargo.toml v1.6.0)** — install as a library with `cargo add alice-llm` to embed the engine in downstream Rust binaries or apps. Auto-publish enabled (2026-09-13): tag push `v*.*.*` triggers `.github/workflows/release.yml` `publish-crates-io` job for GitHub Release + crates.io sync.
+
+**Phase X.8 LOL Bridge (2026-07-23, B-plan 10/10)** — natural-language → SDF: the model emits `Sphere { radius: 1.5 }` etc. under a GBNF-subset grammar for the [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL, then compiles to an `SdfNode`. Verified end-to-end on Mac (arm64 laptop Metal) and ARM64 embedded board (8 GB). See `examples/lol_gen.rs`. **B-10 (2026-09-14): token-trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) replaces the per-token FSM probe — grammar masking dropped from ~8 s to ~1 ms per step outside comment states on MiniCPM5-2B (vocab 130k), leaving generation forward-bound (~25 tok/s CPU).**
+
+**Perplexity example (`examples/perplexity.rs`, 2026-07-24)** — WikiText-2 test PPL via CPU forward + sliding-window log-probability, 500 tokens: **Qwen 3.5-4B Q4_K_M = 16.38**, **Bonsai 27B Q1_0 = 18.12**. Caveat: llama.cpp reports PPL 6.09 ± 1.05 on the same Qwen 3.5-4B Q4_K_M with 1 chunk / 512 context — a **2.68× divergence** with ALICE-LLM's forward path. BOS is not the cause (Qwen 3.5 GGUF has no `bos_token_id`, both implementations omit BOS). Root-cause tracked as **Phase X.3.e.3.36+** (Q4_K dequant / attention softmax / KV-layout instrumentation). Treat these numbers as ALICE-LLM's own baseline until llama.cpp parity is reached.
+
+**Diagnostic tooling (Phase X.3.e.3.30+)** — new examples for depth-routing analysis: `examples/entropy_mod_qwen35.rs` (entropy-driven Mixture-of-Depths observation), `examples/early_exit_qwen35.rs` (early-exit ablation), `examples/entropy_ppl_correlation_qwen35.rs` (correlation validation between per-layer entropy and end-position PPL).
+
+**Sparse attention (KV-outer, `src/sparse_attention/`, 2026-07-31)** — pure-Rust port of the MiniMax Sparse Attention (`MiniMax-AI/MSA`, MIT) + M3 KV-outer sparse (`fw-ai/minimax-kernels`, Apache-2.0) algorithms: CSR inverse-index builder, top-K KV-block selector, dense proxy pass, load-balance scheduler, KV-outer forward with GQA row-packing + online-softmax, and standard FlashAttention LSE combine. One-shot API `kvouter_attention(...)`. Verified against a naïve dense reference (no-causal / GQA / causal) with relative error < 1e-4 when every block is selected. Feature flags: `parallel` (rayon), `simd` (`wide` f32x8), `gpu` (wgpu compute shader with Metal-verified CPU-parity), `quant` (FP8 E4M3 KV cache). See `examples/sparse_attention_demo.rs` and `NOTICE` for upstream attribution.
+
+**Sparse attention env hook (Phase MSA.5.6, 2026-07-31)** — `gqa_attention` in `llama3.rs` (Qwen 3.5 / Llama 3 / Bonsai / Elyza / Gemma / every standard GQA arch) reads the `ALICE_SPARSE_TOPK` environment variable and, when set, dispatches to `sparse_attention::llama3_bridge::llama3_sparse_attention`. `ALICE_SPARSE_TOPK=0` selects every block (dense-equivalent modulo FP re-association); larger values select only the top-K KV blocks per query. Full 558-test lib suite passes with the env set. Does **not** cover K3 (Kimi K3 uses MLA — Multi-head Latent Attention — with LoRA-compressed KV, which needs a separate MLA-aware bridge; see `sparse_attention::llama3_bridge` module doc).
 
 ## Features
 
@@ -106,7 +157,7 @@ Chat is non-streaming in this alpha because the embedded sidecar predates the Op
 - **x86_64 SIMD (AVX2 + AVX-512BW/F)** — Q4_K / Q5_K / Q6_K / Q8_0 / Ternary dot products with runtime CPU-feature dispatch (`is_x86_feature_detected!` cached in `OnceLock`); AVX-512 uses `__mmask16` for the Ternary bitmask path
 - **Sparse ternary** — N:M structured sparsity, packed 2-bit, LUT+SDOT optimized, block-packed layout
 - **GPU inference (wgpu)** — Metal/Vulkan/DX12 compute shaders, Q4_K / **Q5_K** / Q6_K / **Q8_0** / **Q1_0** dequant-fused matvec, **fused SwiGLU (Q4_K and Q1_0 variants)**, batch-4 speculative decoding, zero per-token allocation, subgroup SIMD reduction, **DeltaNet SSM path (alpha / beta / conv1d / gated delta rule with Bonsai Gap-B refinement) for Qwen 3.5 / Qwen 3.6 / Bonsai 27B hybrid**
-- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) split DeltaNet layers on CPU and Attention layers on GPU, exchanging hidden state per token via `write_f32` / `read_f32`. Bypasses the wgpu-hal Vulkan weight-duplication penalty on Jetson-class unified-memory targets when combined with a future attention-only load path.
+- **Per-layer hybrid execution** — `--hybrid-per-layer` orchestrator + `Llama3Model::forward_with_layer_hook` (CPU) + `GpuModel::run_attention_layer_only` (GPU) split DeltaNet layers on CPU and Attention layers on GPU, exchanging hidden state per token via `write_f32` / `read_f32`. Bypasses the wgpu-hal Vulkan weight-duplication penalty on embedded-board-class unified-memory targets when combined with a future attention-only load path.
 - **Ternary QAT** — STE, L1 regularization, AdamW, layerwise mixed precision
 - **God-object–free config** — `Llama3Config` (38 → 16 fields) and `LayerWeights` (33 → 17 fields) split into cohesive sub-structs (`AttentionExtrasConfig`, `SsmDeltaNetConfig`, `MoeConfig`, `Gemma3nConfig`, `Gemma4Config`, `QwenAttentionBiases`, `QwenAttentionNorms`, `Gemma3nLayerAugmentations`, `MoeExpertWeights`) with backward-compat accessor methods
 - **Flat cache-aligned `Matrix<T>`** — single contiguous `Vec<T>` row-major layout replaces `Vec<Vec<T>>`, `matmul_flat` uses FMA `mul_add` on a `j`-contiguous inner loop for cache-line coalescing
@@ -129,10 +180,25 @@ src/
 └── training.rs  — Ternary QAT: STE, QatLinear, L1 regularization, AdamW, MSE loss
 
 .cargo/
-└── config.toml  — rustflags: target-cpu=native (enables LLVM SDOT auto-vectorization)
+└── config.toml  — no target-cpu=native (opt in per invocation, see the NEON bench section)
 ```
 
 ---
+
+## Desktop App — ALICE-LLM Studio
+
+[ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) is a companion desktop app that wraps this engine in a Tauri GUI: an embedded `alice-llm-server` sidecar, a HuggingFace GGUF browser with per-file streaming download and hardware-fit hints (🟢 comfortable / 🟡 tight / 🟠 hybrid / 🔴 oversized), and an Ollama-style chat pane with `max_tokens` / `temperature` controls. Local models live under `~/.alice-llm-studio/models/`.
+
+**Latest release: [v0.1.0-alpha](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/tag/v0.1.0-alpha)** (2026-07-22, embeds ALICE-LLM v1.2.1). Signed installers are not shipped yet, so the first launch may need a Gatekeeper / SmartScreen bypass.
+
+| Platform | Download |
+|---|---|
+| macOS (Apple Silicon) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-aarch64-apple-darwin.dmg) |
+| macOS (Intel) | [`.dmg`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-apple-darwin.dmg) |
+| Linux x86_64 | [`.AppImage`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-unknown-linux-gnu.AppImage) |
+| Windows x86_64 | [`.msi`](https://github.com/ext-sakamoro/ALICE-LLM-Studio/releases/download/v0.1.0-alpha/alice-llm-studio-v0.1.0-alpha-x86_64-pc-windows-msvc.msi) |
+
+Chat is non-streaming in this alpha because the embedded sidecar predates the OpenAI SSE surface — the hardware-fit hints are advisory since the shipped `alice-llm-server` doesn't yet accept `--hybrid` / `--hybrid-per-layer` from the GUI. Both gaps are tracked upstream; the CLI examples below expose the full feature surface today.
 
 ## GPU Inference (wgpu / Metal)
 
@@ -160,13 +226,13 @@ cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
   --prompt "The capital of Japan is" --max-tokens 40 \
   --hybrid-per-layer --max-seq-len 512
 
-# CPU delegate hybrid (skips GPU entirely, mmap zero-copy) — Jetson-friendly
+# CPU delegate hybrid (skips GPU entirely, mmap zero-copy) — embedded-board-friendly
 cargo run --example qwen_gpu --features "gpu,gguf" --release -- \
   --model models/Bonsai-27B-Q1_0.gguf \
   --prompt "The capital of Japan is" --max-tokens 40 --hybrid
 ```
 
-### The GPU Optimization Journey (Apple M3 Metal, Llama-3.2-1B Q4_K_M)
+### The GPU Optimization Journey (arm64 laptop (Metal), Llama-3.2-1B Q4_K_M)
 
 ```
                         ┌─────────────────────────────────────────┐
@@ -217,14 +283,16 @@ Accept rate:           90% (19/21)
 
 Both models share a single `GpuEngine` (`Rc<GpuEngine>`) — same wgpu Device/Queue, independent KV caches.
 
-### Bonsai 27B Q1_0 on Jetson Orin Nano 8GB (Vulkan iGPU)
+### Bonsai 27B Q1_0 on an ARM64 embedded board (8 GB) (Vulkan iGPU)
 
 **End-to-end status (Phase X.3.e.3.22-3.29, 2026-07-17)**
 
-- **Mac M3 Metal**: full GPU forward runs Bonsai 27B Q1_0 end-to-end at 1.1 tok/s, generating coherent English + LaTeX. Fixed by shipping Q1_0 fused SwiGLU (`swiglu_fused_q1_0.wgsl`), the attn_q per-head interleaved layout de-interleave in `upload_w_bonsai_split`, and Q5_K/Q8_0 dequant kernels for Qwen 3.5-4B's mixed-quant weights.
-- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan) — Qwen 3.5-4B**: **coherent generation at 0.3 tok/s via `--hybrid-per-layer` + `attention_only_load`** (Phase X.3.e.3.29). CPU processes 24 DeltaNet layers, GPU processes 8 Attention layers, DeltaNet weights are skipped from the GPU upload so the total footprint fits under Vulkan's 2×-duplication budget. `"I'm not sure what the user is asking about, and I'm not"` in 50 s / 15 tokens.
-- **Jetson Orin Nano 8GB (Tegra iGPU, Vulkan) — Bonsai 27B**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) generates `"The capital of Japan is **Tokyo**."` at ~0.09 tok/s. `--hybrid-per-layer` still exceeds the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication (7.6 GB) leaves nothing for headroom; llama.cpp Vulkan with unified-memory zero-copy is the recommended path for Bonsai 27B on Jetson today, or wait for `wgpu-hal` Vulkan zero-copy upstream.
-- **Per-layer hybrid on Mac M3 Metal**: coherent at 1.2 tok/s. Weight upload cut from 2338 ms to 1059 ms once DeltaNet weights are skipped (Phase X.3.e.3.29).
+- **arm64 laptop Metal**: full GPU forward runs Bonsai 27B Q1_0 end-to-end at 1.1 tok/s, generating coherent English + LaTeX. Fixed by shipping Q1_0 fused SwiGLU (`swiglu_fused_q1_0.wgsl`), the attn_q per-head interleaved layout de-interleave in `upload_w_bonsai_split`, and Q5_K/Q8_0 dequant kernels for Qwen 3.5-4B's mixed-quant weights.
+- **ARM64 embedded board, 8 GB (Vulkan iGPU) — Qwen 3.5-4B**: **coherent generation at 0.3 tok/s via `--hybrid-per-layer` + `attention_only_load`** (Phase X.3.e.3.29). CPU processes 24 DeltaNet layers, GPU processes 8 Attention layers, DeltaNet weights are skipped from the GPU upload so the total footprint fits under Vulkan's 2×-duplication budget. `"I'm not sure what the user is asking about, and I'm not"` in 50 s / 15 tokens.
+- **ARM64 embedded board, 8 GB (Vulkan iGPU) — Bonsai 27B**: `--hybrid` (Phase X.3.e.3.17 CPU-delegate MVP) generates `"The capital of Japan is **Tokyo**."` at ~0.09 tok/s. `--hybrid-per-layer` still exceeds the memory budget because 3.6 GB CPU model + 3.8 GB attention-only GPU × 2 duplication (7.6 GB) leaves nothing for headroom; llama.cpp Vulkan with unified-memory zero-copy is the recommended path for Bonsai 27B on an ARM64 embedded board today, or wait for `wgpu-hal` Vulkan zero-copy upstream.
+- **Per-layer hybrid on an arm64 laptop Metal**: coherent at 1.2 tok/s. Weight upload cut from 2338 ms to 1059 ms once DeltaNet weights are skipped (Phase X.3.e.3.29).
+
+PrismML's Bonsai 27B ships as a 3.6 GB Q1_0 GGUF (post-training 1.125 bpw binary quantisation: 128-element blocks of 18 bytes = a 2-byte f16 scale `d` + 16 bytes of packed 1-bit weights, value = ±d).
 
 Micro-benchmark: ALICE-LLM's Q1_0 wgpu path takes the largest layer matvec (`blk.0.attn_qkv.weight`, 10240 × 5120, 7.03 MB) from CPU NEON 20 ms down to GPU Vulkan sub-ms:
 
@@ -262,7 +330,7 @@ The row-batching approach: 1 workgroup produces N output rows sharing one input 
 
 ## The CPU Optimization Journey (70B Sparse Ternary)
 
-Complete record of optimizing 70B sparse ternary matvec from scalar implementation to the physical memory bandwidth limit of M1 Pro.
+Complete record of optimizing 70B sparse ternary matvec from scalar implementation to the physical memory bandwidth limit of a 200 GB/s arm64 SoC.
 
 ### The Wall
 
@@ -416,9 +484,9 @@ let w3 = expand_packed_2bit_lut(blk_base.add(3 * bytes_per_block)); // Row 3
 
 **27% → 45%. TLB miss elimination alone improved bandwidth utilization by 1.67x.**
 
-### The Ceiling: 45% = M1 Pro CPU Physical Limit
+### The Ceiling: 45% = CPU Physical Limit (200 GB/s arm64 SoC)
 
-The M1 Pro SoC bandwidth of 200 GB/s is shared with GPU/NPU/Media Engine. The bandwidth available exclusively to the CPU is approximately 90 GB/s (45%). This is a hard constraint imposed by the OS kernel and memory controller arbitration, and cannot be broken through software.
+The SoC bandwidth of 200 GB/s is shared with GPU/NPU/Media Engine. The bandwidth available exclusively to the CPU is approximately 90 GB/s (45%). This is a hard constraint imposed by the OS kernel and memory controller arbitration, and cannot be broken through software.
 
 ### Summary Table
 
@@ -435,20 +503,20 @@ The M1 Pro SoC bandwidth of 200 GB/s is shared with GPU/NPU/Media Engine. The ba
 
 | Attempt | Result | Root Cause |
 |---|---|---|
-| Software prefetch (`prfm`) | **−10%** | M1 Pro HW prefetcher already optimal; `prfm` pollutes L1 cache |
+| Software prefetch (`prfm`) | **−10%** | The SoC's HW prefetcher is already optimal; `prfm` pollutes L1 cache |
 | E-core exclusion (4 P-core threads) | **−14%** | Apple UMA: E-cores contribute bandwidth even if individually slower |
-| Chunk size 8→16 rows | **−16%** | Rayon work-stealing imbalance; 8 = optimal for M1 Pro L1 geometry |
+| Chunk size 8→16 rows | **−16%** | Rayon work-stealing imbalance; 8 = optimal for this SoC's L1 geometry |
 | 2x block unrolling | **−3%** | acc0–acc3 already independent; extra loop overhead for no gain |
 
-**Lessons from failure**: The M1 Pro has an exceptionally capable HW prefetcher, and software intervention causes cache pollution. In Apple UMA, excluding E-cores means discarding part of the available bandwidth. These experiments served as **proof by elimination** that TLB misses were the true cause of the "27% wall".
+**Lessons from failure**: This SoC has an exceptionally capable HW prefetcher, and software intervention causes cache pollution. In Apple UMA, excluding E-cores means discarding part of the available bandwidth. These experiments served as **proof by elimination** that TLB misses were the true cause of the "27% wall".
 
 ---
 
 ## aarch64 NEON Quantized Matvec Bench (Issue #30)
 
-Per-quantization NEON matvec kernels on Apple M3 (Mac) and NVIDIA Tegra Orin Nano (Jetson). 128 × 4096 f32-output matvec, 200-iter median (µs/matvec):
+Per-quantization NEON matvec kernels on an arm64 laptop and an ARM64 embedded board (8 GB). 128 × 4096 f32-output matvec, 200-iter median (µs/matvec):
 
-| Quant | Mac M3 scalar | Mac M3 NEON | Speedup | Jetson scalar | Jetson NEON | Speedup |
+| Quant | arm64 laptop scalar | arm64 laptop NEON | Speedup | ARM64 embedded board scalar | ARM64 embedded board NEON | Speedup |
 |:---|---:|---:|---:|---:|---:|---:|
 | Q4_K | (already NEON) | **32.3** | — | (already NEON) | **172.7** | — |
 | Q5_K | (scalar + SDOT auto-vec) | **42.9** | — | (scalar + SDOT auto-vec) | **282.7** | — |
@@ -464,9 +532,9 @@ Per-quantization NEON matvec kernels on Apple M3 (Mac) and NVIDIA Tegra Orin Nan
 
 **Observations**:
 
-- On Jetson, **Q6_K NEON (165.2 µs) is now faster than Q4_K NEON (172.7 µs)** since the qh packing overhead is gone. The two K-quant kernels are essentially at the memory-bandwidth floor.
+- On an ARM64 embedded board, **Q6_K NEON (165.2 µs) is now faster than Q4_K NEON (172.7 µs)** since the qh packing overhead is gone. The two K-quant kernels are essentially at the memory-bandwidth floor.
 - Q8_0 sits ~4× above Q4_K on both platforms because Q8_0 packs only 1 byte per element vs Q4_K's 0.56 bytes/element — nearly 2× more bytes read per output.
-- Mac M3 speedups over Jetson (2.4–6.6×) correlate with LPDDR5X vs LPDDR5 bandwidth (~5.8× ratio); compute-heavy quants get closer to that ceiling.
+- arm64 laptop speedups over an ARM64 embedded board (2.4–6.6×) correlate with LPDDR5X vs LPDDR5 bandwidth (~5.8× ratio); compute-heavy quants get closer to that ceiling.
 
 Bench harness: `cargo run --release --example bench_simd_matvec --features gguf`
 
@@ -603,102 +671,6 @@ BitNet b1.58-style quantization-aware training:
   → Overall avg:   ~1.1 bit/param → 70B ≈ 9.6 GB
 ```
 
-## Performance
-
-<!-- The 1B / 8B rows below need a local GGUF model and were measured by hand
-     (M1 Pro, 2026-03); they are not reproduced by CI. The 70B sparse-ternary
-     table is synthetic (no model file) and is regenerated by the example named
-     under it — those numbers carry a perf-measured marker. -->
-
-### 1B Model (Llama-3.2-1B-Instruct Q4_K_M, M1 Pro)
-
-| Configuration | Decode Speed |
-|---|---|
-| Full 16-layer inference | **20.2 tok/s** |
-| Logit accuracy vs llama.cpp | ±0.09 (top-1 token match) |
-
-### 8B Model (ELYZA-JP Q4_K_M, M1 Pro)
-
-| Phase | Configuration | Decode Speed | Prefill (16 tok) |
-|---|---|---|---|
-| Phase 1 | Bug fix (dequant→integer dot product) | 1.2 tok/s | 14.2s |
-| Phase 2 | + Q8_K reuse, auto-vec, Rayon | 5.1 tok/s | 4.1s |
-| Phase 3 | + Contiguous KV cache | **5.9 tok/s** | **3.3s** |
-
-### 70B Sparse Ternary (Simulated, Apple M3)
-
-```bash
-cargo run --release --example bench_70b_sparse --features "gguf,parallel"
-```
-
-<!-- perf-measured: 2026-09-16 examples/bench_70b_sparse.rs (Apple M3, release; a second run on the same
-     machine under load gave 2.78 tok/s, so treat the last digit as noise) -->
-
-| Projection | Size | Time/iter |
-|---|---|---|
-| Q proj | 8192×8192 | 0.39 ms |
-| K proj | 1024×8192 | 0.06 ms |
-| V proj | 1024×8192 | 0.07 ms |
-| O proj | 8192×8192 | 0.31 ms |
-| Gate (FFN) | 28672×8192 | 1.02 ms |
-| Up (FFN) | 28672×8192 | 1.04 ms |
-| Down (FFN) | 8192×28672 | 1.04 ms |
-| **1 layer** | | **3.9 ms** |
-| **1 token (80 layers)** | | **314 ms → 3.18 tok/s** |
-
-(M1 Pro, 2026-03: 7.1 ms / layer, 569 ms / token → 1.76 tok/s)
-
-### Device Projections (bandwidth-limited)
-
-| Device | Memory BW | Est. tok/s |
-|---|---|---|
-| Raspberry Pi 5 | 34 GB/s | 0.7 |
-| Mac Mini M4 | 120 GB/s | 2.3 |
-| M1 Pro (measured 2026-03) | 91 GB/s | 1.8 |
-| Mac Mini M4 Pro | 273 GB/s | 5.3 |
-| Mac Studio M4 Ultra | 800 GB/s | 15.6 |
-
-### Quantization Block Specs
-
-| Type | Block Size | Bytes/Block | bpw | Layout |
-|---|---|---|---|---|
-| Q2_K | 256 | 84 | 2.625 | scales[16] + qs[64] + d(f16) + dmin(f16) |
-| Q3_K | 256 | 110 | 3.4375 | hmask[32] + qs[64] + scales[12] + d(f16) |
-| Q4_K | 256 | 144 | 4.5 | d(f16) + dmin(f16) + scales[12] + qs[128] |
-| Q5_K | 256 | 176 | 5.5 | d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] |
-| Q6_K | 256 | 210 | 6.5625 | ql[128] + qh[64] + scales[16] + d(f16) |
-| Q8_0 | 32 | 34 | 8.5 | d(f16) + qs[32] |
-
-Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer — e.g. Q3_K for attention, Q4_K/Q5_K for FFN, Q6_K for embeddings, F32 for norms — so effective bpw is higher than the base type.
-
-### 30B / 70B Model Size Estimates
-
-| Quant | bpw (eff.) | 30B | 70B |
-|---|---|---|---|
-| F16 | 16.0 | 60.0 GB | 140.0 GB |
-| Q8_0 | 8.5 | 31.9 GB | 74.4 GB |
-| Q6_K | 6.56 | 24.6 GB | 57.4 GB |
-| Q5_K_M | ~5.7 | ~21.4 GB | ~49.9 GB |
-| Q4_K_M | ~4.8 | ~18.0 GB | ~42.0 GB |
-| Q3_K_L | ~4.0 | ~15.0 GB | ~35.0 GB |
-| Q3_K_M | ~3.9 | ~14.6 GB | ~34.1 GB |
-| Q3_K_S | ~3.5 | ~13.1 GB | ~30.6 GB |
-| Q2_K | ~3.2 | ~12.0 GB | ~28.0 GB |
-
-### Recommended Quantization by Device Memory
-
-| Memory | 30B Model | 70B Model |
-|---|---|---|
-| **16 GB** (MBA M3) | Q2_K (12GB) ○ / Q3_K_S (13GB) △ | × |
-| **24 GB** (M3 Pro) | Q4_K_M (18GB) ○ | × |
-| **32 GB** (M3 Max) | Q6_K (25GB) ○ | Q2_K (28GB) △ |
-| **36 GB** (M3 Pro) | Q6_K (25GB) ○ | Q3_K_S (31GB) △ |
-| **48 GB** (M4 Max) | Q8_0 (32GB) ○ | Q3_K_M (34GB) ○ |
-| **64 GB** (M2 Ultra) | F16 (60GB) △ | Q4_K_M (42GB) ○ |
-| **128 GB** (M4 Ultra) | F16 (60GB) ○ | Q8_0 (74GB) ○ |
-
-○ = comfortable (model + OS + KV cache fit in RAM), △ = runs with swap pressure
-
 ## Inference Server (OpenAI-compatible API)
 
 ```bash
@@ -735,7 +707,7 @@ curl http://localhost:8090/v1/models
 --ternary-threshold <f>   Ternary sparsity threshold (default: 0.7)
 ```
 
-## Cargo Features
+## Cargo features
 
 | Feature | Description |
 |---|---|
@@ -750,6 +722,136 @@ curl http://localhost:8090/v1/models
 | `dspark-serde` | Serde serialization for DSpark snapshots |
 | `imatrix` | ALICE-Dynamic-v1 tier-decision CLI (`layer_assignments.json` emitter, Phase I.0 + I.3, Unsloth-baseline heuristics) |
 | `server` | HTTP inference server (axum), includes `gpu` + `gguf` + `grammar` |
+
+## Performance
+
+<!-- The 1B / 8B rows below need a local GGUF model and were measured by hand
+     (200 GB/s arm64 SoC, 2026-03); they are not reproduced by CI. The 70B sparse-ternary
+     table is synthetic (no model file) and is regenerated by the example named
+     under it — those numbers carry a perf-measured marker. -->
+
+### 1B Model (Llama-3.2-1B-Instruct Q4_K_M, 200 GB/s arm64 SoC)
+
+| Configuration | Decode Speed |
+|---|---|
+| Full 16-layer inference | **20.2 tok/s** |
+| Logit accuracy vs llama.cpp | ±0.09 (top-1 token match) |
+
+### 8B Model (ELYZA-JP Q4_K_M, 200 GB/s arm64 SoC)
+
+| Phase | Configuration | Decode Speed | Prefill (16 tok) |
+|---|---|---|---|
+| Phase 1 | Bug fix (dequant→integer dot product) | 1.2 tok/s | 14.2s |
+| Phase 2 | + Q8_K reuse, auto-vec, Rayon | 5.1 tok/s | 4.1s |
+| Phase 3 | + Contiguous KV cache | **5.9 tok/s** | **3.3s** |
+
+### 70B Sparse Ternary (Simulated, arm64 laptop)
+
+```bash
+cargo run --release --example bench_70b_sparse --features "gguf,parallel"
+```
+
+<!-- perf-measured: 2026-09-16 examples/bench_70b_sparse.rs (arm64 laptop, release; a second run on the same
+     machine under load gave 2.78 tok/s, so treat the last digit as noise) -->
+
+| Projection | Size | Time/iter |
+|---|---|---|
+| Q proj | 8192×8192 | 0.39 ms |
+| K proj | 1024×8192 | 0.06 ms |
+| V proj | 1024×8192 | 0.07 ms |
+| O proj | 8192×8192 | 0.31 ms |
+| Gate (FFN) | 28672×8192 | 1.02 ms |
+| Up (FFN) | 28672×8192 | 1.04 ms |
+| Down (FFN) | 8192×28672 | 1.04 ms |
+| **1 layer** | | **3.9 ms** |
+| **1 token (80 layers)** | | **314 ms → 3.18 tok/s** |
+
+(200 GB/s arm64 SoC, 2026-03: 7.1 ms / layer, 569 ms / token → 1.76 tok/s)
+
+### Device Projections (bandwidth-limited)
+
+| Device | Memory BW | Est. tok/s |
+|---|---|---|
+| arm64 SBC | 34 GB/s | 0.7 |
+| arm64 desktop (LPDDR5) | 120 GB/s | 2.3 |
+| 200 GB/s arm64 SoC (measured 2026-03) | 91 GB/s | 1.8 |
+| arm64 desktop (LPDDR5X) | 273 GB/s | 5.3 |
+| arm64 workstation (high-bandwidth) | 800 GB/s | 15.6 |
+
+### Quantization Block Specs
+
+| Type | Block Size | Bytes/Block | bpw | Layout |
+|---|---|---|---|---|
+| Q2_K | 256 | 84 | 2.625 | scales[16] + qs[64] + d(f16) + dmin(f16) |
+| Q3_K | 256 | 110 | 3.4375 | hmask[32] + qs[64] + scales[12] + d(f16) |
+| Q4_K | 256 | 144 | 4.5 | d(f16) + dmin(f16) + scales[12] + qs[128] |
+| Q5_K | 256 | 176 | 5.5 | d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] |
+| Q6_K | 256 | 210 | 6.5625 | ql[128] + qh[64] + scales[16] + d(f16) |
+| Q8_0 | 32 | 34 | 8.5 | d(f16) + qs[32] |
+
+Mixed quantization variants (`_S`, `_M`, `_L`) use different types per layer — e.g. Q3_K for attention, Q4_K/Q5_K for FFN, Q6_K for embeddings, F32 for norms — so effective bpw is higher than the base type.
+
+### 30B / 70B Model Size Estimates
+
+| Quant | bpw (eff.) | 30B | 70B |
+|---|---|---|---|
+| F16 | 16.0 | 60.0 GB | 140.0 GB |
+| Q8_0 | 8.5 | 31.9 GB | 74.4 GB |
+| Q6_K | 6.56 | 24.6 GB | 57.4 GB |
+| Q5_K_M | ~5.7 | ~21.4 GB | ~49.9 GB |
+| Q4_K_M | ~4.8 | ~18.0 GB | ~42.0 GB |
+| Q3_K_L | ~4.0 | ~15.0 GB | ~35.0 GB |
+| Q3_K_M | ~3.9 | ~14.6 GB | ~34.1 GB |
+| Q3_K_S | ~3.5 | ~13.1 GB | ~30.6 GB |
+| Q2_K | ~3.2 | ~12.0 GB | ~28.0 GB |
+
+### Recommended Quantization by Device Memory
+
+| Memory | 30B Model | 70B Model |
+|---|---|---|
+| **16 GB** (MBA M3) | Q2_K (12GB) ○ / Q3_K_S (13GB) △ | × |
+| **24 GB** | Q4_K_M (18GB) ○ | × |
+| **32 GB** (arm64 laptop) | Q6_K (25GB) ○ | Q2_K (28GB) △ |
+| **36 GB** | Q6_K (25GB) ○ | Q3_K_S (31GB) △ |
+| **48 GB** | Q8_0 (32GB) ○ | Q3_K_M (34GB) ○ |
+| **64 GB** | F16 (60GB) △ | Q4_K_M (42GB) ○ |
+| **128 GB** | F16 (60GB) ○ | Q8_0 (74GB) ○ |
+
+○ = comfortable (model + OS + KV cache fit in RAM), △ = runs with swap pressure
+
+## Minimum supported Rust version
+
+`Cargo.toml` does not declare a `rust-version`. The repository pins its
+toolchain in `rust-toolchain.toml` (currently 1.98.1); CI and
+`scripts/preflight.sh` build with that pin, and older toolchains are not
+tested.
+
+## Building and testing
+
+```bash
+cargo build --release --features "gguf,parallel"
+cargo test --lib                                # unit tests, default features
+cargo test --lib --features simd
+cargo test --test analytic_oracle               # closed-form oracle tests
+python3 scripts/docs_lint.py --check            # public-document vocabulary, CHANGELOG structure
+```
+
+`scripts/preflight.sh` reproduces the CI checks locally. `--quick` runs
+formatting, actionlint, the docs lint, clippy (including the x86_64 target),
+rustdoc, release / example builds, cargo-deny, cargo-machete and the stub
+guards, and skips the test and audit suites. The GPU tests need a wgpu
+adapter; CI only creates the pipelines (`smoke_test_gpu_pipeline_creation`).
+
+## Related crates
+
+| Crate | Role |
+|-------|------|
+| [ALICE-LLM Studio](https://github.com/ext-sakamoro/ALICE-LLM-Studio) | desktop app (Tauri) that embeds `alice-llm-server` |
+| [ALICE-LOL](https://github.com/ext-sakamoro/ALICE-LOL) | the SDF description language that the grammar-constrained LOL bridge emits |
+| [ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System) | index of the ALICE crates |
+
+Release history is in [`CHANGELOG.md`](CHANGELOG.md). Design notes and
+validation records are in [`docs/`](docs/).
 
 ## License
 

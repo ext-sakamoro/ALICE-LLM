@@ -42,6 +42,10 @@ step "ci.yml / fmt: Check formatting"
 step "ci.yml / actionlint: actionlint"
 actionlint .github/workflows/*.yml
 
+step "ci.yml / docs_lint: docs lint (tests + public documents)"
+python3 scripts/test_docs_lint.py
+python3 scripts/docs_lint.py --check
+
 step "ci.yml / clippy: cargo clippy (default features, all targets)"
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets -- -D warnings )
@@ -110,7 +114,7 @@ step "security-audit.yml / stub-guard: Detect todo! / unimplemented! (informatio
     || true)
   if [ -n "$hits" ]; then
     count=$(echo "$hits" | wc -l | tr -d ' ')
-    echo "::warning::${count} todo!()/unimplemented!() marker(s) in src/ (informational, CLAUDE.md legitimate fail-fast idiom):"
+    echo "::warning::${count} todo!()/unimplemented!() marker(s) in src/ (informational, intentional fail-fast idiom):"
     echo "$hits" | head -20
   else
     echo "OK: No todo!/unimplemented! markers in src/"

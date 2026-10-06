@@ -323,7 +323,7 @@ pub struct GpuEngine {
     /// Nanoseconds per GPU timestamp tick (0.0 if timestamps not supported).
     pub timestamp_period: f32,
     /// Adapter type — used by `GpuModel::load` for OOM prevention heuristics.
-    /// `IntegratedGpu` = unified memory (Jetson / Apple Silicon / AMD APU / Intel iGPU),
+    /// `IntegratedGpu` = unified memory (ARM64 embedded board / Apple Silicon / AMD APU / Intel iGPU),
     /// requires higher peak memory factor since wgpu Vulkan / Metal double-allocates.
     pub device_type: wgpu::DeviceType,
     matvec_q4k_pipeline: wgpu::ComputePipeline,
@@ -1225,7 +1225,7 @@ impl GpuPass<'_> {
     ///
     /// Register cost: 32 f32 accumulators per thread (scalar named vars,
     /// no dynamic indexing) — verified compiles clean on Vulkan iGPU
-    /// (Jetson Orin Nano, Ampere) and Metal (Apple Silicon).
+    /// (ARM64 embedded board, Ampere) and Metal (Apple Silicon).
     ///
     /// Input / output layout matches `matvec_q1_0_row4_batch4`:
     ///   input[batch * cols  + col]   for batch ∈ [0..4)
@@ -2143,7 +2143,7 @@ pub struct GpuModelConfig {
     /// Used by the per-layer hybrid orchestrator (`--hybrid-per-layer`) so
     /// only Attention layer weights land on the GPU, cutting the GPU
     /// memory footprint from ~2.7 GB (Qwen 3.5-4B) or ~3.8 GB (Bonsai 27B)
-    /// down to ~25 %, which fits in Jetson Orin Nano's ~2-3 GB usable
+    /// down to ~25 %, which fits in an ARM64 embedded board's ~2-3 GB usable
     /// unified-memory budget after `wgpu-hal` Vulkan 2× duplication.
     ///
     /// When enabled, calling any DeltaNet path on the GPU (e.g., a full
@@ -2636,7 +2636,7 @@ impl GpuModel {
         // 1 workgroup produces 4 output rows (input read shared across the
         // 4 rows), cutting workgroup count 4× and total input-read traffic
         // 4×. Empirically 1.82× vs the base `matvec_q1_0` kernel on
-        // Jetson Vulkan iGPU for Bonsai 27B attn_qkv (Step 6, PR #74).
+        // ARM64 embedded board Vulkan iGPU for Bonsai 27B attn_qkv (Step 6, PR #74).
         let dispatch_rows = match w.quant {
             GpuQuantType::Q1_0 => w.rows.div_ceil(4),
             GpuQuantType::Q4K | GpuQuantType::Q5K | GpuQuantType::Q6K | GpuQuantType::Q8_0 => {
@@ -2966,7 +2966,7 @@ impl GpuModel {
         }
 
         // OOM prevention: estimate peak memory usage and log warning if projected
-        // to exceed available system memory. On integrated GPU (Jetson / Apple Silicon /
+        // to exceed available system memory. On integrated GPU (ARM64 embedded board / Apple Silicon /
         // AMD APU / Intel iGPU), wgpu Vulkan / Metal typically double-allocates weight
         // memory (GGUF mmap + Vulkan buffer copy), so peak is ~2x GGUF size.
         let estimate = estimate_gpu_load_memory(engine.device_type, gguf, &config);
@@ -3241,7 +3241,7 @@ impl GpuModel {
                     // orchestrator processes DeltaNet layers on the CPU, so
                     // the GPU never touches these weights. This cuts GPU
                     // memory to ~25% for Qwen 3.5 / Bonsai 27B and fits the
-                    // Jetson unified-memory budget.
+                    // ARM64 embedded board unified-memory budget.
                     //
                     // The dummy LayerWeightBufs push below still runs so
                     // `layer_weights[i]` stays aligned with the global
@@ -4772,7 +4772,7 @@ impl GpuModel {
         // Q1_0 uses the row4 kernel by default (Step 6, PR #74): 1 workgroup
         // produces 4 output rows, cutting workgroup count 4× and total
         // input-read traffic 4×. Empirically 1.82× vs base `matvec_q1_0`
-        // on Jetson Vulkan iGPU for Bonsai 27B attn_qkv. Dispatch dims
+        // on an ARM64 embedded board Vulkan iGPU for Bonsai 27B attn_qkv. Dispatch dims
         // pre-computed in `build_matvec_bg` for ceil(rows / 4).
         let pipeline = match mv.quant {
             GpuQuantType::Q4K => &engine.matvec_q4k_pipeline,

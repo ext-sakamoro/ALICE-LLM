@@ -60,7 +60,7 @@ Isolation methodology (次段):
 
 `unsloth/Qwen3.5-4B-GGUF` に Q3_K_S (2.11 GB) / Q4_K_M (2.74 GB) 等の GGUF 存在、Qwen3.5-4B safetensors は `linear_attn.A_log` / `dt_bias` / `norm.weight` 等 SSM tensors 全て含む (HF API で確認済)、Q4_K quantization は ALICE-LLM 実装済 = **Qwen3.5-4B Q4_K_M で DeltaNet SSM validation 可能** (2.74 GB DL、~40 min)
 
-将来 session の推奨手順:
+今後の推奨手順:
 1. Qwen3.5-4B Q4_K_M DL
 2. llama.cpp fork で reference 生成 (interactive で prompt + /exit の流れ、chat template 依存)
 3. ALICE-LLM elyza_gguf 例で同 prompt 生成 (chat template 一致必要、要確認)
@@ -88,16 +88,14 @@ df -h ~
 
 # 実行前 checklist
 # - Mac disk usage < 85%
-# - ~/Downloads / ~/CTW cleanup done (memory 済 dir を rm -rf)
-# - `~/bin/disk-check` で cross-machine 集計確認
+# - 不要な大 file の cleanup 済
 ```
 
 不足なら大 file cleanup を先行:
 
 ```bash
 # 候補
-du -sh ~/CTW/* ~/Downloads/* 2>/dev/null | sort -h | tail -20
-# CTW / hololive で memory 化済 repo は rm -rf 可
+du -sh ~/Downloads/* 2>/dev/null | sort -h | tail -20
 ```
 
 ### 1.2 Build environment
@@ -400,7 +398,7 @@ llama.cpp は SIMD accumulate、順序が並列 chunk 単位で異なる
 
 | Task | 工数 | 前提 |
 |---|---|---|
-| Mac disk cleanup | 30 min - 2h | 何を消せるか user 判断次第 |
+| Mac disk cleanup | 30 min - 2h | 何を消せるか次第 |
 | llama.cpp fork clone + build | 15 min | disk cleanup 済 |
 | Bonsai GGUF DL | 2-5 min | HuggingFace access |
 | llama.cpp reference tensor dump | 30 min | Option A / B / C の選定 + 実行 |
@@ -423,10 +421,6 @@ llama.cpp は SIMD accumulate、順序が並列 chunk 単位で異なる
 - **Reference**: PrismML llama.cpp fork `src/models/qwen35.cpp:436-562` + `src/models/delta-net-base.cpp:289-371`
 - **Bonsai GGUF**: https://huggingface.co/prism-ml/bonsai-27b-ternary-g128
 - **Qwen3.5-4B safetensors** (SSM tensor 存在確認 2026-07-16): https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/model.safetensors.index.json
-- **ALICE-* memory**:
-  - `~/claude-config/memory/alice_llm_edge_stack_roadmap.md`
-  - `~/claude-config/memory/reference_bonsai_27b_prism_ml.md`
-  - `~/claude-config/claude-skills/edge-llm-inference-architecture/SKILL.md`
 
 ---
 

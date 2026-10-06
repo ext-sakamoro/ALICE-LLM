@@ -1506,7 +1506,7 @@ mod neon_dot {
         // range [-32, 31]. The shift-mask trick lets the same qh vector feed
         // all four quadrants with only add / and / or / shl / shr — no per-
         // element scalar packing. This replaces the previous scalar bit
-        // packing loop (~14 µs of the old 89 µs NEON path on Mac M3).
+        // packing loop (~14 µs of the old 89 µs NEON path on an arm64 laptop).
         let mut aux8 = [0i8; QK_K];
         let mask_nib = vdupq_n_u8(0x0F);
         let mask_hi = vdupq_n_u8(0x30);
@@ -4412,7 +4412,7 @@ fn mxfp4_matvec_fused_scalar(
 
 /// Runtime-dispatched MXFP4 matvec (Phase X.4.f.2.a-b, 2026-07-28).
 ///
-/// - **aarch64** (Jetson / Apple Silicon / any ARMv8-A): dispatches per
+/// - **aarch64** (ARM64 embedded board / Apple Silicon / any ARMv8-A): dispatches per
 ///   row to [`neon_dot::mxfp4_dot_row`] which does scalar per-block
 ///   dequant followed by NEON `vfmaq_f32` 4-wide FMA × 8 iterations.
 /// - **x86_64 with AVX2** (Ryzen / Xeon / any Haswell+): dispatches
@@ -4574,7 +4574,7 @@ fn q2_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, ou
 ///
 /// - **Row-parallel via rayon** (feature `parallel`): each output row
 ///   is a fully independent dequant-and-dot workload, so partition
-///   `0..rows` across worker threads (~10× speedup on Mac mini M2 Pro
+///   `0..rows` across rayon threads (~10× speedup on an arm64 desktop
 ///   10-core, near-linear scaling).
 /// - **Fused per-block dequant + dot**: instead of allocating a full
 ///   `cols`-length f32 row buffer, dequantize each 256-element IQ1_S
@@ -4586,7 +4586,7 @@ fn q2_0_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, ou
 /// K3 per-token workload: 92 MoE layers × 16 top-k experts × 3 matvec
 /// (gate + up + down) = 4416 IQ1_S matvec calls. Combined with rayon
 /// parallelism the previously ~30 min sequential path should collapse
-/// to ~3-5 min on Mac mini.
+/// to ~3-5 min on an arm64 desktop.
 #[allow(dead_code)]
 fn iq1_s_matvec_fallback(input: &[f32], data: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
     assert!(rows > 0);

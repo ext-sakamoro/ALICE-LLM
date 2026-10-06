@@ -7,38 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **License: `AGPL-3.0-or-later` → `AGPL-3.0-or-later OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ / ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
-
 ### Added
+
+- `scripts/docs_lint.py` + `scripts/test_docs_lint.py` and a CI `docs_lint` job (ubuntu / macOS / Windows, also in `scripts/preflight.sh`, including `--quick`): public documents and every tracked file are checked for development-process vocabulary, device product names and private names (the names are stored only as SHA-256 hashes), and the CHANGELOG for duplicate / out-of-order version headings and non-Keep-a-Changelog categories under `[Unreleased]`; a check that compares nothing fails
 - `tests/analytic_oracle.rs` — 12 closed-form tests (after the first selected-file mutants run, 87.1 % on sampling / rope / linalg / attention: per-pair RoPE frequency `base^(−2i/dim)`, rms_norm large-eps shrink, GeLU tanh form and odd part, strict temperature guard at `f32::EPSILON`, CDF boundary belongs to the next bin, every empty attention operand): `dot_flat` exact on integer inputs for every length 0..=70; RMSNorm unit rms / scale invariance / eps independence; LayerNorm mean 0 / var 1 / affine invariance; SiLU points (σ(ln 3) = 3/4, odd part = x); RoPE norm preservation, exact rotation of the frequency-1 pair by `position` radians, relative-position property ⟨q(m), k(n)⟩ = ⟨q(m+d), k(n+d)⟩; softmax Σ = 1 / shift invariance / two-element formula; temperature scaling with the T → 0 (argmax) and T → ∞ (uniform) limits; top-k keeps exactly k, top-p the smallest nucleus (0.5 / 0.3 / 0.2 example); `sample_with_random` inverts the CDF; attention with a dominant key returns that value, identical keys average, causal mask shape; Q8_K quantisation `d = max / 128`, reconstruction error ≤ d/2 (≤ d for the clamped signed extreme), block sums (2026-09-16)
 - `quality-deep.yml`: cargo-mutants on PR diffs (`--in-diff`) and on manually selected files (`workflow_dispatch` `paths`); the whole crate is ~9,700 mutants, too heavy for a weekly run on GitHub-hosted runners `src/gpu.rs` (needs a GPU adapter) and `src/bin/**` are excluded in `.cargo/mutants.toml`
 - CI `doc` job (`RUSTDOCFLAGS=-D warnings`, docs.rs feature set); the test job now runs the oracle file and the doc tests (which had never run: `cargo test --lib` skips them, 0 doctests existed)
 
-### Changed
-- CI clippy job is a hard gate: `-D warnings`, `--all-targets`, three feature sets (default / `simd` / full incl. `gpu`, `server`); it ran `-W clippy::all` on `--lib` only, which cannot fail — 13 findings in tests / examples had accumulated (`chunks_exact(8)` → `as_chunks::<8>()` in the SIMD kernels, `Option::filter`, decimal literals in bitwise tests, redundant references in example `println!`) `bench_grammar_mask` declares `required-features = ["gguf", "grammar"]` (it did not compile in a default build)
-- README 70B sparse-ternary table re-measured with `examples/bench_70b_sparse.rs` (Apple M3, 2026-09-16: 3.9 ms / layer, 314 ms / token → 3.18 tok/s; the M1 Pro 2026-03 row kept for reference) and marked `<!-- perf-measured -->`; the 1B / 8B rows are annotated as hand-measured with a local model, not reproduced by CI
-- `GpuModel::debug_dump_layer0_deltanet_stages` returns a `DeltaNetLayer0Stages` struct instead of a 10-element tuple (the tuple made `cargo mutants --list` enumerate 4^10 = 1,048,576 replacement candidates for that one function)
-- The two `ignore` doctests are a compiled `no_run` example (`KimiK3Model::new`) and a `text` excerpt (`llama3_bridge` module doc); `# Panics` docs on `Matrix::get` / `set` / `GpuEngine::upload_weights_q8_0`
-- CI: `rust-toolchain.toml` pin → 1.98.1 (6 release 遅れで `cargo-semver-checks@latest` MSRV 1.93 に追い抜かれ semver job が赤、2026-09-14) + `cargo-semver-checks` を 0.50.0 に明示 pin 1.98.1 の新規 lint 修正 (gguf sort_by_key / chunks_exact 3 件)
-
-### Added
-
 - **Two-phase generation: free think prefix → grammar (Phase X.8 B-11, 2026-09-14)** — `Llama3Model::generate_grammar_prefixed(tokenizer, prompt, &GrammarPrefix { stop_marker, max_prefix_tokens }, …) -> GrammarGenResult` think-first model (MiniCPM5 / Qwen 3 thinking) が `<think>…</think>` を **grammar の外で** 書けるようにし、marker 検出 (token id 列一致 → decode suffix 一致 fallback) 後に同じ KV cache から FSM root + trie mask で decode budget / EOS で marker 未出現なら marker token を context に注入して強制 close (思考の途中で grammar に入ると `arc_shape(0,0,0,0)` 等の garbage になる実測を回避) `GrammarGenResult` は `prefix_text` / `prefix_tokens` / `prefix_marker_hit` / `prefix_ms` と grammar 側 `text` / `tokens_generated` を分離 既存 `generate_grammar` は共通 `grammar_decode_loop` に refactor (挙動不変) `examples/lol_gen.rs` に `--think [MARKER]` / `--prefix-budget N`
-  - 実測 (MiniCPM5-2B Q4_K_M、ChatML prompt + canonical example、budget 2000): think 2000 token (231 s、context 増で 8.7 tok/s) → 強制 close → `union(cylinder(25,50), translate(25,0,50, rotate(0,90,0, torus(12,4))))` = mug 完全正解 (直径 50 / 高さ 100 / 側面 handle) grammar のみ (think なし) では `cylinder(50,100)` で handle 省略 evidence `~/claude-config/evidence_b10_trie_mask/05_*.log` (no think) / `08_*.log` (think) chat model は ChatML (`<|im_start|>user … <|im_start|>assistant\n`) で包まないと `<think>` を出さず文書の続きを書く (`06_*.log`)
-
-### Performance
-
-- **Grammar-constrained decoding: token trie mask (Phase X.8 B-10, 2026-09-14)** — `grammar::TokenTrie` (vocab 全 token text を文字 trie に 1 回構築、130k vocab で 68 ms / 231k node) + `sampling::mask_logits_by_grammar_trie` (FSM 状態から trie を DFS、拒否 edge で subtree 枝刈り、受理 edge でのみ FSM clone) を追加し `Llama3Model::generate_grammar` をこちらに切替 従来の `mask_logits_by_grammar` は vocab 全 token を独立に probe (`text_of` String alloc + `Fsm::accepts_str` の FSM clone) しており、MiniCPM5-2B (vocab 130,560) × `lol.gbnf` の実測で **1 step 6.7-8.1 s、end-to-end の 95-98 %** を占めていた trie 版は同条件で **avg 377 ms/step、comment 状態を除けば 0-6 ms/step**、生成 token 列は naive 版と 16/16 一致 (evidence `~/claude-config/evidence_b10_trie_mask/`) 副次効果で alloc 圧が消え forward も 153-388 → 35-57 ms/token に安定 `Fsm::accepts` を alloc-free の head-only probe に変更 (`accepts_str` / `advance` の意味は不変) naive 版は parity test の reference として残置
-  - 残る重さ: `//` line comment 内 (`noteol*` = ほぼ全 char 受理) では trie 全走査で 0.5-1 s/step、model も comment に「考え事」を書き続けて本体を出さないため LLM 向け grammar から comment rule を外す対応は ALICE-LOL 側で別途
-  - `examples/bench_grammar_mask.rs` — step ごとの mask / forward 時間分離計測 (`--naive` で reference 版)
-
-### CI/CD
-
-- **`.cargo/config.toml` から `target-cpu=native` を外した (2026-09-29)** — CI runner の CPU 世代に依存して rustc 自身が SIGILL で落ちる (run 36431060432 の `rustdoc (-D warnings, docs.rs feature set)` job: `error: rustc interrupted by SIGILL` / `signal: 4, SIGILL: illegal instruction`、rustc の引数末尾が `-C target-cpu=native`) commit と無関係に red / green が揺れるため、直前に push した人の変更が疑われて原因究明が逸れる native が要るのは microbench だけで test / clippy / rustdoc には不要 local の opt-in 経路は `RUSTFLAGS="-C target-cpu=native" cargo …` と `cargo … --config 'build.rustflags=["-C","target-cpu=native"]'` の 2 つ (どちらも実測、README / README_JP に記載) `.cargo/config.local.toml` は cargo が自動では読まないので使えない (2026-09-29 実測) 同じ方針を ALICE-Text / ALICE-View と揃えた
-- **crates.io auto-publish workflow added (2026-09-13)** — `.github/workflows/release.yml` に `publish-crates-io` job を append 既存 build job (matrix 5 target + GitHub Release upload) と並列で `cargo publish --dry-run` → `cargo publish` を実行、tag push `v*.*.*` で自動発火 GitHub Secret `CARGO_REGISTRY_TOKEN` は設定済 次 tag push (e.g., `v1.6.1` / `v1.7.0`) から GitHub Release + crates.io 同時 publish が有効
-
-### Added
+  - 実測 (MiniCPM5-2B Q4_K_M、ChatML prompt + canonical example、budget 2000): think 2000 token (231 s、context 増で 8.7 tok/s) → 強制 close → `union(cylinder(25,50), translate(25,0,50, rotate(0,90,0, torus(12,4))))` = mug 完全正解 (直径 50 / 高さ 100 / 側面 handle) grammar のみ (think なし) では `cylinder(50,100)` で handle 省略 chat model は ChatML (`<|im_start|>user … <|im_start|>assistant\n`) で包まないと `<think>` を出さず文書の続きを書く (`06_*.log`)
 
 - **DSpark Phase 12b Part 3c2 — K3Model integration + delta mode full
   wiring** (2026-08-06). Phase 12b delta encoding pipeline の最終 wire-up、
@@ -80,12 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   594 test 無破壊 pass (mechanical 変更、Part 3a の bit-exact 検証済
   primitive を wire するだけ) **scope 削減**: 当初 Part 3c 全部
   (~490 LOC) 予定だったが、K3Model 統合 + delta mode wiring は Part 3c2
-  次 session に分割 Part 3c1 は wire-up 基盤のみ (~250 LOC) を確実 ship
+  次回 に分割 Part 3c1 は wire-up 基盤のみ (~250 LOC) を確実 ship
   Part 3c2 完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
 
 - **DSpark Phase 12b Part 3b — delta ring infrastructure**
   (2026-08-06). Phase 12b Part 3b の delta mode 用 K3Model infrastructure
-  を実装 (**forward wire-up は Part 3c 次 session**、Part 3a の primitive
+  を実装 (**forward wire-up は Part 3c 次回**、Part 3a の primitive
   と Part 3b の ring 管理を組合わせて実 forward 統合)
   (1) `KimiK3Model` に field 追加: `snapshot_ring_delta:
   VecDeque<KimiK3ModelSnapshotDelta>` + `delta_snapshots: bool`
@@ -137,13 +114,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Part 3) では K3 layer + K3Model 統合 + push/rollback delta mode まで
   含む予定だったが、実装複雑度と単一 session の tightness を honest
   評価して head-level capture 関数のみ (Part 3a、~200 LOC) を ship
-  Part 3b (K3 layer + K3Model 統合 + ring 統合) は次 session、Part 3b
+  Part 3b (K3 layer + K3Model 統合 + ring 統合) は次回、Part 3b
   完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
 
 - **DSpark Phase 12b Part 1+2 — rank-1 delta encoding primitives**
   (2026-08-06). RadixArk/Kimi-K3-DSpark 吸収の Phase 12b (Y1+Y2 scope) の
   Part 1+2 完了 Part 3 (KDA forward 統合 + push/rollback delta mode) は
-  次 session (1) `KimiDeltaHeadUpdate` struct (q_pre/k_pre/v_pre/k_conv/
+  次回 (1) `KimiDeltaHeadUpdate` struct (q_pre/k_pre/v_pre/k_conv/
   v_conv/alpha/beta) を追加、KDA 1 step の rollback 復元に必要な update
   tuple を保持 メモリ ~3KB per head (d_k=d_v=128 想定) vs full snapshot
   ~68KB per head = **~23× 圧縮 per delta** (2) `KimiDeltaHeadCache::apply_update(update)`
@@ -239,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dspark-serde) unchanged、両 example compile pass、clippy pedantic+nursery
   0 warn 新規範囲、fmt check pass **メモリコスト**: snapshot 1 個 K3
   default で ~36MB (KDA recurrent state 支配)、ring=8 で ~290MB overhead
-  during draft phase Phase 11 (Track 5-4 実測、user 実行) は次 session
+  during draft phase Phase 11 (Track 5-4 実測、user 実行) は次回
 
 - **DSpark Phase 9 — `DraftBackend` trait + `impl for Llama3Model` +
   method refactor to `&mut dyn DraftBackend`** (2026-08-01).
@@ -262,7 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §4c) デフォルト lib test 558 pass 維持、speculative_dspark 84 test (with
   dspark-serde) pass、両 example compile pass、clippy pedantic+nursery 0
   warn 新規範囲、fmt check pass Phase 10 (KDA snapshot 実装 + `impl DraftBackend
-  for KimiK3Model`) は次 session
+  for KimiK3Model`) は次回
 
 - **DSpark Phase 8 — `KimiK3Model::forward_with_layer_hook` +
   `forward_capture_hidden` (K3 の 93 層 hook API)** (2026-08-01).
@@ -283,7 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo build --features dspark` compile pass、fmt / clippy 新規範囲 0 warn、
   実 K3 動作検証は user が real weights (566GB) で実行 Phase 9 (DraftBackend
   trait or wrapper design で K3 draft を generate_speculative_dual_dspark に
-  統合) は次 session
+  統合) は次回
 
 - **DSpark Phase 7 — `DsparkLabelSample` + label collection method +
   `dspark_train_confidence_head` example + `--confidence-head` load path**
@@ -305,7 +282,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default / 84 with dspark-serde) 全 pass、default lib test 558 pass、
   clippy pedantic+nursery 0 warn 新規範囲、fmt check pass Phase 8
   (KimiK3Model::forward_capture_hidden or DFlashParallelDraft の llama3
-  統合検討) は次 session
+  統合検討) は次回
 
 - **Sparse attention env hook in `gqa_attention` — Phase MSA.5.6**
   (2026-07-31). `llama3.rs::gqa_attention` (Qwen 3.5 / Llama 3 / Bonsai /
@@ -405,7 +382,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   81 with dspark-serde) 全 pass、clippy pedantic+nursery 0 warn 新規範囲、
   fmt check pass、default lib test 515 pass (+3) Phase 7 (trained
   PositionConfidenceHead の accept/reject label collection example +
-  DFlashParallelDraft の llama3 統合検討) は次 session
+  DFlashParallelDraft の llama3 統合検討) は次回
 
 - **DSpark Phase 5 — llama3 `generate_speculative_dual_dspark` +
   `dspark` feature + `apply_bigram_bias_maybe` helper +
@@ -431,7 +408,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --features dspark --example speculative_dspark_dual` compile pass /
   clippy pedantic+nursery 0 warn 新規範囲 / fmt check pass Phase 6
   (PositionConfidenceHead / DFlashParallelDraft の llama3 統合) は hidden
-  state exposure が必要で次 session
+  state exposure が必要で次回
 
 - **DSpark Phase 4 — `BigramBias` trait + `FullCountBigramBias` +
   `dspark-serde` feature** (2026-07-31). RadixArk/Kimi-K3-DSpark 吸収の
@@ -452,7 +429,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply}` 18 追加 unit test (計 70 test、+ serde feature で 4 追加、計 74
   test) 全 pass、clippy pedantic+nursery 0 warn (両 feature)、fmt check
   pass Phase 5 (llama3.rs `generate_speculative_dual` optional feature gate
-  配線) は次 session
+  配線) は次回
 
 - **DSpark Phase 3 — `speculative_dspark::DFlashParallelDraft`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 3 要素の 3 番目 DFlash 並列 draft を実装 外部
@@ -470,7 +447,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BigramVocabMismatch / DraftLogitsAllNonFinite / DraftModelFailed(String)) 計
   17 variant 19 追加 unit test 全 pass (計 52 test)、clippy pedantic+nursery
   0 warn、fmt check pass Phase 4 (llama3.rs `generate_speculative_dual` optional
-  feature 配線 + full-count sketch) は次 session
+  feature 配線 + full-count sketch) は次回
 
 - **DSpark Phase 2 — `speculative_dspark::PositionConfidenceHead`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 3 要素の 2 番目 位置別 confidence head を実装
@@ -482,7 +459,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   17 追加 unit test 全 pass (計 33 test)、clippy pedantic+nursery 0 warn、
   `DsparkError` に 5 variant 追加 (ZeroBlockSize / ZeroHiddenDim /
   HiddenLenMismatch / PositionOutOfRange / BlockStatesCountMismatch) Phase 3
-  (DFlashParallelDraft + `generate_speculative_dual` 配線) は次 session
+  (DFlashParallelDraft + `generate_speculative_dual` 配線) は次回
 
 - **DSpark Phase 1 — `speculative_dspark::MarkovBigramBias`** (2026-07-29).
   RadixArk/Kimi-K3-DSpark 吸収 3 要素 (DFlash 並列 draft + Markov logit-bias +
@@ -494,13 +471,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bucket_len}` + `DsparkError` (4 variant) 16 unit test 全 pass、clippy
   pedantic+nursery 0 warn (`imprecise_flops` 修正で `ln_1p` 使用)
 
-- **🎉 Real Kimi K3 (moonshotai/Kimi-K3 2.8T MoE) 1 token forward
+- **Real Kimi K3 (moonshotai/Kimi-K3 2.8T MoE) 1 token forward
   完走達成** (2026-07-28 22:47 JST). Full pipeline demonstrated on
   real GrEarl/Kimi-K3-GGUF-IQ1_S (566GB across 94 shards) via
   ALICE-LLM pure Rust implementation. Only Rust K3 implementation
   known to actually run real K3 weights end-to-end (llama.cpp
   pwilkin PR #26185 is still draft stage; the reference GGUF
-  converter has not landed upstream). Environment: Mac mini M2 Pro
+  converter has not landed upstream). Environment: arm64 desktop
   (10-core, 32 GB unified) + external USB SSD 960 GB ExFAT for
   the split GGUF, macOS 26.5.1, Rust 1.94.1, alice-llm 1.6.0
   features `gguf,hf-config,parallel`, invoked via
@@ -817,23 +794,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dense_ffn_forward` zero-input-gives-zero + bounded-output
   smoke tests.
 
-### Changed
-
-- **`model_forward_panics_at_first_kda_layer_with_todo_message`**
-  → **`model_forward_panics_on_empty_layers_vec`**. The KDA
-  `todo!()` message was previously the first panic
-  `KimiK3Model::forward` raised because the layer loop never
-  touched `weights.layers`. With X.4.c.3.3.a wiring the MLA and
-  Dense branches into real per-layer weight lookups, the
-  metadata-only `dummy_weights` fixture (which ships
-  `layers: Vec::new()`) now panics with index-out-of-bounds
-  first. The updated test asserts that behaviour and documents
-  the precondition: `load_kimi_k3_model_weights` must run before
-  `forward`. A full-fixture end-to-end forward test lands at
-  Phase X.4.c.3.3.d when a synthetic-GGUF-with-tensors builder
-  is available.
-
-### Deferred (X.4.c.3.3.b/c + X.4.c.3.4, next sessions — still needed for real K3)
+#### Deferred (X.4.c.3.3.b/c + X.4.c.3.4, follow-up — still needed for real K3)
 
 - **X.4.c.3.3.b KDA per-head aggregation**: per-head slicing from
   the fused `attn_q` / `attn_k` / `attn_v` tensors + per-head
@@ -853,8 +814,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   need pwilkin PR #26185 precise reading before wiring — the K3
   tech report §2.2 leaves the exact per-layer AttnRes projection
   underspecified relative to the GGUF tensor set.
-- **Real K3 GGUF forward on Mac mini (via Tailscale)**: user
-  flagged that Mac mini has enough disk to hold the ~527 GB
+- **Real K3 GGUF forward on an arm64 desktop**: the
+  arm64 desktop has enough disk to hold the ~527 GB
   GrEarl IQ1_S 94-part upload. Scheduled after X.4.c.3.3.b/c/4
   land the real forward path.
 
@@ -908,7 +869,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predicate correctness at layers 0/3/4/7, and Dense-vs-MoE
   boundary at `first_k_dense_replace = 1`.
 
-### Deferred (X.4.c.3, next session — makes K3 actually run)
+#### Deferred (X.4.c.3, follow-up — makes K3 actually run)
 
 - **`forward_kimi_k3` real implementation**: wire X.4.b.2 tensor
   refs into a 93-layer forward using the X.4.c.1 KDA primitives,
@@ -966,7 +927,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configs, graceful handling of missing optional keys, and a
   regression guard on the hyphenated `meta_prefix`.
 
-### Deferred (X.4.b.2 + X.4.c.3, next session)
+#### Deferred (X.4.b.2 + X.4.c.3, follow-up)
 
 - **Weight tensor loader**: per-layer tensor lookup + shape
   validation for the ~2573 tensors K3 emits (F32 + Q4_K + F16 +
@@ -1015,10 +976,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into X.4.f.1 (完了) and X.4.f.2 (SIMD NEON / AVX2 / AVX-512
   variants, deferred).
 
-### Deferred
+#### Deferred
 
 - Phase X.4.f.2 (SIMD variants): NEON kernel for aarch64
-  (Jetson / Mac M-series), AVX2 / AVX-512 for x86_64. Follows the
+  (ARM64 embedded board / Apple Silicon), AVX2 / AVX-512 for x86_64. Follows the
   Q1_0 / Q2_0 pattern (see `neon_dot::q1_0_dot_row_pos_only` +
   per-block sum precompute), validated against
   `mxfp4_matvec_fused_scalar` for bit-exact parity.
@@ -1030,7 +991,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (2026-07-28). Ships the paper §2.2 Eq 8-10 runtime primitives as
   a standalone module ahead of the eventual
   `forward_kimi_k3`-level integration. Block AttnRes reduces the
-  `O(Ld)` memory/communication cost of Full AttnRes to `O(Nd)` by
+  `O(Ld)` memory and communication cost of Full AttnRes to `O(Nd)` by
   summing layer outputs within `N` block groups; K3 partitions its
   93 layers into 8 blocks of 12 layers each (with the last block a
   partial 9-layer block). New API:
@@ -1074,7 +1035,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since the paper leaves that kernel's parameterization
   underspecified.
 
-### Deferred
+#### Deferred
 
 - Final N-block aggregation layer (paper §2.2 "the final output
   layer aggregates all N block representations"): the exact
@@ -1124,7 +1085,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proportional to the sigmoid ratio vs baseline. All tolerances
   are 1e-3 to 1e-6.
 
-### Deferred
+#### Deferred
 
 - Phase X.4.c.3 (block-level integration): wiring
   `kimi_delta_forward_head` into the eventual `forward_kimi_k3`
@@ -1187,7 +1148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a) the multimodal fusion timing (scheduled at X.4.i) and (b)
   the community GGUF metadata prefix (external dependency, X.4.b).
 
-### Deferred
+#### Deferred
 
 - Phase X.4.c.2 (block-level integration): wiring the primitives
   above into `forward_kimi_k3`, including per-head projection with
@@ -1219,7 +1180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`recommended_budget_bytes(active_bytes,
     safety_multiplier_x10)`** — companion helper that scales
     `active_bytes` by a fixed-point multiplier for LRU cache
-    sizing (default 1.2× gives 24 → 30 GB budget for K3 on Mac M3
+    sizing (default 1.2× gives 24 → 30 GB budget for K3 on an arm64 laptop
     Max 128 GB unified memory).
 - **Four Kimi K3 unit tests** covering (a) sizing-helper
   correctness against the paper's ≈ 24 GB estimate, (b)
@@ -1270,6 +1231,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- README / README_JP follow one section layout: Contents, Installation, Example (a library snippet and the CLI example), Highlights, the existing technical sections, Cargo features, Performance, Minimum supported Rust version, Building and testing, Related crates, License; the Japanese README now carries the sections it was missing (NEON matvec bench, the Bonsai end-to-end status, the x86_64 SIMD and sparse-attention highlights, the re-measured 70B table)
+- Benchmarks and test hosts in documents, comments and example output are described by hardware class (for example "arm64 laptop", "ARM64 embedded board, 8 GB unified memory") instead of product names; measured numbers are unchanged. Wording in public documents, code comments and CI files was tidied to pass the docs lint (no behaviour change; the bandwidth labels printed by `examples/bench_70b_sparse.rs` changed accordingly)
+- `.gitignore` no longer lists editor-local files; `scripts/*.py` is no longer ignored
+- `[Unreleased]` regrouped into one `### Added` and one `### Changed` list (the former Performance / CI/CD / Notes / Deferred blocks are sub-headings)
+- **License: `AGPL-3.0-or-later` → `AGPL-3.0-or-later OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ / ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
+
+- CI clippy job is a hard gate: `-D warnings`, `--all-targets`, three feature sets (default / `simd` / full incl. `gpu`, `server`); it ran `-W clippy::all` on `--lib` only, which cannot fail — 13 findings in tests / examples had accumulated (`chunks_exact(8)` → `as_chunks::<8>()` in the SIMD kernels, `Option::filter`, decimal literals in bitwise tests, redundant references in example `println!`) `bench_grammar_mask` declares `required-features = ["gguf", "grammar"]` (it did not compile in a default build)
+- README 70B sparse-ternary table re-measured with `examples/bench_70b_sparse.rs` (arm64 laptop, 2026-09-16: 3.9 ms / layer, 314 ms / token → 3.18 tok/s; the 2026-03 row (200 GB/s arm64 SoC) kept for reference) and marked `<!-- perf-measured -->`; the 1B / 8B rows are annotated as hand-measured with a local model, not reproduced by CI
+- `GpuModel::debug_dump_layer0_deltanet_stages` returns a `DeltaNetLayer0Stages` struct instead of a 10-element tuple (the tuple made `cargo mutants --list` enumerate 4^10 = 1,048,576 replacement candidates for that one function)
+- The two `ignore` doctests are a compiled `no_run` example (`KimiK3Model::new`) and a `text` excerpt (`llama3_bridge` module doc); `# Panics` docs on `Matrix::get` / `set` / `GpuEngine::upload_weights_q8_0`
+- CI: `rust-toolchain.toml` pin → 1.98.1 (6 release 遅れで `cargo-semver-checks@latest` MSRV 1.93 に追い抜かれ semver job が赤、2026-09-14) + `cargo-semver-checks` を 0.50.0 に明示 pin 1.98.1 の新規 lint 修正 (gguf sort_by_key / chunks_exact 3 件)
+
+#### Performance
+
+- **Grammar-constrained decoding: token trie mask (Phase X.8 B-10, 2026-09-14)** — `grammar::TokenTrie` (vocab 全 token text を文字 trie に 1 回構築、130k vocab で 68 ms / 231k node) + `sampling::mask_logits_by_grammar_trie` (FSM 状態から trie を DFS、拒否 edge で subtree 枝刈り、受理 edge でのみ FSM clone) を追加し `Llama3Model::generate_grammar` をこちらに切替 従来の `mask_logits_by_grammar` は vocab 全 token を独立に probe (`text_of` String alloc + `Fsm::accepts_str` の FSM clone) しており、MiniCPM5-2B (vocab 130,560) × `lol.gbnf` の実測で **1 step 6.7-8.1 s、end-to-end の 95-98 %** を占めていた trie 版は同条件で **avg 377 ms/step、comment 状態を除けば 0-6 ms/step**、生成 token 列は naive 版と 16/16 一致 副次効果で alloc 圧が消え forward も 153-388 → 35-57 ms/token に安定 `Fsm::accepts` を alloc-free の head-only probe に変更 (`accepts_str` / `advance` の意味は不変) naive 版は parity test の reference として残置
+  - 残る重さ: `//` line comment 内 (`noteol*` = ほぼ全 char 受理) では trie 全走査で 0.5-1 s/step、model も comment に「考え事」を書き続けて本体を出さないため LLM 向け grammar から comment rule を外す対応は ALICE-LOL 側で別途
+  - `examples/bench_grammar_mask.rs` — step ごとの mask / forward 時間分離計測 (`--naive` で reference 版)
+
+#### CI/CD
+
+- **`.cargo/config.toml` から `target-cpu=native` を外した (2026-09-29)** — CI runner の CPU 世代に依存して rustc 自身が SIGILL で落ちる (run 36431060432 の `rustdoc (-D warnings, docs.rs feature set)` job: `error: rustc interrupted by SIGILL` / `signal: 4, SIGILL: illegal instruction`、rustc の引数末尾が `-C target-cpu=native`) commit と無関係に red / green が揺れるため、直前に push した人の変更が疑われて原因究明が逸れる native が要るのは microbench だけで test / clippy / rustdoc には不要 local の opt-in 経路は `RUSTFLAGS="-C target-cpu=native" cargo …` と `cargo … --config 'build.rustflags=["-C","target-cpu=native"]'` の 2 つ (どちらも実測、README / README_JP に記載) `.cargo/config.local.toml` は cargo が自動では読まないので使えない (2026-09-29 実測) 同じ方針を ALICE-Text / ALICE-View と揃えた
+- **crates.io auto-publish workflow added (2026-09-13)** — `.github/workflows/release.yml` に `publish-crates-io` job を append 既存 build job (matrix 5 target + GitHub Release upload) と並列で `cargo publish --dry-run` → `cargo publish` を実行、tag push `v*.*.*` で自動発火 GitHub Secret `CARGO_REGISTRY_TOKEN` は設定済 次 tag push (e.g., `v1.6.1` / `v1.7.0`) から GitHub Release + crates.io 同時 publish が有効
+
+- **`model_forward_panics_at_first_kda_layer_with_todo_message`**
+  → **`model_forward_panics_on_empty_layers_vec`**. The KDA
+  `todo!()` message was previously the first panic
+  `KimiK3Model::forward` raised because the layer loop never
+  touched `weights.layers`. With X.4.c.3.3.a wiring the MLA and
+  Dense branches into real per-layer weight lookups, the
+  metadata-only `dummy_weights` fixture (which ships
+  `layers: Vec::new()`) now panics with index-out-of-bounds
+  first. The updated test asserts that behaviour and documents
+  the precondition: `load_kimi_k3_model_weights` must run before
+  `forward`. A full-fixture end-to-end forward test lands at
+  Phase X.4.c.3.3.d when a synthetic-GGUF-with-tensors builder
+  is available.
+
 - **`ModelArch::KimiK3` doc comment** — updated to reflect the
   released spec (2.8T total / 104B active, 896 experts top-16, 93
   layers = 69 KDA + 24 Gated MLA + 1 dense, hidden 7168, 1M context,
@@ -1278,10 +1276,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Phase X.4.b (community GGUF conversion) as the outstanding
   blocker, rather than the initial weight release.
 
-### Notes
+#### Notes
 
-- The `todo!()` in `forward_kimi_k3` remains intentional per
-  CLAUDE.md's "仮実装完了偽装の禁止" rule. Downstream users who
+- The `todo!()` in `forward_kimi_k3` remains intentional: an
+  unimplemented path must fail fast, never return silently. Downstream users who
   feed a Kimi K3 GGUF (once the community conversion lands) will
   hit an explicit panic pointing to `docs/KIMI_K3_INTEGRATION.md`
   rather than silent garbage from the vanilla-attention path.
@@ -1484,7 +1482,7 @@ Downstream crates can adopt `_no_read` incrementally.
   partial parse. Fine-tuned LOL emission is future work — the mask
   guarantees syntactic validity but semantic quality tracks the
   underlying model.
-- Phase X.8 B-9-B (Jetson Vulkan smoke run) and a version bump to
+- Phase X.8 B-9-B (ARM64 embedded board Vulkan smoke run) and a version bump to
   1.3.0 (additive `grammar` feature is SemVer-minor) are follow-up
   work.
 
@@ -1531,7 +1529,7 @@ Downstream crates can adopt `_no_read` incrementally.
   asking about" instead of the correct Tokyo answer. One-line fix: pass
   `q_dim_attn = num_heads * head_dim` for `cols` (neutral for standard
   models where `q_dim == hidden_dim` — Llama, Qwen 2 / 2.5 / 3, Mistral).
-  Result on both Mac Metal and Jetson Vulkan:
+  Result on both Mac Metal and ARM64 embedded board Vulkan:
   Qwen 3.5-4B L3 pos 17 hidden cosine `0.7057 → 0.9970` across all
   positions; end-to-end generation "The capital of Japan is **Tokyo**.
   It is the country's capital, largest city, ..." Diagnostic journey:
@@ -1542,7 +1540,7 @@ Downstream crates can adopt `_no_read` incrementally.
   RoPE precomputed frequencies had zero effect), until direct per-op
   dumps revealed that V projection was correct (cos 0.9992) but `o_buf`
   was orthogonal (cos 0.118) — the shape parameter was the root cause.
-  All 326 tests continue to pass on both Apple M3 Metal and Jetson Orin
+  All 326 tests continue to pass on both arm64 laptop (Metal) and ARM64 embedded board
   Nano 8GB (Vulkan).
 - **`src/bin/server.rs` stale config API** (c1cfabe). Followed the
   `Llama3Config` God-object-free refactor: six field accesses
@@ -1553,13 +1551,12 @@ Downstream crates can adopt `_no_read` incrementally.
   `attention_only_load`) sourced from `llm_config.use_neox_rope()` and
   `false` respectively. Restored `cargo build --release --features
   server --bin alice-llm-server` on both Apple Silicon and aarch64
-  Vulkan. Verified end-to-end on Extoria-Jetson (Yahboom Orin Nano
-  8GB): Llama-3.2-1B-Instruct-Q4_K_M loaded via `alice-llm-server
+  Vulkan. Verified end-to-end on an ARM64 embedded board (8 GB unified memory): Llama-3.2-1B-Instruct-Q4_K_M loaded via `alice-llm-server
   --model … --port 8000`, `/v1/chat/completions` returns "Tokyo."
-  at 9.68 tok/s over Tailscale MagicDNS. `attention_only_load: false`
+  at 9.68 tok/s over the local network. `attention_only_load: false`
   means the server bin still requires the full model to fit in unified
   memory (Qwen 3.5-4B needs 7.82 GB projected peak against 3.28 GB
-  available on Jetson and OOM-kills); routing hybrid architectures
+  available on an ARM64 embedded board and OOM-kills); routing hybrid architectures
   through `GpuModel::run_attention_layer_only` inside the server is
   future work.
 
@@ -1592,8 +1589,7 @@ Downstream crates can adopt `_no_read` incrementally.
 - **`docs/ALICE_ROUTER_SPEC.md`** — design specification for the
   `alice-router` sibling crate (orchestration + verification layer
   above ALICE-LLM engines and external HTTP APIs). Spec only, no
-  crate yet. 21 sections following `comprehensive-spec-templates`
-  skill: vision / scope / positioning (vs Sakana Fugu / LangChain /
+  crate yet. 21 sections: vision / scope / positioning (vs Sakana Fugu / LangChain /
   LiteLLM / OpenRouter) / architecture / data model / Rust trait API
   surface / routing strategies / verification / backend integration
   (Kimi K3 API + AliceLLMBackend) / caching / observability / config
@@ -1601,12 +1597,12 @@ Downstream crates can adopt `_no_read` incrementally.
   plan / roadmap (R.0-R.7) / open questions / related ALICE work /
   glossary.
 - **`README.md` + `README_JP.md`** (fc78c12, 5bc4ec8). Added
-  Phase X.3.e.3.37 fix highlight, updated the Jetson Qwen 3.5-4B
+  Phase X.3.e.3.37 fix highlight, updated the ARM64 embedded board Qwen 3.5-4B
   hybrid-per-layer line from `0.3 tok/s` (pre-fix, incoherent) to
   `0.4 tok/s` returning the correct "The capital of Japan is Tokyo.
   It is the country's capital, largest city," output, and added a
-  Jetson multi-model support statement covering the four models
-  verified on Extoria-Jetson (Yahboom Orin Nano 8GB) on 2026-07-21:
+  ARM64 embedded board multi-model support statement covering the four models
+  verified on an ARM64 embedded board (8 GB unified memory) on 2026-07-21:
   Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` at 0.4 tok/s, Ornith 9B
   Q4_K_M `--hybrid` at 0.2 tok/s, Bonsai 27B Q1_0 `--hybrid` at
   0.1 tok/s, and DeepSeek V2-Lite Q4_K_M (deepseek2 arch, MoE 64
@@ -1615,8 +1611,7 @@ Downstream crates can adopt `_no_read` incrementally.
 ## [1.1.0] - 2026-07-18
 
 Aggregated work since `1.0.0`. Grouped by Phase; the "Phase X.Y.Z"
-references map back to the roadmap in `memory/alice_llm_future_work.md`
-and the journey entries in `memory/alice_llm_phase_x3e3_journey.md`.
+references map back to the project roadmap.
 
 ### Added
 
@@ -1628,7 +1623,7 @@ and the journey entries in `memory/alice_llm_phase_x3e3_journey.md`.
   `todo!()`, GGUF `"kimi"` prefix detection, dispatch wiring. The
   actual forward path waits on the 2026-07-27 open-weight release.
 - **Phase X.3.e.3.29 — `attention_only_load` flag** (d479e6a).
-  Enables real Phase A2 hybrid on Jetson (Qwen 3.5-4B) by skipping
+  Enables real Phase A2 hybrid on an ARM64 embedded board (Qwen 3.5-4B) by skipping
   DeltaNet weight upload to GPU when the CPU handles those layers.
 - **Phase X.3.e.3.28 — `--hybrid-per-layer`** (9d644fb).
   CPU DeltaNet + GPU Attention concurrent execution.
@@ -1641,7 +1636,7 @@ and the journey entries in `memory/alice_llm_phase_x3e3_journey.md`.
   zero-init (12ab0ae), BOS token prepend + `attn_out_normed` field
   + prompt template sync (29f6db4). Cumulative: 6 CPU + 6 GPU fixes
   landing Bonsai 27B on Mac Metal (1.1 tok/s) and A6000 (6.9 tok/s)
-  and Qwen 3.5-4B on Jetson USB Orin 8GB via hybrid mode (0.3 tok/s
+  and Qwen 3.5-4B on an ARM64 embedded board (8 GB) via hybrid mode (0.3 tok/s
   = 3.3× speedup).
 - **V2-Lite Q8_0 validation methodology** (e9f8586). Prompt token IDs
   dump in `examples/elyza_gguf.rs` and `kv_a_full` split diagnostic
@@ -1700,8 +1695,7 @@ and the journey entries in `memory/alice_llm_phase_x3e3_journey.md`.
 - `Cargo.toml` version stays at `1.0.0`. No git tag has been cut for
   this window; releases will start being tagged from the next
   semantic version bump.
-- The `todo!()` in `forward_kimi_k3` is intentional per CLAUDE.md's
-  "仮実装完了偽装の禁止" rule — no silent Ok on unimplemented paths,
+- The `todo!()` in `forward_kimi_k3` is intentional — no silent Ok on unimplemented paths,
   and users get an explicit panic pointing to the integration doc if
   they somehow feed a Kimi K3 GGUF before Phase X.4.b lands.
 - Two open stubs are tracked in ALICE-CodeTracker (ID `019f6f7f`):

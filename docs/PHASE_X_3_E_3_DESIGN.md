@@ -1,7 +1,7 @@
 # Phase X.3.e.3 — SSM-math refinement (Bonsai / Qwen 3.6 DeltaNet)
 
 **Status**: **✅ Complete** (2026-07-16、5 commit で全 subphase landing)
-**Predecessor**: Phase X.3.e.2 (PR #66、DeltaNet forward wiring) + X.5 (PR #67、Jetson load-and-run 動作証明)
+**Predecessor**: Phase X.3.e.2 (PR #66、DeltaNet forward wiring) + X.5 (PR #67、ARM64 組込みボード load-and-run 動作証明)
 **Objective**: Bonsai 27B の DeltaNet forward path で **Qwen 3.5 と Bonsai / Qwen 3.6 の SSM 数値挙動一致を担保** し、`ssm_a` / `ssm_dt_bias` / `ssm_norm` の `#[allow(dead_code)]` を全撤去する **達成済**
 
 ---
@@ -24,7 +24,7 @@ Phase X.3.e.3 は当初 4 Gap と設計、実装過程で reference (`PrismML ll
 
 **残る作業**:
 
-- **X.3.e.3.3 End-to-end numerical validation** (別 session、要 disk cleanup + llama.cpp fork build) → 実行手順を `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented、disk 空けた後に ~3-5h で完遂可能
+- **X.3.e.3.3 End-to-end numerical validation** (別途、要 disk cleanup + llama.cpp fork build) → 実行手順を `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented、disk 空けた後に ~3-5h で完遂可能
 - **X.3.e.3.4 Qwen 3.5 backwards compat 意思決定** → **✅ 2026-07-16 解決済**: HuggingFace API で Qwen3.5-4B safetensors を確認、`linear_attn.A_log` / `dt_bias` / `norm.weight` / `in_proj_qkv` / `in_proj_z` / `conv1d.weight` 全て存在。ALICE-LLM loader が unconditional で `tensor_to_f32(...)` で Option を読む設計なので、Qwen 3.5 GGUF (正しく converted) なら SSM tensors も Some で load される。よって `is_bonsai_path = ssm_a.is_some() && ssm_dt_bias.is_some()` は自動的に Qwen 3.5 でも true → SSM refinement 適用 → reference formula と一致 = **意思決定不要、現行 code が正解**。命名の misleading (`bonsai_semantics` / `is_bonsai_path` は実質「GGUF に SSM refinement tensor 含む」) は将来 followup で `use_ssm_refinement` へ rename 推奨だが機能は unchanged
 
 ---
@@ -38,7 +38,7 @@ Phase X.3.e.2 で Bonsai 27B の DeltaNet forward path が「panic なし load-a
 3. `ssm_norm` (128 dim, per-head qk_dim RMSNorm) — loaded but not consumed → **Gap C で解消 (commit `005b3d0`)**
 4. `dn_alpha` / `dn_beta` の per-V-head vs per-KV-head 解釈 — 現状 loop は `dn_num_kv_heads=16` 回、Bonsai の 48-entry alpha/beta の 32 entries が silent drop されている可能性 → **Gap A で解消 (commit `146ee22`)**
 
-Phase X.3.e.3 は当初 llama.cpp Qwen 3.6 reference 出力との numerical comparison を通じて 4 gap を埋める予定だったが、実際は **`gh api` で PrismML llama.cpp fork の `qwen35.cpp` を直接精読** することで 4 gap + 2 追加 refinement (§Q/K L2Norm without silu、§silu(z) order) を code-level で reference formula と数式一致まで進めた 実 GGUF DL + build を伴う end-to-end 数値検証は別 session に持ち越し
+Phase X.3.e.3 は当初 llama.cpp Qwen 3.6 reference 出力との numerical comparison を通じて 4 gap を埋める予定だったが、実際は **`gh api` で PrismML llama.cpp fork の `qwen35.cpp` を直接精読** することで 4 gap + 2 追加 refinement (§Q/K L2Norm without silu、§silu(z) order) を code-level で reference formula と数式一致まで進めた 実 GGUF DL + build を伴う end-to-end 数値検証は別途実施
 
 ---
 
@@ -363,7 +363,7 @@ if layer == DUMP_TARGET_LAYER {
 | llama.cpp reference が取得不可 | Blocker、SSM math 確定不能 | PrismML HuggingFace transformers 実装で代替 dump / Bonsai 論文付録 数値例 参照 |
 | Gap A 修正で Qwen 3.5 regression | 既存 3B/7B model 出力破綻 | backwards compat test 追加 + `num_v_heads == num_kv_heads` の 1:1 mapping で etxist 動作維持 |
 | Gap B の 3 hypothesis 全て不一致 | 更なる仮説必要 (long research) | Option B3 (skip) で Phase X.3.e.3.1 partial landing、B1/B2 は X.3.e.3.2 で追加 |
-| Bonsai 27B 実行に 8GB unified memory 不足 | Jetson で validation 不能 | Mac M-series で validation (Jetson は SIMD 最適化後の速度検証専用) |
+| Bonsai 27B 実行に 8GB unified memory 不足 | ARM64 組込みボード で validation 不能 | Apple Silicon で validation (ARM64 組込みボード は SIMD 最適化後の速度検証専用) |
 | State buffer 3× 大 (16→48 heads) で OOM | 5120 * 128 * 48 * 4 bytes/f32 = 125 MB / layer × 48 layers = 6 GB | 実測 (Phase X.5 は 8GB tight 動作、48 KV state は 2 GB 増、OOM リスクあり) |
 
 ---
@@ -411,9 +411,9 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
 - [x] Post-conv1d silu + z-gate after ssm-norm → commit `c342f10` (§Q/K L2Norm + §silu(z) order、reference qwen35.cpp:502 + :562)
 - [x] Qwen 3.5 (num_v_heads == num_kv_heads) regression なし → **304 tests pass** (前 296 + 新規 8)
 - [x] **Qwen 3.5 backwards compat 意思決定** (旧 X.3.e.3.4) → **✅ 解決** (HuggingFace API 確認、Qwen 3.5 も同 SSM tensors を持つため現行 conditional が Qwen 3.5 でも auto-trigger、意思決定不要)
-- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3) → **別 session** (要 GGUF DL + llama.cpp build、手順 doc `PHASE_X_3_E_3_3_VALIDATION.md` 参照)
-- [ ] End-to-end first 3 tokens 一致 (prompt fixed, seed fixed) → **別 session** (同上)
-- [ ] Bonsai 27B Jetson load time が X.5 baseline から±10% 以内 → **別 session** (要実機測定)
+- [ ] llama.cpp Bonsai 27B との step-by-step numerical diff (rel < 1e-3) → **別途** (要 GGUF DL + llama.cpp build、手順 doc `PHASE_X_3_E_3_3_VALIDATION.md` 参照)
+- [ ] End-to-end first 3 tokens 一致 (prompt fixed, seed fixed) → **別途** (同上)
+- [ ] Bonsai 27B ARM64 組込みボード load time が X.5 baseline から±10% 以内 → **別途** (要実機測定)
 
 ---
 
@@ -421,7 +421,7 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
 
 - Predecessor:
   - [PR #66 — Phase X.3.e.2 DeltaNet forward wiring](https://github.com/ext-sakamoro/ALICE-LLM/pull/66)
-  - [PR #67 — Phase X.5 Jetson load-and-run 動作証明](https://github.com/ext-sakamoro/ALICE-LLM/pull/67)
+  - [PR #67 — Phase X.5 ARM64 組込みボード load-and-run 動作証明](https://github.com/ext-sakamoro/ALICE-LLM/pull/67)
 - Landing commits (2026-07-16、all authored by `Moroya Sakamoto <sakamoro@alicelaw.net>`):
   - `146ee22` — Gap A per-V-head loop
   - `005b3d0` — Gap C ssm_norm RMSNorm
@@ -435,14 +435,10 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
   - Issue #60 (Phase X.3 diff analysis, Comment `4978572709`)
   - Qwen 3.6 HF config: https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/config.json
 - Successor:
-  - Phase X.3.e.3.3 (別 session、要 external resource): llama.cpp end-to-end numerical validation — 実行手順 `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented
+  - Phase X.3.e.3.3 (別途、要 external resource): llama.cpp end-to-end numerical validation — 実行手順 `docs/PHASE_X_3_E_3_3_VALIDATION.md` に documented
   - ~~Phase X.3.e.3.4~~ Qwen 3.5 backwards compat 意思決定 — **✅ 2026-07-16 解決済** (HuggingFace API で SSM tensor 存在確認、意思決定不要)
   - Phase X.4 (4-bit KV cache) — X.3.e.3 完了、着手可
   - Phase X.8 (Guided Generation) — Bonsai output quality 確定後着手
-- ALICE-* memory:
-  - `~/claude-config/memory/reference_bonsai_27b_prism_ml.md`
-  - `~/claude-config/memory/alice_llm_edge_stack_roadmap.md`
-  - `~/claude-config/claude-skills/edge-llm-inference-architecture/SKILL.md` §10 Pattern #1-5
 
 ---
 
@@ -465,7 +461,7 @@ Summary:
 
 Numerical validation:
 - Qwen 3.5 (32-head) regression: 0 (既存 296 tests pass、+8 新規 test)
-- llama.cpp Bonsai 27B step-by-step diff: 別 session (要 GGUF + build)
+- llama.cpp Bonsai 27B step-by-step diff: 別途 (要 GGUF + build)
 
 Impact:
 - `#[allow(dead_code)]` を ssm_a / ssm_dt_bias / ssm_norm から全撤去

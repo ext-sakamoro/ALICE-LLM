@@ -14,7 +14,7 @@
 //!   WGSL shader matches the CPU reference within FP summation noise).
 //!
 //! On a memory-bound decode workload, GPU matvec should approach the device
-//! memory bandwidth × row byte cost lower bound. On Jetson Orin Nano 8GB
+//! memory bandwidth × row byte cost lower bound. On an ARM64 embedded board (8 GB)
 //! (Vulkan, Ampere), Bonsai 27B's `attn_qkv` is ~7 MB / row-family × 40 blocks
 //! → the theoretical ceiling is on the order of 100+ µs / matvec, orders of
 //! magnitude faster than the CPU NEON `q1_0_dot_row_pos_only` path at ~10 s /
@@ -274,7 +274,7 @@ fn main() {
         // Bandwidth headroom check
         let bytes_per_matvec = tensor_data.len() as f64;
         let bandwidth_gb_s = bytes_per_matvec / (batched_per_matvec * 1000.0);
-        // ~68 GB/s LPDDR5 on Jetson Orin Nano, ~200 GB/s LPDDR5X on M3 Max
+        // ~68 GB/s LPDDR5 on an ARM64 embedded board, ~200 GB/s LPDDR5X on an arm64 laptop
         println!(
             "Effective per-matvec bandwidth: {:.2} GB/s (weight bytes / matvec time)",
             bandwidth_gb_s

@@ -7,8 +7,8 @@
 //! ~1.5 GB and up to 10+ GB without duplicated match arms.
 //!
 //! Only Q_K family + Q8_0 + F32 are exposed here. I-quant family (IQ2/3/4)
-//! is intentionally excluded — see [[project_alice_llm_imatrix_cli_design]]
-//! alternative (d) for the rationale.
+//! is intentionally excluded: their codebook-based block layouts need a
+//! separate quantiser and are out of scope for the tier decision.
 
 use crate::gguf::GgmlType;
 

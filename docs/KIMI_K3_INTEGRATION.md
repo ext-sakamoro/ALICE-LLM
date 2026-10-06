@@ -15,11 +15,9 @@ model". It is the flagship test case of the ALICE-LLM
 **Transformer Hybrid Hegemony Thesis** (see `docs/HEGEMONY_THESIS.md`).
 Kimi K3 is Bonsai 27B's strategy scaled 10×: hybrid linear attention
 (KDA) + sparse MoE (896/16) + quantization-aware training (MXFP4). If
-ALICE-LLM runs Bonsai 27B on Jetson 8GB, running Kimi K3 on Mac M3 Max
-consumer hardware is a logical necessity. See also
-`~/.claude/projects/-Users-ys/memory/alice_llm_moe_phase_x4_kimi_k3_roadmap.md`
-for the memory-side roadmap with sub-phase breakdown and user decision
-points (A: scope, B: edge/cloud, C: MXFP4 GPU shader, D: start timing).
+ALICE-LLM runs Bonsai 27B on an ARM64 embedded board (8 GB), running Kimi K3 on an arm64 laptop
+consumer hardware is a logical necessity. Open decision points:
+A: scope, B: edge/cloud, C: MXFP4 GPU shader, D: start timing.
 
 ## What we know (public, 2026-07-17 + 2026-07-24 update)
 
@@ -41,15 +39,15 @@ points (A: scope, B: edge/cloud, C: MXFP4 GPU shader, D: start timing).
 | API input price | $3 / 1M tokens ✅ | Investing.com 2026-07-17 |
 | API output price | $15 / 1M tokens ✅ | Investing.com |
 | API cache-hit input | $0.30 / 1M tokens ✅ | Investing.com |
-| Pricing vs Claude Opus 4.8 | ~60% | Investing.com |
+| Pricing vs Anthropic Opus 4.8 | ~60% | Investing.com |
 | Pricing vs GPT-5.6 Sol | ~50% | Investing.com |
 | **MoE topology** | **896 total experts, top-16 active per token** ✅ | Multiple sources confirmed |
 | Active params per token | ~48-50 B (2.8T × 16/896) ✅ | Derived |
 | **Active weights per token (Q4)** | **~24 GB** ✅ | 48B × 0.5 bytes/param, derived |
-| Intelligence Index | 57 (Artificial Analysis) — matches Claude 3.5 Sonnet + o1 | Investing.com |
-| Benchmark (Moonshot) | Beats GPT-5.6 Sol / Claude Fable 5 / Claude Opus 4.8 (Artificial Analysis) | Announcement |
-| Frontend Code Arena | 1679 pt で首位 (Claude Fable 5 抜き) ✅ | Moonshot 公式 |
-| 独立 benchmark 順位 | 4 位 (Claude Fable 5 + GPT-5.6 Sol の下、Claude Opus 4.8 の上) ✅ | Tom's Hardware |
+| Intelligence Index | 57 (Artificial Analysis) — matches Anthropic 3.5 Sonnet + o1 | Investing.com |
+| Benchmark (Moonshot) | Beats GPT-5.6 Sol / Anthropic Fable 5 / Anthropic Opus 4.8 (Artificial Analysis) | Announcement |
+| Frontend Code Arena | 1679 pt で首位 (Anthropic Fable 5 抜き) ✅ | Moonshot 公式 |
+| 独立 benchmark 順位 | 4 位 (Anthropic Fable 5 + GPT-5.6 Sol の下、Anthropic Opus 4.8 の上) ✅ | Tom's Hardware |
 | Market reaction | Tech + semiconductor stocks dropped on release day | Investing.com |
 | **GPU 逼迫** | **公開 48h で新規 subscription 停止** ✅ | ITmedia 2026-07-21 |
 
@@ -537,7 +535,7 @@ Kimi Delta is a Gated DeltaNet family, which ALICE-LLM already ships:
 
 ### Phase X.11 (MoE 汎化、+4-5 週)
 
-Kimi K3 実装で得た知見を横展開し 7 系統 MoE を共通 loader + forward で扱えるようにする ([[alice_llm_moe_phase_x4_kimi_k3_roadmap]] §Phase X.11 参照)
+Kimi K3 実装で得た知見を横展開し 7 系統 MoE を共通 loader + forward で扱えるようにする
 
 | Phase | Scope | 工数 |
 |---|---|---|
@@ -558,15 +556,15 @@ Investing.com confirmation + 2026-07-24 MXFP4 native size update):
 **total weights are 594 GB in MXFP4 native (or 1.4 TB in Q4 GGUF community
 conversion), but per-token active weights are only ~24 GB Q4**
 (16 experts × ~48 B active / 896 = 48B active × 0.5 bytes/param).
-That's Mac M3 Max tier — the constraint shifts from "does it fit in RAM"
+That's arm64 laptop tier — the constraint shifts from "does it fit in RAM"
 to "can we stream the top-16 experts from disk fast enough per token".
 
 | Target hardware | Total weight | Active/token (Q4) | Feasibility |
 |---|---|---|---|
-| **Mac M3 Ultra 512 GB + 2 TB NVMe** | 594 GB MXFP4 native | ~24 GB hot | ✅ **Full in-memory 可能** (NVMe streaming 不要、0.5-2 tok/s 目標) |
-| **Mac M3 Max 128 GB + 2 TB NVMe** | 594 GB on disk | ~24 GB hot | ✅ **Viable if expert streaming works** — target 0.5-2 tok/s bounded by NVMe I/O |
-| Mac M3 Max 128 GB (in-memory only) | — | — | ❌ (128 GB < 594 GB) |
-| Jetson USB Orin 8 GB | — | — | ❌ Not viable (even active weights don't fit, 24 GB > 8 GB unified) |
+| **arm64 laptop Ultra 512 GB + 2 TB NVMe** | 594 GB MXFP4 native | ~24 GB hot | ✅ **Full in-memory 可能** (NVMe streaming 不要、0.5-2 tok/s 目標) |
+| **arm64 laptop 128 GB + 2 TB NVMe** | 594 GB on disk | ~24 GB hot | ✅ **Viable if expert streaming works** — target 0.5-2 tok/s bounded by NVMe I/O |
+| arm64 laptop 128 GB (in-memory only) | — | — | ❌ (128 GB < 594 GB) |
+| ARM64 embedded board (8 GB) | — | — | ❌ Not viable (even active weights don't fit, 24 GB > 8 GB unified) |
 | **RunPod H100 80 GB × 8 (640 GB)** | ~594 GB MXFP4 | — | ✅ **Full in-memory 可能** (MXFP4 native なら 640 > 594) |
 | RunPod H200 141 GB × 8 (1.13 TB) | ~594 GB MXFP4 | — | ✅ 余裕 |
 | Paperspace A6000 48 GB | — | — | ❌ Not viable single-card |
@@ -642,6 +640,5 @@ Until 2026-07-27:
   `todo!("KIMI-K3 forward: waiting for open weight release 2026-07-27 — see docs/KIMI_K3_INTEGRATION.md")`
 - No silent Ok, no default values, no placeholder logits
 
-**Reason**: "仮実装完了偽装の禁止" (CLAUDE.md) — never let a stub silently
-succeed. If a user tries to load a Kimi K3 GGUF before X.4.b/c lands, they
+**Reason**: never let a stub silently succeed. If a user tries to load a Kimi K3 GGUF before X.4.b/c lands, they
 get an explicit panic pointing to this doc, not garbage output.

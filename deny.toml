@@ -1,12 +1,10 @@
 # cargo-deny 設定 (v0.14+ schema)
 # https://embarkstudios.github.io/cargo-deny/
 #
-# canonical CI template: [[reference_alice_ci_canonical_template]]
 # ALICE-SDF v1.7.7 (commit 52d26f9) の deny.toml を base に ALICE-LLM 用に調整
 #
 # ALICE-LLM 自身は AGPL-3.0-or-later だが、target crate なので license
 # check 対象で reject されるため exception で自己許可
-# (canonical [[reference_alice_ci_canonical_template]] 罠 #7 の target-side 版)
 #
 # ALICE-LLM は現状 ALICE-* sibling path dep 無し (alice-stubs は no-op)
 
@@ -26,7 +24,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "deny"
 ignore = [
-    # bincode 1.x unmaintained (transitive dep、canonical 罠 #6 の with_limit 適用済)
+    # bincode 1.x unmaintained (transitive dep、deserialize 側は with_limit で上限を掛けている)
     "RUSTSEC-2025-0141",
     # paste unmaintained (pyo3-macros 経由 transitive、除去不能)
     "RUSTSEC-2024-0436",

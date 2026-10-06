@@ -1,8 +1,7 @@
 # alice-router — Design Specification (Draft)
 
 **Status**: Spec only. Crate does not exist yet. This document exists to
-lock the design surface before any Rust code is written, per
-`comprehensive-spec-templates` skill guidance.
+lock the design surface before any Rust code is written.
 
 **Version**: 0.0 (pre-crate, spec-first)
 **Author**: Moroya Sakamoto
@@ -22,7 +21,7 @@ observed. It complements ALICE-LLM (single-model inference engine) by
 turning a collection of engines and external APIs into a **single
 addressable "meta-model"**.
 
-The design is influenced by Sakana AI's "multi-agent system as a model"
+The design is influenced by Sakana AI's "system of cooperating models as a model"
 framing (Sakana Fugu, 2026-07) but rebuilt from first principles for
 Rust, edge deployment, and explicit cost accounting.
 
@@ -111,7 +110,7 @@ Key invariants:
 pub struct Message {
     pub role: Role,              // System / User / Assistant / Tool
     pub content: Content,        // Text | MultiModal (image / audio bytes)
-    pub name: Option<String>,    // Optional attribution for multi-agent
+    pub name: Option<String>,    // Optional attribution for multi-model routing
 }
 
 /// The full request the router acts on.
@@ -213,9 +212,8 @@ Error taxonomy (top-level `RouteError`):
 - `ConfigError(ConfigError)`
 
 The router core NEVER swallows a `BackendError` silently — either it is
-retried against another backend, or it surfaces as a `RouteError`. Per
-CLAUDE.md "薄っぺらい対応禁止" rule (fallback loops that hide the root
-cause are banned).
+retried against another backend, or it surfaces as a `RouteError`. Fallback loops that hide the root
+cause are not allowed.
 
 ---
 
@@ -437,8 +435,7 @@ Per §5 taxonomy plus these rules:
 - **Audit**: every request/response pair can be optionally persisted
   to an append-only journal (Phase R.4). Off by default.
 
-Reference: CLAUDE.md § "AI-Tencho 情報の隔離ルール" — the same
-isolation posture applies: multiple concurrent tenants MUST NOT share
+Isolation: multiple concurrent tenants MUST NOT share
 router state without explicit tagging.
 
 ---
@@ -447,7 +444,7 @@ router state without explicit tagging.
 
 | Metric | Target | Measurement |
 |---|---|---|
-| Route decision time (Heuristic, cached) | <1 ms | criterion bench, Mac M3 |
+| Route decision time (Heuristic, cached) | <1 ms | criterion bench, arm64 laptop |
 | Route decision time (Heuristic, uncached) | <5 ms | criterion bench |
 | Verifier overhead (SelfVerify, ALICE-LLM local) | <200 ms | end-to-end integration bench |
 | Cache hit rate (steady state, HeuristicPolicy) | >70% | 24 h synthetic replay |
@@ -470,7 +467,7 @@ harness (`criterion` + `divan`) and users can verify locally.
 | Benchmark | `criterion` | §14 metrics |
 | End-to-end | GitHub Actions | Real ALICE-LLM backend on Bonsai + mock HTTP backend |
 
-**Mock backend requirement** (per CLAUDE.md rule): external APIs
+**Mock backend requirement**: external APIs
 (`Anthropic`, `Moonshot`, `OpenAI`) are never called in unit or
 integration tests. Real calls live behind
 `--features integration-live` and are opt-in.
@@ -490,7 +487,7 @@ integration tests. Real calls live behind
 | R.6 | Streaming interleave: cancel in-flight verifiers on early primary completion. | R.5 |
 | R.7 | Multi-tenant isolation + resource quotas per tenant. | R.6 + audit journal (R.4) |
 
-Each phase ends with a `karikari-review` §9 gate (fmt / clippy / test /
+Each phase ends with a review gate (fmt / clippy / test /
 doc) and a `CHANGELOG.md` entry.
 
 ---
@@ -513,7 +510,7 @@ doc) and a `CHANGELOG.md` entry.
 
 ## §18. Prior art
 
-- **Sakana AI Fugu** (2026-07) — "multi-agent system as a model".
+- **Sakana AI Fugu** (2026-07) — "system of cooperating models as a model".
   Primary influence on §7. Public architecture is a blackbox; we
   reimplement the *idea* (verifier over ensemble) without reverse
   engineering internals.

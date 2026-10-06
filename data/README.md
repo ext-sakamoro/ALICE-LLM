@@ -7,7 +7,7 @@ prepare local artifacts on demand.
 
 ## ⚠ Known limitation: `examples/perplexity` diverges from llama.cpp (2026-07-24)
 
-Cross-validation on Mac M3 Metal, WikiText-2 test first 500 tokens, ctx=512:
+Cross-validation on an arm64 laptop Metal, WikiText-2 test first 500 tokens, ctx=512:
 
 | Implementation | Qwen 3.5-4B Q4_K_M PPL |
 |---|---|
@@ -17,8 +17,8 @@ Cross-validation on Mac M3 Metal, WikiText-2 test first 500 tokens, ctx=512:
 
 Cause is not BOS handling (Qwen 3.5 GGUF defines no `bos_token_id` and
 neither tool prepends BOS in this config). The gap is attributable to Qwen
-3.5 forward path numerical drift in ALICE-LLM (see Phase X.3.e.3.30-35
-diagnostic in `memory/alice_llm_future_work.md`) and possibly to Q4_K
+3.5 forward path numerical drift in ALICE-LLM (Phase X.3.e.3.30-35
+diagnostic) and possibly to Q4_K
 dequant precision differences.
 
 Bonsai 27B Q1_0 cannot be validated against llama.cpp: mainline llama.cpp

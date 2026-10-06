@@ -8,10 +8,10 @@
 //!     --model path/to/model.gguf --port 8000 [--hybrid]
 //!
 //! `--hybrid` bypasses GPU allocation and runs inference on CPU via
-//! `Llama3Model`. Purpose: Jetson 8GB unified memory has a wgpu-hal Vulkan
+//! `Llama3Model`. Purpose: ARM64 embedded board (8 GB) unified memory has a wgpu-hal Vulkan
 //! weight 2× duplication issue that pushes 27B-class models past 8 GB;
 //! hybrid mode uses ~1× memory. Also useful for Qwen 3.5-4B which shows GPU
-//! numerical drift (PAD248319). Speed on Jetson: ~0.2-0.5 tok/s.
+//! numerical drift (PAD248319). Speed on an ARM64 embedded board: ~0.2-0.5 tok/s.
 //!
 //! Endpoints:
 //!   POST /v1/chat/completions — OpenAI chat format
@@ -317,7 +317,7 @@ struct HealthResponse {
 /// Runtime inference backend — GPU (wgpu) or CPU (Llama3Model).
 ///
 /// `--hybrid` flag switches to CPU path, avoiding GPU allocation entirely.
-/// Purpose: Jetson 8GB Vulkan weight 2× duplication makes Bonsai 27B Q1_0
+/// Purpose: ARM64 embedded board (8 GB) Vulkan weight 2× duplication makes Bonsai 27B Q1_0
 /// (3.6 GB × 2 = 7.2 GB) tight; CPU path uses 3.6 GB total. Also useful for
 /// Qwen 3.5-4B which exhibits GPU numerical drift (PAD248319).
 enum ModelBackend {
@@ -813,7 +813,7 @@ fn main() {
         .unwrap_or(8000);
 
     // --hybrid: skip GPU allocation, run inference on CPU via Llama3Model.
-    // Purpose: Jetson 8GB Vulkan weight 2× duplication makes Bonsai 27B tight;
+    // Purpose: ARM64 embedded board (8 GB) Vulkan weight 2× duplication makes Bonsai 27B tight;
     // hybrid mode halves memory footprint. Also avoids Qwen 3.5-4B GPU PAD248319.
     let hybrid = args.iter().any(|a| a == "--hybrid");
 

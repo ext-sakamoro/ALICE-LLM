@@ -17,7 +17,7 @@
 //!   `num_experts_per_tok = 16` (sparsity 16/896 ≈ 1.79%, sparser than V3).
 //!   Per-token active weights ≈ 24 GB at Q4 (see
 //!   [`kimi_k3_active_bytes`] for the derivation) — well within an
-//!   NVMe-backed Mac M3 Max 128 GB budget once streamed.
+//!   NVMe-backed arm64 laptop 128 GB budget once streamed.
 //!
 //! The core of the colibri innovation is to **load routed experts on
 //! demand** with an LRU cache, keyed by `(layer_idx, kind, expert_idx)`.
@@ -405,7 +405,7 @@ impl StreamingExpertPool {
     ///   budget gives one-token headroom + LRU reuse across tokens.
     /// * **Kimi K3 Q4** (community GGUF, when it lands): active per
     ///   token ≈ 92 layers × 16 experts × ~16.5 MB ≈ **24 GB**, see
-    ///   [`kimi_k3_active_bytes`]. A 30-40 GB budget fits a Mac M3 Max
+    ///   [`kimi_k3_active_bytes`]. A 30-40 GB budget fits a arm64 laptop
     ///   128 GB unified memory comfortably (leaves ~80+ GB for KV
     ///   cache + attention + shared experts + OS).
     ///
@@ -735,7 +735,7 @@ pub const fn kimi_k3_active_bytes(
 /// pays off whenever two consecutive tokens share any routed experts,
 /// as the persistence heuristic observed on DeepSeek V3).
 ///
-/// For Kimi K3 Q4 on Mac M3 Max 128 GB, the recommended budget is
+/// For Kimi K3 Q4 on an arm64 laptop 128 GB, the recommended budget is
 /// `kimi_k3_active_bytes(92, 16, 3584, 3072, 50) × 12 / 10 ≈ 30 GB`.
 /// Higher multipliers (15-17) trade RAM for hit rate; lower multipliers
 /// (10-11) trade hit rate for headroom on tighter machines.

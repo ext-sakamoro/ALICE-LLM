@@ -1,8 +1,8 @@
 //! Unsloth-baseline heuristic rules for per-tensor quant tier assignment.
 //!
 //! Implements the eight heuristics extracted from Unsloth Dynamic v3.0's
-//! per-layer decisions in
-//! [[success_unsloth_v3_sensitivity_oracle_2026_09_12]]:
+//! per-layer decisions (a metadata-only analysis of the published
+//! Unsloth Dynamic v3.0 GGUFs, 2026-09-12):
 //!
 //! | # | Rule | Priority |
 //! |---|------|----------|

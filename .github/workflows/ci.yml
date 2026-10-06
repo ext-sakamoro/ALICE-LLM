@@ -32,6 +32,28 @@ jobs:
           fail_level: error
           reporter: github-check
 
+  docs_lint:
+    # Public documents and every tracked file: no development-process vocabulary,
+    # device product names or private names; CHANGELOG version headings and
+    # [Unreleased] categories well formed. Every check must compare at least one
+    # item, so a renamed file cannot turn the gate into a no-op. Run on all three
+    # OSes: the script reads UTF-8 explicitly and must not depend on the locale.
+    name: Docs lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Docs lint (tests)
+        run: python scripts/test_docs_lint.py
+      - name: Docs lint (public documents, CHANGELOG structure)
+        run: python scripts/docs_lint.py --check
+
   clippy:
     # Hard gate (`-D warnings`, `--all-targets`) over three feature sets:
     # default, `simd` (the wide kernels in sparse_attention/simd.rs) and the
@@ -175,6 +197,7 @@ jobs:
     needs:
       - fmt
       - actionlint
+      - docs_lint
       - clippy
       - test
       - doc
