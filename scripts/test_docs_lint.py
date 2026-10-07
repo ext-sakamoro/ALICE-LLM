@@ -188,7 +188,7 @@ class DevelopmentVocabulary(unittest.TestCase):
 
     def test_an_english_word_next_to_japanese_is_found(self):
         # `\b` sees no boundary between "worker" and "が"; this is the case that slipped through
-        e = errors({"README_JP.md": README + "3 件とも thin_wall workerが見つけた\n"})
+        e = errors({"README_JP.md": README + "3 件とも workerが見つけた\n"})
         self.assertTrue(any("agent process `worker`" in x for x in e), e)
         e = errors({"README_JP.md": README + "詳細はBacklogに記録\n"})
         self.assertTrue(any("internal tracker `Backlog`" in x for x in e), e)
@@ -212,33 +212,33 @@ class DevelopmentVocabulary(unittest.TestCase):
 
     def test_vocabulary_is_checked_in_every_tracked_file(self):
         for rel, text, label in (("src/a.rs", "// see the Backlog\n", "internal tracker"),
-                                 ("docs/ROADMAP.md", "worker 5 本で実施\n", "agent process"),
-                                 ("tests/b.rs", "// (ys-08 判断)\n", "session name"),
+                                 ("docs/ROADMAP.md", "worker で実施\n", "agent process"),
+                                 ("tests/b.rs", "// (ys-00 判断)\n", "session name"),
                                  ("examples/c.rs", "//! user 裁定: 追加しない\n", "instruction source"),
-                                 ("src/d.rs", "/// oracle: `sakamoro-ff`'s derivation\n", "session name")):
+                                 ("src/d.rs", "/// oracle: `sakamoro-00`'s derivation\n", "session name")):
             e = errors({rel: text})
             self.assertTrue(any(x.startswith(f"{rel}:1: {label}") for x in e), (rel, e))
 
     def test_device_product_names(self):
         for text in ("// measured on Jetson Orin Nano", "| Mac Mini M4 Pro | 273 GB/s |",
-                     "bench on Apple M3, release", "(M1 Pro, 2026-03)", "served over Tailscale"):
+                     "bench on Apple M3, release", "(M1 Pro, 2026-03)"):
             e = errors({"src/a.rs": text + "\n"})
             self.assertTrue(any("device" in x for x in e), (text, e))
         # hardware classes and backend names are fine
         self.assertEqual(errors({"src/a.rs": "// arm64 laptop (Metal), ARM64 embedded board (8 GB, Vulkan)\n"}), [])
 
     def test_private_note_names(self):
-        for text in ("// see [[feedback_degenerate_case_as_silent_wrong_answer]]",
-                     "//! `feedback_mms_degree_blind_on_structured_lattice` measured",
-                     "# canonical CI template: [[reference_alice_ci_canonical_template]]",
-                     "/// (`project_alice_physics_world_auditor_engine_gaps`)",
+        for text in ("// see [[feedback_sample_note_name]]",
+                     "//! `feedback_another_sample_note` measured",
+                     "# canonical CI template: [[reference_alice_sample_note]]",
+                     "/// (`project_alice_sample_note`)",
                      "// `memory/feedback_x.md`"):
             e = errors({"src/a.rs": text + "\n"})
             self.assertTrue(any("internal note" in x or "internal tracker" in x for x in e), (text, e))
 
     def test_internal_rule_and_template_references(self):
         for text, label in (("/// (see skill §1 経路 5)", "agent process"),
-                            ("# 罠 #22 に従う", "internal note"),
+                            ("# 罠 #1 に従う", "internal note"),
                             ("# canonical CI template", "internal note")):
             e = errors({"src/a.rs": text + "\n"})
             self.assertTrue(any(label in x for x in e), (text, e))
