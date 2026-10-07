@@ -161,9 +161,11 @@ class Vocabulary(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", h) for h in dl.PRIVATE_NAME_HASHES))
 
     def test_private_address_and_device(self):
-        e = errors({"README.md": README + "runs on Jetson at 100.64.0.1\n"})
+        # separate inputs: a device name and an address are tested apart, never as a pair
+        e = errors({"README.md": README + "the build host is a Jetson board\n"})
         self.assertTrue(any("device `Jetson`" in x for x in e), e)
-        self.assertTrue(any("private address `100.64.0.1`" in x for x in e), e)
+        e = errors({"README.md": README + "the service listens on 100.127.255.254\n"})
+        self.assertTrue(any("private address `100.127.255.254`" in x for x in e), e)
 
     def test_ordinary_english_is_not_flagged(self):
         # "memory footprint" and a netcode "session" are ordinary words
