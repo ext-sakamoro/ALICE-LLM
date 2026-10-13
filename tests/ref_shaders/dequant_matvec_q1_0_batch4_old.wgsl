@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q1_0_batch4_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q1_0_batch4.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q1_0_batch4.wgsl) tests/ref_shaders/dequant_matvec_q1_0_batch4_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q1_0_batch4_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q1_0_batch4_old.wgsl             # only the array-size edits
+//
 // Q1_0 batch-4 matvec: weight decoded ONCE, 4 scalar FMAs in registers.
 // Mirrors `dequant_matvec_q4k_batch4.wgsl` for Bonsai 27B / PrismML Q1_0
 // (128 elements/block, 18 bytes/block, binary g128).
@@ -20,10 +39,10 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 
 // One partial-sum slot per subgroup (max 16 subgroups for workgroup_size 128).
-var<workgroup> sg0: array<f32, 16>;
-var<workgroup> sg1: array<f32, 16>;
-var<workgroup> sg2: array<f32, 16>;
-var<workgroup> sg3: array<f32, 16>;
+var<workgroup> sg0: array<f32, 128>;
+var<workgroup> sg1: array<f32, 128>;
+var<workgroup> sg2: array<f32, 128>;
+var<workgroup> sg3: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 

@@ -7964,6 +7964,418 @@ mod tests {
             assert!(!table.is_empty(), "compared nothing");
         }
 
+        /// Query a fresh adapter's subgroup size range without building a
+        /// `GpuEngine` (no pipelines, no device) — used only to decide
+        /// whether this specific run's actual subgroup size is small enough
+        /// to expose the pre-2.0.1 workgroup-array-size bug (see the
+        /// `*_published_2_0_0_vs_new` tests below). Returns `None` if no
+        /// adapter is available, matching `try_gpu_engine`'s skip contract.
+        fn probed_subgroup_size_range() -> Option<(u32, u32)> {
+            pollster::block_on(async {
+                let instance = wgpu::Instance::default();
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        ..Default::default()
+                    })
+                    .await?;
+                let limits = adapter.limits();
+                Some((limits.min_subgroup_size, limits.max_subgroup_size))
+            })
+        }
+
+        /// (kernel name, published alice-llm 2.0.0 shader source — an
+        /// untouched copy of what `git show v2.0.0:src/shaders/<name>.wgsl`
+        /// returns, see each `tests/ref_shaders/*_published_2_0_0.wgsl`
+        /// file's sibling `_old.wgsl` for the provenance-verification
+        /// commands — and the max subgroup count that published kernel's
+        /// workgroup-array size assumed, i.e. `old_array_len` before the
+        /// 2.0.1 fix widened it to the full workgroup size).
+        const PUBLISHED_2_0_0_MATVEC: &[(&str, &str, u32)] = &[
+            (
+                "q1_0",
+                include_str!("../tests/ref_shaders/dequant_matvec_q1_0_published_2_0_0.wgsl"),
+                16,
+            ),
+            (
+                "q1_0_batch4",
+                include_str!(
+                    "../tests/ref_shaders/dequant_matvec_q1_0_batch4_published_2_0_0.wgsl"
+                ),
+                16,
+            ),
+            (
+                "q1_0_row4",
+                include_str!("../tests/ref_shaders/dequant_matvec_q1_0_row4_published_2_0_0.wgsl"),
+                16,
+            ),
+            (
+                "q1_0_row4_batch4",
+                include_str!(
+                    "../tests/ref_shaders/dequant_matvec_q1_0_row4_batch4_published_2_0_0.wgsl"
+                ),
+                16,
+            ),
+            (
+                "q1_0_row8_batch4",
+                include_str!(
+                    "../tests/ref_shaders/dequant_matvec_q1_0_row8_batch4_published_2_0_0.wgsl"
+                ),
+                16,
+            ),
+            (
+                "q4k",
+                include_str!("../tests/ref_shaders/dequant_matvec_q4k_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "q4k_batch4",
+                include_str!("../tests/ref_shaders/dequant_matvec_q4k_batch4_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "q5k",
+                include_str!("../tests/ref_shaders/dequant_matvec_q5k_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "q6k",
+                include_str!("../tests/ref_shaders/dequant_matvec_q6k_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "q6k_batch4",
+                include_str!("../tests/ref_shaders/dequant_matvec_q6k_batch4_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "q8_0",
+                include_str!("../tests/ref_shaders/dequant_matvec_q8_0_published_2_0_0.wgsl"),
+                2,
+            ),
+        ];
+
+        const PUBLISHED_2_0_0_SWIGLU: &[(&str, &str, u32)] = &[
+            (
+                "swiglu_q1_0",
+                include_str!("../tests/ref_shaders/swiglu_fused_q1_0_published_2_0_0.wgsl"),
+                16,
+            ),
+            (
+                "swiglu_q4k",
+                include_str!("../tests/ref_shaders/swiglu_fused_q4k_published_2_0_0.wgsl"),
+                8,
+            ),
+            (
+                "swiglu_q4k_batch4",
+                include_str!("../tests/ref_shaders/swiglu_fused_q4k_batch4_published_2_0_0.wgsl"),
+                8,
+            ),
+        ];
+
+        /// Proves the no-early-return + subgroup-size rewrite didn't change
+        /// results anywhere the ACTUAL unmodified published 2.0.0 kernel was
+        /// already correct — i.e. on any adapter whose real subgroup count
+        /// (`workgroup_size / sg_size`) doesn't exceed what that published
+        /// kernel's workgroup array assumed. This only runs on an adapter
+        /// reporting a single fixed subgroup size (`adapter.limits()` only
+        /// exposes a min/max RANGE; there's no probe shader here reading
+        /// `@builtin(subgroup_size)` at runtime, so a genuine range —
+        /// measured on Metal, 4..=64 — can't be trusted in either
+        /// direction and is skipped outright, not guessed at). Measured on
+        /// lavapipe (subgroup_size 8, fixed): q1_0-family kernels (assumed
+        /// bound 16) are safe to compare (actual count 16, not over), while
+        /// q4k/q5k/q6k/q8_0-family kernels (assumed bound 8 or 2) exceed
+        /// their bound there and are skipped per-kernel with a named,
+        /// counted line, not silently passed.
+        #[test]
+        fn matvec_kernels_published_2_0_0_vs_new_where_safe() {
+            let Some(engine) = try_gpu_engine() else {
+                return;
+            };
+            // `adapter.limits()` only exposes a [min, max] RANGE, not the
+            // actual per-dispatch subgroup size (no probe-shader here to
+            // read `@builtin(subgroup_size)` at runtime) — so this leg only
+            // runs where that range collapses to a single known value
+            // (measured: lavapipe, 8..=8). Where it's a genuine range
+            // (measured: Metal, 4..=64) neither bound can be trusted:
+            // asserting "safe" from max could be wrong if the real
+            // dispatch picks something smaller, and gating off min would
+            // make this leg skip everywhere without ever proving anything
+            // on that adapter — so it skips there too, honestly, rather
+            // than claiming a confidence this query can't support.
+            let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                return;
+            };
+            if min_sg != max_sg {
+                eprintln!(
+                    "published-2.0.0-vs-new: skip (adapter reports a subgroup_size RANGE                      {min_sg}..={max_sg}, not a fixed value — this leg only runs where it's                      deterministic, see this test's doc comment)"
+                );
+                return;
+            }
+            let sg_size = min_sg;
+            const BLOCKS_PER_ROW: u32 = 2;
+            const PAD: u32 = 3;
+            let mut compared_count = 0usize;
+            let mut skipped: Vec<&str> = Vec::new();
+            for k in matvec_kernels() {
+                let Some(&(_, published_src, old_assumed_max_subgroups)) = PUBLISHED_2_0_0_MATVEC
+                    .iter()
+                    .find(|(name, _, _)| *name == k.name)
+                else {
+                    panic!("kernel={}: no PUBLISHED_2_0_0_MATVEC entry", k.name);
+                };
+                let actual_n_sg = k.workgroup_size.div_ceil(sg_size.max(1));
+                if actual_n_sg > old_assumed_max_subgroups {
+                    skipped.push(k.name);
+                    eprintln!(
+                        "kernel={} skip: actual_n_sg={actual_n_sg} > published kernel's assumed \
+                         max {old_assumed_max_subgroups} (sg_size={sg_size}) — the published \
+                         2.0.0 kernel is known-buggy here, this leg only proves parity where it \
+                         was already correct",
+                        k.name
+                    );
+                    continue;
+                }
+                for &rows_real in &sweep_sizes(k.rows_per_group) {
+                    let n_groups_real = rows_real.div_ceil(k.rows_per_group.max(1));
+                    let groups_pad = n_groups_real + PAD;
+                    let row_bytes = BLOCKS_PER_ROW * k.block_bytes;
+                    let weight_bytes = filler_bytes((rows_real * row_bytes) as usize, 0x2545_F491);
+                    let input_len = (BLOCKS_PER_ROW * k.workgroup_size) as usize;
+                    let input = filler_f32(input_len, 0x27D4_EB2F);
+                    let output_len = (rows_real.max(1) * k.n_batch) as usize;
+
+                    let weights_buf =
+                        engine
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: None,
+                                contents: if weight_bytes.is_empty() {
+                                    &[0u8; 4]
+                                } else {
+                                    &weight_bytes
+                                },
+                                usage: wgpu::BufferUsages::STORAGE,
+                            });
+                    let input_buf = engine.upload_f32(&input);
+                    let output_buf = engine.alloc_f32(output_len);
+                    let params = engine.make_uniform(&MatvecParams {
+                        rows: rows_real,
+                        cols: 0,
+                        blocks_per_row: BLOCKS_PER_ROW,
+                        grid_x: groups_pad,
+                        batch_size: k.n_batch,
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                    });
+                    let bufs = [&weights_buf, &input_buf.buffer, &output_buf.buffer, &params];
+
+                    let published_out = run_kernel(
+                        &engine,
+                        published_src,
+                        k.entry_point,
+                        groups_pad,
+                        &bufs,
+                        &output_buf,
+                    );
+                    let new_out = run_kernel(
+                        &engine,
+                        k.new_src,
+                        k.entry_point,
+                        groups_pad,
+                        &bufs,
+                        &output_buf,
+                    );
+                    for (side, out) in [("published", &published_out), ("new", &new_out)] {
+                        for (i, v) in out.iter().enumerate() {
+                            assert!(
+                                v.is_finite(),
+                                "kernel={} rows_real={rows_real} {side}[{i}]={v}: expected finite",
+                                k.name
+                            );
+                        }
+                    }
+                    let expected_compared = (rows_real.max(1) * k.n_batch) as usize;
+                    assert_eq!(
+                        published_out.len(),
+                        expected_compared,
+                        "kernel={}: compared nothing expected",
+                        k.name
+                    );
+                    assert!(expected_compared > 0, "kernel={}: compared nothing", k.name);
+                    compared_count += expected_compared;
+                    let mismatched = published_out
+                        .iter()
+                        .zip(new_out.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        mismatched,
+                        0,
+                        "kernel={} rows_real={rows_real}: {mismatched}/{} values not \
+                         bit-identical published={published_out:?} new={new_out:?}",
+                        k.name,
+                        published_out.len()
+                    );
+                }
+            }
+            eprintln!(
+                "published-2.0.0-vs-new matvec: compared={compared_count} skipped_kernels={skipped:?}"
+            );
+            assert!(
+                compared_count > 0 || !skipped.is_empty(),
+                "compared nothing and skipped nothing — this leg ran no evidence at all"
+            );
+        }
+
+        /// Swiglu-family twin of `matvec_kernels_published_2_0_0_vs_new_where_safe`.
+        #[test]
+        fn swiglu_kernels_published_2_0_0_vs_new_where_safe() {
+            let Some(engine) = try_gpu_engine() else {
+                return;
+            };
+            // `adapter.limits()` only exposes a [min, max] RANGE, not the
+            // actual per-dispatch subgroup size (no probe-shader here to
+            // read `@builtin(subgroup_size)` at runtime) — so this leg only
+            // runs where that range collapses to a single known value
+            // (measured: lavapipe, 8..=8). Where it's a genuine range
+            // (measured: Metal, 4..=64) neither bound can be trusted:
+            // asserting "safe" from max could be wrong if the real
+            // dispatch picks something smaller, and gating off min would
+            // make this leg skip everywhere without ever proving anything
+            // on that adapter — so it skips there too, honestly, rather
+            // than claiming a confidence this query can't support.
+            let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                return;
+            };
+            if min_sg != max_sg {
+                eprintln!(
+                    "published-2.0.0-vs-new: skip (adapter reports a subgroup_size RANGE                      {min_sg}..={max_sg}, not a fixed value — this leg only runs where it's                      deterministic, see this test's doc comment)"
+                );
+                return;
+            }
+            let sg_size = min_sg;
+            const BLOCKS_PER_ROW: u32 = 2;
+            const PAD: u32 = 3;
+            let mut compared_count = 0usize;
+            let mut skipped: Vec<&str> = Vec::new();
+            for k in swiglu_kernels() {
+                let Some(&(_, published_src, old_assumed_max_subgroups)) = PUBLISHED_2_0_0_SWIGLU
+                    .iter()
+                    .find(|(name, _, _)| *name == k.name)
+                else {
+                    panic!("kernel={}: no PUBLISHED_2_0_0_SWIGLU entry", k.name);
+                };
+                let actual_n_sg = k.workgroup_size.div_ceil(sg_size.max(1));
+                if actual_n_sg > old_assumed_max_subgroups {
+                    skipped.push(k.name);
+                    eprintln!(
+                        "kernel={} skip: actual_n_sg={actual_n_sg} > published kernel's assumed \
+                         max {old_assumed_max_subgroups} (sg_size={sg_size})",
+                        k.name
+                    );
+                    continue;
+                }
+                for &rows_real in &sweep_sizes(1) {
+                    let rows_pad = rows_real + PAD;
+                    let row_bytes = BLOCKS_PER_ROW * k.block_bytes;
+                    let gate_bytes = filler_bytes((rows_real * row_bytes) as usize, 0x1656_67B1);
+                    let up_bytes = filler_bytes((rows_real * row_bytes) as usize, 0x6A09_E667);
+                    let input_len = (BLOCKS_PER_ROW * k.workgroup_size) as usize;
+                    let input = filler_f32(input_len, 0xBB67_AE85);
+                    let output_len = (rows_real.max(1) * k.n_batch) as usize;
+
+                    let mk_buf = |bytes: &[u8]| {
+                        engine
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: None,
+                                contents: if bytes.is_empty() { &[0u8; 4] } else { bytes },
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                    };
+                    let gate_buf = mk_buf(&gate_bytes);
+                    let up_buf = mk_buf(&up_bytes);
+                    let input_buf = engine.upload_f32(&input);
+                    let output_buf = engine.alloc_f32(output_len);
+                    let params = engine.make_uniform(&MatvecParams {
+                        rows: rows_real,
+                        cols: 0,
+                        blocks_per_row: BLOCKS_PER_ROW,
+                        grid_x: rows_pad,
+                        batch_size: 1,
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                    });
+                    let bufs = [
+                        &gate_buf,
+                        &up_buf,
+                        &input_buf.buffer,
+                        &output_buf.buffer,
+                        &params,
+                    ];
+
+                    let published_out = run_kernel(
+                        &engine,
+                        published_src,
+                        k.entry_point,
+                        rows_pad,
+                        &bufs,
+                        &output_buf,
+                    );
+                    let new_out = run_kernel(
+                        &engine,
+                        k.new_src,
+                        k.entry_point,
+                        rows_pad,
+                        &bufs,
+                        &output_buf,
+                    );
+                    for (side, out) in [("published", &published_out), ("new", &new_out)] {
+                        for (i, v) in out.iter().enumerate() {
+                            assert!(
+                                v.is_finite(),
+                                "kernel={} rows_real={rows_real} {side}[{i}]={v}: expected finite",
+                                k.name
+                            );
+                        }
+                    }
+                    let expected_compared = (rows_real.max(1) * k.n_batch) as usize;
+                    assert_eq!(
+                        published_out.len(),
+                        expected_compared,
+                        "kernel={}: compared nothing expected",
+                        k.name
+                    );
+                    assert!(expected_compared > 0, "kernel={}: compared nothing", k.name);
+                    compared_count += expected_compared;
+                    let mismatched = published_out
+                        .iter()
+                        .zip(new_out.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        mismatched,
+                        0,
+                        "kernel={} rows_real={rows_real}: {mismatched}/{} values not \
+                         bit-identical published={published_out:?} new={new_out:?}",
+                        k.name,
+                        published_out.len()
+                    );
+                }
+            }
+            eprintln!(
+                "published-2.0.0-vs-new swiglu: compared={compared_count} skipped_kernels={skipped:?}"
+            );
+            assert!(
+                compared_count > 0 || !skipped.is_empty(),
+                "compared nothing and skipped nothing — this leg ran no evidence at all"
+            );
+        }
+
         /// attention.wgsl: covers both removed guards — `h >= num_heads`
         /// (workgroup-id padding, via `h_pad`) and the legitimate in-range
         /// `seq_len == 0` case (via `seq_len` itself, not padding).

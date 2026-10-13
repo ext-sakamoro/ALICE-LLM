@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q1_0_row8_batch4_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q1_0_row8_batch4.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q1_0_row8_batch4.wgsl) tests/ref_shaders/dequant_matvec_q1_0_row8_batch4_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q1_0_row8_batch4_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q1_0_row8_batch4_old.wgsl             # only the array-size edits
+//
 // Q1_0 row8×batch4 matvec: 1 workgroup produces 8 rows × 4 batches = 32 outputs.
 //
 // Compounds Step 4's row4×batch4 win by doubling the row batching factor.
@@ -43,11 +62,11 @@ struct Params {
 // WGSL naga transpiles this into a single Metal `threadgroup type_4&`,
 // staying under the resource-slot budget while preserving the same
 // per-accumulator 16 subgroup partial-sum layout.
-var<workgroup> sg_all: array<f32, 512>;
+var<workgroup> sg_all: array<f32, 4096>;
 
 // Convenience: base index of accumulator `(row, batch)` in `sg_all`.
 fn sg_base(row: u32, batch: u32) -> u32 {
-    return (row * 4u + batch) * 16u;
+    return (row * 4u + batch) * 128u;
 }
 
 const BLOCK_BYTES: u32 = 18u;

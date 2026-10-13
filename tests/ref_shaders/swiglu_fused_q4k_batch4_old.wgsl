@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `swiglu_fused_q4k_batch4_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/swiglu_fused_q4k_batch4.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/swiglu_fused_q4k_batch4.wgsl) tests/ref_shaders/swiglu_fused_q4k_batch4_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/swiglu_fused_q4k_batch4_published_2_0_0.wgsl tests/ref_shaders/swiglu_fused_q4k_batch4_old.wgsl             # only the array-size edits
+//
 // Fused SwiGLU Q4_K batch-4: weight decoded ONCE, 8 scalar FMAs in registers.
 // gate0..gate3 + up0..up3 = 8 accumulators, all physical registers.
 // output[k][row] = silu(gate_k) × up_k for k=0..3.
@@ -18,14 +37,14 @@ struct Params {
 const BLOCK_WORDS: u32 = 36u;
 
 // 8 separate workgroup arrays — no dynamic indexing
-var<workgroup> sg_g0: array<f32, 8>;
-var<workgroup> sg_g1: array<f32, 8>;
-var<workgroup> sg_g2: array<f32, 8>;
-var<workgroup> sg_g3: array<f32, 8>;
-var<workgroup> sg_u0: array<f32, 8>;
-var<workgroup> sg_u1: array<f32, 8>;
-var<workgroup> sg_u2: array<f32, 8>;
-var<workgroup> sg_u3: array<f32, 8>;
+var<workgroup> sg_g0: array<f32, 256>;
+var<workgroup> sg_g1: array<f32, 256>;
+var<workgroup> sg_g2: array<f32, 256>;
+var<workgroup> sg_g3: array<f32, 256>;
+var<workgroup> sg_u0: array<f32, 256>;
+var<workgroup> sg_u1: array<f32, 256>;
+var<workgroup> sg_u2: array<f32, 256>;
+var<workgroup> sg_u3: array<f32, 256>;
 
 fn extract_byte(word: u32, pos: u32) -> u32 {
     return (word >> (pos * 8u)) & 0xFFu;

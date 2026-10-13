@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q8_0_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q8_0.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q8_0.wgsl) tests/ref_shaders/dequant_matvec_q8_0_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q8_0_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q8_0_old.wgsl             # only the array-size edits
+//
 // Q8_0 dequantized matrix-vector multiply compute shader.
 //
 // Reference: `dequantize_q8_0` in `~/ALICE-LLM/src/gguf.rs:778-792`.
@@ -40,7 +59,7 @@ fn sign_extend_i8(u: u32) -> f32 {
 
 // Small shared array — max 2 subgroups on typical GPUs (workgroup_size=32,
 // subgroup_size >= 16).
-var<workgroup> sg_partial: array<f32, 2>;
+var<workgroup> sg_partial: array<f32, 32>;
 
 @compute @workgroup_size(32)
 fn matvec_q8_0(

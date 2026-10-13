@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q1_0_row4_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q1_0_row4.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q1_0_row4.wgsl) tests/ref_shaders/dequant_matvec_q1_0_row4_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q1_0_row4_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q1_0_row4_old.wgsl             # only the array-size edits
+//
 // Q1_0 row4 matvec (single batch, 4 output rows per workgroup).
 //
 // Mirrors `dequant_matvec_q1_0_row4_batch4.wgsl` but for the standard
@@ -28,10 +47,10 @@ struct Params {
 
 // One partial-sum slot per subgroup per output row (max 16 subgroups for
 // workgroup_size 128).
-var<workgroup> sg0: array<f32, 16>;
-var<workgroup> sg1: array<f32, 16>;
-var<workgroup> sg2: array<f32, 16>;
-var<workgroup> sg3: array<f32, 16>;
+var<workgroup> sg0: array<f32, 128>;
+var<workgroup> sg1: array<f32, 128>;
+var<workgroup> sg2: array<f32, 128>;
+var<workgroup> sg3: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 

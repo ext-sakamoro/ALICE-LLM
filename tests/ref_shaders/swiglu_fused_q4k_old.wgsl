@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `swiglu_fused_q4k_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/swiglu_fused_q4k.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/swiglu_fused_q4k.wgsl) tests/ref_shaders/swiglu_fused_q4k_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/swiglu_fused_q4k_published_2_0_0.wgsl tests/ref_shaders/swiglu_fused_q4k_old.wgsl             # only the array-size edits
+//
 // Fused SwiGLU Q4_K kernel: output[row] = silu(gate·input) × up·input.
 // Each workgroup computes one output row from two Q4_K weight matrices.
 // Eliminates intermediate gate/up buffers and the silu_mul dispatch.
@@ -17,8 +36,8 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-var<workgroup> sg_gate: array<f32, 8>;
-var<workgroup> sg_up: array<f32, 8>;
+var<workgroup> sg_gate: array<f32, 256>;
+var<workgroup> sg_up: array<f32, 256>;
 
 const BLOCK_WORDS: u32 = 36u;
 

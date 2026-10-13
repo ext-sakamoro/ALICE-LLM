@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q5k_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q5k.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q5k.wgsl) tests/ref_shaders/dequant_matvec_q5k_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q5k_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q5k_old.wgsl             # only the array-size edits
+//
 // Q5_K dequantized matrix-vector multiply compute shader.
 //
 // Reference: `dequantize_q5_k` in `~/ALICE-LLM/src/gguf.rs:737-776`.
@@ -31,7 +50,7 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 
 // One slot per subgroup (max 8 subgroups on Metal / Vulkan with 256/32 threads).
-var<workgroup> sg_partial: array<f32, 8>;
+var<workgroup> sg_partial: array<f32, 256>;
 
 const BLOCK_WORDS: u32 = 44u;
 // Q5_K layout: word 0 is d/dmin, words 1..3 are scales, words 4..11 are qh

@@ -1,3 +1,22 @@
+// PROVENANCE (old_vs_new_oracle control file, see src/gpu.rs's
+// `old_vs_new_oracle` module doc for how this is used):
+//
+// This is pre-no-early-return control flow with the subgroup-size fix
+// applied (control for the early-return change only) — i.e. the
+// published alice-llm 2.0.0 kernel (sibling `dequant_matvec_q1_0_row4_batch4_published_2_0_0.wgsl`
+// is an untouched copy of that exact release; diff them to confirm) PLUS
+// the 2.0.1 workgroup-array-size fix mirrored in verbatim. Without that
+// fix mirrored here, this file and the current `src/shaders/dequant_matvec_q1_0_row4_batch4.wgsl`
+// would legitimately disagree on any backend whose actual subgroup size
+// is smaller than this kernel's original assumed bound (measured:
+// lavapipe, subgroup_size 8) — a real, independently-fixed bug, not
+// something the no-early-return rewrite this oracle exists to isolate
+// should be blamed for.
+//
+// Verify provenance:
+//   diff <(git show v2.0.0:src/shaders/dequant_matvec_q1_0_row4_batch4.wgsl) tests/ref_shaders/dequant_matvec_q1_0_row4_batch4_published_2_0_0.wgsl   # empty
+//   diff tests/ref_shaders/dequant_matvec_q1_0_row4_batch4_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q1_0_row4_batch4_old.wgsl             # only the array-size edits
+//
 // Q1_0 row4×batch4 matvec: 1 workgroup produces 4 rows × 4 batches = 16 outputs.
 //
 // Extends the Step 2 batch4 kernel by ALSO batching 4 output rows per
@@ -35,22 +54,22 @@ struct Params {
 // per accumulator = 16 × 16 = 256 f32 = 1024 bytes shared memory. Trivially
 // under the 32 KB / 48 KB per-workgroup shared-memory limits on Metal and
 // Vulkan integrated GPUs.
-var<workgroup> sg00: array<f32, 16>;
-var<workgroup> sg01: array<f32, 16>;
-var<workgroup> sg02: array<f32, 16>;
-var<workgroup> sg03: array<f32, 16>;
-var<workgroup> sg10: array<f32, 16>;
-var<workgroup> sg11: array<f32, 16>;
-var<workgroup> sg12: array<f32, 16>;
-var<workgroup> sg13: array<f32, 16>;
-var<workgroup> sg20: array<f32, 16>;
-var<workgroup> sg21: array<f32, 16>;
-var<workgroup> sg22: array<f32, 16>;
-var<workgroup> sg23: array<f32, 16>;
-var<workgroup> sg30: array<f32, 16>;
-var<workgroup> sg31: array<f32, 16>;
-var<workgroup> sg32: array<f32, 16>;
-var<workgroup> sg33: array<f32, 16>;
+var<workgroup> sg00: array<f32, 128>;
+var<workgroup> sg01: array<f32, 128>;
+var<workgroup> sg02: array<f32, 128>;
+var<workgroup> sg03: array<f32, 128>;
+var<workgroup> sg10: array<f32, 128>;
+var<workgroup> sg11: array<f32, 128>;
+var<workgroup> sg12: array<f32, 128>;
+var<workgroup> sg13: array<f32, 128>;
+var<workgroup> sg20: array<f32, 128>;
+var<workgroup> sg21: array<f32, 128>;
+var<workgroup> sg22: array<f32, 128>;
+var<workgroup> sg23: array<f32, 128>;
+var<workgroup> sg30: array<f32, 128>;
+var<workgroup> sg31: array<f32, 128>;
+var<workgroup> sg32: array<f32, 128>;
+var<workgroup> sg33: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 
