@@ -6,6 +6,19 @@ authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 description = "Pure Rust LLM inference engine — GGUF v3 parser, K-quants, hybrid CPU/GPU DeltaNet+Attention, wgpu compute shaders, speculative decoding, OpenAI-compatible HTTP server."
 readme = "README.md"
+# the published crate: the library and binary sources (shaders are under src/), the examples
+# declared below, and the documents a user of the crate reads (scripts, logs, docs/, CI files and
+# test data stay in the repository); a leading / anchors a pattern at the crate root
+include = [
+    "/src/**",
+    "/examples/**",
+    "/README.md",
+    "/README_JP.md",
+    "/CHANGELOG.md",
+    "/LICENSE-AGPL",
+    "/LICENSE-COMMERCIAL.md",
+    "/NOTICE",
+]
 repository = "https://github.com/ext-sakamoro/ALICE-LLM"
 homepage = "https://github.com/ext-sakamoro/ALICE-LLM"
 documentation = "https://docs.rs/alice-llm"
