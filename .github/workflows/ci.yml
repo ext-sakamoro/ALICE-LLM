@@ -160,11 +160,18 @@ jobs:
     #
     # windows-latest additionally exercises the D3D12 WARP software adapter
     # (GitHub's windows-latest runners have no hardware GPU, so `wgpu`'s
-    # default adapter request lands on WARP — the same backend a
-    # `return`/`discard` before a compute-shader barrier was measured to
-    # fault on, 0xC0000005, even for a workgroup-uniform guard). This leg
-    # also runs the matvec/attention/sparse-attention GPU-dispatch
-    # correctness tests (not just pipeline creation), including:
+    # default adapter request lands on WARP). WARP does not advertise the
+    # `SUBGROUP` feature at all, and 14 of this crate's 16 kernels require
+    # it, so `GpuEngine::new()` (which builds every kernel's pipeline
+    # eagerly) cannot construct on this runner — every test that needs it
+    # prints a named, counted marker line (`try_gpu_engine`'s
+    # `SUBGROUP_UNSUPPORTED_MARKER` in src/gpu.rs) and skips rather than
+    # failing red or silently passing. This is a tracked, documented gap
+    # (tracked as a known, documented gap), not a regression; the root fix (lazy
+    # per-kernel pipeline construction + a subgroup-free fallback reduction
+    # path, making this leg green without a skip) is a separate, later
+    # release. This leg still runs the matvec/attention/sparse-attention
+    # GPU-dispatch correctness tests (not just pipeline creation), including:
     #   - the single out-of-range-workgroup oracle against a CPU reference
     #     (matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows)
     #   - the full bit-identical old-vs-new oracle for all 16 rewritten
@@ -180,9 +187,9 @@ jobs:
       matrix:
         # macos-latest has Apple Metal (Apple Silicon runner), so pipeline
         # creation actually exercises the Metal shader compiler.
-        # windows-latest has no hardware GPU either, but `wgpu`'s DX12
-        # backend enumerates the WARP software adapter the same way it
-        # would a real one, so dispatch actually runs there too.
+        # windows-latest has no hardware GPU either; `wgpu`'s DX12 backend
+        # enumerates the WARP software adapter, which lacks SUBGROUP (see
+        # above) — most of this leg's tests print the named skip marker.
         # ubuntu-latest does not have GPU hardware and no software compute
         # fallback either, so the test skips gracefully (compile-check +
         # adapter-absence path) — kept for the pure compile-check signal.
@@ -191,6 +198,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # lavapipe (Mesa's software Vulkan rasterizer) so ubuntu-latest's
+      # `wgpu` adapter request finds a real, working adapter instead of
+      # falling through the "no GPU adapter found" skip path — without
+      # this, the ubuntu leg below only compile-checks and never actually
+      # dispatches a kernel.
+      - name: Install lavapipe (software Vulkan, ubuntu-latest only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
       # windows-latest (WARP) runs the same NEW-kernel-only tests as the
       # other two OSes, but never `old_vs_new_oracle::`: that module builds
       # and DISPATCHES the pre-rewrite reference kernel (the one with the
@@ -198,10 +213,17 @@ jobs:
       # which is exactly the shape measured to crash WARP — running it there
       # would make this leg red by construction, not because of a real
       # regression. The old-vs-new comparison only runs where the OLD kernel
-      # can safely execute (ubuntu-latest's software Vulkan / macos-latest's
+      # can safely execute (ubuntu-latest's lavapipe / macos-latest's
       # Metal); windows-latest instead gets new-vs-CPU-reference coverage
-      # (q5k/q8_0 today; more to follow) which exercises the NEW kernel only,
-      # on every backend including WARP.
+      # (q5k/q8_0 today; more to follow), which exercises the NEW kernel
+      # only — but even that cannot construct `GpuEngine` on WARP for the
+      # 14 kernels requiring SUBGROUP (see the matrix comment above and
+      # `SUBGROUP_UNSUPPORTED_MARKER` in src/gpu.rs), so most of this leg's
+      # tests print the named skip marker rather than exercising dispatch.
+      # `--nocapture` so the measured worst_rel each test eprintln!s is
+      # visible in the CI log (cargo otherwise captures/hides stdout+stderr
+      # for passing tests), needed to calibrate the tolerance constants
+      # from real per-backend data rather than a single developer machine.
       - name: cargo test --features gpu (pipeline smoke + dispatch correctness, windows-latest)
         if: matrix.os == 'windows-latest'
         # pwsh (this runner's default shell) uses `` ` `` for line
@@ -216,7 +238,8 @@ jobs:
             matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows \
             cpu_reference_oracle:: \
             integration_tests::test_attention \
-            sparse_attention::gpu::tests::
+            sparse_attention::gpu::tests:: \
+            --nocapture
       - name: cargo test --features gpu (pipeline smoke + dispatch correctness + old-vs-new oracle, ubuntu/macos)
         if: matrix.os != 'windows-latest'
         env:
@@ -230,7 +253,8 @@ jobs:
             old_vs_new_oracle:: \
             cpu_reference_oracle:: \
             integration_tests::test_attention \
-            sparse_attention::gpu::tests::
+            sparse_attention::gpu::tests:: \
+            --nocapture
 
   build_release:
     name: Build (release)
