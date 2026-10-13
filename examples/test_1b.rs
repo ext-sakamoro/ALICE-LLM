@@ -37,8 +37,12 @@ fn f32_matvec_deq(
 }
 
 fn main() {
-    let data =
-        fs::read("~/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf").unwrap();
+    // the model file is given on the command line or in ALICE_LLM_MODEL (there is no default path)
+    let path = std::env::args().nth(1).or_else(|| std::env::var("ALICE_LLM_MODEL").ok()).unwrap_or_else(|| {
+        eprintln!("usage: cargo run --release --example test_1b -- <Llama-3.2-1B Q4_K_M .gguf> (or set ALICE_LLM_MODEL)");
+        std::process::exit(2)
+    });
+    let data = fs::read(&path).unwrap();
     let gguf = GgufFile::parse(&data).unwrap();
 
     let h = 2048; // hidden_dim

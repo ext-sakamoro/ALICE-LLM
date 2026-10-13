@@ -51,12 +51,19 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let draft_path = parse_arg::<String>(&args, "--draft-model").unwrap_or_else(|| {
-        "~/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
-    });
-    let verify_path = parse_arg::<String>(&args, "--verify-model").unwrap_or_else(|| {
-        "~/models/llama-3.1-8b-gguf/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf".to_string()
-    });
+    // both model files are given as options or in the environment (there are no default paths)
+    let draft_path = parse_arg::<String>(&args, "--draft-model")
+        .or_else(|| std::env::var("ALICE_LLM_DRAFT_MODEL").ok())
+        .unwrap_or_else(|| {
+            eprintln!("usage: cargo run --release --example speculative_dual_gpu -- --draft-model <small.gguf> --verify-model <large.gguf> (or set ALICE_LLM_DRAFT_MODEL)");
+            std::process::exit(2)
+        });
+    let verify_path = parse_arg::<String>(&args, "--verify-model")
+        .or_else(|| std::env::var("ALICE_LLM_VERIFY_MODEL").ok())
+        .unwrap_or_else(|| {
+            eprintln!("usage: cargo run --release --example speculative_dual_gpu -- --draft-model <small.gguf> --verify-model <large.gguf> (or set ALICE_LLM_VERIFY_MODEL)");
+            std::process::exit(2)
+        });
     let raw_prompt = parse_arg::<String>(&args, "--prompt")
         .unwrap_or_else(|| "The meaning of life is".to_string());
     let max_tokens: usize = parse_arg(&args, "--max-tokens").unwrap_or(64);

@@ -25,8 +25,10 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
 }
 
 fn main() {
-    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
-        "~/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
+    // the model file is given on the command line or in ALICE_LLM_MODEL (there is no default path)
+    let model_path = std::env::args().nth(1).or_else(|| std::env::var("ALICE_LLM_MODEL").ok()).unwrap_or_else(|| {
+        eprintln!("usage: cargo run --release --example bench_gpu_ffn -- <model.gguf> (or set ALICE_LLM_MODEL)");
+        std::process::exit(2)
     });
 
     println!("Loading model: {model_path}");

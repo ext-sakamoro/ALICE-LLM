@@ -21,8 +21,11 @@ fn main() {
         .iter()
         .find(|a| !a.starts_with('-') && **a != args[0])
         .cloned()
+        // the model file is given on the command line or in ALICE_LLM_MODEL (there is no default path)
+        .or_else(|| std::env::var("ALICE_LLM_MODEL").ok())
         .unwrap_or_else(|| {
-            "~/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
+            eprintln!("usage: cargo run --release --example bench_gpu_forward -- <model.gguf> (or set ALICE_LLM_MODEL)");
+            std::process::exit(2)
         });
 
     println!("Loading model: {model_path}");

@@ -54,8 +54,10 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let model_path = parse_arg::<String>(&args, "--model").unwrap_or_else(|| {
-        "~/models/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string()
+    // the model file is given with --model or in ALICE_LLM_MODEL (there is no default path)
+    let model_path = parse_arg::<String>(&args, "--model").or_else(|| std::env::var("ALICE_LLM_MODEL").ok()).unwrap_or_else(|| {
+        eprintln!("usage: cargo run --release --example speculative_gpu -- --model <model.gguf> (or set ALICE_LLM_MODEL)");
+        std::process::exit(2)
     });
     let raw_prompt = parse_arg::<String>(&args, "--prompt")
         .unwrap_or_else(|| "The meaning of life is".to_string());

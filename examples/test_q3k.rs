@@ -2,7 +2,11 @@ use alice_llm::gguf::GgufFile;
 use std::fs;
 
 fn main() {
-    let path = "~/models/llama-3.2-1b-q3k/Llama-3.2-1B-Instruct-Q3_K_L.gguf";
+    // the model file is given on the command line or in ALICE_LLM_MODEL (there is no default path)
+    let path = std::env::args().nth(1).or_else(|| std::env::var("ALICE_LLM_MODEL").ok()).unwrap_or_else(|| {
+        eprintln!("usage: cargo run --release --example test_q3k -- <Llama-3.2-1B Q3_K .gguf> (or set ALICE_LLM_MODEL)");
+        std::process::exit(2)
+    });
     println!("Loading Q3_K_M model...");
     let data = fs::read(path).unwrap();
     let gguf = GgufFile::parse(&data).unwrap();
