@@ -1,0 +1,77 @@
+[public-text]
+
+# Vocabulary-linter scripts hold the denylist patterns + fixtures in plain text by
+# design; per-class line counts are pinned so any growth fails the gate.
+
+[[public-text.allow]]
+path = "scripts/docs_lint.py"
+class = "agent process"
+count = 4
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/docs_lint.py"
+class = "device"
+count = 1
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/docs_lint.py"
+class = "internal tracker"
+count = 1
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/docs_lint.py"
+class = "note link"
+count = 1
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "agent process"
+count = 16
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "device"
+count = 3
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "instruction source"
+count = 1
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "internal note"
+count = 6
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "internal tracker"
+count = 7
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "note link"
+count = 2
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "private address"
+count = 2
+why = "vocabulary linter denylist / fixtures"
+
+[[public-text.allow]]
+path = "scripts/test_docs_lint.py"
+class = "session name"
+count = 3
+why = "vocabulary linter denylist / fixtures"
+
