@@ -1248,6 +1248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The measurement logs of local runs (`logs/`) are no longer kept in the repository (`.gitignore`); they named local file paths
 - Examples that load a model take the file from the command line or from `ALICE_LLM_MODEL` (`ALICE_LLM_DRAFT_MODEL` / `ALICE_LLM_VERIFY_MODEL` for `speculative_dual_gpu`) and exit with a usage line when neither is given; they had a fixed default path to a local file
 - The published crate holds only the library and binary sources (`src/`, with the shaders), `examples/`, the READMEs, `CHANGELOG.md`, the licenses and `NOTICE` (`include` in Cargo.toml); `docs/`, `scripts/`, `logs/`, test data and CI files stay in the repository
 - `scripts/docs_lint.py`: an empty `[Unreleased]` passes when the newest section is the Cargo.toml version (the state right after a release), and that section is then checked for categories, repeated categories and emoji markers in its place; an empty `[Unreleased]` above an older version, or text without a category, still fails

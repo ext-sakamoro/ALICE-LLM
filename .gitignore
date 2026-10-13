@@ -6,3 +6,6 @@
 !/data/README.md
 .DS_Store
 __pycache__/
+
+# measurement logs of local runs (they name local paths)
+/logs/
