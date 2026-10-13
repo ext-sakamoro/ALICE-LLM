@@ -7,7 +7,7 @@ name: Fuzz
 # - GGUF binary parser / GBNF text parser / logits post-processing は attacker-controlled
 #   input を受ける経路のため panic-free / OOM-free が必須
 #
-# 罠:
+# 注意:
 # - cargo-fuzz は nightly toolchain 必須 (rust-toolchain 1.92.0 pin を上書き)
 
 on:

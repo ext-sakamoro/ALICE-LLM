@@ -416,7 +416,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (2) `FullCountBigramBias` は `HashMap<TokenId, HashMap<TokenId, u32>>`
   で全観測 count を sparse 保持し apply 時に count 降順 → token id 昇順
   で top-K を選択、Phase 1 の eager truncate 制約 (rank 到達後の tied
-  arrival が drop される罠) を解消、(3) `DFlashParallelDraft::draft` の
+  arrival が drop される問題) を解消、(3) `DFlashParallelDraft::draft` の
   signature を `Option<&MarkovBigramBias>` → `Option<&dyn BigramBias>` に
   変更 (Rust 型推論で既存呼出は無改修で coerce)、(4) optional feature
   `dspark-serde = ["dep:serde"]` を追加、`MarkovBigramBias` /

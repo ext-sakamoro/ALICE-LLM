@@ -112,7 +112,7 @@ fn gated_deltanet_head_disjoint(
 - **現象**: Bonsai config `linear_num_v_heads=48, linear_num_kv_heads=16` (3 V heads per KV head group)
 - **現在の挙動**: loop `for head in 0..16` で `dn_alpha[0..16]` のみ使用、`dn_alpha[16..48]` が drop される
 - **正解**: 各 KV head 内の 3 V heads は独立した alpha/beta を持つ、loop 構造を per-V-head に変更する必要
-- **影響**: alpha/beta 情報の 2/3 が失われている、Bonsai output が数値的に破綻している可能性が高い
+- **影響**: alpha/beta 情報の 2/3 が失われている、Bonsai output が数値的に正しくない可能性が高い
 
 ### Gap B: `ssm_a` / `ssm_dt_bias` (Mamba-style SSM refinement、優先度: 中〜高)
 
@@ -361,7 +361,7 @@ if layer == DUMP_TARGET_LAYER {
 | Risk | 影響 | 対策 |
 |---|---|---|
 | llama.cpp reference が取得不可 | Blocker、SSM math 確定不能 | PrismML HuggingFace transformers 実装で代替 dump / Bonsai 論文付録 数値例 参照 |
-| Gap A 修正で Qwen 3.5 regression | 既存 3B/7B model 出力破綻 | backwards compat test 追加 + `num_v_heads == num_kv_heads` の 1:1 mapping で etxist 動作維持 |
+| Gap A 修正で Qwen 3.5 regression | 既存 3B/7B model 出力の劣化 | backwards compat test 追加 + `num_v_heads == num_kv_heads` の 1:1 mapping で etxist 動作維持 |
 | Gap B の 3 hypothesis 全て不一致 | 更なる仮説必要 (long research) | Option B3 (skip) で Phase X.3.e.3.1 partial landing、B1/B2 は X.3.e.3.2 で追加 |
 | Bonsai 27B 実行に 8GB unified memory 不足 | ARM64 組込みボード で validation 不能 | Apple Silicon で validation (ARM64 組込みボード は SIMD 最適化後の速度検証専用) |
 | State buffer 3× 大 (16→48 heads) で OOM | 5120 * 128 * 48 * 4 bytes/f32 = 125 MB / layer × 48 layers = 6 GB | 実測 (Phase X.5 は 8GB tight 動作、48 KV state は 2 GB 増、OOM リスクあり) |
