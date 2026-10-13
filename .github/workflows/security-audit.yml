@@ -215,8 +215,8 @@ jobs:
   semver-checks:
     name: cargo-semver-checks (API compat, informational)
     runs-on: ubuntu-latest
-    # ALICE-LLM は crates.io 未 publish (private repo publish=default true)
-    # git baseline (main~1) で比較、informational only
+    # alice-llm は crates.io に公開済み この job は公開版でなく直前の commit (HEAD~1) と比べる
+    # informational only
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -233,7 +233,7 @@ jobs:
         with:
           tool: cargo-semver-checks@0.50.0
 
-      # crates.io 未 publish のため --baseline-rev で git 経由の比較
+      # 直前の commit を baseline にして git 経由で比べる (--baseline-rev)
       # main の直前 commit と比較 (informational、break あっても block しない)
       - name: Run cargo semver-checks
         run: |
