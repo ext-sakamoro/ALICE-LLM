@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-13
+
+**Breaking:** code built against 1.x needs a change in these places
+
+- `KimiDeltaConfig` follows the field names of the published Kimi K3 `config.json`: the fields `full_attention_interval`, `delta_state_dim`, `attention_residuals_scale`, `rope_scaling_type`, `rope_scaling_factor` and `kv_compression_scheme` are removed, and new fields are added (`full_attn_layers`, `kda_layers`, `kda_head_dim`, `kda_num_heads`, `kda_short_conv_kernel_size` and others), so a struct literal written against 1.x no longer compiles
+- `GgmlType` has the new variant `IQ1_S`; an exhaustive `match` on `GgmlType` without a wildcard arm no longer compiles
+- `ModelArch::from_gguf` and `Llama3Config::from_gguf` take any `G: GgufSource` (`GgufFile` or the new `GgufMultiFile`) instead of `&GgufFile`
+- `GpuModel::debug_dump_layer0_deltanet_stages` returns the struct `DeltaNetLayer0Stages` instead of a tuple of ten vectors
+
+**Migration from 1.x:**
+
+- `KimiDeltaConfig`: build it with `KimiDeltaConfig::from_hf_config(bytes)` (feature `hf-config`) or `KimiDeltaConfig::from_gguf(&gguf, prefix)`; a hand-written value uses the new fields with `..Default::default()`, e.g. `KimiDeltaConfig { kda_layers: Some(layers), ..Default::default() }`; the removed fields have no replacement value (the layer layout is given by `full_attn_layers` / `kda_layers`)
+- `GgmlType`: add an arm for `GgmlType::IQ1_S` or a `_ =>` arm to an exhaustive `match`
+- `from_gguf`: a direct call such as `Llama3Config::from_gguf(&gguf)` is unchanged; a path used as a function value (`.map(Llama3Config::from_gguf)`) becomes a closure `.map(|g| Llama3Config::from_gguf(g))`
+- `debug_dump_layer0_deltanet_stages`: the tuple positions map in order to the fields `norm`, `q`, `k`, `v`, `alpha`, `beta`, `attn_out`, `attn_out_normed`, `o_buf`, `hidden` (`let (norm, ..) = …` becomes `let s = …; s.norm`)
+
 ### Added
+
+- Public API since 1.6.0, in summary (each item is described below): constrained generation with a grammar prefix (`Llama3Model::generate_grammar_prefixed`, `GrammarGenResult`, `GrammarPrefix`, `grammar::trie::TokenTrie`, `sampling::mask_logits_by_grammar_trie`); the modules `sparse_attention`, `imatrix` (feature `imatrix`), `speculative_dspark` and `iq1_s`; multi-file GGUF input (`GgufMultiFile`, the trait `GgufSource`) and MXFP4 GPU packing helpers in `gguf`; Kimi K3 support in `llama3` (`KimiDeltaConfig::from_hf_config` / `from_gguf`, `KimiDeltaHeadCache`, `BlockAttnResState` and related items); `gpu::DeltaNetLayer0Stages`
 
 - `scripts/docs_lint.py` + `scripts/test_docs_lint.py` and a CI `docs_lint` job (ubuntu / macOS / Windows, also in `scripts/preflight.sh`, including `--quick`): public documents and every tracked file are checked for development-process vocabulary, device product names and private names (the names are stored only as SHA-256 hashes), and the CHANGELOG for duplicate / out-of-order version headings and non-Keep-a-Changelog categories under `[Unreleased]`; a check that compares nothing fails
 - `tests/analytic_oracle.rs` — 12 closed-form tests (after the first selected-file mutants run, 87.1 % on sampling / rope / linalg / attention: per-pair RoPE frequency `base^(−2i/dim)`, rms_norm large-eps shrink, GeLU tanh form and odd part, strict temperature guard at `f32::EPSILON`, CDF boundary belongs to the next bin, every empty attention operand): `dot_flat` exact on integer inputs for every length 0..=70; RMSNorm unit rms / scale invariance / eps independence; LayerNorm mean 0 / var 1 / affine invariance; SiLU points (σ(ln 3) = 3/4, odd part = x); RoPE norm preservation, exact rotation of the frequency-1 pair by `position` radians, relative-position property ⟨q(m), k(n)⟩ = ⟨q(m+d), k(n+d)⟩; softmax Σ = 1 / shift invariance / two-element formula; temperature scaling with the T → 0 (argmax) and T → ∞ (uniform) limits; top-k keeps exactly k, top-p the smallest nucleus (0.5 / 0.3 / 0.2 example); `sample_with_random` inverts the CDF; attention with a dominant key returns that value, identical keys average, causal mask shape; Q8_K quantisation `d = max / 128`, reconstruction error ≤ d/2 (≤ d for the clamped signed extreme), block sums (2026-09-16)
@@ -1230,6 +1248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `scripts/docs_lint.py`: an empty `[Unreleased]` passes when the newest section is the Cargo.toml version (the state right after a release), and that section is then checked for categories, repeated categories and emoji markers in its place; an empty `[Unreleased]` above an older version, or text without a category, still fails
 - README / README_JP follow one section layout: Contents, Installation, Example (a library snippet and the CLI example), Highlights, the existing technical sections, Cargo features, Performance, Minimum supported Rust version, Building and testing, Related crates, License; the Japanese README now carries the sections it was missing (NEON matvec bench, the Bonsai end-to-end status, the x86_64 SIMD and sparse-attention highlights, the re-measured 70B table)
 - Benchmarks and test hosts in documents, comments and example output are described by hardware class (for example "arm64 laptop", "ARM64 embedded board, 8 GB unified memory") instead of product names; measured numbers are unchanged. Wording in public documents, code comments and CI files was tidied to pass the docs lint (no behaviour change; the bandwidth labels printed by `examples/bench_70b_sparse.rs` changed accordingly)
 - `.gitignore` no longer lists editor-local files; `scripts/*.py` is no longer ignored

@@ -182,6 +182,11 @@ def unreleased_body(changelog: str) -> str | None:
     return m.group(1) if m else None
 
 
+def section_body(changelog: str, version: str) -> str | None:
+    m = re.search(r"^## \[" + re.escape(version) + r"\][^\n]*\n(.*?)(?=^## \[|\Z)", changelog, re.M | re.S)
+    return m.group(1) if m else None
+
+
 def check(root: str) -> tuple[list[str], dict[str, int]]:
     errors: list[str] = []
     counts = {"vocabulary": 0, "versions": 0, "categories": 0}
@@ -218,17 +223,27 @@ def check(root: str) -> tuple[list[str], dict[str, int]]:
         if cv and released and cv not in released and semver_key(cv) < semver_key(released[0]):
             errors.append(f"CHANGELOG.md: Cargo.toml version {cv} is older than the newest section [{released[0]}]")
         body = unreleased_body(cl)
+        # an empty [Unreleased] is the state right after a release: it passes only when the newest
+        # section is the Cargo.toml version (anything else empty there still compares nothing)
+        # an empty [Unreleased] is the state right after a release: the newest section, which was
+        # written as [Unreleased] until now, is checked in its place, and only when it is the
+        # Cargo.toml version (anything else empty there still compares nothing)
+        just_released = body is not None and not body.strip() and bool(released) and released[0] == cv
+        if just_released:
+            name, body = released[0], section_body(cl, released[0])
+        else:
+            name = "Unreleased"
         if body is not None:
             cats = re.findall(r"^### (\w+)", body, re.M)
             counts["categories"] = len(cats)
             for c in sorted(set(cats)):
                 if c not in CATEGORIES:
-                    errors.append(f"CHANGELOG.md [Unreleased]: `### {c}` is not a Keep a Changelog category")
+                    errors.append(f"CHANGELOG.md [{name}]: `### {c}` is not a Keep a Changelog category")
                 elif cats.count(c) > 1:
-                    errors.append(f"CHANGELOG.md [Unreleased]: `### {c}` appears {cats.count(c)} times (append to one list)")
+                    errors.append(f"CHANGELOG.md [{name}]: `### {c}` appears {cats.count(c)} times (append to one list)")
             for i, line in enumerate(body.splitlines(), 1):
                 if EMOJI_RE.search(line):
-                    errors.append(f"CHANGELOG.md [Unreleased] line {i}: emoji status marker (use **Behavior change:** / **Breaking:**)")
+                    errors.append(f"CHANGELOG.md [{name}] line {i}: emoji status marker (use **Behavior change:** / **Breaking:**)")
         else:
             counts["categories"] = 1  # no unreleased work: nothing to compare, not an error
 

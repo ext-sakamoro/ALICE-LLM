@@ -287,6 +287,36 @@ class Changelog(unittest.TestCase):
         e = errors({"CHANGELOG.md": cl})
         self.assertTrue(any("no section and there is no [Unreleased]" in x for x in e), e)
 
+    def test_an_empty_unreleased_right_after_a_release_passes(self):
+        cl = CHANGELOG.replace("## [Unreleased]\n\n### Added", "## [Unreleased]\n\n## [1.5.0] - 2026-10-13\n\n### Added", 1)
+        self.assertEqual(errors({"CHANGELOG.md": cl}), [])
+
+    def test_an_empty_unreleased_above_an_older_version_still_fails(self):
+        cl = CHANGELOG.replace("## [Unreleased]\n\n### Added", "## [Unreleased]\n\n## [1.4.5] - 2026-10-13\n\n### Added", 1)
+        e = errors({"CHANGELOG.md": cl})
+        self.assertTrue(any("`categories` compared nothing" in x for x in e), e)
+
+    def released_section(self, extra: str) -> str:
+        """an empty [Unreleased] right above [1.5.0] (the Cargo.toml version), with `extra` in [1.5.0]"""
+        return CHANGELOG.replace("## [Unreleased]\n\n### Added", "## [Unreleased]\n\n## [1.5.0] - 2026-10-13\n\n" + extra + "### Added", 1)
+
+    def test_the_just_released_section_is_checked_for_categories(self):
+        e = errors({"CHANGELOG.md": self.released_section("### Improvements\n\n- x\n\n")})
+        self.assertTrue(any("[1.5.0]: `### Improvements` is not a Keep a Changelog category" in x for x in e), e)
+
+    def test_the_just_released_section_is_checked_for_emoji(self):
+        e = errors({"CHANGELOG.md": self.released_section("- \u26a0\ufe0f x\n\n")})
+        self.assertTrue(any("[1.5.0] line" in x and "emoji" in x for x in e), e)
+
+    def test_the_just_released_section_is_checked_for_a_repeated_category(self):
+        e = errors({"CHANGELOG.md": self.released_section("### Added\n\n- y\n\n")})
+        self.assertTrue(any("[1.5.0]: `### Added` appears 2 times" in x for x in e), e)
+
+    def test_unreleased_text_without_a_category_still_fails(self):
+        cl = CHANGELOG.replace("## [Unreleased]\n\n### Added", "## [Unreleased]\n\n- loose line\n\n## [1.5.0] - 2026-10-13\n\n### Added", 1)
+        e = errors({"CHANGELOG.md": cl})
+        self.assertTrue(any("`categories` compared nothing" in x for x in e), e)
+
     def test_cargo_version_older_than_newest_section(self):
         e = errors({"Cargo.toml": CARGO.replace('1.5.0', '1.2.0')})
         self.assertTrue(any("older than the newest section" in x for x in e), e)
