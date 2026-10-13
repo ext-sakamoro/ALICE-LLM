@@ -38,9 +38,15 @@ fn sign_extend_i8(u: u32) -> f32 {
     return f32(u) - sign * 256.0;
 }
 
-// Small shared array — max 2 subgroups on typical GPUs (workgroup_size=32,
-// subgroup_size >= 16).
-var<workgroup> sg_partial: array<f32, 2>;
+// Sized to the full workgroup (32), not an assumed minimum subgroup size:
+// `n_sg = 32u / sg_size` below is only bounded by this array's length when
+// `sg_size` could be as small as 1. A software adapter reporting a smaller
+// subgroup size than real hardware (e.g. llvmpipe) silently indexes past a
+// too-small array — WGSL's robustness guarantee clamps/wraps the
+// out-of-bounds access rather than trapping, so this previously produced
+// wrong totals, not a crash. Correctness here must not depend on any
+// assumption about `sg_size`.
+var<workgroup> sg_partial: array<f32, 32>;
 
 @compute @workgroup_size(32)
 fn matvec_q8_0(

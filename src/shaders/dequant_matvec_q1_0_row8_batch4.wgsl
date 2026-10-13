@@ -33,8 +33,10 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 
 // Single consolidated threadgroup array — 32 accumulator slots (8 rows ×
-// 4 batches) × 16 subgroups = 512 f32 = 2 KB smem. Indexed as
-// `sg_all[(row * 4 + batch) * 16 + sg_id]`.
+// 4 batches) sized to the full workgroup (128), not an assumed minimum
+// subgroup size (see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc
+// comment): 32 × 128 = 4096 f32 = 16384 bytes smem. Indexed as
+// `sg_all[(row * 4 + batch) * 128 + sg_id]`.
 //
 // Metal has a per-shader hard limit on the *number* of distinct
 // `threadgroup` resources (each `var<workgroup>` becomes one Metal
@@ -42,12 +44,12 @@ struct Params {
 // resource location available"), so we consolidate into one flat array.
 // WGSL naga transpiles this into a single Metal `threadgroup type_4&`,
 // staying under the resource-slot budget while preserving the same
-// per-accumulator 16 subgroup partial-sum layout.
-var<workgroup> sg_all: array<f32, 512>;
+// per-accumulator subgroup partial-sum layout.
+var<workgroup> sg_all: array<f32, 4096>;
 
 // Convenience: base index of accumulator `(row, batch)` in `sg_all`.
 fn sg_base(row: u32, batch: u32) -> u32 {
-    return (row * 4u + batch) * 16u;
+    return (row * 4u + batch) * 128u;
 }
 
 const BLOCK_BYTES: u32 = 18u;

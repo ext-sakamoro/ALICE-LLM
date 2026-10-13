@@ -30,11 +30,12 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// Only enough slots for the worst-case number of subgroups per workgroup
-// (workgroup_size 128 / subgroup_size 8 = 16 slots; NVIDIA Ampere has 32-lane
-// subgroups so 128/32 = 4 slots suffice, but keeping 16 makes the shader
-// portable across Apple Silicon (32-lane) and older Intel iGPUs (8-lane).)
-var<workgroup> sg_partial: array<f32, 16>;
+// Sized to the full workgroup (128), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment. (This
+// previously assumed subgroup_size >= 8 for a 16-slot bound; measured on
+// a software Vulkan adapter with a smaller actual subgroup size, that
+// bound silently produced wrong totals rather than a visible error.)
+var<workgroup> sg_partial: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 

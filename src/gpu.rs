@@ -457,6 +457,12 @@ impl GpuEngine {
             eprintln!("[gpu] TIMESTAMP_QUERY supported");
         }
         eprintln!("[gpu] SUBGROUP supported={has_subgroups}");
+        if has_subgroups {
+            eprintln!(
+                "[gpu] subgroup_size range: {}..={}",
+                adapter_limits.min_subgroup_size, adapter_limits.max_subgroup_size
+            );
+        }
 
         let mut required_features = wgpu::Features::empty();
         if has_timestamps {

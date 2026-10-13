@@ -30,8 +30,9 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// One slot per subgroup (max 8 subgroups on Metal / Vulkan with 256/32 threads).
-var<workgroup> sg_partial: array<f32, 8>;
+// Sized to the full workgroup (256), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment.
+var<workgroup> sg_partial: array<f32, 256>;
 
 const BLOCK_WORDS: u32 = 44u;
 // Q5_K layout: word 0 is d/dmin, words 1..3 are scales, words 4..11 are qh

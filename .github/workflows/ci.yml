@@ -239,7 +239,7 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture
+            --nocapture | tee test_output.log
       - name: cargo test --features gpu (pipeline smoke + dispatch correctness + old-vs-new oracle, ubuntu/macos)
         if: matrix.os != 'windows-latest'
         env:
@@ -254,7 +254,25 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture
+            --nocapture | tee test_output.log
+      # A leg that silently found no adapter at all (lavapipe missing /
+      # Metal unavailable) must not pass by default — ubuntu-latest ran 0.05s
+      # for 18 "tests" before lavapipe was installed here, meaning every one
+      # of them had hit the no-adapter skip and the whole leg was vacuous.
+      # Require evidence of either a genuinely-constructed engine
+      # (`[gpu] adapter:`, printed once per successful GpuEngine::new()) or
+      # the counted, named SUBGROUP skip marker (the one documented,
+      # intentional case where 0 engine constructions is still legitimate:
+      # windows-latest/WARP). Zero of both means the gate itself ran nothing.
+      - name: Require real GPU test evidence (no silent 0-test pass)
+        run: |
+          adapter_count=$(grep -c '\[gpu\] adapter:' test_output.log || true)
+          marker_count=$(grep -c 'GpuEngine cannot be constructed (SUBGROUP unsupported)' test_output.log || true)
+          echo "adapter_count=$adapter_count marker_count=$marker_count"
+          if [ "$adapter_count" -eq 0 ] && [ "$marker_count" -eq 0 ]; then
+            echo "::error::this leg exercised 0 GPU tests (no adapter constructed, no named skip marker printed) — gate defect, not a legitimate pass"
+            exit 1
+          fi
 
   build_release:
     name: Build (release)

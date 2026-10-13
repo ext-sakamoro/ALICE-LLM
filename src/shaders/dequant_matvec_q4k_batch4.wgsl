@@ -16,10 +16,12 @@ struct Params {
 
 const BLOCK_WORDS: u32 = 36u;
 
-var<workgroup> sg0: array<f32, 8>;
-var<workgroup> sg1: array<f32, 8>;
-var<workgroup> sg2: array<f32, 8>;
-var<workgroup> sg3: array<f32, 8>;
+// Sized to the full workgroup (256), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment.
+var<workgroup> sg0: array<f32, 256>;
+var<workgroup> sg1: array<f32, 256>;
+var<workgroup> sg2: array<f32, 256>;
+var<workgroup> sg3: array<f32, 256>;
 
 fn extract_byte(word: u32, pos: u32) -> u32 {
     return (word >> (pos * 8u)) & 0xFFu;

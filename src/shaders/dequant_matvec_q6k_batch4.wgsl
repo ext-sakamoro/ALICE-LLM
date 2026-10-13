@@ -15,10 +15,12 @@ struct Params {
 
 const BLOCK_BYTES: u32 = 210u;
 
-var<workgroup> sg0: array<f32, 8>;
-var<workgroup> sg1: array<f32, 8>;
-var<workgroup> sg2: array<f32, 8>;
-var<workgroup> sg3: array<f32, 8>;
+// Sized to the full workgroup (256), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment.
+var<workgroup> sg0: array<f32, 256>;
+var<workgroup> sg1: array<f32, 256>;
+var<workgroup> sg2: array<f32, 256>;
+var<workgroup> sg3: array<f32, 256>;
 
 fn rb(bb_word: u32, bb_frac: u32, offset: u32) -> u32 {
     let a = bb_frac + offset;

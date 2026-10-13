@@ -30,27 +30,27 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// 16 partial-sum slots per subgroup for the 16 (row × batch) accumulators.
-// workgroup_size 128 / subgroup_size 8 = 16 subgroups worst case, so 16 slots
-// per accumulator = 16 × 16 = 256 f32 = 1024 bytes shared memory. Trivially
-// under the 32 KB / 48 KB per-workgroup shared-memory limits on Metal and
-// Vulkan integrated GPUs.
-var<workgroup> sg00: array<f32, 16>;
-var<workgroup> sg01: array<f32, 16>;
-var<workgroup> sg02: array<f32, 16>;
-var<workgroup> sg03: array<f32, 16>;
-var<workgroup> sg10: array<f32, 16>;
-var<workgroup> sg11: array<f32, 16>;
-var<workgroup> sg12: array<f32, 16>;
-var<workgroup> sg13: array<f32, 16>;
-var<workgroup> sg20: array<f32, 16>;
-var<workgroup> sg21: array<f32, 16>;
-var<workgroup> sg22: array<f32, 16>;
-var<workgroup> sg23: array<f32, 16>;
-var<workgroup> sg30: array<f32, 16>;
-var<workgroup> sg31: array<f32, 16>;
-var<workgroup> sg32: array<f32, 16>;
-var<workgroup> sg33: array<f32, 16>;
+// Sized to the full workgroup (128) per (row × batch) accumulator, not an
+// assumed minimum subgroup size — see `dequant_matvec_q8_0.wgsl`'s
+// `sg_partial` doc comment. 16 accumulators × 128 slots = 2048 f32 = 8192
+// bytes shared memory, still comfortably under the 32 KB / 48 KB
+// per-workgroup shared-memory limits on Metal and Vulkan integrated GPUs.
+var<workgroup> sg00: array<f32, 128>;
+var<workgroup> sg01: array<f32, 128>;
+var<workgroup> sg02: array<f32, 128>;
+var<workgroup> sg03: array<f32, 128>;
+var<workgroup> sg10: array<f32, 128>;
+var<workgroup> sg11: array<f32, 128>;
+var<workgroup> sg12: array<f32, 128>;
+var<workgroup> sg13: array<f32, 128>;
+var<workgroup> sg20: array<f32, 128>;
+var<workgroup> sg21: array<f32, 128>;
+var<workgroup> sg22: array<f32, 128>;
+var<workgroup> sg23: array<f32, 128>;
+var<workgroup> sg30: array<f32, 128>;
+var<workgroup> sg31: array<f32, 128>;
+var<workgroup> sg32: array<f32, 128>;
+var<workgroup> sg33: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 

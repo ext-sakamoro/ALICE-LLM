@@ -17,8 +17,10 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-var<workgroup> sg_gate: array<f32, 8>;
-var<workgroup> sg_up: array<f32, 8>;
+// Sized to the full workgroup (256), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment.
+var<workgroup> sg_gate: array<f32, 256>;
+var<workgroup> sg_up: array<f32, 256>;
 
 const BLOCK_WORDS: u32 = 36u;
 

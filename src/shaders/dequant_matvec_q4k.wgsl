@@ -15,8 +15,13 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// Only 8 slots needed (one per subgroup) instead of 256
-var<workgroup> sg_partial: array<f32, 8>;
+// Sized to the full workgroup (256), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment for why a
+// smaller, sg_size-derived bound silently produces wrong totals (WGSL's
+// robustness guarantee clamps/wraps out-of-bounds workgroup-array access
+// rather than trapping) on a backend whose actual subgroup size is smaller
+// than assumed.
+var<workgroup> sg_partial: array<f32, 256>;
 
 // Q4_K block layout (144 bytes = 36 words):
 //   word 0:       d(f16) | dmin(f16)

@@ -19,11 +19,12 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// One partial-sum slot per subgroup (max 16 subgroups for workgroup_size 128).
-var<workgroup> sg0: array<f32, 16>;
-var<workgroup> sg1: array<f32, 16>;
-var<workgroup> sg2: array<f32, 16>;
-var<workgroup> sg3: array<f32, 16>;
+// Sized to the full workgroup (128), not an assumed minimum subgroup size
+// — see `dequant_matvec_q8_0.wgsl`'s `sg_partial` doc comment.
+var<workgroup> sg0: array<f32, 128>;
+var<workgroup> sg1: array<f32, 128>;
+var<workgroup> sg2: array<f32, 128>;
+var<workgroup> sg3: array<f32, 128>;
 
 const BLOCK_BYTES: u32 = 18u;
 
