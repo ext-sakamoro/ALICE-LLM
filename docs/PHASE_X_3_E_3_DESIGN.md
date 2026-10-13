@@ -392,10 +392,10 @@ Phase X.3.e.3 完了不能 (llama.cpp reference 取得不能 or numerical diff �
 | PR polish (fmt / clippy / doc) | 30 min | 6.x 完了 |
 | **合計** | **7-8h** | Phase X.3.e.3 全 subtask |
 
-**段階 分割案**:
-- Session 1 (~3h): 5.1 + 5.2 + 4.2 + 4.3 + tests → PR "X.3.e.3.1 landing"
-- Session 2 (~3h): 5.3 diff + 4.4 + tests → PR "X.3.e.3.2 landing"
-- Session 3 (optional、~1-2h): performance regression check + doc polish
+**作業分割案**:
+- 段階 1 (~3h): 5.1 + 5.2 + 4.2 + 4.3 + tests → PR "X.3.e.3.1 landing"
+- 段階 2 (~3h): 5.3 diff + 4.4 + tests → PR "X.3.e.3.2 landing"
+- 段階 3 (optional、~1-2h): performance regression check + doc polish
 
 ---
 

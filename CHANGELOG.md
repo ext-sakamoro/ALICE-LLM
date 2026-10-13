@@ -1192,7 +1192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `n_experts`) panics rather than serving garbage from an
   adjacent slab.
 - **Doc sync** — `docs/KIMI_K3_INTEGRATION.md` gains an
-  **X.4.e.1** row (this session, complete) ahead of the original
+  **X.4.e.1** row (complete in this release) ahead of the original
   **X.4.e** (now scoped to "connect the pool infra to real K3
   GGUF + implement the K3 LatentMoE + RMSNorm + SiTU-GLU forward
   path in `forward_deepseek_moe_layer`", still blocked on X.4.b

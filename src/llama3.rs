@@ -8280,7 +8280,7 @@ fn identity_matrix_f32(d: usize) -> Vec<f32> {
 //   per-expert byte-slice indexing that plugs into the Phase
 //   X.4.e.1 streaming pool. Doing it correctly needs a
 //   `RoutedExpertStorage` extraction similar to DeepSeek V3's
-//   pattern; scoping this session on the outer routing loop keeps
+//   pattern; scoping this change to the outer routing loop keeps
 //   the surface area tractable.
 
 /// Sigmoid router with `noaux_tc` bias correction for K3 Stable
