@@ -13,6 +13,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -24,6 +25,7 @@ jobs:
   actionlint:
     name: actionlint (workflow YAML validation)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Run actionlint
@@ -31,6 +33,12 @@ jobs:
         with:
           fail_level: error
           reporter: github-check
+      # every job has a job-level timeout-minutes (a hung step otherwise holds a shared
+      # runner for GitHub's 6-hour limit); the checker's own tests run first
+      - name: workflow-timeouts
+        run: |
+          python3 scripts/test_workflow_timeouts.py
+          python3 scripts/workflow_timeouts.py
 
   docs_lint:
     # Public documents and every tracked file: no development-process vocabulary,
@@ -40,6 +48,7 @@ jobs:
     # OSes: the script reads UTF-8 explicitly and must not depend on the locale.
     name: Docs lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +73,7 @@ jobs:
     # not depend on the locale (same reasoning as docs_lint).
     name: WGSL return/discard-before-barrier lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +96,7 @@ jobs:
     # cannot fail; 13 findings in tests / examples had accumulated
     name: Clippy (-D warnings, ${{ matrix.features }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -116,6 +127,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.features }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +157,7 @@ jobs:
   doc:
     name: rustdoc (-D warnings, docs.rs feature set)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -189,6 +202,7 @@ jobs:
     #     sizes per kernel, asserting old and new agree bit-for-bit
     name: GPU pipeline creation + dispatch correctness (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -313,6 +327,7 @@ jobs:
   build_release:
     name: Build (release)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -332,6 +347,7 @@ jobs:
     # /v1/completions is protected too.
     name: Examples & server compile
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -352,6 +368,7 @@ jobs:
     # repos is issue read-only. Scoped to this job only.
     name: Open issue on CI failure
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs:
       - fmt
       - actionlint

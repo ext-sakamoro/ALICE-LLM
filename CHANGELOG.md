@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI: every job now has a job-level `timeout-minutes` (21 of 22 jobs had none, so a hung step could hold a shared runner for GitHub's 6-hour limit). Each bound is the larger of 2× the slowest and 4× the median of the last 12 successful runs, rounded up to 5 minutes, with a floor of 15 minutes for jobs that run cargo (a cache miss rebuilds) and 10 for the rest; the release build gets 30 against a 4.6-minute maximum. Existing bounds (quality-deep's mutants) are unchanged, and the release workflow changes only by these lines. `scripts/workflow_timeouts.py` (tests: `scripts/test_workflow_timeouts.py`, byte-identical to ALICE-LOL's) checks every job and fails when it reads none; it runs in CI (the actionlint job) and in preflight.
+
 ## [2.0.1] - 2026-10-13
 
 ### Fixed

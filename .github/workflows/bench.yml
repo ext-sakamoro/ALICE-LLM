@@ -25,6 +25,7 @@ jobs:
   bench-matvec:
     name: bench_simd_matvec (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       # Run all runners even if one fails so we always publish partial
       # numbers instead of aborting the whole matrix on the first hiccup.
