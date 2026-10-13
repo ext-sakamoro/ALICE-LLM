@@ -112,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   speculative_dspark 84 test unchanged、clippy pedantic+nursery 0 warn
   新規範囲、fmt check pass **scope 削減**: 当初 Y1 (800 LOC full
   Part 3) では K3 layer + K3Model 統合 + push/rollback delta mode まで
-  含む予定だったが、実装複雑度と単一段階 の tightness を honest
+  含む予定だったが、実装複雑度と 1 回の変更に収まる範囲を honest
   評価して head-level capture 関数のみ (Part 3a、~200 LOC) を ship
   Part 3b (K3 layer + K3Model 統合 + ring 統合) は次回、Part 3b
   完了で **6-10× 実メモリ圧縮 (290MB → 30-48MB)** が実現
@@ -179,7 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   568 pass (unchanged)、dspark feature 577 pass (+9)、speculative_dspark
   84 test unchanged、両 example compile pass、clippy pedantic+nursery 0
   warn 新規範囲、fmt check pass Phase 12b (rank-1 delta encoding、10-65×
-  圧縮、深い KDA forward 改修) は 複数回 相当で次候補
+  圧縮、深い KDA forward 改修) は複数回の変更に分ける規模で次候補
 
 - **DSpark Phase 10 — KimiK3Model snapshot/rollback infrastructure +
   `impl DraftBackend for KimiK3Model`** (2026-08-01).

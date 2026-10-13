@@ -4,7 +4,7 @@
 
 ## Execution Log (2026-07-16)
 
-段階 で実行して判明した事項:
+実行して判明した事項:
 
 ### 🚨 CRITICAL FINDING (2026-07-16 update)
 
@@ -407,7 +407,7 @@ llama.cpp は SIMD accumulate、順序が並列 chunk 単位で異なる
 | Comparison script 実行 + 分析 | 30 min | 両 dump 揃った状態 |
 | **合計** | **3-5h** | + disk cleanup 時間 |
 
-**段階 分割案**:
+**作業分割案**:
 - **段階 A (~1h)**: disk cleanup + llama.cpp fork clone + build + Bonsai GGUF DL
 - **段階 B (~1h)**: llama.cpp reference dump 生成 (Option A / B / C 決定)
 - **段階 C (~1.5h)**: ALICE-LLM dump feature 実装 + build + Bonsai dump

@@ -117,8 +117,8 @@ fn gpu_config_from_llama3(cfg: &Llama3Config) -> GpuModelConfig {
 /// hybrid mode uses 3.6 GB total).
 ///
 /// True per-layer hybrid (DeltaNet on CPU + Attention on GPU) requires
-/// `Llama3Model::forward_layers_range()` refactor and is Phase A2 (next
-/// step) work — landing here is the memory-fix MVP that ships now.
+/// `Llama3Model::forward_layers_range()` refactor and is Phase A2 (later)
+/// work — landing here is the memory-fix MVP that ships now.
 fn run_hybrid_cpu_delegate(
     model_path: &str,
     raw_prompt: &str,
