@@ -122,7 +122,7 @@ Speed: 5.9 tok/s (4434 prefill + 1432 decode = 5883 total ms)
 
 **ARM64 組込みボード マルチモデル対応 (2026-07-21 ARM64 組込みボード (8 GB) で検証)**: Qwen 3.5-4B Q4_K_M `--hybrid-per-layer` (GPU+CPU) 0.4 tok/s、Ornith 9B Q4_K_M `--hybrid` (pure CPU) 0.2 tok/s、Bonsai 27B Q1_0 `--hybrid` 0.1 tok/s、DeepSeek V2-Lite Q4_K_M (deepseek2 arch、MoE 64 experts / 6 active per token) CPU 0.1 tok/s — 4B〜27B モデルクラスが 8GB unified memory 環境で CPU delegate 経路で動作、フル GPU allocation が wgpu-hal Vulkan 2× duplication 制約を超えても実用。**
 
-**crates.io 公開済 (Cargo.toml v2.0.0)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。tag push `v*.*.*` で `.github/workflows/release.yml` が `alice-llm-server` の binary を build して GitHub Release に添付します。crates.io への publish は release の手順の別の段で行い、tag では発火しません。
+**crates.io 公開済 (Cargo.toml v2.0.1)** — `cargo add alice-llm` でライブラリ依存として組み込み可能。下流の Rust バイナリ / アプリに本エンジンを直接埋め込めます。tag push `v*.*.*` で `.github/workflows/release.yml` が `alice-llm-server` の binary を build して GitHub Release に添付します。crates.io への publish は release の手順の別の段で行い、tag では発火しません。
 
 **Phase X.8 LOL Bridge (2026-07-23、B 案 10/10 完結)** — 自然言語 → SDF 生成パイプライン。モデルが GBNF サブセット文法の制約下で [`alice-lol`](https://crates.io/crates/alice-lol-macro) DSL の `Sphere { radius: 1.5 }` 等を emit し、`SdfNode` にコンパイルされます。Mac (arm64 laptop Metal) と ARM64 組込みボード (8 GB) の両実機で end-to-end 動作を確認済み。`examples/lol_gen.rs` 参照。**B-10 (2026-09-14): token trie mask (`grammar::TokenTrie` + `sampling::mask_logits_by_grammar_trie`) で per-token FSM probe を置換、MiniCPM5-2B (vocab 130k) で grammar mask が 1 step ~8 s → comment 状態以外 ~1 ms になり生成は forward 律速 (CPU ~25 tok/s) に。**
 

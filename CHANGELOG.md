@@ -45,9 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one, reporting the step green regardless of the real result; every such
   step now runs under an explicit shell with pipefail enabled, and a
   dedicated check confirms a failing command piped through another command
-  still fails the step. The subgroup-size and subgroup-count-rounding
-  issues above were present, undetected, in every published 1.x release
-  and in 2.0.0; none of them are new to this release.
+  still fails the step.
 
 ## [2.0.0] - 2026-10-13
 

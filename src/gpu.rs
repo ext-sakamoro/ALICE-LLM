@@ -8391,31 +8391,117 @@ mod tests {
         /// that the ceiling-division idiom appears in the text and that the
         /// formula itself behaves correctly across every realistic hardware
         /// subgroup size, including ones larger than the workgroup.
+        /// Blanks out `//` line comments and (WGSL block comments nest)
+        /// `/* */` comments with spaces, preserving every newline and the
+        /// overall length so this stays a drop-in text-search target —
+        /// same algorithm as `scripts/no_return_before_barrier.py`'s
+        /// `strip_comments`, reimplemented here so a commented-out mention
+        /// of the expected `n_sg` line can't satisfy a text-presence check.
+        fn strip_wgsl_comments(text: &str) -> String {
+            let chars: Vec<char> = text.chars().collect();
+            let n = chars.len();
+            let mut out = String::with_capacity(n);
+            let mut i = 0;
+            while i < n {
+                if i + 1 < n && chars[i] == '/' && chars[i + 1] == '/' {
+                    while i < n && chars[i] != '\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < n && chars[i] == '/' && chars[i + 1] == '*' {
+                    let mut depth = 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    while i < n && depth > 0 {
+                        if i + 1 < n && chars[i] == '/' && chars[i + 1] == '*' {
+                            depth += 1;
+                            out.push(' ');
+                            out.push(' ');
+                            i += 2;
+                        } else if i + 1 < n && chars[i] == '*' && chars[i + 1] == '/' {
+                            depth -= 1;
+                            out.push(' ');
+                            out.push(' ');
+                            i += 2;
+                        } else {
+                            out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            out
+        }
+
+        /// Every `let n_sg = ...;` statement in (already comment-stripped)
+        /// WGSL text, each captured verbatim including the `let n_sg = `
+        /// prefix and trailing `;` — used to assert both that there is
+        /// EXACTLY one such statement per kernel and that it is character-
+        /// for-character the expected ceiling-division form, not merely
+        /// that some substring of the expected form appears somewhere
+        /// (which a stray comment or a differently-spaced truncating form
+        /// could satisfy).
+        fn find_n_sg_statements(stripped: &str) -> Vec<String> {
+            let needle = "let n_sg = ";
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = stripped[from..].find(needle) {
+                let start = from + rel;
+                let after = start + needle.len();
+                match stripped[after..].find(';') {
+                    Some(semi) => {
+                        out.push(stripped[start..=after + semi].to_string());
+                        from = after + semi + 1;
+                    }
+                    None => break,
+                }
+            }
+            out
+        }
+
+        fn workgroup_size_from_text(src: &str) -> u32 {
+            let needle = "@workgroup_size(";
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("no @workgroup_size(...) found in shader text"))
+                + needle.len();
+            let end = src[start..]
+                .find(')')
+                .unwrap_or_else(|| panic!("unterminated @workgroup_size(..."));
+            src[start..start + end]
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("@workgroup_size(...) not a plain integer: {e}"))
+        }
+
         #[test]
         fn n_sg_ceiling_division_handles_subgroup_larger_than_workgroup() {
-            fn workgroup_size_from_text(src: &str) -> u32 {
-                let needle = "@workgroup_size(";
-                let start = src
-                    .find(needle)
-                    .unwrap_or_else(|| panic!("no @workgroup_size(...) found in shader text"))
-                    + needle.len();
-                let end = src[start..]
-                    .find(')')
-                    .unwrap_or_else(|| panic!("unterminated @workgroup_size(..."));
-                src[start..start + end]
-                    .trim()
-                    .parse()
-                    .unwrap_or_else(|e| panic!("@workgroup_size(...) not a plain integer: {e}"))
-            }
-
+            // Checks both the current kernel and its frozen `_old.wgsl`
+            // control (the fix is mirrored into both, see each `_old.wgsl`
+            // file's provenance header) — `*_published_2_0_0.wgsl` is
+            // deliberately excluded, since that file must stay byte-
+            // identical to the actual published 2.0.0 release, truncating
+            // division bug and all.
             let all_kernels: Vec<(&str, &str, u32)> = matvec_kernels()
                 .into_iter()
-                .map(|k| (k.name, k.new_src, k.workgroup_size))
-                .chain(
-                    swiglu_kernels()
-                        .into_iter()
-                        .map(|k| (k.name, k.new_src, k.workgroup_size)),
-                )
+                .flat_map(|k| {
+                    [
+                        (k.name, k.new_src, k.workgroup_size),
+                        (k.name, k.old_src, k.workgroup_size),
+                    ]
+                })
+                .chain(swiglu_kernels().into_iter().flat_map(|k| {
+                    [
+                        (k.name, k.new_src, k.workgroup_size),
+                        (k.name, k.old_src, k.workgroup_size),
+                    ]
+                }))
                 .collect();
             assert!(!all_kernels.is_empty(), "no kernels to check");
 
@@ -8428,21 +8514,23 @@ mod tests {
                      test table is out of sync with the shader"
                 );
 
-                // The ceiling-division idiom, independent of the exact
-                // workgroup size value (which varies per kernel): the
-                // truncating form `<N>u / sg_size` with nothing else added
-                // must NOT appear; the `+ sg_size - 1u` compensation must.
-                assert!(
-                    src.contains("+ sg_size - 1u) / sg_size"),
-                    "kernel={name}: shader text does not contain the ceiling-division idiom \
-                     `(workgroup_size + sg_size - 1u) / sg_size` — may have regressed to \
-                     truncating division"
+                let stripped = strip_wgsl_comments(src);
+                let statements = find_n_sg_statements(&stripped);
+                assert_eq!(
+                    statements.len(),
+                    1,
+                    "kernel={name}: expected exactly 1 `let n_sg = ...;` statement (outside \
+                     comments), found {}: {statements:?}",
+                    statements.len()
                 );
-                let truncating = format!("let n_sg = {text_workgroup_size}u / sg_size;");
-                assert!(
-                    !src.contains(&truncating),
-                    "kernel={name}: shader text still contains the truncating form \
-                     `{truncating}`"
+                let expected =
+                    format!("let n_sg = ({text_workgroup_size}u + sg_size - 1u) / sg_size;");
+                assert_eq!(
+                    statements[0], expected,
+                    "kernel={name}: the shader's only `let n_sg = ...;` statement is not \
+                     character-for-character the expected ceiling-division form — may have \
+                     regressed to truncating division, or to a differently-formatted variant \
+                     that evaluates the same but isn't what was reviewed"
                 );
 
                 for sg_size in [1u32, 4, 8, 16, 32, 64, 128] {
@@ -8476,6 +8564,55 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// Break-tests for the text-pin checker itself (`strip_wgsl_comments`
+        /// and `find_n_sg_statements`), not for any real shader: proves two
+        /// ways a looser check (plain `src.contains(...)`) could be fooled
+        /// are both actually caught.
+        #[test]
+        fn n_sg_text_pin_rejects_comment_only_ceil_form() {
+            let src = "// let n_sg = (256u + sg_size - 1u) / sg_size;\n\
+                        let n_sg = 256u / sg_size;\n";
+            let stripped = strip_wgsl_comments(src);
+            let statements = find_n_sg_statements(&stripped);
+            // The commented-out ceiling form must not count: only the real,
+            // still-truncating statement should be found, and it must not
+            // equal the expected ceiling text.
+            assert_eq!(
+                statements,
+                vec!["let n_sg = 256u / sg_size;".to_string()],
+                "a commented-out ceiling form was wrongly counted as a real statement"
+            );
+            assert_ne!(
+                statements[0], "let n_sg = (256u + sg_size - 1u) / sg_size;",
+                "the truncating statement should not match the expected ceiling text"
+            );
+        }
+
+        #[test]
+        fn n_sg_text_pin_rejects_no_space_truncating_form() {
+            // No spaces around `/` at all — a plain `.contains("+ sg_size -
+            // 1u) / sg_size")` substring check (the FIRST version of this
+            // pin) would not be fooled by this specific case, but an
+            // exact-statement comparison is the robust property: this
+            // statement, found verbatim, must not equal the expected form.
+            let src = "let n_sg=256u/sg_size;\n";
+            let stripped = strip_wgsl_comments(src);
+            let statements = find_n_sg_statements(&stripped);
+            // The no-space form doesn't even match the `let n_sg = ` (with
+            // spaces) prefix this checker looks for, so it's found as zero
+            // statements — which the real per-kernel test already asserts
+            // must be exactly 1, so this form fails for being absent, not
+            // for silently passing.
+            assert_eq!(
+                statements,
+                Vec::<String>::new(),
+                "the no-space truncating form should not be found by a prefix search for \
+                 `let n_sg = ` (note the required spacing) — this is fine: the real per-kernel \
+                 check asserts exactly 1 statement is found, so an unexpectedly-formatted line \
+                 fails as a count mismatch rather than silently passing"
+            );
         }
 
         /// Minimal, purpose-built reduction shader (NOT a real kernel —
