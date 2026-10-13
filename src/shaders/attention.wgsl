@@ -39,11 +39,22 @@ fn attention(
     let batch_idx = wg.y;
     let tid = lid.x;
 
-    if (h >= params.num_heads) { return; }
+    // No early return before the barriers below: an out-of-range workgroup
+    // (dispatched beyond `num_heads` by a future caller that over-provisions
+    // the grid) still reaches every barrier, it only skips the final write.
+    // A workgroup-uniform early return here (the guard depends only on
+    // `wid`, never on `lid`) was measured to still fault on D3D12 WARP, so
+    // this form is required regardless of guard uniformity.
+    let h_in_bounds = h < params.num_heads;
 
-    // Causal: token k attends to seq_len + k positions
+    // Causal: token k attends to seq_len + k positions. `seq_len == 0u` is a
+    // legitimate (in-range) zero-length attention window, not an
+    // out-of-range dispatch: every loop below that is bounded by `seq_len`
+    // simply performs zero iterations, so this needs no guard of its own —
+    // it falls through to Phase 3 writing an explicit `0.0`, which is more
+    // correct than the old early return's implicit "leave the output buffer
+    // whatever it already was".
     let seq_len = params.seq_len + batch_idx;
-    if (seq_len == 0u) { return; }
 
     let heads_per_kv = params.num_heads / params.num_kv_heads;
     let kv_h = h / heads_per_kv;
@@ -121,7 +132,9 @@ fn attention(
             let v_off = tt * params.kv_dim + kv_h * params.head_dim;
             weighted_val = weighted_val + scores[tt] * v_cache[v_off + d_idx];
         }
-        out_buf[out_off + d_idx] = weighted_val;
+        if (h_in_bounds) {
+            out_buf[out_off + d_idx] = weighted_val;
+        }
         d_idx = d_idx + 256u;
     }
 }

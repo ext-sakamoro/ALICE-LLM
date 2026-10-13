@@ -667,4 +667,441 @@ mod tests {
             );
         }
     }
+
+    /// Bit-identical old-vs-new oracle for `sparse_attention_forward.wgsl`
+    /// (the no-early-return rewrite): covers the out-of-range-workgroup
+    /// padding case (the removed `partial_idx >= total_partials` guard) and
+    /// the legitimate in-range `block_len == 0` case (the removed
+    /// early-bail-and-write-sentinel block) separately, since they are
+    /// different removed guards with different replacement strategies — see
+    /// `sparse_attention_forward.wgsl`'s module doc. `qhead = 1` so
+    /// `abs_edge == partial_idx` directly, simplifying `edge_meta`
+    /// construction to one 5-i32 record per partial. `page_id` is always -1
+    /// (never dereferenced as a valid page — robustness-safe, and the point
+    /// here is old-vs-new control-flow agreement, not realistic V-weighting).
+    #[cfg(feature = "internal-kernel-oracle")]
+    #[test]
+    fn sparse_attention_forward_old_vs_new_bit_identical() {
+        use wgpu::util::DeviceExt as _;
+
+        const OLD_SHADER: &str =
+            include_str!("../../tests/ref_shaders/sparse_attention_forward_old.wgsl");
+
+        let Some(gpu) = setup_gpu() else {
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+
+        let old_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sparse_attention_forward_old"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(OLD_SHADER)),
+        });
+        let old_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sparse_attention_forward_old"),
+            layout: None,
+            module: &old_module,
+            entry_point: Some("sparse_forward"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        const HEAD_DIM: u32 = 4;
+        const BLOCK_SIZE: u32 = 8;
+        const PAGE_SIZE: u32 = 8;
+        const PAD: u32 = 3;
+
+        // (total_partials_real, block_len for every edge, label)
+        let cases: &[(u32, i32, &str)] = &[
+            (0, 0, "zero partials (every workgroup is padding)"),
+            (1, 0, "one partial, legitimate block_len=0"),
+            (1, 1, "one partial, block_len=1"),
+            (3, 0, "several partials, all block_len=0"),
+            (
+                3,
+                (BLOCK_SIZE - 1) as i32,
+                "several partials, block_len=tile-1",
+            ),
+            (5, BLOCK_SIZE as i32, "several partials, block_len=tile"),
+        ];
+
+        let mut table: Vec<(u32, i32, usize, usize)> = Vec::new(); // (total_partials_real, block_len, compared, mismatched)
+
+        for &(total_partials_real, block_len, _label) in cases {
+            let dispatch_x = total_partials_real + PAD;
+
+            let mut edge_meta: Vec<i32> = Vec::with_capacity((total_partials_real * 5) as usize);
+            for p in 0..total_partials_real {
+                edge_meta.push(0); // q_idx
+                edge_meta.push(0); // h
+                edge_meta.push(0); // blk
+                edge_meta.push((p % 2) as i32); // batch — varied, just to touch indexing
+                edge_meta.push(block_len); // block_len
+            }
+            let params = GpuParams {
+                total_partials: total_partials_real,
+                qhead: 1,
+                head_dim: HEAD_DIM,
+                block_size: BLOCK_SIZE,
+                page_size: PAGE_SIZE,
+                pages_per_block: 1,
+                hkv: 1,
+                hq: 1,
+                msb: 1,
+                max_pages: 4,
+                softmax_scale: 0.5,
+                _pad: 0,
+            };
+
+            let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let q_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[0.1f32; 16]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let k_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[0.2f32; 64]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let v_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[0.3f32; 64]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let edge_meta_bytes: &[i32] = if edge_meta.is_empty() {
+                &[0i32; 5]
+            } else {
+                &edge_meta
+            };
+            let edge_meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(edge_meta_bytes),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let block_tables_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[-1i32; 16]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+            let o_len = ((total_partials_real.max(1) * HEAD_DIM) as usize).max(1);
+            let m_len = total_partials_real.max(1) as usize;
+            let l_len = total_partials_real.max(1) as usize;
+
+            let run = |pipeline: &wgpu::ComputePipeline| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+                let o_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (o_len * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let m_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (m_len * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let l_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (l_len * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let layout = pipeline.get_bind_group_layout(0);
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: q_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: k_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: v_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: edge_meta_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: block_tables_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: o_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: m_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: l_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                let o_stage = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (o_len * 4) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let m_stage = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (m_len * 4) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let l_stage = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (l_len * 4) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                {
+                    let mut pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(dispatch_x.max(1), 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(&o_buf, 0, &o_stage, 0, (o_len * 4) as u64);
+                encoder.copy_buffer_to_buffer(&m_buf, 0, &m_stage, 0, (m_len * 4) as u64);
+                encoder.copy_buffer_to_buffer(&l_buf, 0, &l_stage, 0, (l_len * 4) as u64);
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::Maintain::Wait);
+                (
+                    read_f32_buffer(&device, &o_stage, o_len).unwrap(),
+                    read_f32_buffer(&device, &m_stage, m_len).unwrap(),
+                    read_f32_buffer(&device, &l_stage, l_len).unwrap(),
+                )
+            };
+
+            let (old_o, old_m, old_l) = run(&old_pipeline);
+            let (new_o, new_m, new_l) = run(&gpu.pipeline);
+
+            // `page_id` is always -1 here (never dereferenced as valid) and
+            // every other input is plain deterministic f32 (no fp16/
+            // quantized decode anywhere in this shader), so finite is
+            // asserted outright, not counted.
+            for (side, out) in [
+                ("old o_partial", &old_o),
+                ("new o_partial", &new_o),
+                ("old m_partial", &old_m),
+                ("new m_partial", &new_m),
+                ("old l_partial", &old_l),
+                ("new l_partial", &new_l),
+            ] {
+                for (i, v) in out.iter().enumerate() {
+                    assert!(
+                        v.is_finite(),
+                        "total_partials_real={total_partials_real} block_len={block_len} {side}[{i}]={v}: expected finite"
+                    );
+                }
+            }
+            let expected_o_len = (total_partials_real.max(1) * HEAD_DIM) as usize;
+            let expected_ml_len = total_partials_real.max(1) as usize;
+            assert_eq!(old_o.len(), expected_o_len, "o_partial length mismatch");
+            assert_eq!(old_m.len(), expected_ml_len, "m_partial length mismatch");
+            assert_eq!(old_l.len(), expected_ml_len, "l_partial length mismatch");
+            assert!(
+                expected_o_len > 0 && expected_ml_len > 0,
+                "total_partials_real={total_partials_real}: compared nothing"
+            );
+
+            let bits_mismatch = |a: &[f32], b: &[f32]| -> usize {
+                a.iter()
+                    .zip(b.iter())
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count()
+            };
+            let mismatched = bits_mismatch(&old_o, &new_o)
+                + bits_mismatch(&old_m, &new_m)
+                + bits_mismatch(&old_l, &new_l);
+            let compared = old_o.len() + old_m.len() + old_l.len();
+            table.push((total_partials_real, block_len, compared, mismatched));
+            assert_eq!(
+                mismatched, 0,
+                "total_partials_real={total_partials_real} block_len={block_len} dispatch_x={dispatch_x}: \
+                 {mismatched}/{compared} values not bit-identical \
+                 old=(o={old_o:?} m={old_m:?} l={old_l:?}) new=(o={new_o:?} m={new_m:?} l={new_l:?})"
+            );
+        }
+
+        eprintln!("=== sparse_attention_forward old-vs-new oracle: (total_partials, block_len) x size table ===");
+        for (total_partials_real, block_len, compared, mismatched) in &table {
+            eprintln!(
+                "total_partials={total_partials_real:>4} block_len={block_len:>4} compared={compared:>6} mismatched={mismatched:>6}"
+            );
+        }
+        assert!(!table.is_empty(), "compared nothing");
+    }
+
+    /// New-kernel-vs-CPU-reference at large sizes (the ruling's "129 class"),
+    /// safe on every backend including WARP: `kvouter_forward_gpu` always
+    /// compiles from the CURRENT `sparse_attention_forward.wgsl` (this
+    /// module's `SHADER_WGSL` const), never the pre-rewrite one, so unlike
+    /// `old_vs_new_oracle::sparse_attention_forward_old_vs_new_bit_identical`
+    /// this test has nothing WARP-unsafe to exclude — it's the same shape as
+    /// the existing small-scale `gpu_forward_matches_cpu_forward_small`
+    /// above, just scaled up.
+    ///
+    /// Tolerance, not bitwise: this involves the same softmax +
+    /// sequential-vs-parallel-reduction mismatch as `attention`'s CPU
+    /// reference above, so exact equality is not the right bar. The bound
+    /// is pinned to 10x the worst relative error actually measured on this
+    /// machine (Metal) at tq=129/head_dim=37:
+    /// `1.231e-4 * 10 = 1.231e-3`.
+    ///
+    /// The legitimate in-range `block_len == 0` case (the removed
+    /// early-bail-and-write-sentinel block's former special case) is
+    /// deliberately NOT exercised here: tried `used_kv_lens = 0` for a whole
+    /// batch (the index builder emits zero edges for that batch — a
+    /// different, index-level case, never reaching the shader at all) and
+    /// `used_kv_lens` less than one block (every edge that produced still
+    /// came back with a nonzero `block_len` after `build_kvouter_index`'s
+    /// own filtering). Neither reaches the shader's `block_len == 0` path
+    /// through this public `build_kvouter_index`/`kvouter_forward_gpu`
+    /// pipeline — it is covered instead, directly, by
+    /// `old_vs_new_oracle::sparse_attention_forward_old_vs_new_bit_identical`,
+    /// which builds `edge_meta` by hand specifically to force that value
+    /// regardless of what the index builder would ever produce.
+    #[test]
+    fn gpu_forward_matches_cpu_forward_large() {
+        let Some(gpu) = setup_gpu() else {
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+
+        let tq = 129; // matches the ruling's "129" size class
+        let hq = 1;
+        let hkv = 1;
+        let head_dim = 37; // matches the ruling's "37" size class
+        let page_size = 4;
+        let block_size = 8; // 2 pages/block
+        let max_pages = 6; // 3 blocks' worth of pages per batch
+        let num_pages = max_pages + 1; // +1 so page index 0 is never page_slot's only option
+
+        let q: Vec<f32> = (0..tq * hq * head_dim)
+            .map(|i| (i as f32 * 0.011).sin())
+            .collect();
+        let k: Vec<f32> = (0..num_pages * hkv * page_size * head_dim)
+            .map(|i| (i as f32 * 0.007).sin())
+            .collect();
+        let v: Vec<f32> = (0..num_pages * hkv * page_size * head_dim)
+            .map(|i| (i as f32 * 0.013).cos())
+            .collect();
+
+        let tbl = BlockTables::new((0..max_pages as i32).collect(), 1, max_pages).unwrap();
+        let cu = CuSeqlensQ::new(vec![0, tq as i64]).unwrap();
+        // `used = max_pages * page_size` -> every page fully valid (this is
+        // the size/throughput leg; see the function doc for why the
+        // degenerate `block_len == 0` case is not attempted here).
+        let used = vec![(max_pages * page_size) as i32];
+        let pages_per_block = block_size / page_size;
+        let msb = max_pages / pages_per_block; // max selected *blocks* (not pages)
+        let mut sel_flat = Vec::new();
+        for _i in 0..tq {
+            for _h in 0..hkv {
+                for r in 0..msb {
+                    sel_flat.push(r as i32);
+                }
+            }
+        }
+        let sel = SparseSelection::new(sel_flat, tq, hkv, msb).unwrap();
+        let idx = build_kvouter_index(&sel, &tbl, &cu, Some(&used), block_size, page_size).unwrap();
+        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let cpu = kvouter_forward(
+            &q,
+            &k,
+            &v,
+            &idx,
+            &tbl,
+            &cu,
+            Some(&used),
+            hq,
+            hkv,
+            head_dim,
+            block_size,
+            page_size,
+            softmax_scale,
+            false,
+        )
+        .unwrap();
+        let gpu_out = gpu
+            .kvouter_forward_gpu(
+                &q,
+                &k,
+                &v,
+                &idx,
+                &tbl,
+                &cu,
+                Some(&used),
+                hq,
+                hkv,
+                head_dim,
+                block_size,
+                page_size,
+                softmax_scale,
+            )
+            .unwrap();
+
+        const MEASURED_WORST_REL: f32 = 1.231e-4; // Metal, tq=129/head_dim=37
+        const TOL: f32 = MEASURED_WORST_REL * 10.0;
+
+        assert_eq!(cpu.o_partial.len(), gpu_out.o_partial.len());
+        assert!(!cpu.o_partial.is_empty(), "compared nothing (o_partial)");
+        let mut worst_rel: f32 = 0.0;
+        for (c, g) in cpu.o_partial.iter().zip(&gpu_out.o_partial) {
+            assert!(c.is_finite(), "cpu reference o_partial not finite: {c}");
+            assert!(g.is_finite(), "gpu o_partial not finite: {g}");
+            let rel = (c - g).abs() / c.abs().max(1e-6);
+            worst_rel = worst_rel.max(rel);
+            assert!(
+                rel < TOL,
+                "o_partial mismatch: cpu={c}, gpu={g}, rel={rel}, tol={TOL}"
+            );
+        }
+        for (c, g) in cpu.m_partial.iter().zip(&gpu_out.m_partial) {
+            assert!(c.is_finite(), "cpu reference m_partial not finite: {c}");
+            assert!(g.is_finite(), "gpu m_partial not finite: {g}");
+            assert!(
+                (c - g).abs() < TOL,
+                "m_partial mismatch: cpu={c}, gpu={g}, tol={TOL}"
+            );
+        }
+        for (c, g) in cpu.l_partial.iter().zip(&gpu_out.l_partial) {
+            assert!(c.is_finite(), "cpu reference l_partial not finite: {c}");
+            assert!(g.is_finite(), "gpu l_partial not finite: {g}");
+            let rel = (c - g).abs() / c.abs().max(1e-6);
+            assert!(
+                rel < TOL,
+                "l_partial mismatch: cpu={c}, gpu={g}, rel={rel}, tol={TOL}"
+            );
+        }
+        eprintln!(
+            "=== sparse_attention_forward large new-vs-CPU-reference: tq={tq} head_dim={head_dim} \
+             partials={} worst_rel={worst_rel} (tol {TOL}) ===",
+            cpu.o_partial.len() / head_dim
+        );
+    }
 }

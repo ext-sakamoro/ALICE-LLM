@@ -75,7 +75,13 @@ fn swiglu_fused_q1_0(
     @builtin(subgroup_size) sg_size: u32,
 ) {
     let row = wid.y * params.grid_x + wid.x;
-    if (row >= params.rows) { return; }
+    // No early return before the barrier below: an out-of-range workgroup
+    // still reaches every barrier (an out-of-range `weights`/`input_vec`
+    // index is WGSL-robustness-safe to read, just garbage), it only skips
+    // the final write. A workgroup-uniform early return here (the guard
+    // depends only on `wid`, never on `lid`) was measured to still fault on
+    // D3D12 WARP, so this form is required regardless of guard uniformity.
+    let row_in_bounds = row < params.rows;
 
     let tid = lid.x;
     // Which byte within the 16-byte packed qs and which bit inside it
@@ -116,7 +122,7 @@ fn swiglu_fused_q1_0(
     }
     workgroupBarrier();
 
-    if (tid == 0u) {
+    if (tid == 0u && row_in_bounds) {
         var g: f32 = 0.0;
         var u: f32 = 0.0;
         let n_sg = 128u / sg_size;

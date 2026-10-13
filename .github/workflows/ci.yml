@@ -54,6 +54,30 @@ jobs:
       - name: Docs lint (public documents, CHANGELOG structure)
         run: python scripts/docs_lint.py --check
 
+  wgsl_lint:
+    # No `return`/`discard` before a compute entry point's (last) barrier:
+    # a workgroup-uniform guard in that position was measured to still fault
+    # on D3D12 WARP (see gpu_pipeline_smoke's job doc) even though it is
+    # WGSL-spec-legal. Scans every `src/shaders/*.wgsl` entry point; 0 files
+    # or 0 entry points scanned is a failure (compared nothing), not a pass.
+    # Run on all three OSes since the script reads UTF-8 explicitly and must
+    # not depend on the locale (same reasoning as docs_lint).
+    name: WGSL return/discard-before-barrier lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: WGSL lint (tests)
+        run: python scripts/test_no_return_before_barrier.py
+      - name: WGSL lint (no return/discard before a barrier)
+        run: python scripts/no_return_before_barrier.py
+
   clippy:
     # Hard gate (`-D warnings`, `--all-targets`) over three feature sets:
     # default, `simd` (the wide kernels in sparse_attention/simd.rs) and the
@@ -133,24 +157,80 @@ jobs:
     # instantiates GpuEngine::new() and catches any pipeline compilation
     # panic, distinguishing "no GPU adapter" (acceptable on headless CI)
     # from real shader validation errors (test fails).
-    name: GPU pipeline creation smoke test (${{ matrix.os }})
+    #
+    # windows-latest additionally exercises the D3D12 WARP software adapter
+    # (GitHub's windows-latest runners have no hardware GPU, so `wgpu`'s
+    # default adapter request lands on WARP — the same backend a
+    # `return`/`discard` before a compute-shader barrier was measured to
+    # fault on, 0xC0000005, even for a workgroup-uniform guard). This leg
+    # also runs the matvec/attention/sparse-attention GPU-dispatch
+    # correctness tests (not just pipeline creation), including:
+    #   - the single out-of-range-workgroup oracle against a CPU reference
+    #     (matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows)
+    #   - the full bit-identical old-vs-new oracle for all 16 rewritten
+    #     kernels (`old_vs_new_oracle` module, `internal-kernel-oracle`
+    #     feature — builds the pre-rewrite kernel from
+    #     `tests/ref_shaders/*_old.wgsl`, excluded from the published
+    #     package, see `Cargo.toml`), swept over 0/1/non-multiple/tile±1
+    #     sizes per kernel, asserting old and new agree bit-for-bit
+    name: GPU pipeline creation + dispatch correctness (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # macos-latest has Apple Metal (Apple Silicon runner), so pipeline
         # creation actually exercises the Metal shader compiler.
-        # ubuntu-latest does not have GPU hardware, but the test skips
-        # gracefully (compile-check + adapter-absence path).
-        os: [ubuntu-latest, macos-latest]
+        # windows-latest has no hardware GPU either, but `wgpu`'s DX12
+        # backend enumerates the WARP software adapter the same way it
+        # would a real one, so dispatch actually runs there too.
+        # ubuntu-latest does not have GPU hardware and no software compute
+        # fallback either, so the test skips gracefully (compile-check +
+        # adapter-absence path) — kept for the pure compile-check signal.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --features gpu (pipeline smoke test)
+      # windows-latest (WARP) runs the same NEW-kernel-only tests as the
+      # other two OSes, but never `old_vs_new_oracle::`: that module builds
+      # and DISPATCHES the pre-rewrite reference kernel (the one with the
+      # return-before-barrier pattern this whole patch exists to remove),
+      # which is exactly the shape measured to crash WARP — running it there
+      # would make this leg red by construction, not because of a real
+      # regression. The old-vs-new comparison only runs where the OLD kernel
+      # can safely execute (ubuntu-latest's software Vulkan / macos-latest's
+      # Metal); windows-latest instead gets new-vs-CPU-reference coverage
+      # (q5k/q8_0 today; more to follow) which exercises the NEW kernel only,
+      # on every backend including WARP.
+      - name: cargo test --features gpu (pipeline smoke + dispatch correctness, windows-latest)
+        if: matrix.os == 'windows-latest'
+        # pwsh (this runner's default shell) uses `` ` `` for line
+        # continuation, not `\` — force bash (present via Git for Windows)
+        # so the `\`-continued multi-line command below parses correctly.
+        shell: bash
+        run: |
+          cargo test --lib --features gpu -- \
+            smoke_test_gpu_pipeline_creation \
+            q5k_matvec_matches_cpu_dequant_reference \
+            q8_0_matvec_matches_cpu_dequant_reference \
+            matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows \
+            cpu_reference_oracle:: \
+            integration_tests::test_attention \
+            sparse_attention::gpu::tests::
+      - name: cargo test --features gpu (pipeline smoke + dispatch correctness + old-vs-new oracle, ubuntu/macos)
+        if: matrix.os != 'windows-latest'
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
-        run: cargo test --lib --features gpu smoke_test_gpu_pipeline_creation
+        run: |
+          cargo test --lib --features gpu,internal-kernel-oracle -- \
+            smoke_test_gpu_pipeline_creation \
+            q5k_matvec_matches_cpu_dequant_reference \
+            q8_0_matvec_matches_cpu_dequant_reference \
+            matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows \
+            old_vs_new_oracle:: \
+            cpu_reference_oracle:: \
+            integration_tests::test_attention \
+            sparse_attention::gpu::tests::
 
   build_release:
     name: Build (release)
@@ -198,6 +278,7 @@ jobs:
       - fmt
       - actionlint
       - docs_lint
+      - wgsl_lint
       - clippy
       - test
       - doc

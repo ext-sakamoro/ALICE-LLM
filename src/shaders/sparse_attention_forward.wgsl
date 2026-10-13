@@ -62,9 +62,14 @@ fn sparse_forward(
     let partial_idx = wg.x;
     let tid = lid.x;
 
-    if (partial_idx >= params.total_partials) {
-        return;
-    }
+    // No early return before the barriers below: an out-of-range workgroup
+    // (dispatched beyond `total_partials` by a future caller that
+    // over-provisions the grid) still reaches every barrier, it only skips
+    // the final writes. A workgroup-uniform early return here (the guard
+    // depends only on `wg.x`, never on `tid`) was measured to still fault
+    // on D3D12 WARP, so this form is required regardless of guard
+    // uniformity.
+    let partial_in_bounds = partial_idx < params.total_partials;
 
     let abs_edge = partial_idx / params.qhead;
     let qh = partial_idx % params.qhead;
@@ -90,19 +95,13 @@ fn sparse_forward(
     }
     workgroupBarrier();
 
-    // Early bail: block is entirely masked. Thread 0 writes sentinel partial.
-    if (block_len == 0u) {
-        if (tid == 0u) {
-            m_partial[partial_idx] = NEG_LARGE;
-            l_partial[partial_idx] = 0.0;
-            var d0: u32 = 0u;
-            while (d0 < params.head_dim) {
-                o_partial[partial_idx * params.head_dim + d0] = 0.0;
-                d0 = d0 + 1u;
-            }
-        }
-        return;
-    }
+    // `block_len == 0u` (the edge is entirely masked) is a legitimate,
+    // in-range result — not an out-of-range dispatch — so it is not an
+    // early-return candidate. It needs no special-casing either: every
+    // phase below is bounded by `block_len`, so a zero `block_len` makes
+    // each phase's loop run zero iterations and naturally reproduces the
+    // same sentinel values an explicit early-bail would have written
+    // (m_val stays NEG_LARGE, l_val stays 0.0, every `acc` stays 0.0).
 
     // --- Phase 1: compute Q · K per position (stride WG_SIZE) ------------
     var t = tid;
@@ -207,11 +206,13 @@ fn sparse_forward(
                 acc = acc + w * v_pages[page_base + d];
             }
         }
-        o_partial[partial_idx * params.head_dim + d] = acc;
+        if (partial_in_bounds) {
+            o_partial[partial_idx * params.head_dim + d] = acc;
+        }
         d = d + WG_SIZE;
     }
 
-    if (tid == 0u) {
+    if (tid == 0u && partial_in_bounds) {
         m_partial[partial_idx] = m_val;
         l_partial[partial_idx] = l_val;
     }

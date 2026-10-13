@@ -24,6 +24,14 @@ homepage = "https://github.com/ext-sakamoro/ALICE-LLM"
 documentation = "https://docs.rs/alice-llm"
 keywords = ["llm", "inference", "gguf", "gpu", "quantization"]
 categories = ["science", "algorithms", "wasm"]
+# Pre-rewrite WGSL kept only as a test-only bit-identical oracle reference
+# (`tests/ref_shaders/*_old.wgsl`, `include_str!`-ed from the
+# `internal-kernel-oracle`-gated tests in src/gpu.rs / src/sparse_attention/
+# gpu.rs) — never shipped. No `exclude` is needed for this: the `include`
+# allowlist above already omits `tests/` entirely, and Cargo ignores
+# `exclude` outright once `include` is present (`cargo package --list`
+# warns "both package.include and package.exclude are specified; the
+# exclude list will be ignored" if both are set — verified).
 
 [lib]
 crate-type = ["rlib"]
@@ -45,6 +53,13 @@ dspark = []
 # Emits `layer_assignments.json` from a GGUF using the Unsloth-baseline
 # heuristics (no calibration data required); see `src/imatrix/heuristic.rs`.
 imatrix = ["gguf", "dep:serde", "dep:serde_json"]
+# Dev-only: enables the bit-identical old-vs-new kernel oracle tests, which
+# `include_str!` the pre-rewrite reference shaders under `tests/ref_shaders/`
+# (excluded from the published package, see `exclude` below). Not in
+# `default`, so `cargo test --features gpu` on the published/unpacked crate
+# never references the excluded files; only a git checkout (where those
+# files physically exist) is expected to build with this feature on.
+internal-kernel-oracle = ["gpu"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }

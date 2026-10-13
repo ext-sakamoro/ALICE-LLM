@@ -76,9 +76,13 @@ fn matvec_q1_0_row4_batch4(
 ) {
     let row_group = wid.y * params.grid_x + wid.x;
     let row_base = row_group * 4u;
-    // Early exit if this row-group is entirely past the row count. Individual
-    // rows within a group are guarded during the output write step below.
-    if (row_base >= params.rows) { return; }
+    // No early return before the barrier below: a workgroup whose whole
+    // row_base is out of range still reaches every barrier (its per-row
+    // writes at the bottom are already individually guarded by `ri < rows`,
+    // which also correctly skips all 4 writes here; out-of-range `weights`
+    // reads are WGSL-robustness-safe). A workgroup-uniform early return
+    // (depends only on `wid`, never on `lid`) was measured to still fault
+    // on D3D12 WARP, so this form is required regardless of guard uniformity.
 
     let tid = lid.x;                              // 0..128, one thread per element
     let byte_idx_in_block = 2u + tid / 8u;
