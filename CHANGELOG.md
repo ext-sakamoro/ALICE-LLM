@@ -235,8 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   変更、既存 example (`speculative_dspark_dual` / `dspark_train_confidence_head`)
   は Rust 型推論で `&mut draft_model` を `&mut dyn DraftBackend` に無改修
   coerce (4) `KimiK3Model` の impl は Phase 10 (KDA layer の recurrent
-  state snapshot 実装が blocker、詳細設計 memo は `a note`
-  §4c) デフォルト lib test 558 pass 維持、speculative_dspark 84 test (with
+  state snapshot 実装が blocker) デフォルト lib test 558 pass 維持、speculative_dspark 84 test (with
   dspark-serde) pass、両 example compile pass、clippy pedantic+nursery 0
   warn 新規範囲、fmt check pass Phase 10 (KDA snapshot 実装 + `impl DraftBackend
   for KimiK3Model`) は次回

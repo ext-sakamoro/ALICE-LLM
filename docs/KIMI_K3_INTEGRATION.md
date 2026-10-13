@@ -576,7 +576,7 @@ target. Without MXFP4 support, ALICE-LLM must rely on community Q4 GGUF
 conversion (~1.4 TB) which fits only in H200 8× (marginal on H100 8×).
 With MXFP4 support, H100 8× becomes a comfortable target and consumer
 Mac hardware runs Kimi K3 with expert streaming = the "consumer hardware
-runs 2.8T MoE" reversal that validates the a note.
+runs 2.8T MoE" reversal.
 
 Practical near-term target on consumer hardware: **expert-streaming mode**
 adapting the DeepSeek V3 Phase 4 (Issue #34) design. Each forward:
@@ -624,9 +624,9 @@ the selected experts.
 
 ## Related ALICE-LLM work
 
-- [[docs/DEEPSEEK_V2_LITE_VALIDATION.md]] — validation methodology template
-- [[docs/BONSAI_GPU_SUPPORT.md]] — hybrid DeltaNet reference
-- [[docs/PHASE_X_3_E_3_3_VALIDATION.md]] — GPU numerical parity approach
+- `docs/DEEPSEEK_V2_LITE_VALIDATION.md` — validation methodology template
+- `docs/BONSAI_GPU_SUPPORT.md` — hybrid DeltaNet reference
+- `docs/PHASE_X_3_E_3_3_VALIDATION.md` — GPU numerical parity approach
 - `src/llama3.rs:gated_deltanet_step*` — DeltaNet CPU forward
 - `SsmDeltaNetConfig` (`src/llama3.rs:192`) — extend for Kimi-specific fields
 - `alice-tracker.toml` — new project entry `kimi-k3-integration` needed
