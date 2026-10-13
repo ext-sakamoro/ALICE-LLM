@@ -244,6 +244,15 @@ def check(
 
 
 def main() -> int:
+    # Windows runners default stdout/stderr to the system ANSI codepage (not
+    # UTF-8), which cannot encode this script's Japanese error text and
+    # crashes with UnicodeEncodeError before the actual check result ever
+    # prints — measured on windows-latest CI.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=DEFAULT_ROOT)
     args = ap.parse_args()

@@ -19,6 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import no_return_before_barrier as g  # noqa: E402
 
 SHADER_PATH = "src/shaders/dummy.wgsl"
+# `g.check_file` reports paths via `os.path.relpath`, which uses the native
+# separator (`\` on Windows) — assertions that substring-match a reported
+# path must compare against this, not the forward-slash form used to build
+# the fixture's file tree (`os.path.join`/`os.makedirs` accept `/` fine on
+# every OS, but the *reported* path does not stay forward-slashed).
+SHADER_PATH_NATIVE = os.path.normpath(SHADER_PATH)
 
 CLEAN = """\
 @compute @workgroup_size(64)
@@ -127,7 +133,7 @@ class Teeth(unittest.TestCase):
     def test_return_before_a_barrier_fails(self):
         e, c = run({SHADER_PATH: RETURN_BEFORE_BARRIER})
         self.assertEqual(len(e), 1, e)
-        self.assertTrue(f"{SHADER_PATH}:4" in e[0], e)
+        self.assertTrue(f"{SHADER_PATH_NATIVE}:4" in e[0], e)
 
     def test_discard_before_a_barrier_fails(self):
         e, _ = run({SHADER_PATH: DISCARD_BEFORE_BARRIER})
@@ -178,6 +184,7 @@ class Teeth(unittest.TestCase):
                 [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "no_return_before_barrier.py"), "--root", root],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("entry point が 0 件", result.stdout)
