@@ -244,6 +244,15 @@ jobs:
         if: matrix.os != 'windows-latest'
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C target-feature=+dotprod' || '' }}
+        # GitHub's IMPLICIT default shell (no `shell:` key at all) is plain
+        # `bash -e {0}` — NOT `-o pipefail` — so `cmd | tee file` here would
+        # silently swallow `cargo test`'s real exit code behind `tee`'s
+        # (near-always 0) one, reporting this step green even when the
+        # underlying tests failed. Explicitly requesting `shell: bash`
+        # expands to the FULL `bash --noprofile --norc -eo pipefail {0}`
+        # invocation, which is what every other step in this job that
+        # already declares `shell: bash` gets.
+        shell: bash
         run: |
           cargo test --lib --features gpu,internal-kernel-oracle -- \
             smoke_test_gpu_pipeline_creation \
