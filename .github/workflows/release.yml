@@ -12,6 +12,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # the documents every release archive carries (one list for the tar.gz and the zip steps)
+  RELEASE_DOCS: README.md CHANGELOG.md LICENSE-AGPL LICENSE-COMMERCIAL.md NOTICE
 
 jobs:
   build:
@@ -45,6 +47,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      - name: Check the documents the archive carries
+        shell: bash
+        run: |
+          read -r -a docs <<< "$RELEASE_DOCS"
+          if [ "${#docs[@]}" -eq 0 ]; then echo "::error::RELEASE_DOCS names no file"; exit 1; fi
+          missing=0
+          for f in "${docs[@]}"; do
+            if [ ! -f "$f" ]; then echo "::error::$f is in RELEASE_DOCS but not in the checkout"; missing=1; fi
+          done
+          exit "$missing"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +95,8 @@ jobs:
           STAGE="alice-llm-server-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp target/${{ matrix.target }}/release/alice-llm-server "$STAGE/"
-          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          read -r -a docs <<< "$RELEASE_DOCS"
+          cp "${docs[@]}" "$STAGE/"
           tar czf "$STAGE.tar.gz" "$STAGE"
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
 
@@ -93,7 +107,8 @@ jobs:
           STAGE="alice-llm-server-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp target/${{ matrix.target }}/release/alice-llm-server.exe "$STAGE/"
-          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          read -r -a docs <<< "$RELEASE_DOCS"
+          cp "${docs[@]}" "$STAGE/"
           7z a "$STAGE.zip" "$STAGE"
           certutil -hashfile "$STAGE.zip" SHA256 | grep -v ":" | head -1 > "$STAGE.zip.sha256"
 

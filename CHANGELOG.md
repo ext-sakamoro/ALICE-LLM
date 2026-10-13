@@ -1248,6 +1248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The release archives of `alice-llm-server` carry `README.md`, `CHANGELOG.md`, `LICENSE-AGPL`, `LICENSE-COMMERCIAL.md` and `NOTICE` (one list, `RELEASE_DOCS` in `.github/workflows/release.yml`); the packaging copied a `LICENSE` file that the repository does not have, so the release build stopped there, and a step now names any listed file that is missing before the build starts
 - crates.io publishing is a step of the release procedure and no longer runs from a tag push (the `publish-crates-io` job is removed from `.github/workflows/release.yml`; the build and GitHub Release jobs are unchanged)
 - The measurement logs of local runs (`logs/`) are no longer kept in the repository (`.gitignore`); they named local file paths
 - Examples that load a model take the file from the command line or from `ALICE_LLM_MODEL` (`ALICE_LLM_DRAFT_MODEL` / `ALICE_LLM_VERIFY_MODEL` for `speculative_dual_gpu`) and exit with a usage line when neither is given; they had a fixed default path to a local file
