@@ -239,7 +239,7 @@ fn matvec_q1_0_row8_batch4(
         var t50: f32 = 0.0; var t51: f32 = 0.0; var t52: f32 = 0.0; var t53: f32 = 0.0;
         var t60: f32 = 0.0; var t61: f32 = 0.0; var t62: f32 = 0.0; var t63: f32 = 0.0;
         var t70: f32 = 0.0; var t71: f32 = 0.0; var t72: f32 = 0.0; var t73: f32 = 0.0;
-        let n_sg = 128u / sg_size;
+        let n_sg = (128u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             t00 += sg_all[sg_base(0u, 0u) + s]; t01 += sg_all[sg_base(0u, 1u) + s];
             t02 += sg_all[sg_base(0u, 2u) + s]; t03 += sg_all[sg_base(0u, 3u) + s];

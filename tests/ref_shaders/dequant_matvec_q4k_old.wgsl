@@ -13,6 +13,15 @@
 // something the no-early-return rewrite this oracle exists to isolate
 // should be blamed for.
 //
+// Also mirrors the 2.0.1 n_sg rounding fix: `n_sg = WG / sg_size` is
+// truncating integer division, so a device whose subgroup size exceeds
+// this kernel's workgroup size (e.g. a 64-wide subgroup on this
+// kernel's 32-wide workgroup) computes n_sg = 0 and skips the
+// reduction entirely, writing nothing — the fixed form is
+// `n_sg = (WG + sg_size - 1) / sg_size`. This bug predates 2.0.1
+// (present in the published 2.0.0 and 1.x releases too), which is why
+// it's also mirrored here rather than left as a historical artifact.
+//
 // Verify provenance:
 //   diff <(git show v2.0.0:src/shaders/dequant_matvec_q4k.wgsl) tests/ref_shaders/dequant_matvec_q4k_published_2_0_0.wgsl   # empty
 //   diff tests/ref_shaders/dequant_matvec_q4k_published_2_0_0.wgsl tests/ref_shaders/dequant_matvec_q4k_old.wgsl             # only the array-size edits
@@ -126,7 +135,7 @@ fn matvec_q4k(
     // Step 3: Thread 0 reduces 8 partial sums
     if (tid == 0u) {
         var total: f32 = 0.0;
-        let n_sg = 256u / sg_size;
+        let n_sg = (256u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             total += sg_partial[s];
         }

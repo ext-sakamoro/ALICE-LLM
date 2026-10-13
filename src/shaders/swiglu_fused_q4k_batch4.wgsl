@@ -148,7 +148,7 @@ fn swiglu_fused_q4k_batch4(
     if (tid == 0u && row_in_bounds) {
         var tg0: f32 = 0.0; var tg1: f32 = 0.0; var tg2: f32 = 0.0; var tg3: f32 = 0.0;
         var tu0: f32 = 0.0; var tu1: f32 = 0.0; var tu2: f32 = 0.0; var tu3: f32 = 0.0;
-        let n_sg = 256u / sg_size;
+        let n_sg = (256u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             tg0 += sg_g0[s]; tg1 += sg_g1[s]; tg2 += sg_g2[s]; tg3 += sg_g3[s];
             tu0 += sg_u0[s]; tu1 += sg_u1[s]; tu2 += sg_u2[s]; tu3 += sg_u3[s];

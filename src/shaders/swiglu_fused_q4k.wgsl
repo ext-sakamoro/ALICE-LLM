@@ -114,7 +114,7 @@ fn swiglu_fused_q4k(
     if (tid == 0u && row_in_bounds) {
         var gate_val: f32 = 0.0;
         var up_val: f32 = 0.0;
-        let n_sg = 256u / sg_size;
+        let n_sg = (256u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             gate_val += sg_gate[s];
             up_val += sg_up[s];

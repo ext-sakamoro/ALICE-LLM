@@ -118,7 +118,7 @@ fn matvec_q4k(
     // Step 3: Thread 0 reduces 8 partial sums
     if (tid == 0u && row_in_bounds) {
         var total: f32 = 0.0;
-        let n_sg = 256u / sg_size;
+        let n_sg = (256u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             total += sg_partial[s];
         }

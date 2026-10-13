@@ -58,7 +58,7 @@ A CPU build that loads GGUF files and uses all cores:
 
 ```toml
 [dependencies]
-alice-llm = { version = "1.6", features = ["gguf", "parallel"] }
+alice-llm = { version = "2.0.1", features = ["gguf", "parallel"] }
 ```
 
 Models are GGUF files, for example:

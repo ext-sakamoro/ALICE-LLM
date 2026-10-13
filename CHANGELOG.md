@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-13
+
+### Fixed
+
+- **Compute shader control flow**: every subgroup-reduction kernel (the
+  dequantized matvec and fused SwiGLU shaders, 14 entry points total) had a
+  `return`/`discard` before a `workgroupBarrier()` call, guarded by a
+  workgroup-uniform condition. WGSL-spec-legal uniform control flow is not
+  sufficient evidence of safety on every backend: this was measured to fault
+  a D3D12 WARP (software) adapter even though the guard never depended on
+  per-invocation state. Every entry point is rewritten so every invocation
+  always reaches every barrier; the guard now conditions only the final
+  write.
+- **Workgroup-shared reduction array sizing**: the same 14 kernels' shared
+  memory for combining per-subgroup partial sums was sized from an assumed
+  minimum device subgroup size, not the device's actual reported one. A
+  device whose real subgroup size is smaller than assumed silently wrote
+  wrong totals rather than trapping (WGSL's robustness guarantee clamps an
+  out-of-bounds workgroup-array access instead of erroring) — measured on a
+  software Vulkan adapter reporting a subgroup size of 8. Every such array
+  is now sized to the kernel's full workgroup size, which needs no
+  assumption about the device's actual subgroup size at all.
+- **Subgroup-count rounding**: the same 14 kernels computed the number of
+  subgroups per workgroup via truncating integer division
+  (`workgroup_size / subgroup_size`). On a device whose subgroup size
+  exceeds a given kernel's workgroup size, this truncates to zero and the
+  reduction loop never runs, silently producing zero output for every row.
+  This predates 2.0.1 — it was present in every published 1.x and 2.0.0
+  release — and is now fixed with ceiling division.
+- **CI**: a GPU test job that silently found no adapter at all (and so
+  exercised none of its GPU-dispatch tests) is no longer reported as a
+  pass; it must show evidence of either a real dispatch or a named,
+  counted reason the dispatch was skipped. A pipe through a shell step
+  without an explicit interactive shell could previously hide a failing
+  command's exit code behind a downstream command's (near-always zero)
+  one, reporting the step green regardless of the real result; every such
+  step now runs under an explicit shell with pipefail enabled, and a
+  dedicated check confirms a failing command piped through another command
+  still fails the step. The subgroup-size and subgroup-count-rounding
+  issues above were present, undetected, in every published 1.x release
+  and in 2.0.0; none of them are new to this release.
+
 ## [2.0.0] - 2026-10-13
 
 **Breaking:** code built against 1.x needs a change in these places

@@ -109,7 +109,7 @@ fn matvec_q1_0_batch4(
         var t1: f32 = 0.0;
         var t2: f32 = 0.0;
         var t3: f32 = 0.0;
-        let n_sg = 128u / sg_size;
+        let n_sg = (128u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             t0 += sg0[s];
             t1 += sg1[s];

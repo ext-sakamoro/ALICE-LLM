@@ -89,7 +89,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: [default, simd, full]
+        # `gpu-oracle` adds `internal-kernel-oracle` on top of the full set:
+        # without it, the old_vs_new / published-2.0.0 / n_sg-rounding test
+        # code under that feature gate is never even compiled by this job,
+        # let alone linted (caught as a gap during 2.0.1 review).
+        features: [default, simd, full, gpu-oracle]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -105,6 +109,9 @@ jobs:
       - name: cargo clippy (full feature set, all targets)
         if: matrix.features == 'full'
         run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings
+      - name: cargo clippy (full feature set + internal-kernel-oracle, all targets)
+        if: matrix.features == 'gpu-oracle'
+        run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings
 
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.features }})

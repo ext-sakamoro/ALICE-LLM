@@ -190,7 +190,7 @@ fn matvec_q1_0_row4_batch4(
         var t10: f32 = 0.0; var t11: f32 = 0.0; var t12: f32 = 0.0; var t13: f32 = 0.0;
         var t20: f32 = 0.0; var t21: f32 = 0.0; var t22: f32 = 0.0; var t23: f32 = 0.0;
         var t30: f32 = 0.0; var t31: f32 = 0.0; var t32: f32 = 0.0; var t33: f32 = 0.0;
-        let n_sg = 128u / sg_size;
+        let n_sg = (128u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             t00 += sg00[s]; t01 += sg01[s]; t02 += sg02[s]; t03 += sg03[s];
             t10 += sg10[s]; t11 += sg11[s]; t12 += sg12[s]; t13 += sg13[s];

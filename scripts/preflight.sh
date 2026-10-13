@@ -58,6 +58,10 @@ step "ci.yml / clippy: cargo clippy (full feature set, all targets)"
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server" -- -D warnings )
 
+step "ci.yml / clippy: cargo clippy (full feature set + internal-kernel-oracle, all targets)"
+relint
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings )
+
 # Hand-added (kept across regeneration): the CI clippy runner is x86_64, this
 # Mac is aarch64 — arch-gated bodies (AVX2 / AVX-512 kernels in gguf.rs) only
 # lint against the x86_64 target (2026-09-16: 5 findings reached CI this way)

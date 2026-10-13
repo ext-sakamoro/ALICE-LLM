@@ -126,7 +126,7 @@ fn swiglu_fused_q1_0(
     if (tid == 0u && row_in_bounds) {
         var g: f32 = 0.0;
         var u: f32 = 0.0;
-        let n_sg = 128u / sg_size;
+        let n_sg = (128u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             g += sg_gate[s];
             u += sg_up[s];

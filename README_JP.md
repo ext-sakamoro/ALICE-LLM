@@ -52,7 +52,7 @@ cargo add alice-llm
 
 ```toml
 [dependencies]
-alice-llm = { version = "1.6", features = ["gguf", "parallel"] }
+alice-llm = { version = "2.0.1", features = ["gguf", "parallel"] }
 ```
 
 モデルは GGUF ファイル。例:

@@ -110,7 +110,7 @@ fn matvec_q1_0(
 
     if (tid == 0u && row_in_bounds) {
         var total: f32 = 0.0;
-        let n_sg = 128u / sg_size;
+        let n_sg = (128u + sg_size - 1u) / sg_size;
         for (var s = 0u; s < n_sg; s = s + 1u) {
             total += sg_partial[s];
         }

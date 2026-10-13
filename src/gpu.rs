@@ -8376,6 +8376,203 @@ mod tests {
             );
         }
 
+        /// `n_sg = workgroup_size / sg_size` is truncating integer division:
+        /// a device whose subgroup size exceeds a kernel's workgroup size
+        /// (e.g. a 64-wide subgroup on q8_0's 32-wide workgroup) computes
+        /// `n_sg = 0` and the reduction loop `for s in 0..n_sg` never runs,
+        /// writing nothing for every row — silently, no backend we test on
+        /// (lavapipe's subgroup size is fixed at 8, never larger than any
+        /// of these kernels' workgroup sizes) can exercise this for real,
+        /// so it's pinned here as a pure arithmetic property instead. The
+        /// correct form is `n_sg = (workgroup_size + sg_size - 1) / sg_size`
+        /// (ceiling division) — this test derives each kernel's workgroup
+        /// size from its own shader TEXT (not a hardcoded duplicate, so a
+        /// future workgroup-size change is still covered), and asserts both
+        /// that the ceiling-division idiom appears in the text and that the
+        /// formula itself behaves correctly across every realistic hardware
+        /// subgroup size, including ones larger than the workgroup.
+        #[test]
+        fn n_sg_ceiling_division_handles_subgroup_larger_than_workgroup() {
+            fn workgroup_size_from_text(src: &str) -> u32 {
+                let needle = "@workgroup_size(";
+                let start = src
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("no @workgroup_size(...) found in shader text"))
+                    + needle.len();
+                let end = src[start..]
+                    .find(')')
+                    .unwrap_or_else(|| panic!("unterminated @workgroup_size(..."));
+                src[start..start + end]
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|e| panic!("@workgroup_size(...) not a plain integer: {e}"))
+            }
+
+            let all_kernels: Vec<(&str, &str, u32)> = matvec_kernels()
+                .into_iter()
+                .map(|k| (k.name, k.new_src, k.workgroup_size))
+                .chain(
+                    swiglu_kernels()
+                        .into_iter()
+                        .map(|k| (k.name, k.new_src, k.workgroup_size)),
+                )
+                .collect();
+            assert!(!all_kernels.is_empty(), "no kernels to check");
+
+            for (name, src, declared_workgroup_size) in all_kernels {
+                let text_workgroup_size = workgroup_size_from_text(src);
+                assert_eq!(
+                    text_workgroup_size, declared_workgroup_size,
+                    "kernel={name}: struct's workgroup_size={declared_workgroup_size} doesn't \
+                     match the shader text's own @workgroup_size({text_workgroup_size}) — the \
+                     test table is out of sync with the shader"
+                );
+
+                // The ceiling-division idiom, independent of the exact
+                // workgroup size value (which varies per kernel): the
+                // truncating form `<N>u / sg_size` with nothing else added
+                // must NOT appear; the `+ sg_size - 1u` compensation must.
+                assert!(
+                    src.contains("+ sg_size - 1u) / sg_size"),
+                    "kernel={name}: shader text does not contain the ceiling-division idiom \
+                     `(workgroup_size + sg_size - 1u) / sg_size` — may have regressed to \
+                     truncating division"
+                );
+                let truncating = format!("let n_sg = {text_workgroup_size}u / sg_size;");
+                assert!(
+                    !src.contains(&truncating),
+                    "kernel={name}: shader text still contains the truncating form \
+                     `{truncating}`"
+                );
+
+                for sg_size in [1u32, 4, 8, 16, 32, 64, 128] {
+                    let naive = text_workgroup_size / sg_size; // the old, buggy form
+                    let ceil = text_workgroup_size.div_ceil(sg_size); // the fixed form
+                                                                      // The buggy and fixed forms only disagree when sg_size
+                                                                      // doesn't evenly divide the workgroup size; the whole
+                                                                      // point of this kernel's n_sg is "how many subgroups
+                                                                      // does this workgroup span", which is never zero for a
+                                                                      // nonempty workgroup.
+                    assert!(
+                        ceil >= 1,
+                        "kernel={name} workgroup_size={text_workgroup_size} sg_size={sg_size}: \
+                         ceil(workgroup_size/sg_size)={ceil} — a nonempty workgroup must span \
+                         at least one subgroup"
+                    );
+                    if sg_size > text_workgroup_size {
+                        assert_eq!(
+                            naive, 0,
+                            "kernel={name} workgroup_size={text_workgroup_size} \
+                             sg_size={sg_size}: expected the truncating form to wrongly compute \
+                             0 here (demonstrating the bug this fix addresses) — got {naive}, \
+                             the reproduction itself is wrong"
+                        );
+                        assert_eq!(
+                            ceil, 1,
+                            "kernel={name} workgroup_size={text_workgroup_size} \
+                             sg_size={sg_size}: a subgroup wider than the whole workgroup must \
+                             still cover it in exactly 1 subgroup, got {ceil}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Minimal, purpose-built reduction shader (NOT a real kernel —
+        /// deliberately not q8_0 itself, whose per-thread indexing assumes
+        /// exactly one thread per block element and so cannot simply be
+        /// recompiled at a smaller workgroup size without also rewriting
+        /// its data layout). Every thread contributes exactly `1.0`;
+        /// `subgroupAdd` + the same ceiling-division `n_sg` pattern used by
+        /// every production kernel combines the per-subgroup partial sums.
+        /// The correct total is always `workgroup_size` (one per thread),
+        /// regardless of the device's actual subgroup size — including
+        /// when that subgroup size exceeds `workgroup_size` itself, which
+        /// is exactly the case the truncating (pre-fix) form of `n_sg`
+        /// computed as 0 and silently wrote nothing for.
+        fn n_sg_probe_shader(workgroup_size: u32) -> String {
+            format!(
+                "@group(0) @binding(0) var<storage, read_write> output_vec: array<f32>;\n\
+                 var<workgroup> sg_partial: array<f32, {workgroup_size}>;\n\
+                 @compute @workgroup_size({workgroup_size})\n\
+                 fn probe_n_sg_rounding(\n\
+                 \x20   @builtin(local_invocation_id) lid: vec3<u32>,\n\
+                 \x20   @builtin(subgroup_invocation_id) sg_lane: u32,\n\
+                 \x20   @builtin(subgroup_size) sg_size: u32,\n\
+                 ) {{\n\
+                 \x20   let tid = lid.x;\n\
+                 \x20   let sg_sum = subgroupAdd(1.0);\n\
+                 \x20   let sg_id = tid / sg_size;\n\
+                 \x20   if (sg_lane == 0u) {{\n\
+                 \x20       sg_partial[sg_id] = sg_sum;\n\
+                 \x20   }}\n\
+                 \x20   workgroupBarrier();\n\
+                 \x20   if (tid == 0u) {{\n\
+                 \x20       var total: f32 = 0.0;\n\
+                 \x20       let n_sg = ({workgroup_size}u + sg_size - 1u) / sg_size;\n\
+                 \x20       for (var s = 0u; s < n_sg; s = s + 1u) {{\n\
+                 \x20           total += sg_partial[s];\n\
+                 \x20       }}\n\
+                 \x20       output_vec[0] = total;\n\
+                 \x20   }}\n\
+                 }}\n"
+            )
+        }
+
+        /// Exercises the `n_sg` ceiling-division fix with a REAL dispatch
+        /// (not just the arithmetic pinned above) at two workgroup sizes
+        /// relative to lavapipe's measured, fixed subgroup size of 8:
+        /// `workgroup_size=8` (subgroup size equals workgroup size, the
+        /// boundary case) and `workgroup_size=4` (subgroup size EXCEEDS
+        /// workgroup size — the exact configuration the pre-fix truncating
+        /// division computed `n_sg=0` for). Skips with a named reason on
+        /// any adapter not reporting a fixed subgroup size (see
+        /// `matvec_kernels_published_2_0_0_vs_new_where_safe`'s doc comment
+        /// for why a range can't be used here either).
+        #[test]
+        fn n_sg_rounding_exercised_by_real_dispatch() {
+            let Some(engine) = try_gpu_engine() else {
+                return;
+            };
+            let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                return;
+            };
+            if min_sg != max_sg {
+                eprintln!(
+                    "n_sg_rounding_exercised_by_real_dispatch: skip (subgroup_size RANGE \
+                     {min_sg}..={max_sg}, not fixed — need a known value to pick a workgroup \
+                     size that's provably <= it)"
+                );
+                return;
+            }
+            let sg_size = min_sg;
+            let mut compared = 0usize;
+            for &workgroup_size in &[sg_size, sg_size / 2] {
+                if workgroup_size == 0 {
+                    continue; // sg_size == 1: sg_size/2 would be 0, not a valid workgroup size
+                }
+                let src = n_sg_probe_shader(workgroup_size);
+                let output_buf = engine.alloc_f32(1);
+                let bufs = [&output_buf.buffer];
+                let out = run_kernel(&engine, &src, "probe_n_sg_rounding", 1, &bufs, &output_buf);
+                assert_eq!(out.len(), 1, "compared nothing");
+                compared += 1;
+                assert_eq!(
+                    out[0], workgroup_size as f32,
+                    "workgroup_size={workgroup_size} sg_size={sg_size}: expected total={workgroup_size} \
+                     (one contribution per thread), got {} — n_sg rounding dropped a subgroup's \
+                     partial sum",
+                    out[0]
+                );
+                eprintln!(
+                    "n_sg_rounding_exercised_by_real_dispatch: workgroup_size={workgroup_size} \
+                     sg_size={sg_size} total={} (expected {workgroup_size}) ok",
+                    out[0]
+                );
+            }
+            assert!(compared > 0, "compared nothing");
+        }
+
         /// attention.wgsl: covers both removed guards — `h >= num_heads`
         /// (workgroup-id padding, via `h_pad`) and the legitimate in-range
         /// `seq_len == 0` case (via `seq_len` itself, not padding).
