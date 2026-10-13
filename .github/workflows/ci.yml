@@ -239,7 +239,7 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture | tee test_output.log
+            --nocapture 2>&1 | tee test_output.log
       - name: cargo test --features gpu (pipeline smoke + dispatch correctness + old-vs-new oracle, ubuntu/macos)
         if: matrix.os != 'windows-latest'
         env:
@@ -254,7 +254,7 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture | tee test_output.log
+            --nocapture 2>&1 | tee test_output.log
       # A leg that silently found no adapter at all (lavapipe missing /
       # Metal unavailable) must not pass by default — ubuntu-latest ran 0.05s
       # for 18 "tests" before lavapipe was installed here, meaning every one
@@ -265,6 +265,10 @@ jobs:
       # intentional case where 0 engine constructions is still legitimate:
       # windows-latest/WARP). Zero of both means the gate itself ran nothing.
       - name: Require real GPU test evidence (no silent 0-test pass)
+        # windows-latest's default shell is pwsh, which does not understand
+        # this bash conditional syntax (`[ ... ]`) — force bash (present via
+        # Git for Windows) on every OS for consistency.
+        shell: bash
         run: |
           adapter_count=$(grep -c '\[gpu\] adapter:' test_output.log || true)
           marker_count=$(grep -c 'GpuEngine cannot be constructed (SUBGROUP unsupported)' test_output.log || true)
