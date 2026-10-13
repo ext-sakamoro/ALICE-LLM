@@ -8440,27 +8440,86 @@ mod tests {
         }
 
         /// Every `let n_sg = ...;` statement in (already comment-stripped)
-        /// WGSL text, each captured verbatim including the `let n_sg = `
-        /// prefix and trailing `;` — used to assert both that there is
-        /// EXACTLY one such statement per kernel and that it is character-
-        /// for-character the expected ceiling-division form, not merely
-        /// that some substring of the expected form appears somewhere
-        /// (which a stray comment or a differently-spaced truncating form
-        /// could satisfy).
+        /// WGSL text, found by scanning for `n_sg` as a whole word preceded
+        /// (after only whitespace) by `let` or `var` as a whole word, and
+        /// captured from that keyword through the next `;` — used to
+        /// assert both that there is EXACTLY one such statement per kernel
+        /// and that it is (whitespace-insensitively) the expected
+        /// ceiling-division form. A literal-prefix search for `"let n_sg =
+        /// "` (an earlier version of this check) missed `let n_sg=...`,
+        /// `let  n_sg =...` (extra whitespace), `let n_sg: u32 = ...`
+        /// (a type annotation) and a `var n_sg = ...;` shadow declared
+        /// next to the real one — all five are found by this scan.
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+
+        fn find_word(haystack: &[u8], word: &[u8], from: usize) -> Option<usize> {
+            let mut i = from;
+            while i + word.len() <= haystack.len() {
+                if &haystack[i..i + word.len()] == word {
+                    let before_ok = i == 0 || !is_ident_byte(haystack[i - 1]);
+                    let after = i + word.len();
+                    let after_ok = after >= haystack.len() || !is_ident_byte(haystack[after]);
+                    if before_ok && after_ok {
+                        return Some(i);
+                    }
+                }
+                i += 1;
+            }
+            None
+        }
+
+        fn collapse_whitespace(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            let mut last_was_space = false;
+            for c in s.chars() {
+                if c.is_whitespace() {
+                    if !last_was_space {
+                        out.push(' ');
+                    }
+                    last_was_space = true;
+                } else {
+                    out.push(c);
+                    last_was_space = false;
+                }
+            }
+            out.trim().to_string()
+        }
+
         fn find_n_sg_statements(stripped: &str) -> Vec<String> {
-            let needle = "let n_sg = ";
+            let bytes = stripped.as_bytes();
             let mut out = Vec::new();
             let mut from = 0usize;
-            while let Some(rel) = stripped[from..].find(needle) {
-                let start = from + rel;
-                let after = start + needle.len();
-                match stripped[after..].find(';') {
-                    Some(semi) => {
-                        out.push(stripped[start..=after + semi].to_string());
-                        from = after + semi + 1;
-                    }
-                    None => break,
+            while let Some(word_start) = find_word(bytes, b"n_sg", from) {
+                // Walk backward over whitespace only, then require the
+                // token immediately before that whitespace to be exactly
+                // `let` or `var` (its own whole word) — anything else
+                // (`n_sg_other`, or `n_sg` not preceded by a declaration
+                // keyword at all) is not a declaration and is skipped.
+                let mut k = word_start;
+                while k > 0 && (bytes[k - 1] as char).is_whitespace() {
+                    k -= 1;
                 }
+                let kw_end = k;
+                let mut kw_start = kw_end;
+                while kw_start > 0 && is_ident_byte(bytes[kw_start - 1]) {
+                    kw_start -= 1;
+                }
+                let kw = &stripped[kw_start..kw_end];
+                let word_end = word_start + 4; // "n_sg".len()
+                if (kw == "let" || kw == "var") && kw_start < kw_end {
+                    match stripped[word_end..].find(';') {
+                        Some(semi) => {
+                            let stmt_end = word_end + semi + 1;
+                            out.push(collapse_whitespace(&stripped[kw_start..stmt_end]));
+                            from = stmt_end;
+                            continue;
+                        }
+                        None => break, // unterminated statement, stop scanning
+                    }
+                }
+                from = word_end;
             }
             out
         }
@@ -8523,8 +8582,9 @@ mod tests {
                      comments), found {}: {statements:?}",
                     statements.len()
                 );
-                let expected =
-                    format!("let n_sg = ({text_workgroup_size}u + sg_size - 1u) / sg_size;");
+                let expected = collapse_whitespace(&format!(
+                    "let n_sg = ({text_workgroup_size}u + sg_size - 1u) / sg_size;"
+                ));
                 assert_eq!(
                     statements[0], expected,
                     "kernel={name}: the shader's only `let n_sg = ...;` statement is not \
@@ -8591,27 +8651,53 @@ mod tests {
         }
 
         #[test]
-        fn n_sg_text_pin_rejects_no_space_truncating_form() {
-            // No spaces around `/` at all — a plain `.contains("+ sg_size -
-            // 1u) / sg_size")` substring check (the FIRST version of this
-            // pin) would not be fooled by this specific case, but an
-            // exact-statement comparison is the robust property: this
-            // statement, found verbatim, must not equal the expected form.
-            let src = "let n_sg=256u/sg_size;\n";
+        fn n_sg_text_pin_finds_every_spelling_of_a_truncating_declaration() {
+            // Three ways the earlier literal-prefix-search version of this
+            // checker (`stripped.find("let n_sg = ")`) would have missed a
+            // real declaration entirely — each must still be found (as a
+            // single statement, still not matching the expected ceiling
+            // text, since all three are the unfixed truncating form).
+            let cases: &[(&str, &str)] = &[
+                ("no space around `=`", "let n_sg=256u/sg_size;\n"),
+                ("extra whitespace", "let  n_sg  =  256u / sg_size;\n"),
+                ("a type annotation", "let n_sg: u32 = 256u / sg_size;\n"),
+            ];
+            for (label, src) in cases {
+                let stripped = strip_wgsl_comments(src);
+                let statements = find_n_sg_statements(&stripped);
+                assert_eq!(
+                    statements.len(),
+                    1,
+                    "{label}: expected exactly 1 statement found, got {statements:?}"
+                );
+                assert_ne!(
+                    statements[0], "let n_sg = (256u + sg_size - 1u) / sg_size;",
+                    "{label}: this is the truncating form and must not match the ceiling text"
+                );
+            }
+        }
+
+        #[test]
+        fn n_sg_text_pin_detects_a_shadowing_declaration() {
+            // A second, wrongly-truncating `var n_sg = ...;` declared in a
+            // nested scope right next to the real (correct) `let n_sg =
+            // ...;` must not be invisible: the real per-kernel check's
+            // "exactly 1 statement" assertion is what actually catches
+            // this, so what matters here is that BOTH are found (count 2),
+            // not silently merged into or shadowed by just one.
+            let src = "let n_sg = (256u + sg_size - 1u) / sg_size;\n\
+                        {\n\
+                        \x20   var n_sg = 256u / sg_size;\n\
+                        }\n";
             let stripped = strip_wgsl_comments(src);
             let statements = find_n_sg_statements(&stripped);
-            // The no-space form doesn't even match the `let n_sg = ` (with
-            // spaces) prefix this checker looks for, so it's found as zero
-            // statements — which the real per-kernel test already asserts
-            // must be exactly 1, so this form fails for being absent, not
-            // for silently passing.
             assert_eq!(
                 statements,
-                Vec::<String>::new(),
-                "the no-space truncating form should not be found by a prefix search for \
-                 `let n_sg = ` (note the required spacing) — this is fine: the real per-kernel \
-                 check asserts exactly 1 statement is found, so an unexpectedly-formatted line \
-                 fails as a count mismatch rather than silently passing"
+                vec![
+                    "let n_sg = (256u + sg_size - 1u) / sg_size;".to_string(),
+                    "var n_sg = 256u / sg_size;".to_string(),
+                ],
+                "both the correct declaration and the shadowing one must be found"
             );
         }
 
