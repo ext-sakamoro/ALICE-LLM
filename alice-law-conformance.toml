@@ -1,0 +1,105 @@
+# ALICE-Law conformance manifest for this crate (alice-llm). One entry per gate
+# defined in ALICE-Law's conformance/gates.toml; the schema (status / evidence /
+# mutant / since / note / reference_repo) is the "Manifest" section of
+# docs/CONFORMANCE.md in that repository.
+#
+# Every entry is written from what this repository's tree at the commit below
+# shows, checked directly: cargo test --lib (default, simd, and the full feature
+# set: 568, 568 and 711 passed), cargo test --release --lib (568 passed), cargo
+# test --test analytic_oracle (debug and release, 12 passed), the CI clippy
+# commands (ci.yml:116,119,122,125) on all four of their feature sets, and
+# type-resolved disallowed-methods / disallowed-types probes (not committed)
+# run over `cargo clippy --lib --bins` for the default, simd and full feature
+# sets, on aarch64-apple-darwin (built and tested) and x86_64-apple-darwin
+# (clippy only, not executed). The full set is gguf, parallel, simd, grammar,
+# quant, hf-config, dspark, dspark-serde, imatrix, gpu and server; every
+# feature set built here. Not covered: the examples, fuzz/ and tests/ for the
+# probe counts below (the CI clippy commands do build them), and any Linux or
+# Windows target.
+#
+# No cell is `pass`: a `pass` needs committed evidence and a named mutant that
+# turns it red, and this repository has no Law gate yet (no clippy.toml, no
+# alice-det-math dependency, no identifier, no release or aarch64 test leg, no
+# scan, no public-text step). `fail-known` says where the requirement is
+# absent or unmet. `unverified` says why the cell could not be decided.
+#
+# Checked at: f8c0927 (origin/main, 2026-10-15).
+
+[G1]
+status = "fail-known"
+note = "the requirement is absent: there is no clippy.toml or .clippy.toml (no disallowed-methods list for f32 and f64) and the CI clippy commands (.github/workflows/ci.yml:116,119,122,125) pass `-D warnings` over default, simd, the full set and the full set plus internal-kernel-oracle without banning a method; there is no canary. A probe list of the 25 banned names plus powi on f32 and f64 reports 68 sites in library and binary code (not #[cfg(test)]): f32::exp 34, tanh 13, powf 5, sin_cos 4, powi 4, ln_1p 4, ln 2, sin 1, cos 1; 60 of them in the default build and the same 68 on aarch64 and x86_64. Examples: src/linalg.rs:77 (exp) and :84 (tanh), src/rope.rs:18 (powf), :20 (cos), :21 (sin), src/sampling.rs:84 (exp), src/llama3.rs:5325 (powf) and :5327 (sin_cos), src/gpu.rs:79 and :206 (exp, ln_1p), src/training.rs:212 (powi). The crate has no dependency on alice-det-math (Cargo.toml). Planted calls (`x.sin()` on f32 appended to src/linalg.rs, `x.cos()` on f64 inside the gpu feature module src/gpu.rs) passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). powi (pending, banned by default) is called at src/gguf.rs:6429, src/sparse_attention/quant.rs:152 and src/training.rs:212,213, and the crate states no reason for it. The WGSL kernels (src/shaders) are not reached by a Rust lint."
+reference_repo = "ALICE-Analytics"
+
+[G2]
+status = "fail-known"
+note = "no Law helper for max/min, no default-deny manifest of raw_* exceptions and no clippy ban on f32::max / f32::min exist. The probe reports 35 f32 max/min sites in library code (not #[cfg(test)]), for example src/gguf.rs:5833 (`abs_max.max(..)`) and :5870 (`.max(-127.0).min(127.0)`), src/quantization.rs:25,26,94,95, src/sampling.rs:81 (`fold(f32::NEG_INFINITY, f32::max)`) and 27 sites in src/llama3.rs (16275, 18250, 19425 and others); a planted `x.max(y).min(2.0)` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). f32::clamp (4 calls in src) is not in the probe. SIMD widths the crate builds: NEON 4-lane intrinsics (src/gguf.rs:1384), AVX2 8-lane intrinsics (src/gguf.rs:2034) and wide::f32x8 (src/matrix.rs:209, feature simd); no test feeds a (+0, -0) or (-0, +0) pair through a max/min at any width (the only -0.0 literals in src are the E2M1 decode table at src/gguf.rs:6414,6735 and a test input at src/llama3.rs:11949)."
+reference_repo = "ALICE-Analytics"
+
+[G3]
+status = "fail-known"
+note = "no checker for an outer negation of an fma result exists (no script in scripts/, no ci.yml step). The probe reports 6 f32::mul_add calls in library code (src/linalg.rs:84, src/matrix.rs:148,240, src/quantization.rs:56, src/rope.rs:23,24); a read of each finds negation only on an operand (src/rope.rs:23 negates the third argument, `-(vec[i + half] * sin_a)`), none on a whole fma result, and the NEON intrinsics vfmaq_f32 (src/gguf.rs:1633 and others) are not mul_add. That is an audit of today's tree, not a gate: a planted `-(a.mul_add(b, c))` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted), so a later outer negation would not turn anything red. The WGSL kernels use fma( (80 uses in src/shaders) and are not read by any checker. Not n/a: that status needs a scanner that finds zero sites and the mutant of adding one, and there is no scanner."
+reference_repo = "ALICE-LOL"
+
+[G4]
+status = "fail-known"
+note = "no signed-zero or exact-cancellation golden test exists: tests/ holds tests/analytic_oracle.rs (12 tests, closed-form identities and tolerances, its own header says no golden values) and tests/ref_shaders (WGSL sources), and no test in tests/ compares to_bits or from_bits against a fixed pattern (grep: 0). CI runs the tests only in the debug profile (.github/workflows/ci.yml:134,144,149,152): matrix ubuntu-latest and macos-latest (Apple Silicon, see the comment at ci.yml:209) with default and simd features, so a debug leg exists on x86_64 and on aarch64, but no release leg runs a test (see G5), so the {debug, release} x {x86_64, aarch64} matrix is half present, and no case is built to hit a signed zero or an exact cancellation."
+reference_repo = "ALICE-LOL"
+
+[G5]
+status = "fail-known"
+note = "no CI step runs the test suite under the release profile: .github/workflows/ci.yml:144,149,152,155 are `cargo test --lib`, `cargo test --lib --features simd`, `cargo test --test analytic_oracle` and `cargo test --doc` without --release, and the only release step is `cargo build --release --lib` (ci.yml:335,336, a build, not a test). No job uses an aarch64 Linux runner; the aarch64 coverage is macos-latest (ci.yml:134) in debug. release.yml:40,90 cross-builds an aarch64 Linux server binary in release without running a test. `cargo test --release --lib` (568 passed) and `cargo test --release --test analytic_oracle` (12 passed) were run locally on aarch64-apple-darwin on 2026-10-15, but no CI leg runs them."
+reference_repo = "ALICE-LOL"
+
+[G6]
+status = "fail-known"
+note = "the crate exports no semantics identifier: src/lib.rs has no SEMANTICS_ID (or equivalent) and Cargo.toml [dependencies] holds no alice-det-math or other Law-bearing crate whose identifier it could fold, so there is no hex test and no pin-change test. The only fingerprint in the crate is the KV cache file's model-shape hash (src/llama3.rs:4911, std DefaultHasher over layer, head and dimension counts), which says nothing about arithmetic. Whether inference arithmetic is meant to be a Law-bearing quantity of this crate is a scope question the tree does not answer (docs/CONFORMANCE.md lists inference numerics and ML activations under 'Out of scope')."
+
+[G7]
+status = "unverified"
+note = "audit: the type-erasing boundaries are the GGUF reader (src/gguf.rs, bytes of a file the user supplies), the KV cache reader (src/llama3.rs:4959, file), and the HTTP server (src/bin/server.rs, JSON); the crate has no extern \"C\" or no_mangle item, no pyo3 or wasm-bindgen export, no dyn Any registry (the only downcast_ref calls, src/gpu.rs:6963,7011 and src/llama3.rs:11776, read panic payloads) and no build.rs or procedural macro (grep over src and Cargo.toml, file listing at f8c0927). It takes no value from another Law-bearing crate (no such dependency), so no producer identifier exists to travel with a value, and without a G6 identifier there is nothing to compare. Not claimed as n/a: that status needs a scanner that finds zero such sites with the mutant of adding one, and there is none."
+
+[G8]
+status = "unverified"
+note = "undecided: the durable forms the crate writes are the KV cache file (src/llama3.rs:4931 write_to: magic ALICEKV1, KV_FORMAT_VERSION 1 at :4852, a model-shape fingerprint, then f32 key and value data) and the layer assignment JSON of src/bin/imatrix.rs:127; the dspark example also writes a bincode file (examples/dspark_train_confidence_head.rs:199). None carries an identifier of arithmetic meaning, and the KV reader refuses only a magic, version or shape-fingerprint mismatch (src/llama3.rs:4969,4976 and the fingerprint error at :4888). Whether the cached key and value tensors are Law-bearing values in the gate's sense (docs/CONFORMANCE.md puts ML activations under 'Out of scope') is a decision about the crate's role that the tree does not answer; it is needed before the cell can be pass, fail-known or n/a."
+
+[G9]
+status = "unverified"
+note = "depends on G8 (the persisted identifier whose history G9 audits), which is undecided, and on G6, since the crate has no identifier whose history could be audited. CHANGELOG.md records no identifier move (grep for SEMANTICS and identifier: 0)."
+
+[G10]
+status = "fail-known"
+note = "no lint or scan bans run-varying sources: there is no clippy.toml (so no disallowed-methods / disallowed-types for SystemTime::now, Instant::now, thread_rng, RandomState) and no scan step in .github/workflows/ci.yml or scripts/; a planted `SystemTime::now().duration_since(UNIX_EPOCH)` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). The probe reports 38 Instant::now and 38 Instant::elapsed calls (38 sites in the default build, all 78 with the gpu and server features) and 2 SystemTime::now calls in src/bin/server.rs:492 (request id) and :785 (timestamp). The ones read here are diagnostic timing: src/gpu.rs:2495,2498 returns elapsed microseconds, src/llama3.rs:10841-10975 prints elapsed milliseconds with eprintln!. Whether any such value reaches a computed output was not traced. There is no thread_rng, from_entropy, getrandom, Uuid or RandomState in src (grep); the sampler takes its random number as an argument (src/sampling.rs:114 sample_with_random)."
+reference_repo = "ALICE-Analytics"
+
+[G11]
+status = "unverified"
+note = "no Law gate is implemented in this repository (see G1 to G5, G10, G12, G13, G14), so there is no checker for which a canary, a run-nothing failure and a copy check could be named; the cell becomes decidable when the first gate lands. The checkers that exist (scripts/docs_lint.py with scripts/test_docs_lint.py, scripts/no_return_before_barrier.py with its test, scripts/workflow_timeouts.py with its test) carry tests and fail when they compared nothing, but they are not the gates G11 enumerates. scripts/test_workflow_timeouts.py is stated in CHANGELOG.md to be byte-identical to a sibling repository's copy; no byte-identity check runs in CI, so clause (c) has no committed check."
+
+[G12]
+status = "fail-known"
+note = "no CI job runs ALICE-Law's scripts/public_text_check.py: .github/workflows/ has bench.yml, ci.yml, fuzz.yml, quality-deep.yml, release.yml and security-audit.yml, none fetches the script, pins a revision or carries a copy (grep for public_text and public-text over .github and scripts: 0), although .public-text.toml (allow entries for scripts/docs_lint.py and scripts/test_docs_lint.py) exists. scripts/docs_lint.py is the crate's own checker and does not count. Run once by hand at f8c0927 (`public_text_check.py --repo . --tree HEAD`, script SHA-256 84226ec7a693c8dfdfeee619c1240a25745804728ca71cfc4543781dab54b298 from ALICE-Law d46d94e), it reported 2 findings in 191 files (docs/ALICE_ROUTER_SPEC.md:48, src/bin/server.rs:910), so the text is not clean today and no job keeps it so."
+reference_repo = "ALICE-Analytics"
+
+[G13]
+status = "fail-known"
+note = "machine half: the lint is absent, there is no clippy.toml (so no disallowed-types / disallowed-methods for HashMap, HashSet and RandomState), no allowlist of membership-only sites and no ordered-reduction test at two thread counts (grep for num_threads, ThreadPool and RAYON_NUM_THREADS over src, tests and .github: 0); a planted `HashMap::values()` summed in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). The probe reports 41 uses of HashMap or HashSet types in library and binary code (33 in the default build), and iteration calls at src/gguf.rs:660 (keys), src/gpu.rs:2571 (values), src/grammar/gbnf.rs:165 (values), src/speculative_dspark.rs:541 and src/tokenizer.rs:30 (iter), src/bin/imatrix.rs:90 and :95; a `for x in &map` loop is not in the probe. The one that sorts its result with an explicit tie-break is src/speculative_dspark.rs:541-542; the others were not traced to an output. The parallel feature uses rayon (par_iter_mut at src/gguf.rs:3486 and others, par_iter at src/deepseek_streaming.rs:512); a grep for lines combining par_iter or rayon with reduce, sum or fold found none (multi-line chains were not traced), and no test runs those paths at two thread counts. Not n/a: that status needs a scanner that finds zero sites with the mutant of adding one, and there is none."
+
+[G14]
+status = "fail-known"
+note = "the build configuration sets no fast-math-style flag and no target-cpu=native: .cargo/config.toml:20 holds the native flag only as a comment, there is no build.rs and no [profile] section in Cargo.toml, and the only RUSTFLAGS in any workflow is `-C target-feature=+dotprod` on the macOS test legs (.github/workflows/ci.yml:143,148,282). Unmet: no CI step scans .cargo/config*, workflow env, build.rs or the Cargo.toml profiles to keep that true, and no test asserts round-to-nearest-even or that subnormals are not flushed to zero (the gate names two tests; grep for MIN_POSITIVE, subnormal, denormal over tests finds none, and src/gpu.rs:7062 documents rounding an f16 subnormal to zero in a test helper)."
+
+[features.simd]
+guarantee = "outside"
+note = "enables the wide::f32x8 paths (src/matrix.rs:209, src/sparse_attention/simd.rs). Condition 1 is unmet: the crate has no arithmetic identifier to compare (G6), and the G1 and G2 sites above apply to this build as well."
+
+[features.parallel]
+guarantee = "outside"
+note = "enables rayon (par_iter_mut at src/gguf.rs:3486 and others). Condition 1 is unmet (no arithmetic identifier, G6) and no test runs the parallel paths at two thread counts (G13)."
+
+[features.gguf]
+guarantee = "outside"
+note = "enables the GGUF reader and the NEON and AVX2 intrinsic matvec kernels (src/gguf.rs:1384, :2034). Condition 1 is unmet (no arithmetic identifier, G6) and the probe sites of G1 and G2 in src/gguf.rs apply."
+
+[features.gpu]
+guarantee = "outside"
+note = "enables the wgpu engine and the WGSL kernels (src/gpu.rs, src/shaders). Condition 1 is unmet (no arithmetic identifier, G6); the WGSL arithmetic is not reached by any Rust lint, and the CI gpu legs compare kernels with tolerances and with the previous kernels, not with a recorded bit pattern on every architecture (G4)."
