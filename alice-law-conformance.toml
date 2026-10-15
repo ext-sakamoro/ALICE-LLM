@@ -17,6 +17,11 @@
 # probe counts below (the CI clippy commands do build them), and any Linux or
 # Windows target.
 #
+# Premise shared by G6, G7 and G8: this crate is treated as Law-bearing until its
+# owner decides the scope question (docs/CONFORMANCE.md lists inference numerics
+# and ML activations under 'Out of scope'); a required identifier that is absent
+# is therefore fail-known at the place it is absent.
+#
 # No cell is `pass`: a `pass` needs committed evidence and a named mutant that
 # turns it red, and this repository has no Law gate yet (no clippy.toml, no
 # alice-det-math dependency, no identifier, no release or aarch64 test leg, no
@@ -56,15 +61,16 @@ note = "the crate exports no semantics identifier: src/lib.rs has no SEMANTICS_I
 
 [G7]
 status = "unverified"
-note = "audit: the type-erasing boundaries are the GGUF reader (src/gguf.rs, bytes of a file the user supplies), the KV cache reader (src/llama3.rs:4959, file), and the HTTP server (src/bin/server.rs, JSON); the crate has no extern \"C\" or no_mangle item, no pyo3 or wasm-bindgen export, no dyn Any registry (the only downcast_ref calls, src/gpu.rs:6963,7011 and src/llama3.rs:11776, read panic payloads) and no build.rs or procedural macro (grep over src and Cargo.toml, file listing at f8c0927). It takes no value from another Law-bearing crate (no such dependency), so no producer identifier exists to travel with a value, and without a G6 identifier there is nothing to compare. Not claimed as n/a: that status needs a scanner that finds zero such sites with the mutant of adding one, and there is none."
+note = "audit: the type-erasing boundaries are the GGUF reader (src/gguf.rs, bytes of a file the user supplies), the KV cache reader (src/llama3.rs:4959, file), and the HTTP server (src/bin/server.rs, JSON); the crate has no extern \"C\" or no_mangle item, no pyo3 or wasm-bindgen export, no dyn Any registry (the only downcast_ref calls, src/gpu.rs:6963,7011 and src/llama3.rs:11776, read panic payloads) and no build.rs or procedural macro (grep over src and Cargo.toml, file listing at f8c0927). No boundary receives another crate's Law-bearing value: Cargo.toml has no dependency on a Law-bearing crate, so the list of such boundaries is empty; the boundaries above only carry this crate's own data, and the durable file is G8's. Without a G6 identifier there is also nothing to compare. Not claimed as n/a: that status needs a scanner that finds zero such sites with the mutant of adding one, and there is none."
 
 [G8]
-status = "unverified"
-note = "undecided: the durable forms the crate writes are the KV cache file (src/llama3.rs:4931 write_to: magic ALICEKV1, KV_FORMAT_VERSION 1 at :4852, a model-shape fingerprint, then f32 key and value data) and the layer assignment JSON of src/bin/imatrix.rs:127; the dspark example also writes a bincode file (examples/dspark_train_confidence_head.rs:199). None carries an identifier of arithmetic meaning, and the KV reader refuses only a magic, version or shape-fingerprint mismatch (src/llama3.rs:4969,4976 and the fingerprint error at :4888). Whether the cached key and value tensors are Law-bearing values in the gate's sense (docs/CONFORMANCE.md puts ML activations under 'Out of scope') is a decision about the crate's role that the tree does not answer; it is needed before the cell can be pass, fail-known or n/a."
+status = "fail-known"
+note = "the durable forms the crate writes carry no identifier of arithmetic meaning (premise in the header): the KV cache file (src/llama3.rs:4931 write_to: magic ALICEKV1, KV_FORMAT_VERSION 1 at :4852, a model-shape fingerprint from std DefaultHasher at :4911, then the f32 key and value data) and the reader refuses only a magic, version or shape-fingerprint mismatch (src/llama3.rs:4969,4976 and the fingerprint error at :4888); there is no field to compare and no check_semantics. The layer assignment JSON of src/bin/imatrix.rs:127 holds tensor names and tier names, not float values, and is not counted; the dspark example's bincode file (examples/dspark_train_confidence_head.rs:199) writes a trained head and is an example, not library code, and was not audited."
+reference_repo = "ALICE-Zip"
 
 [G9]
 status = "unverified"
-note = "depends on G8 (the persisted identifier whose history G9 audits), which is undecided, and on G6, since the crate has no identifier whose history could be audited. CHANGELOG.md records no identifier move (grep for SEMANTICS and identifier: 0)."
+note = "depends on G8 and G6: the persisted identifier whose history G9 audits does not exist (both are fail-known), so the crate has no identifier whose history could be audited. CHANGELOG.md records no identifier move (grep for SEMANTICS and identifier: 0)."
 
 [G10]
 status = "fail-known"
@@ -77,7 +83,7 @@ note = "no Law gate is implemented in this repository (see G1 to G5, G10, G12, G
 
 [G12]
 status = "fail-known"
-note = "no CI job runs ALICE-Law's scripts/public_text_check.py: .github/workflows/ has bench.yml, ci.yml, fuzz.yml, quality-deep.yml, release.yml and security-audit.yml, none fetches the script, pins a revision or carries a copy (grep for public_text and public-text over .github and scripts: 0), although .public-text.toml (allow entries for scripts/docs_lint.py and scripts/test_docs_lint.py) exists. scripts/docs_lint.py is the crate's own checker and does not count. Run once by hand at f8c0927 (`public_text_check.py --repo . --tree HEAD`, script SHA-256 84226ec7a693c8dfdfeee619c1240a25745804728ca71cfc4543781dab54b298 from ALICE-Law d46d94e), it reported 2 findings in 191 files (docs/ALICE_ROUTER_SPEC.md:48, src/bin/server.rs:910), so the text is not clean today and no job keeps it so."
+note = "no CI job runs ALICE-Law's scripts/public_text_check.py: .github/workflows/ has bench.yml, ci.yml, fuzz.yml, quality-deep.yml, release.yml and security-audit.yml, none fetches the script, pins a revision or carries a copy (grep for public_text and public-text over .github and scripts: 0), although .public-text.toml (allow entries for scripts/docs_lint.py and scripts/test_docs_lint.py) exists. scripts/docs_lint.py is the crate's own checker and does not count. Run once by hand at f8c0927 (`public_text_check.py --repo . --tree HEAD`, script SHA-256 84226ec7a693c8dfdfeee619c1240a25745804728ca71cfc4543781dab54b298 from ALICE-Law d46d94e), it reported 2 findings in 191 files, both of the agent-process class (one in a document under docs/, one in a source file under src/bin/), so the text is not clean today and no job keeps it so."
 reference_repo = "ALICE-Analytics"
 
 [G13]
