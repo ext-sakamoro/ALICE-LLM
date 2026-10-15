@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `alice-law-conformance.toml`: ALICE-Law の 14 ゲートそれぞれについて、このリポジトリの現状を実測した適合状況を記載 (pass 0 / fail-known 11 / unverified 3、いずれのゲートも未配線のため pass は無し)
+- `alice-law-conformance.toml`: ALICE-Law の 14 ゲートそれぞれについて、このリポジトリの現状を実測した適合状況を記載 (pass 0 / fail-known 12 / unverified 2、いずれのゲートも未配線のため pass は無し)
 
 ### Changed
 
