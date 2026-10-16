@@ -167,6 +167,10 @@ else
   echo "skip: nightly / cargo-fuzz not installed" >&2
 fi
 
+step "public-text.yml / public-text: Public text (ALICE-Law checker at the pin; tree, then the commits)"
+python3 scripts/test_public_text.py
+scripts/public_text.sh
+
 if [[ $quick -eq 1 ]]; then
   echo; echo "preflight --quick OK (test / bench suites skipped)"; exit 0
 fi

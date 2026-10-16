@@ -23,10 +23,10 @@
 # and ML activations under 'Out of scope'); a required identifier that is absent
 # is therefore fail-known at the place it is absent.
 #
-# No cell is `pass`: a `pass` needs committed evidence and a named mutant that
-# turns it red, and this repository has no Law gate yet (no clippy.toml, no
-# alice-det-math dependency, no identifier, no release or aarch64 test leg, no
-# scan, no public-text step). `fail-known` says where the requirement is
+# A `pass` needs committed evidence and a named mutant that turns it red. G12
+# and G14 have one; the other gates do not yet (no clippy.toml, no alice-det-math
+# dependency, no identifier, no release or aarch64 test leg, no scan).
+# `fail-known` says where the requirement is
 # absent or unmet. `unverified` means not checked yet, and says what is missing.
 #
 # Checked at: f8c0927 (origin/main, 2026-10-15).
@@ -83,9 +83,17 @@ status = "fail-known"
 note = "no Law gate is implemented in this repository (see G1 to G5, G10, G12, G13, G14), so none has a canary, a run-nothing failure or a copy check. Clause (c) has a located absence: scripts/test_workflow_timeouts.py is stated in CHANGELOG.md:16 to be byte-identical to a sibling repository's copy, and no CI step or script compares the two (no such step in .github/workflows/ci.yml or scripts/). The checkers that exist (scripts/docs_lint.py with scripts/test_docs_lint.py, scripts/no_return_before_barrier.py with its test, scripts/workflow_timeouts.py with its test) carry tests and fail when they compared nothing, but they are not the gates G11 enumerates. Two located absences: there is no clippy.toml (nor .clippy.toml) at the repository root, so there is no G1 ban list and the clippy canary shared with ALICE-DB (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py and their tests) has nothing to plant; it is added together with that list. For clause (c), scripts/semver_gate.py and scripts/test_semver_gate.py are byte-identical copies shared with ALICE-Law, ALICE-DB and other crates, and nothing in this repository or its CI compares them with their source."
 
 [G12]
-status = "fail-known"
-note = "no CI job runs ALICE-Law's scripts/public_text_check.py: .github/workflows/ has bench.yml, ci.yml, fuzz.yml, quality-deep.yml, release.yml and security-audit.yml, none fetches the script, pins a revision or carries a copy (grep for public_text and public-text over .github and scripts: 0), although .public-text.toml (allow entries for scripts/docs_lint.py and scripts/test_docs_lint.py) exists. scripts/docs_lint.py is the crate's own checker and does not count. Run once by hand at f8c0927 (`public_text_check.py --repo . --tree HEAD`, script SHA-256 84226ec7a693c8dfdfeee619c1240a25745804728ca71cfc4543781dab54b298 from ALICE-Law d46d94e), it reported 2 findings in 191 files, both of the agent-process class (one in a document under docs/, one in a source file under src/bin/), so the text is not clean today and no job keeps it so."
-reference_repo = "ALICE-Analytics"
+status = "pass"
+evidence = [
+    ".github/workflows/public-text.yml (pushes to main and ci/**, pull requests to main)",
+    "scripts/public_text.sh (fetches ALICE-Law's scripts/public_text_check.py at the pinned revision, refuses it unless the SHA-256 matches, exits 2 when it compared nothing)",
+    ".github/public-text-pin (rev 779fa443f95bc0caca5ca2d5bdb9156051fd6143, sha256 e439fdd7495e45486b67d57d227f828426b703c0224b8a00d2e8a1c2f1e66594)",
+    "scripts/test_public_text.py",
+    "scripts/preflight.sh (step public-text.yml / public-text)",
+]
+mutant = "in a throwaway clone at this commit, commit a README.md line naming a development-process role and run PUBLIC_TEXT_BASE=<previous commit> scripts/public_text.sh: it reports `found: README.md:871: agent process`, `public text: 1 findings in 208 files at HEAD` and exits 1; the unchanged tree reports `public text: 0 findings in 208 files at HEAD` and exits 0 (measured 2026-10-16)"
+since = ""
+reference_repo = "ALICE-DB"
 
 [G13]
 status = "fail-known"

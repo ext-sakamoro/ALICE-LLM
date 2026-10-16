@@ -45,7 +45,7 @@ Rust, edge deployment, and explicit cost accounting.
 - **Guaranteed byte-exact reproducibility across backends** (physically
   impossible when backends include external stochastic APIs; a strict
   deterministic sub-mode is a Phase R.5 stretch goal)
-- **Multi-agent tool-use planning** (LangGraph territory; router
+- **Tool-use planning across several cooperating models** (LangGraph territory; router
   provides the substrate but does not embed the planner)
 
 ---
