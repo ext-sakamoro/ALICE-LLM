@@ -73,12 +73,20 @@ pub fn layer_norm(v: &[f32], eps: f32) -> Vec<f32> {
 
 /// `SiLU` (Swish) activation.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
 /// `GeLU` activation (approximate).
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn gelu(x: f32) -> f32 {
     let c = (2.0 / std::f32::consts::PI).sqrt();
     0.5 * x * (1.0 + (c * (0.044_715 * x * x).mul_add(x, x)).tanh())

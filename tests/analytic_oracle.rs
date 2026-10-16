@@ -68,6 +68,10 @@ fn rms_norm_has_unit_rms_and_is_scale_invariant() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn gelu_closed_form_points() {
     // tanh approximation: gelu(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
     assert_eq!(gelu(0.0), 0.0);
@@ -100,6 +104,10 @@ fn layer_norm_output_has_zero_mean_unit_variance_and_is_affine_invariant() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn silu_closed_form_points() {
     assert_eq!(silu(0.0), 0.0);
     // silu(x) = x·σ(x); σ(ln 3) = 3/4
@@ -120,6 +128,10 @@ fn silu_closed_form_points() {
 // ----------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn rope_preserves_norm_rotates_first_pair_by_position_and_is_relative() {
     let base = 10_000.0f32;
     for dim in [2usize, 4, 8, 64, 128] {
@@ -182,6 +194,10 @@ fn rope_preserves_norm_rotates_first_pair_by_position_and_is_relative() {
 // ----------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn softmax_sums_to_one_is_shift_invariant_and_matches_two_element_formula() {
     for n in [1usize, 2, 3, 8, 9, 65] {
         let l = ramp(n);
@@ -231,6 +247,10 @@ fn temperature_scales_logits_and_the_limits_are_argmax_and_uniform() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn top_k_keeps_exactly_k_finite_logits_and_top_p_the_smallest_nucleus() {
     let l: Vec<f32> = (0..20).map(|i| ((i * 7) % 20) as f32 * 0.3).collect();
     for k in 1..=20usize {

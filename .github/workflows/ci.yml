@@ -2,9 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # ci/**: the same checks on a branch before it is fast-forwarded to main
+    branches: [main, 'ci/**']
   pull_request:
     branches: [main]
+
+# a newer commit on the same branch stops the older run; on main every commit
+# gets its own group and is not stopped
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -123,6 +130,41 @@ jobs:
       - name: cargo clippy (full feature set + internal-kernel-oracle, all targets)
         if: matrix.features == 'gpu-oracle'
         run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings
+
+  g1:
+    # ALICE-Law G1. clippy.toml bans the f32 / f64 methods platform libm may
+    # round differently. The canary proves each entry fires on a fresh call
+    # (in a throwaway crate the crate's #[expect]s cannot reach). The pin
+    # runs clippy with --force-warn clippy::disallowed_methods (stronger than
+    # any #[allow] / #[expect] / cfg_attr in the source) over every feature
+    # set of the clippy job on both Linux targets (the arch-gated kernels of
+    # either), and fails unless the calls found equal
+    # scripts/g1_debt_sites.tsv and scripts/g1_reference_sites.tsv
+    name: G1 (ban-list canary and recorded-call pin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # the pin lints aarch64 as well; rust-toolchain.toml selects the pinned
+      # toolchain, so the target is added to that one
+      - name: aarch64 Linux standard library (pinned toolchain)
+        run: rustup target add aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy canary data (generator tests)
+        run: python3 scripts/test_gen_clippy_canary_calls.py
+      - name: Clippy canary data (generated from clippy.toml, no drift)
+        run: python3 scripts/gen_clippy_canary_calls.py --check
+      - name: Clippy canary (tests)
+        run: python3 scripts/test_clippy_canary.py
+      - name: Clippy canary (every planted banned call is flagged)
+        run: python3 scripts/clippy_canary.py
+      - name: G1 call pin (tests)
+        run: python3 scripts/test_g1_debt_pin.py
+      - name: G1 call pin (every banned call is listed, nothing else)
+        run: python3 scripts/g1_debt_pin.py
 
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.features }})

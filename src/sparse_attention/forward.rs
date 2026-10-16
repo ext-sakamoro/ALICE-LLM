@@ -249,6 +249,10 @@ pub fn kvouter_forward(
 // Per-unit compute
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 fn process_work_unit(
     ctx: &WorkCtx<'_>,
     unit: &WorkSplit,

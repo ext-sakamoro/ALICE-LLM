@@ -467,6 +467,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn gpu_forward_matches_cpu_forward_small() {
         let Some(gpu) = setup_gpu() else {
             eprintln!("skip: no GPU adapter available");
@@ -570,6 +574,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn gpu_forward_gqa_multi_batch() {
         let Some(gpu) = setup_gpu() else {
             eprintln!("skip: no GPU adapter available");
@@ -985,6 +993,10 @@ mod tests {
     /// which builds `edge_meta` by hand specifically to force that value
     /// regardless of what the index builder would ever produce.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn gpu_forward_matches_cpu_forward_large() {
         let Some(gpu) = setup_gpu() else {
             eprintln!("skip: no GPU adapter available");

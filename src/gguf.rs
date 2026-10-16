@@ -6420,6 +6420,10 @@ pub const E2M1_DECODE_TABLE: [f32; 16] = [
 /// `2^(byte - 127)`. Byte value `0xFF` is reserved for NaN. There is no
 /// mantissa field; all scales are exact powers of two.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn decode_e8m0_scale(byte: u8) -> f32 {
     if byte == 0xFF {
         return f32::NAN;
@@ -6960,6 +6964,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn mxfp4_matvec_free_fn_matches_kernel() {
         // The MxfP4Matrix wrapper (public free function) must produce
         // identical results to the internal kernel it dispatches to.
@@ -7031,6 +7039,10 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn mxfp4_matvec_avx2_matches_scalar() {
         // Phase X.4.f.2.b AVX2 parity test. Skips gracefully if the
         // host CPU lacks AVX2 (very old x86_64: Ivy Bridge and older).
@@ -7070,6 +7082,10 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn mxfp4_matvec_neon_matches_scalar() {
         // Phase X.4.f.2.a NEON parity test. NEON uses vaddvq_f32
         // horizontal reduction which differs from the scalar kernel's
@@ -7364,6 +7380,10 @@ mod tests {
     /// consistency check. Guards against future silent regressions in the
     /// bit-lane expansion trick used inside `neon_dot::q1_0_dot_row`.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn q1_0_matvec_matches_scalar_ref() {
         let rows = 4usize;
         let cols = 256usize;
@@ -7416,6 +7436,10 @@ mod tests {
     /// per-byte broadcast + right-shift + mask + subtract-1 path inside
     /// `neon_dot::q2_0_dot_row` on aarch64, scalar fallback everywhere else.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn q2_0_matvec_matches_scalar_ref() {
         let rows = 4usize;
         let cols = 256usize;
@@ -7649,6 +7673,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn test_sparse_ternary_memory_reduction() {
         // 1024-col row, dense ternary = 2 bitmasks of 128 bytes each = 256 bytes + scale
         // sparse ternary = 64 blocks × (2+2) bytes = 256 bytes + scale
@@ -8367,6 +8395,10 @@ mod tests {
     /// stays under 1e-4 relative on `f32::EPSILON * cols`-order inputs.
     #[cfg(target_arch = "aarch64")]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn q8_0_neon_matches_scalar_within_tol() {
         const COLS: usize = 4096;
         const BLOCK_BYTES: usize = 34;

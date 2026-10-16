@@ -78,6 +78,10 @@ fn variance(hidden: &[f32]) -> f32 {
 /// Numerically stable log P(target) from raw logits. Mirrors
 /// `perplexity.rs::log_prob_at` minus the EOG-inf-filter path (plain-text
 /// wikitext scoring does not need it).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn log_prob_at(logits: &[f32], target: u32) -> f32 {
     let target_us = target as usize;
     debug_assert!(
@@ -108,6 +112,10 @@ struct RunSummary {
 }
 
 impl RunSummary {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn ppl(&self) -> f64 {
         if self.n_scored == 0 {
             f64::NAN
@@ -183,6 +191,10 @@ impl RunSummary {
 /// of `layer` and, when the variance is below `threshold`, causes CPU to
 /// skip every layer from `layer` onward for that token.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn run_pass(
     model: &mut Llama3Model,
     tokens: &[u32],

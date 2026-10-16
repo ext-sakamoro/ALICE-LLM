@@ -12,6 +12,10 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(weight).map(|(x, w)| x * scale * w).collect()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }

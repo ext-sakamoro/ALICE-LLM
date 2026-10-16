@@ -60,6 +60,10 @@ fn parse_arg_str<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Shannon entropy of `softmax(logits)` in nats. Numerically stable via the
 /// max-subtraction trick; f64 accumulator for the sum-of-exp.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn softmax_entropy(logits: &[f32]) -> f32 {
     if logits.is_empty() {
         return 0.0;
@@ -90,6 +94,10 @@ fn softmax_entropy(logits: &[f32]) -> f32 {
 
 /// Numerically stable log P(target) from raw logits. Mirrors
 /// `perplexity.rs::log_prob_at`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn log_prob_at(logits: &[f32], target: u32) -> f32 {
     let target_us = target as usize;
     debug_assert!(
@@ -165,6 +173,10 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 

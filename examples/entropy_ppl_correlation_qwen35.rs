@@ -57,6 +57,10 @@ fn variance(hidden: &[f32]) -> f32 {
 /// Numerically stable log P(target) from raw logits. Mirrors
 /// `perplexity.rs::log_prob_at`, minus the eog-filter machinery (plain text
 /// scoring on wikitext does not need it).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn log_prob_at(logits: &[f32], target: u32) -> f32 {
     let target_us = target as usize;
     debug_assert!(
@@ -77,6 +81,10 @@ fn log_prob_at(logits: &[f32], target: u32) -> f32 {
     logits[target_us] - logsumexp
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 

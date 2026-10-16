@@ -204,6 +204,10 @@ impl AdamW {
     }
 
     /// One optimizer step: update weights using accumulated gradients.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+    )]
     pub fn step(&mut self, weights: &mut [f32], grads: &[f32]) {
         assert_eq!(weights.len(), grads.len());
         assert_eq!(weights.len(), self.m.len());

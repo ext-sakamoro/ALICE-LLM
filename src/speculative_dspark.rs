@@ -345,6 +345,10 @@ impl MarkovBigramBias {
     /// # Errors
     /// - `logits.len() != vocab_size` の場合
     /// - `prev >= vocab_size` の場合
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+    )]
     pub fn apply(
         &self,
         prev: TokenId,
@@ -513,6 +517,10 @@ impl FullCountBigramBias {
     /// # Errors
     /// - `logits.len() != vocab_size` の場合
     /// - `prev >= vocab_size` の場合
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+    )]
     pub fn apply(
         &self,
         prev: TokenId,
@@ -728,6 +736,10 @@ impl PositionConfidenceHead {
 }
 
 // 数値安定 sigmoid: z >= 0 は 1/(1+exp(-z))、z < 0 は exp(z)/(1+exp(z))
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 fn stable_sigmoid(z: f32) -> f32 {
     if z >= 0.0 {
         let e = (-z).exp();
@@ -739,6 +751,10 @@ fn stable_sigmoid(z: f32) -> f32 {
 }
 
 // BCE loss: p を [eps, 1-eps] で clamp してから log (log(0) 回避)
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 fn stable_bce(p: f32, y: f32) -> f32 {
     let eps = 1e-7_f32;
     let p_clamped = p.clamp(eps, 1.0 - eps);
@@ -1146,6 +1162,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn observe_increments_count() {
         let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
         bias.observe(1, 2).expect("valid");
@@ -1407,6 +1427,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn confidence_head_train_step_returns_bce_loss_ln2_at_init() {
         // p = 0.5、y = 1 → loss = -ln(0.5) = ln(2) ≈ 0.6931
         let mut head = PositionConfidenceHead::new(2, 3).expect("valid");
@@ -2038,6 +2062,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn full_count_apply_uses_ln_1p() {
         // count=3 → bias = 1.0 * ln(4) を厳密確認
         let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
@@ -2123,6 +2151,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn bigram_bias_trait_markov_impl() {
         let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
         for _ in 0..5 {
@@ -2134,6 +2166,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn bigram_bias_trait_full_count_impl() {
         let mut bias = FullCountBigramBias::new(10, 4).expect("valid");
         for _ in 0..5 {
@@ -2267,6 +2303,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn apply_bigram_bias_maybe_applies_bias_when_enabled() {
         let mut bias = MarkovBigramBias::new(10, 4).expect("valid");
         for _ in 0..5 {

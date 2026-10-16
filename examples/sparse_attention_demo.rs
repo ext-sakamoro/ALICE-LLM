@@ -14,6 +14,10 @@ use alice_llm::sparse_attention::{
     sparse_topk_select_batch, BlockTables, CuSeqlensQ, SparseSelection,
 };
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     // Geometry.
     let tq = 4usize;
@@ -139,6 +143,10 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn naive_dense_reference(
     q: &[f32],
     k_pages: &[f32],

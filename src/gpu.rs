@@ -67,6 +67,10 @@ const GATED_DELTANET_SHADER: &str = include_str!("shaders/gated_deltanet.wgsl");
 /// # Panics
 ///
 /// Panics if `attn_out.len() != gate.len()`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
     assert_eq!(
         attn_out.len(),
@@ -85,6 +89,10 @@ pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
 /// Computes `buf[i] = silu(buf[i])` in-place, matching
 /// `src/shaders/silu_inplace.wgsl` line-by-line. Used by Bonsai / Qwen
 /// 3.6-27B DeltaNet post-conv1d silu (Phase X.3.e.3 Gap A).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn silu_inplace_cpu(buf: &mut [f32]) {
     for x in buf.iter_mut() {
         // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
@@ -99,6 +107,10 @@ pub fn silu_inplace_cpu(buf: &mut [f32]) {
 /// 3.6-27B DeltaNet layers to bring the raw beta projection into the
 /// stable delta-rule integration range (0, 1). Reference: llama.cpp
 /// PrismML fork `qwen35.cpp:440-441` (`ggml_sigmoid(beta)`).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn beta_sigmoid_cpu(beta: &mut [f32]) {
     for b in beta.iter_mut() {
         // sigmoid(x) = 1 / (1 + exp(-x))
@@ -184,6 +196,10 @@ pub fn ssm_norm_per_head_cpu(input: &mut [f32], weight: &[f32], v_dim: usize, ep
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f32]) {
     assert_eq!(
         alpha.len(),
@@ -6805,6 +6821,10 @@ mod tests {
     /// Verify `ssm_norm_per_head_cpu` result magnitude is close to sqrt(v_dim)
     /// (RMSNorm invariant: normalizes to unit RMS = 1.0, so magnitude = sqrt(v_dim)).
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn ssm_norm_per_head_cpu_rms_invariant() {
         let v_dim = 8;
         let num_heads = 3;
@@ -6836,6 +6856,10 @@ mod tests {
     /// GPU-parity ref uses f32 — should agree within FP summation noise for
     /// v_dim=128 (Bonsai standard).
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn ssm_norm_per_head_cpu_matches_llama3_apply_qk_norm() {
         // Simulate Bonsai-like tensor: 3 V heads × 128 v_dim
         let v_dim = 128;
@@ -7190,6 +7214,10 @@ mod tests {
     /// GPU Q8_0 matvec matches the naive CPU reference. Verifies the padded
     /// 9-word block layout and int8 sign extension against `dequantize_q8_0`.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn q8_0_matvec_matches_cpu_dequant_reference() {
         let Some(engine) = try_gpu_engine() else {
             return;
@@ -7261,6 +7289,10 @@ mod tests {
     /// used to special-case — and checks every real row still matches the
     /// CPU dequant reference.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn matvec_q1_0_out_of_range_workgroups_do_not_corrupt_in_bounds_rows() {
         let Some(engine) = try_gpu_engine() else {
             return;
@@ -9219,6 +9251,10 @@ mod tests {
         /// weighted-V), independent of the shader's parallel subgroup/
         /// workgroup reduction.
         #[allow(clippy::too_many_arguments)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+        )]
         fn attention_cpu_reference(
             q: &[f32],
             k_cache: &[f32],

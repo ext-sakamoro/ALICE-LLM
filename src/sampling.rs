@@ -74,6 +74,10 @@ pub fn top_p_filter(logits: &mut [f32], p: f32) {
 }
 
 /// Softmax in-place.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;

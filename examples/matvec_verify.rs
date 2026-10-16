@@ -4,6 +4,10 @@ use alice_llm::gguf::{self, GgufFile};
 use std::env;
 use std::fs;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     let args: Vec<String> = env::args().collect();
     let model_path = args.get(1).expect("Usage: matvec_verify <model.gguf>");

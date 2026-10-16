@@ -30,6 +30,10 @@ use std::time::Instant;
 #[cfg(feature = "gpu")]
 use alice_llm::gpu::GpuEngine;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     let model_path = std::env::args()
         .nth(1)

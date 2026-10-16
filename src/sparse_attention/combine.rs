@@ -31,6 +31,10 @@ use rayon::prelude::*;
 /// Returns a flat `[Tq * Hq * head_dim]` FP32 output buffer.
 ///
 /// [`kvouter_forward`]: super::forward::kvouter_forward
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn lse_combine(
     partials: &ForwardPartials,
     idx: &KvOuterIndex,
@@ -144,6 +148,10 @@ mod tests {
     /// the ground truth for the sparse pipeline when every KV block is
     /// selected.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn dense_reference(
         q: &[f32],
         k_pages: &[f32],
@@ -273,6 +281,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn sparse_full_matches_dense_reference_no_causal() {
         // Tq=2 (single batch), Hq=Hkv=1, head_dim=4, page_size=block_size=2,
         // 3 pages populated (used_kv_lens=6).
@@ -335,6 +347,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn sparse_full_matches_dense_reference_gqa() {
         // GQA: Hq=4, Hkv=2, qhead=2.
         let tq = 3;
@@ -396,6 +412,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn sparse_full_matches_dense_reference_causal() {
         // Same shape as the no-causal test but with `causal=true` and Tq=3
         // so multiple queries in a single batch exercise the right-aligned

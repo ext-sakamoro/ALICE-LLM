@@ -102,6 +102,10 @@ fn bench_matvec(name: &str, matrix: &SparseTernaryMatrix, input: &[f32], iters: 
     ms_per_iter
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     println!("=== 70B Sparse Ternary Benchmark (Simulated) ===");
     println!();

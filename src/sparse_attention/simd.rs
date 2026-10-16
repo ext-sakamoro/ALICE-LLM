@@ -114,6 +114,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn dot_matches_scalar_for_various_lengths() {
         for &n in &[0, 1, 4, 7, 8, 9, 16, 17, 31, 32, 33, 64, 128] {
             let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.13 - 0.5).collect();

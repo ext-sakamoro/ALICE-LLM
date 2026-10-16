@@ -9,6 +9,10 @@
 /// `position` is the token position in the sequence.
 /// `base` is the `RoPE` base frequency (typically 10000).
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn apply_rope(vec: &[f32], position: usize, base: f32) -> Vec<f32> {
     let dim = vec.len();
     let mut out = vec![0.0f32; dim];

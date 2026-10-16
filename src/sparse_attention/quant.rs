@@ -132,6 +132,10 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
 /// caller should never see a NaN in a well-formed cache.
 #[inline]
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
+)]
 pub fn e4m3_to_f32(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let magnitude = b & 0x7F;
@@ -392,6 +396,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn fp8_kv_cache_paired_with_kvouter_forward_end_to_end() {
         // Encode a realistic K/V cache into FP8, decode back, and run the
         // full sparse-attention forward. Compare per-partial-output against

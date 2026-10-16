@@ -362,6 +362,10 @@ mod tests {
         usize,
     );
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+    )]
     fn fixture_gqa() -> GqaFixture {
         // tq=3, hq=4, hkv=2 (qhead=2), head_dim=8, seq_len=12.
         let tq = 3;

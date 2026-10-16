@@ -5,6 +5,10 @@ use std::time::Instant;
 #[cfg(feature = "gpu")]
 use alice_llm::gpu::GpuEngine;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     // the model file is given on the command line or in ALICE_LLM_MODEL (there is no default path)
     let model_path = std::env::args().nth(1).or_else(|| std::env::var("ALICE_LLM_MODEL").ok()).unwrap_or_else(|| {

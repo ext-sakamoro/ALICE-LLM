@@ -22,6 +22,10 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
     for i in (0..head_dim).step_by(2) {
         let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
@@ -35,6 +39,10 @@ fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
 }
 
 #[inline]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }

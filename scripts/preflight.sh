@@ -71,6 +71,20 @@ step "ci.yml / clippy: cargo clippy (full feature set + internal-kernel-oracle, 
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings )
 
+step "ci.yml / g1: Clippy canary data (generator tests, generated from clippy.toml, no drift)"
+python3 scripts/test_gen_clippy_canary_calls.py
+python3 scripts/gen_clippy_canary_calls.py --check
+
+step "ci.yml / g1: Clippy canary (tests, then every planted banned call is flagged)"
+python3 scripts/test_clippy_canary.py
+python3 scripts/clippy_canary.py
+
+step "ci.yml / g1: G1 call pin (tests, then every banned call is listed)"
+rustup target list --installed | grep -q aarch64-unknown-linux-gnu || rustup target add aarch64-unknown-linux-gnu
+rustup target list --installed | grep -q x86_64-unknown-linux-gnu || rustup target add x86_64-unknown-linux-gnu
+python3 scripts/test_g1_debt_pin.py
+python3 scripts/g1_debt_pin.py
+
 # Hand-added (kept across regeneration): the CI clippy runner is x86_64, this
 # Mac is aarch64 — arch-gated bodies (AVX2 / AVX-512 kernels in gguf.rs) only
 # lint against the x86_64 target (2026-09-16: 5 findings reached CI this way)

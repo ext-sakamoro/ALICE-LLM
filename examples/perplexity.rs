@@ -71,6 +71,10 @@ fn parse_arg_str<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 /// treated as -inf (excluded from the softmax denominator). This mirrors
 /// llama.cpp's `common_init_result: added <tok> logit bias = -inf` for EOG
 /// tokens, which shifts the denominator down and slightly reduces PPL.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn log_prob_at(logits: &[f32], target: u32, eog_inf_ids: &[u32]) -> f32 {
     let target_us = target as usize;
     debug_assert!(
@@ -120,6 +124,10 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
