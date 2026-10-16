@@ -1,0 +1,29 @@
+# Deliberate occurrences for scripts/build_config_guard.py (ALICE-Law G14).
+# Each entry needs a reason; an allow covers exactly the lines it names (count),
+# an exclude names a file the guard would otherwise read.
+
+[[exclude]]
+path = "scripts/build_config_guard.py"
+reason = "the guard itself: its rules and documentation spell out the flags it looks for"
+
+[[exclude]]
+path = "scripts/test_build_config_guard.py"
+reason = "the guard's tests: every flag appears as test data in a temporary tree"
+
+[[exclude]]
+path = "alice-law-conformance.toml"
+reason = "the conformance manifest quotes the flags in its G14 evidence and mutant text; cargo does not read it"
+
+[[exclude]]
+path = "scripts/build_flags_check.py"
+reason = "the dynamic G14 check: its rules and documentation spell out the flags it looks for"
+
+[[exclude]]
+path = "scripts/test_build_flags_check.py"
+reason = "the dynamic check's tests: the flags appear in sample rustc command lines"
+
+[[allow]]
+path = "examples/bench_simd_matvec.rs"
+line = "println!(\"    • Scalar fallback: on x86_64, `RUSTFLAGS=\\\"-C target-feature=-avx2,-avx512bw\\\"`\");"
+count = 1
+reason = "an example's printed hint telling a user how to try the scalar fallback; the escaped quotes in the Rust string make the value unresolved, and the example's own build sets no flag"

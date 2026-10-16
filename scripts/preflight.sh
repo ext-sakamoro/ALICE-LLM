@@ -49,6 +49,12 @@ step "ci.yml / docs_lint: docs lint (tests + public documents)"
 python3 scripts/test_docs_lint.py
 python3 scripts/docs_lint.py --check
 
+step "ci.yml / float-environment: run_tests.sh and build configuration guard (tests, then check)"
+python3 scripts/test_run_tests.py
+python3 scripts/test_build_config_guard.py
+python3 scripts/build_config_guard.py
+python3 scripts/test_build_flags_check.py
+
 step "ci.yml / clippy: cargo clippy (default features, all targets)"
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets -- -D warnings )
@@ -164,6 +170,15 @@ fi
 if [[ $quick -eq 1 ]]; then
   echo; echo "preflight --quick OK (test / bench suites skipped)"; exit 0
 fi
+
+step "ci.yml / float-environment: Float environment (debug and release)"
+scripts/run_tests.sh float_environment=2 -- cargo test --test float_environment
+scripts/run_tests.sh float_environment=2 -- cargo test --release --test float_environment
+
+step "ci.yml / float-environment: Effective rustc flags (default, docs.rs feature set, no default features)"
+python3 scripts/build_flags_check.py -- cargo check --release --lib
+python3 scripts/build_flags_check.py -- cargo check --release --lib --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
+python3 scripts/build_flags_check.py -- cargo check --release --lib --no-default-features
 
 step "ci.yml / test: cargo test (default features)"
 ( export CARGO_TERM_COLOR="always"; cargo test --lib )

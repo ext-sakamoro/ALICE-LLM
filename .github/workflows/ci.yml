@@ -154,6 +154,43 @@ jobs:
         if: matrix.features == 'default'
         run: cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
 
+  float-environment:
+    # ALICE-Law G14 on each OS: round-to-nearest-even and no flush-to-zero at run
+    # time in both profiles (scripts/run_tests.sh float_environment=2 fails unless
+    # both tests passed), the static build configuration guard, and on ubuntu /
+    # macOS the flags cargo really passes to rustc, read from `-v` in a fresh
+    # target directory (scripts/build_flags_check.py)
+    name: Float environment (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Float environment (debug and release)
+        run: |
+          scripts/run_tests.sh float_environment=2 -- cargo test --test float_environment
+          scripts/run_tests.sh float_environment=2 -- cargo test --release --test float_environment
+      - name: run_tests.sh and build configuration guard (tests, then check)
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" scripts/test_run_tests.py
+          "$PY" scripts/test_build_config_guard.py
+          "$PY" scripts/build_config_guard.py
+          "$PY" scripts/test_build_flags_check.py
+      - name: Effective rustc flags (default, docs.rs feature set, no default features)
+        if: runner.os != 'Windows'
+        run: |
+          python3 scripts/build_flags_check.py -- cargo check --release --lib
+          python3 scripts/build_flags_check.py -- cargo check --release --lib --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
+          python3 scripts/build_flags_check.py -- cargo check --release --lib --no-default-features
+
   doc:
     name: rustdoc (-D warnings, docs.rs feature set)
     runs-on: ubuntu-latest
