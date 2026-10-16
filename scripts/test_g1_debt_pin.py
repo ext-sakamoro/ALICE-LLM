@@ -64,6 +64,54 @@ class ForceWarnFixture(unittest.TestCase):
             self.assertEqual({(f, ln, m) for f, ln, _col, m in found}, EXPECTED)
 
 
+ACCEPTED_FORM = '''#[expect(
+    clippy::disallowed_methods,
+    reason = "G1 debt: a \\"quoted\\" reason, with [brackets] and (parens)"
+)]
+fn ok(x: f32) -> f32 { x.exp() }
+'''
+
+
+class Marking(unittest.TestCase):
+    def refused(self, src: str) -> list:
+        return p.marking_violations(src)[0]
+
+    def test_the_expected_form_is_accepted(self):
+        self.assertEqual(p.marking_violations(ACCEPTED_FORM), ([], 1))
+
+    def test_every_other_form_is_refused(self):
+        forms = [
+            '#[allow(clippy::disallowed_methods, reason = "x")]\nfn f() {}\n',
+            '#[allow(clippy::disallowed_methods)]\nfn f() {}\n',
+            '#[expect(clippy::style, reason = "x")]\nfn f() {}\n',
+            '#[allow(clippy::all)]\nfn f() {}\n',
+            '#[allow(warnings)]\nfn f() {}\n',
+            '#[cfg_attr(all(), expect(clippy::disallowed_methods, reason = "x"))]\nfn f() {}\n',
+            '#[cfg_attr(test, allow(clippy::disallowed_methods))]\nfn f() {}\n',
+            'mod m {\n    #![allow(clippy::disallowed_methods)]\n}\n',
+            '#![expect(clippy::disallowed_methods, reason = "x")]\n',
+            '#[expect(clippy::disallowed_methods, clippy::float_cmp, reason = "x")]\nfn f() {}\n',
+        ]
+        for src in forms:
+            with self.subTest(src=src):
+                self.assertEqual(len(self.refused(src)), 1)
+
+    def test_level_raising_attributes_are_ignored(self):
+        src = '#![warn(clippy::all, clippy::pedantic)]\n#[deny(clippy::disallowed_methods)]\nfn f() {}\n'
+        self.assertEqual(p.marking_violations(src), ([], 0))
+
+    def test_strings_and_comments_are_not_attributes(self):
+        src = ('// #[allow(clippy::disallowed_methods)]\n'
+               '/// #[allow(clippy::disallowed_methods)]\n'
+               '/* #[allow(clippy::disallowed_methods)] */\n'
+               'const S: &str = "#[allow(clippy::disallowed_methods)]";\n'
+               'const R: &str = r#"#[allow(clippy::disallowed_methods)]"#;\n')
+        self.assertEqual(p.marking_violations(src), ([], 0))
+
+    def test_line_of_a_refused_attribute(self):
+        self.assertEqual(self.refused('fn a() {}\n\n#[allow(warnings)]\nfn f() {}\n')[0][0], 3)
+
+
 class Command(unittest.TestCase):
     def test_force_warn_is_passed_to_rustc(self):
         cmd = p.clippy_command("x86_64-unknown-linux-gnu", ["--features", "a,b"], ["--all-targets"])
