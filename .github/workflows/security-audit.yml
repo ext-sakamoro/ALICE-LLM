@@ -7,6 +7,8 @@ name: Security & Hygiene
 # - dep license 逸脱 (GPL 侵入等) の block
 # - 未使用依存の炙り出し
 # - 仮実装 (todo! / unimplemented! / panic!(STUB) / dbg!) の CI gate
+#
+# crates.io の最新版に対する公開 API の検査は semver-checks.yml (失敗させる)
 
 on:
   push:
@@ -217,34 +219,3 @@ jobs:
           name: coverage-summary
           path: coverage-summary.txt
           retention-days: 30
-
-  semver-checks:
-    name: cargo-semver-checks (API compat, informational)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # alice-llm は crates.io に公開済み この job は公開版でなく直前の commit (HEAD~1) と比べる
-    # informational only
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0  # baseline-rev 比較のため full history 必要
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      # version 明示 pin: `@latest` は rustc MSRV を追いかける (0.50.0 = 1.93+) ので、
-      # rust-toolchain.toml の pin が遅れると赤になる (2026-09-14 事案) toolchain と
-      # 一緒に月次で bump する
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-semver-checks@0.50.0
-
-      # 直前の commit を baseline にして git 経由で比べる (--baseline-rev)
-      # main の直前 commit と比較 (informational、break あっても block しない)
-      - name: Run cargo semver-checks
-        run: |
-          cargo semver-checks check-release \
-            --package alice-llm \
-            --baseline-rev "HEAD~1" \
-            || true

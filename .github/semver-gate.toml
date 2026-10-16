@@ -1,0 +1,11 @@
+# scripts/semver_gate.py: the equal-version mode of alice-llm
+#
+# [crate.alice-llm] in ALICE-Law release-train.toml declares no consumer feature sets, so
+# the gate builds the default features, no default features, and every feature at once;
+# consumer-features here stays unset to match the roster
+#
+# Cargo.toml keeps the released version while changes accumulate under [Unreleased]; the
+# version is raised when the release is cut. A version above the published one is checked as
+# the step the two make (2.0.0 -> 2.0.1, a patch step), and an equal version as the smallest
+# next release, so a change that needs a larger step fails until Cargo.toml carries that bump
+equal-version = "next-smallest-step"
