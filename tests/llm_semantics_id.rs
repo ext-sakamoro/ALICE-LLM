@@ -63,6 +63,18 @@ fn recorded_goldens() -> BTreeMap<String, [u8; 32]> {
     // this reads: a golden passed through a const, a macro or any other form
     // fails here instead of being skipped (so it cannot escape the fold)
     let src = code_only(&src);
+    // the golden file pulls in no other source: `include!` (or `#[path]` / a `mod` item) would let a call
+    // live in a file this scan does not read
+    for banned in ["include!", "include_str!", "include_bytes!", "#[path"] {
+        assert!(!src.contains(banned), "the golden file uses {banned}");
+    }
+    assert!(
+        !src.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("mod ") || t.starts_with("pub mod ")
+        }),
+        "the golden file declares a module"
+    );
     let mut out = BTreeMap::new();
     let mut unfolded: BTreeMap<String, usize> = BTreeMap::new();
     let bytes = src.as_bytes();
@@ -423,26 +435,44 @@ fn the_pins_were_checked_on_this_version_and_toolchain() {
     );
 }
 
-/// Goldens live in `tests/semantics_golden.rs` only: no other test file uses `assert_golden`, so a
-/// scenario cannot be recorded where the fold does not look (a helper with
-/// another name in another file is outside what a source scan can see)
+/// Goldens live in `tests/semantics_golden.rs` only: no other file under `tests/` (any extension, any depth: a
+/// fixture can be pulled in by `include!`) uses `assert_golden`, so a scenario cannot be recorded where the
+/// fold does not look
+///
+/// What a source scan cannot see, in this file or any other: a digest a helper builds at run time
+/// (`format!` / `concat` of parts) or a comparison against a byte array; such a golden is not folded and
+/// must not be written (the convention is `assert_golden` with literal arguments)
 #[test]
 fn no_other_test_file_records_a_golden() {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("tests/") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    walk(&dir, &mut files);
     let mut seen = 0;
-    for entry in std::fs::read_dir(&dir).expect("tests/") {
-        let path = entry.expect("dir entry").path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
-            || name == "semantics_golden.rs"
-            || name == "llm_semantics_id.rs"
-        {
+    for path in files {
+        let name = path
+            .strip_prefix(&dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if name == "semantics_golden.rs" || name == "llm_semantics_id.rs" {
             continue;
         }
         seen += 1;
-        let code = code_only(&std::fs::read_to_string(&path).expect("test file"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).expect("test file")).into_owned();
+        let is_rs = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        let code = if is_rs { code_only(&raw) } else { raw };
         let bytes = code.as_bytes();
         let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let mut from = 0;
@@ -451,8 +481,11 @@ fn no_other_test_file_records_a_golden() {
             from = at + "assert_golden".len();
             let part_of_another =
                 (at > 0 && ident(bytes[at - 1])) || bytes.get(from).is_some_and(|&b| ident(b));
-            assert!(part_of_another, "{name} uses assert_golden at byte {at}");
+            assert!(
+                part_of_another,
+                "tests/{name} uses assert_golden at byte {at}"
+            );
         }
     }
-    assert!(seen > 0, "no other test file was read");
+    assert!(seen > 0, "no other file under tests/ was read");
 }
