@@ -3,10 +3,11 @@
 script with `cat`, and the exit code and messages are checked for a passing
 run, a run in which no test ran, a named file that ran none (or was not built
 at all), a failing command, Windows output (backslash paths, CRLF, ANSI
-colour), and a per-binary minimum (`name=N`: met, missed because a test is
+colour), doctests counted under their own key and not under the binary that
+ran last, a test printing "Running" in its output, and a per-binary minimum (`name=N`: met, missed because a test is
 ignored, a missing binary, and the refused forms `=0`, `=`, a non-number and
 an empty name). The script itself is shared byte for byte with ALICE-DB and
-is not modified here."""
+is not modified in only one of them."""
 import os
 import shutil
 import subprocess
@@ -44,6 +45,10 @@ def result(n, ignored=0):
             "finished in 0.01s")
 
 
+def doctests(crate="alice_analytics"):
+    return f"   Doc-tests {crate}"
+
+
 UNIT = ["     Running unittests src/lib.rs (target/debug/deps/alice_analytics-0123abcd)", result(7)]
 
 
@@ -64,7 +69,7 @@ class RunTests(unittest.TestCase):
     def test_a_passing_run_with_every_named_file(self):
         rc, out, err = self.run_log("alpha,beta", UNIT + [running("alpha"), result(3), running("beta"), result(2)])
         self.assertEqual(rc, 0, err)
-        self.assertIn("run_tests: 12 tests passed in total, 3 in alpha, 2 in beta", out)
+        self.assertIn("run_tests: 12 tests passed in total, 0 doctests, 3 in alpha, 2 in beta", out)
         self.assertEqual(err, "")
 
     def test_no_test_ran_fails(self):
@@ -106,8 +111,47 @@ class RunTests(unittest.TestCase):
                         result(5)]
         rc, out, err = self.run_log("alpha", lines, newline="\r\n")
         self.assertEqual(rc, 0, err)
-        self.assertIn("12 tests passed in total, 5 in alpha", out)
+        self.assertIn("12 tests passed in total, 0 doctests, 5 in alpha", out)
 
+
+    def test_doctests_are_their_own_section(self):
+        # cargo sorts the test binaries and runs the doctests last: their result
+        # line follows `Doc-tests <crate>`, not the last binary's `Running` line
+        lines = UNIT + [running("alpha"), result(3), running("zeta"), result(2), doctests(), result(9)]
+        rc, out, err = self.run_log("alpha,zeta=3", lines)
+        self.assertEqual(rc, 1)
+        self.assertIn("run_tests: 21 tests passed in total, 9 doctests, 3 in alpha, 2 in zeta", out)
+        self.assertIn("run_tests: zeta passed 2 test(s), needs at least 3", err)
+        rc, out, err = self.run_log("alpha,zeta=2", lines)
+        self.assertEqual(rc, 0, err)
+
+    def test_a_binary_named_only_by_its_doctests_did_not_run(self):
+        rc, out, err = self.run_log("zeta", UNIT + [running("alpha"), result(3), doctests("zeta"), result(4)])
+        self.assertEqual(rc, 1)
+        self.assertIn("4 doctests, 0 in zeta", out)
+        self.assertIn("run_tests: zeta did not run any test", err)
+
+    def test_doctests_alone_still_count_as_tests_ran(self):
+        rc, out, err = self.run_log("alpha", [doctests(), result(2)])
+        self.assertEqual(rc, 1)
+        self.assertIn("run_tests: 2 tests passed in total, 2 doctests, 0 in alpha", out)
+        self.assertIn("alpha did not run any test", err)
+
+    def test_windows_doctest_header_is_recognised(self):
+        esc = "\x1b"
+        lines = UNIT + [running("alpha", "\\"), result(1),
+                        f"   {esc}[1m{esc}[32mDoc-tests{esc}[0m alice_analytics", result(6)]
+        rc, out, err = self.run_log("alpha=2", lines, newline="\r\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("14 tests passed in total, 6 doctests, 1 in alpha", out)
+
+    def test_running_printed_by_a_test_does_not_move_the_count(self):
+        # a test's own output (`--nocapture`) is not a section header
+        lines = UNIT + [running("alpha"), "Running tests/beta.rs from a test", "  progress: Running tests/beta.rs",
+                        result(3)]
+        rc, out, err = self.run_log("alpha", lines)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("3 in alpha", out)
 
     def test_a_minimum_that_is_met_passes(self):
         rc, out, err = self.run_log("alpha=2", UNIT + [running("alpha"), result(2)])
