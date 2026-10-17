@@ -65,14 +65,26 @@ note = "the 6 mul_add sites of src/ (src/linalg.rs, src/matrix.rs, src/quantizat
 reference_repo = "ALICE-Kinematics"
 
 [G4]
-status = "fail-known"
-note = "unmet: tests/semantics_golden.rs (3.0.0) compares recorded bits of seven scenarios and tests/law_max_min_ties.rs compares signed zeros and NaN payloads, both run by the test job on ubuntu x86_64 and macOS aarch64, but only in the debug profile; no step runs them under --release, so the debug / release clause is unmet. no signed-zero or exact-cancellation golden test exists: tests/ holds tests/analytic_oracle.rs (12 tests, closed-form identities and tolerances, its own header says no golden values) and tests/ref_shaders (WGSL sources), and no test in tests/ compares to_bits or from_bits against a fixed pattern (grep: 0). CI runs the tests only in the debug profile (.github/workflows/ci.yml:134,144,149,152): matrix ubuntu-latest and macos-latest (Apple Silicon, see the comment at ci.yml:209) with default and simd features, so a debug leg exists on x86_64 and on aarch64, but no release leg runs a test (see G5), so the {debug, release} x {x86_64, aarch64} matrix is half present, and no case is built to hit a signed zero or an exact cancellation."
-reference_repo = "ALICE-LOL"
+status = "pass"
+evidence = [
+    "tests/float_edge_golden.rs: signed zeros and exact cancellations through the public kernels against fixed bit patterns (silu / gelu of +-0, layer_norm of a constant vector = +0, rms_norm of signed zeros, softmax of equal logits = 0.25 exactly, RoPE at position 0 with the sign of each zero derived in the test, quantize of a constant slice); tests/semantics_golden.rs (seven recorded-bit scenarios) and tests/law_max_min_ties.rs (signed zeros and NaN payloads at the max / min sites)",
+    ".github/workflows/ci.yml: debug in the test job's Law tests step (line 197) and release in the release job (line 216, Law tests at line 233), each on ubuntu-latest (x86_64) and macos-latest (aarch64) — the four legs debug / release x x86_64 / aarch64; scripts/run_tests.sh float_edge_golden=6 fails a leg that ran fewer tests",
+]
+mutant = "measured 2026-10-17, reverted: layer_norm computing (x - mean) as -(mean - x), the same value except the sign of an exact zero, fails layer_norm_of_a_constant_vector_is_positive_zero in the release profile; for the scenario goldens, ln_1p returning x * 1.0000001 below half an ulp of 1 fails lawmath_functions_are_the_recorded_bits (G6)"
+since = "3.0.0"
+note = "the expected patterns are written from IEEE 754 arithmetic in the test (exact zeros, exact 0.25, the signs of zero sums) or recorded (the seven scenario digests of G6). The GPU kernels are outside."
+reference_repo = "ALICE-DB"
 
 [G5]
-status = "fail-known"
-note = "no CI step runs the test suite under the release profile: .github/workflows/ci.yml:144,149,152,155 are `cargo test --lib`, `cargo test --lib --features simd`, `cargo test --test analytic_oracle` and `cargo test --doc` without --release, and the only release step is `cargo build --release --lib` (ci.yml:335,336, a build, not a test). No job uses an aarch64 Linux runner; the aarch64 coverage is macos-latest (ci.yml:134) in debug. release.yml:40,90 cross-builds an aarch64 Linux server binary in release without running a test. `cargo test --release --lib` (568 passed) and `cargo test --release --test analytic_oracle` (12 passed) were run locally on aarch64-apple-darwin on 2026-10-15, but no CI leg runs them."
-reference_repo = "ALICE-LOL"
+status = "pass"
+evidence = [
+    ".github/workflows/ci.yml release job (line 216): on ubuntu-latest (x86_64) and macos-latest (aarch64), cargo test --release --lib, cargo test --release --test analytic_oracle, and the Law tests (lawmath_ln_1p, law_max_min_ties, semantics_golden, llm_semantics_id, float_edge_golden, order_independence) through scripts/run_tests.sh with minimum counts",
+    "scripts/preflight.sh runs the same release steps in its full (non --quick) part",
+]
+mutant = "the release leg is the same test binaries as the debug leg under --release; a golden that holds in debug and not in release (a fused multiply-add the optimiser forms on aarch64) fails there; scripts/run_tests.sh fails a leg whose binary ran fewer tests than named (its own tests, scripts/test_run_tests.py)"
+since = "3.0.0"
+note = "the aarch64 release leg is macOS (Apple Silicon); no aarch64 Linux runner runs the tests (the G3 IR gate builds aarch64 Linux release code, without running it). The examples and benches are not part of the Law-bearing suite."
+reference_repo = "ALICE-DB"
 
 [G6]
 status = "pass"
@@ -114,13 +126,21 @@ status = "unverified"
 note = "unverified: both identifiers are introduced in 3.0.0 (LLM_SEMANTICS_ID for G6, the KV cache file identifier for G8), so there is no history to audit yet and no identifier-history test; LLM_PREVIOUS_SEMANTICS_IDS is empty. The first move has to be a major release with both values named in CHANGELOG.md and a test that loads a file stamped with the earlier value."
 
 [G10]
-status = "fail-known"
-note = "no lint or scan bans run-varying sources: clippy.toml has no disallowed-methods / disallowed-types entry for SystemTime::now, Instant::now, thread_rng or RandomState (its list is G1's) and no scan step in .github/workflows/ci.yml or scripts/; a planted `SystemTime::now().duration_since(UNIX_EPOCH)` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). The probe reports 38 Instant::now and 38 Instant::elapsed calls (38 sites in the default build, all 78 with the gpu and server features) and 2 SystemTime::now calls in src/bin/server.rs:492 (request id) and :785 (timestamp). The ones read here are diagnostic timing: src/gpu.rs:2495,2498 returns elapsed microseconds, src/llama3.rs:10841-10975 prints elapsed milliseconds with eprintln!. Whether any such value reaches a computed output was not traced. There is no thread_rng, from_entropy, getrandom, Uuid or RandomState in src (grep); the sampler takes its random number as an argument (src/sampling.rs:114 sample_with_random)."
-reference_repo = "ALICE-Analytics"
+status = "pass"
+evidence = [
+    "scripts/entropy_guard.py (from ALICE-DB, with this repository's ALLOWED table at line 75): src/ outside cfg(test) modules, getrandom, OsRng, thread_rng, rand::random, from_entropy, SystemTime::now, Instant::now, UNIX_EPOCH, RandomState in any form, Uuid::new_v4; every allowed call site has a count and a reason and a drift either way fails; scanning no file fails",
+    "ALLOWED: src/llama3.rs Instant::now 34 (the generate loops' prefill_ms / decode_ms / total_ms / tokens_per_sec and the ALICE_K3_TRACE stderr lines), src/gpu.rs Instant::now 2 (a kernel timing helper, an upload log line), src/bin/server.rs Instant::now 2 (request latency), SystemTime::now 2 and UNIX_EPOCH 3 (the response's created timestamp and request id); no comparison of an elapsed time decides a token (grep of the elapsed values: they are assigned to the statistics fields and divided into tok/s only)",
+    "scripts/test_entropy_guard.py (25 tests; here test_elapsed_only_where_now_is_allowed replaces DB's clippy check: every src/ file calling .elapsed() must be one whose Instant::now calls ALLOWED accounts for, and at least one file must be checked); run by the float-environment job (ubuntu, macOS, Windows) and scripts/preflight.sh",
+    "the sampler takes its random number as an argument (sampling::sample_with_random); the determinism of the computed output is shown by the recorded-bit scenarios of G6",
+]
+mutant = "measured 2026-10-17, reverted: `std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)` added to src/linalg.rs makes scripts/entropy_guard.py report `SystemTime::now in production code: src/linalg.rs:88` and `UNIX_EPOCH ...` (2 problems, exit 1)"
+since = "3.0.0"
+note = "clippy.toml carries no clock or entropy entries: its disallowed-methods are the G1 / G2 float list, and the G1 call pin counts every disallowed-method finding as a recorded call. The default hasher of HashMap / HashSet (RandomState) is reached through HashMap::new without naming RandomState; its effect, iteration order, is G13's audit. The guard script differs from ALICE-DB's in ALLOWED and in that one test."
+reference_repo = "ALICE-DB"
 
 [G11]
 status = "fail-known"
-note = "the G1 ban list has a canary and a compared-nothing failure (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py --check, scripts/g1_debt_pin.py; see G1); the G2 ban shares that canary (clippy.toml rows generated into scripts/clippy_canary_calls.tsv), the G3 checker carries its own probe tests, and the G14 scripts their tests. Clause (c) has a located absence: scripts/test_workflow_timeouts.py is stated in CHANGELOG.md:16 to be byte-identical to a sibling repository's copy, and no CI step or script compares the two (no such step in .github/workflows/ci.yml or scripts/). The checkers that exist (scripts/docs_lint.py with scripts/test_docs_lint.py, scripts/no_return_before_barrier.py with its test, scripts/workflow_timeouts.py with its test) carry tests and fail when they compared nothing, but they are not the gates G11 enumerates. For clause (c), scripts/semver_gate.py and scripts/test_semver_gate.py, and the four clippy canary scripts (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py, scripts/test_clippy_canary.py, scripts/test_gen_clippy_canary_calls.py), are byte-identical copies shared with ALICE-Law, ALICE-DB and other crates, and nothing in this repository or its CI compares them with their source."
+note = "unmet: clause (c). The checkers carry canaries and zero-compared failures: the G1 / G2 clippy canary and call pin, the G3 checker probes, the G10 guard tests (scripts/test_entropy_guard.py), the G14 scripts, scripts/run_tests.sh. Clause (c) is not evidenced: the shared copies (the canary and run_tests scripts, the G3 tool and IR checker, the G14 scripts) are compared with their sources only by a pre-push check outside this repository, not by anything this repository or its CI carries; the cross-repository table is to come from ALICE-Law."
 
 [G12]
 status = "pass"

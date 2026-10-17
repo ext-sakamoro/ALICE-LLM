@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `tests/float_edge_golden.rs` (ALICE-Law G4): 正負のゼロと厳密な打ち消しを公開の kernel で固定の bit と比べる (±0 の silu / gelu、一定値の layer_norm は +0、符号付きゼロの rms_norm、等しい logits の softmax はちょうど 0.25、位置 0 の RoPE は各ゼロの符号を test の中で導いて固定、一定値の量子化)
+- CI (ALICE-Law G4 / G5): 新しい release job が ubuntu (x86_64) と macOS (aarch64) で `cargo test --release --lib`、閉形式の oracle、Law の試験 (lawmath_ln_1p / law_max_min_ties / semantics_golden / llm_semantics_id / float_edge_golden / order_independence) を release の profile で走らせる debug の Law 試験の step にも float_edge_golden を足した preflight も同じ
+- CI (ALICE-Law G10): `scripts/entropy_guard.py` と試験 (ALICE-DB から、許可表はこの repository のもの) が src/ の時計と OS 乱数の呼び出しを数える 許可は生成の統計 (prefill_ms など)・trace の出力・server の応答の時刻と request id で、どれも token を決めない float-environment job (ubuntu / macOS / Windows) と preflight で走る
 - `alice_llm::lawmath` (ALICE-Law G1 / G2): 推論が使う超越関数 (exp / ln / tanh / powf / sin_cos / sin / cos / powi) と max / min / clamp を `alice-det-math` 0.5.1 に通す ln_1p は `alice-det-math` 0.5 に無いので Kahan の形 (`u = 1 + x`、`u == 1` なら `x`、それ以外は `ln(u) * (x / (u - 1))`) で計算し、f64 の `ln_1p` を f32 に丸めた値と比べて |x| < 1e-6 で 2 ulp 以内、softplus の範囲・bigram の件数・-1 付近で 1 ulp 以内 (`tests/lawmath_ln_1p.rs`) library と binary の 68 件の呼び出しを置き換え、`scripts/g1_debt_sites.tsv` は空になった f32 / f64 の max / min / clamp を `clippy.toml` で禁止し、81 件 (src 57、examples 24) を置き換えた `tests/law_max_min_ties.rs` は量子化の min / max、softmax の max、勾配の clip について正負のゼロと NaN で bit を比べる
 - 測った精度と速度 (arm64、release、各範囲 100 万点、基準は f64 の std を f32 に丸めた値): 下表 sin / cos は |x| ≤ 4096 で 2 ulp (絶対誤差 9.3e-8 以下) だが、`alice-det-math` 0.5 の単精度の範囲縮小のため |x| = 32768 で 4.9e-7、131072 で 1.9e-6 (std は 3.0e-8) RoPE の角度ではこの差は f32 の角度自体の丸め (131072 で 1 ulp = 0.0156) より 4 桁小さい
 

@@ -197,7 +197,7 @@ jobs:
       - name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)
         if: matrix.features == 'default'
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
           scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
@@ -206,6 +206,34 @@ jobs:
       - name: Doc tests
         if: matrix.features == 'default'
         run: cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
+
+  release:
+    # ALICE-Law G4 / G5: the Law-bearing tests under the release profile on x86_64
+    # (ubuntu) and aarch64 (macOS, the target whose default codegen fuses multiply-adds):
+    # the library tests, the closed-form oracles, the recorded-bit and edge-case goldens,
+    # the identifier fold and the order tests (scripts/run_tests.sh fails on a binary
+    # that ran fewer tests than named)
+    name: Release profile tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-tests
+      - name: cargo test --release (library)
+        run: cargo test --release --lib
+      - name: Analytic oracle tests (release)
+        run: cargo test --release --test analytic_oracle
+      - name: Law tests (release)
+        run: |
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
+          scripts/run_tests.sh order_independence=3 -- cargo test --release --features gguf,parallel,dspark --test order_independence
 
   float-environment:
     # ALICE-Law G14 on each OS: round-to-nearest-even and no flush-to-zero at run
@@ -234,6 +262,8 @@ jobs:
         run: |
           PY=$(command -v python3 || command -v python)
           "$PY" scripts/test_run_tests.py
+          "$PY" scripts/test_entropy_guard.py
+          "$PY" scripts/entropy_guard.py
           "$PY" scripts/test_build_config_guard.py
           "$PY" scripts/build_config_guard.py
           "$PY" scripts/test_build_flags_check.py

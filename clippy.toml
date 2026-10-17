@@ -5,12 +5,11 @@
 # default). The crate has no libm dependency, so no libm free function can be
 # named. CI runs clippy with -D warnings, which makes each call an error.
 #
-# The inference code calls these methods at the sites listed in
-# scripts/g1_debt_sites.tsv: each carries a scoped
-# #[expect(clippy::disallowed_methods)], and scripts/g1_debt_pin.py fails when
-# the set of calls differs from that list (a new call, or a fixed one still
-# listed). Whether those numerics are Law output is an open decision; until it
-# is made they are recorded debt, not exempt code.
+# The library calls none of them: the inference code goes through
+# src/lawmath.rs (alice-det-math), so scripts/g1_debt_sites.tsv is empty;
+# scripts/g1_debt_pin.py fails when a call appears in library or binary code
+# (tests and examples are listed in scripts/g1_reference_sites.tsv).
+# The max / min / clamp entries at the end are G2: use crate::lawmath.
 disallowed-methods = [
     { path = "f32::sin", reason = "platform libm is not cross-platform bit-exact; use alice_det_math" },
     { path = "f32::cos", reason = "platform libm is not cross-platform bit-exact; use alice_det_math" },
