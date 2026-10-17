@@ -61,7 +61,9 @@ config: scripts/id_move.toml
     features = ["std"]                    # features the probe builds it with (optional)
     default-features = true               # (optional)
     tags = ["v{version}"]                 # release tag patterns
-    doc-features = ["std", "lzma"]        # rustdoc's features for completeness (default: all)
+    doc-features = ["std", "lzma"]        # the features rustdoc (completeness) and the previous-tests
+                                          # are built with (default: all; for crates whose features
+                                          # cannot all be on at once)
     probe-dependencies = ["alice-det-math"]   # crates a path below names besides the package (the
                                           # probe takes the version the package resolves)
     [exempt]                              # [u8; 32] constants that are not identifiers
@@ -499,12 +501,14 @@ def remove_value(source: str, old_hex: str) -> str | None:
     return None
 
 
-def run_named_test(crate_dir: Path, ref: str, target_dir: Path) -> tuple[bool, int, str]:
-    """(passed, tests run, output tail) of one named test in the crate at `crate_dir`"""
+def run_named_test(crate_dir: Path, ref: str, target_dir: Path, features: tuple[str, ...] | None = None) -> tuple[bool, int, str]:
+    """(passed, tests run, output tail) of one named test in the crate at `crate_dir`, built with
+    `features` (the config's doc-features; every feature when None)"""
     rel, fn = ref.split("::")
     sel = ["--test", Path(rel).stem] if rel.startswith("tests/") else ["--lib"]
     env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
-    r = subprocess.run(["cargo", "test", "--quiet", "--manifest-path", str(crate_dir / "Cargo.toml"), "--all-features",
+    feat = ["--all-features"] if features is None else (["--features", ",".join(features)] if features else [])
+    r = subprocess.run(["cargo", "test", "--quiet", "--manifest-path", str(crate_dir / "Cargo.toml"), *feat,
                         *sel, fn, "--", "--exact"], capture_output=True, text=True, env=env)
     ran = sum(int(x) for x in re.findall(r"test result: \w+\. (\d+) passed", r.stdout)) + \
         sum(int(x) for x in re.findall(r"(\d+) failed", r.stdout))
@@ -562,7 +566,7 @@ class PreviousVerifier:
                     shutil.copy(src, dst)
             copy_crate = copy / crate_dir.relative_to(top)
             for ref in spec.previous_tests:
-                ok, ran, out = run_named_test(copy_crate, ref, self.target)
+                ok, ran, out = run_named_test(copy_crate, ref, self.target, self.cfg.doc_features)
                 if not ok or ran < 1:
                     problems.append(f"{spec.path}: previous-tests {ref} does not pass as it is ({ran} run): {out}")
             if problems:
@@ -577,10 +581,14 @@ class PreviousVerifier:
             lines[begin - 1:end] = changed.split("\n")
             path.write_text("\n".join(lines), encoding="utf-8")
             for ref in spec.previous_tests:
-                ok, ran, out = run_named_test(copy_crate, ref, self.target)
+                ok, ran, out = run_named_test(copy_crate, ref, self.target, self.cfg.doc_features)
                 if ok:
                     problems.append(f"{spec.path}: previous-tests {ref} still passes with {old[:8]} taken out of "
                                     f"{list_name}: it does not depend on the old value")
+                elif ran < 1:
+                    # a build that breaks is not a test that tells the old value apart
+                    problems.append(f"{spec.path}: previous-tests {ref} did not run with {old[:8]} taken out of "
+                                    f"{list_name} (the copy does not build): {out}")
                 else:
                     passed_refs.append(ref)
         finally:
