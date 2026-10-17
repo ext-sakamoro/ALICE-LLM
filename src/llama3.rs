@@ -4850,8 +4850,12 @@ impl KvCache {
 // Binary file format (little-endian):
 //
 //   Magic:             "ALICEKV1" (8 bytes)
-//   Version:           u32
-//   Config fingerprint: u64 (hash of hidden_dim/num_layers/num_kv_heads/head_dim/kv_dim)
+//   Version:           u32 (2; files written before 3.0.0 are version 1)
+//   Semantics id:      32 bytes (version 2 only): `crate::semantics::RUNNING_SEMANTICS_ID`
+//                      of the writer, the arithmetic the cached keys and values were
+//                      computed with
+//   Config fingerprint: u64 (version 2: FNV-1a 64 of the shape fields, see
+//                      `kv_cache_fingerprint`; version 1: `DefaultHasher`)
 //   num_layers:        u64
 //   max_seq_len:       u64
 //   kv_dim:            u64
@@ -4865,10 +4869,39 @@ impl KvCache {
 //       skip — shared-KV layers redirect their reads to `map[i]`.
 //
 // The fingerprint hash rejects mismatched-model loads (loading a Llama-3 cache
-// into a Qwen 3 model would produce silent garbage otherwise).
+// into a Qwen 3 model would produce silent garbage otherwise). The semantics id
+// rejects a cache computed with other arithmetic (another alice-det-math
+// generation, or the non-Law `platform-math` build), which would resume
+// generation from keys and values this build does not reproduce.
 
 const KV_MAGIC: &[u8; 8] = b"ALICEKV1";
-const KV_FORMAT_VERSION: u32 = 1;
+const KV_FORMAT_VERSION: u32 = 2;
+/// The format before the semantics id (alice-llm < 3.0.0)
+const KV_FORMAT_VERSION_UNPINNED: u32 = 1;
+
+/// What a KV cache load knows about the arithmetic the file was written with
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KvCacheSemantics {
+    /// The file carries this build's [`crate::semantics::RUNNING_SEMANTICS_ID`]
+    Current,
+    /// The file carries an earlier identifier listed in
+    /// [`crate::semantics::LLM_PREVIOUS_SEMANTICS_IDS`] (same bits)
+    VerifiedPrevious([u8; 32]),
+    /// A version 1 file, written before the identifier existed: nothing is
+    /// known about its arithmetic
+    Unpinned,
+}
+
+/// Whether a version 1 file (no semantics id) is loaded
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvCachePolicy {
+    /// Load it and report [`KvCacheSemantics::Unpinned`]
+    #[default]
+    AcceptUnpinned,
+    /// Refuse it ([`KvCacheLoadError::Unpinned`])
+    RequirePinned,
+}
 
 /// Errors returned by [`Llama3Model::load_kv_cache`]. Distinguishes the
 /// three usual failure modes (I/O, corrupted file, config mismatch) so
@@ -4881,6 +4914,17 @@ pub enum KvCacheLoadError {
     BadMagic { got: [u8; 8] },
     /// File version is not supported by this build.
     UnsupportedVersion { got: u32, expected: u32 },
+    /// The file was written with arithmetic this build does not reproduce
+    /// (another semantics identifier, e.g. the other of the Law and the
+    /// `platform-math` builds)
+    SemanticsMismatch {
+        /// Identifier in the file
+        stored: [u8; 32],
+        /// [`crate::semantics::RUNNING_SEMANTICS_ID`] of this build
+        running: [u8; 32],
+    },
+    /// A version 1 file under [`KvCachePolicy::RequirePinned`]
+    Unpinned,
     /// The config fingerprint recorded in the file does not match the
     /// current model. Loading anyway would produce garbage output.
     FingerprintMismatch { got: u64, expected: u64 },
@@ -4906,6 +4950,20 @@ impl std::fmt::Display for KvCacheLoadError {
                 f,
                 "kv cache load: model config fingerprint mismatch (got {got:#x}, expected {expected:#x})"
             ),
+            Self::SemanticsMismatch { stored, running } => {
+                f.write_str("kv cache load: semantics identifier ")?;
+                for b in stored {
+                    write!(f, "{b:02x}")?;
+                }
+                f.write_str(" is not this build's ")?;
+                for b in running {
+                    write!(f, "{b:02x}")?;
+                }
+                Ok(())
+            }
+            Self::Unpinned => f.write_str(
+                "kv cache load: version 1 file has no semantics identifier and a pin is required",
+            ),
             Self::ShapeMismatch(msg) => write!(f, "kv cache load: shape mismatch — {msg}"),
             Self::OverflowSeqLen { got, max } => write!(
                 f,
@@ -4924,10 +4982,36 @@ impl From<std::io::Error> for KvCacheLoadError {
 }
 
 /// Compact fingerprint of the shape-critical config fields — anything that
-/// affects the KV cache layout. Uses `std::hash::DefaultHasher` for a
-/// dependency-free stable hash. The fingerprint is written into the KV
-/// file header and checked on load; a mismatch aborts loading.
+/// affects the KV cache layout — for version 2 files: FNV-1a 64 over the
+/// fields as little-endian `u64` and the architecture's debug name, so it is
+/// the same with every Rust release (`DefaultHasher`'s algorithm is not
+/// specified across releases). Written into the header and checked on load.
 fn kv_cache_fingerprint(config: &Llama3Config) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    for v in [
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config.hidden_dim,
+        config.max_seq_len,
+    ] {
+        feed(&(v as u64).to_le_bytes());
+    }
+    feed(format!("{:?}", config.arch).as_bytes());
+    h
+}
+
+/// The version 1 fingerprint (`DefaultHasher`), to read files written before
+/// 3.0.0 with the toolchain that wrote them
+fn kv_cache_fingerprint_v1(config: &Llama3Config) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // Only fields that change the KV cache layout. If two models agree on
@@ -4947,9 +5031,15 @@ impl KvCache {
     /// Serialise the cache to `writer`. Fingerprint is provided by the
     /// caller so `Llama3Model::save_kv_cache` can inject the current
     /// config's hash without exposing `KvCache` externally.
-    fn write_to(&self, writer: &mut impl std::io::Write, fingerprint: u64) -> std::io::Result<()> {
+    fn write_to(
+        &self,
+        writer: &mut impl std::io::Write,
+        fingerprint: u64,
+        semantics_id: &[u8; 32],
+    ) -> std::io::Result<()> {
         writer.write_all(KV_MAGIC)?;
         writer.write_all(&KV_FORMAT_VERSION.to_le_bytes())?;
+        writer.write_all(semantics_id)?;
         writer.write_all(&fingerprint.to_le_bytes())?;
         writer.write_all(&(self._num_layers as u64).to_le_bytes())?;
         writer.write_all(&(self.max_seq_len as u64).to_le_bytes())?;
@@ -4976,13 +5066,21 @@ impl KvCache {
     }
 
     /// Reset this cache in place from `reader`. `expected_fingerprint` is
-    /// the caller's current model fingerprint; if the file's stored
-    /// fingerprint disagrees the load is refused.
+    /// the caller's current model fingerprint for a version 2 file and
+    /// `expected_fingerprint_v1` for a version 1 file; if the file's stored
+    /// fingerprint disagrees the load is refused. The semantics identifier of
+    /// a version 2 file is checked against `running` (and the earlier ones
+    /// listed as reproducing the same bits); a version 1 file is
+    /// [`KvCacheSemantics::Unpinned`], refused under
+    /// [`KvCachePolicy::RequirePinned`].
     fn read_from(
         &mut self,
         reader: &mut impl std::io::Read,
         expected_fingerprint: u64,
-    ) -> Result<(), KvCacheLoadError> {
+        expected_fingerprint_v1: u64,
+        running: &[u8; 32],
+        policy: KvCachePolicy,
+    ) -> Result<KvCacheSemantics, KvCacheLoadError> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         if &magic != KV_MAGIC {
@@ -4992,12 +5090,25 @@ impl KvCache {
         let mut buf8 = [0u8; 8];
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != KV_FORMAT_VERSION {
-            return Err(KvCacheLoadError::UnsupportedVersion {
-                got: version,
-                expected: KV_FORMAT_VERSION,
-            });
-        }
+        let (semantics, expected_fingerprint) = match version {
+            KV_FORMAT_VERSION => {
+                let mut stored = [0u8; 32];
+                reader.read_exact(&mut stored)?;
+                (kv_check_semantics(stored, running)?, expected_fingerprint)
+            }
+            KV_FORMAT_VERSION_UNPINNED => match policy {
+                KvCachePolicy::AcceptUnpinned => {
+                    (KvCacheSemantics::Unpinned, expected_fingerprint_v1)
+                }
+                KvCachePolicy::RequirePinned => return Err(KvCacheLoadError::Unpinned),
+            },
+            _ => {
+                return Err(KvCacheLoadError::UnsupportedVersion {
+                    got: version,
+                    expected: KV_FORMAT_VERSION,
+                })
+            }
+        };
         reader.read_exact(&mut buf8)?;
         let file_fingerprint = u64::from_le_bytes(buf8);
         if file_fingerprint != expected_fingerprint {
@@ -5054,8 +5165,25 @@ impl KvCache {
             reader.read_exact(values_bytes)?;
         }
         self.seq_len = seq_len;
-        Ok(())
+        Ok(semantics)
     }
+}
+
+/// The semantics identifier of a version 2 file against this build's
+fn kv_check_semantics(
+    stored: [u8; 32],
+    running: &[u8; 32],
+) -> Result<KvCacheSemantics, KvCacheLoadError> {
+    if &stored == running {
+        return Ok(KvCacheSemantics::Current);
+    }
+    if crate::semantics::LLM_PREVIOUS_SEMANTICS_IDS.contains(&stored) {
+        return Ok(KvCacheSemantics::VerifiedPrevious(stored));
+    }
+    Err(KvCacheLoadError::SemanticsMismatch {
+        stored,
+        running: *running,
+    })
 }
 
 /// Reinterpret an `&[f32]` as an `&[u8]` for I/O. Endianness of the caller
@@ -13365,7 +13493,11 @@ impl<'a> Llama3Model<'a> {
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
         let fingerprint = kv_cache_fingerprint(&self.config);
-        self.kv_cache.write_to(&mut writer, fingerprint)?;
+        self.kv_cache.write_to(
+            &mut writer,
+            fingerprint,
+            &crate::semantics::RUNNING_SEMANTICS_ID,
+        )?;
         use std::io::Write;
         writer.flush()
     }
@@ -13380,15 +13512,40 @@ impl<'a> Llama3Model<'a> {
     /// On success the model's KV cache is byte-identical to the moment
     /// `save_kv_cache` was called, and `forward()` can continue from
     /// `seq_len()` without re-prefilling the prompt.
+    ///
+    /// The result says what is known about the arithmetic the file was
+    /// written with ([`KvCacheSemantics`]): a version 2 file carries the
+    /// writer's semantics identifier and is refused with
+    /// [`KvCacheLoadError::SemanticsMismatch`] when this build does not
+    /// reproduce it (another `alice-det-math` generation, or the other of
+    /// the Law and `platform-math` builds); a version 1 file is
+    /// [`KvCacheSemantics::Unpinned`].
     pub fn load_kv_cache(
         &mut self,
         path: impl AsRef<std::path::Path>,
-    ) -> Result<(), KvCacheLoadError> {
+    ) -> Result<KvCacheSemantics, KvCacheLoadError> {
+        self.load_kv_cache_with(path, KvCachePolicy::AcceptUnpinned)
+    }
+
+    /// [`Self::load_kv_cache`] under `policy`
+    ///
+    /// # Errors
+    /// As [`Self::load_kv_cache`], and [`KvCacheLoadError::Unpinned`] for a
+    /// version 1 file under [`KvCachePolicy::RequirePinned`].
+    pub fn load_kv_cache_with(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        policy: KvCachePolicy,
+    ) -> Result<KvCacheSemantics, KvCacheLoadError> {
         let file = std::fs::File::open(path)?;
         let mut reader = std::io::BufReader::new(file);
-        let fingerprint = kv_cache_fingerprint(&self.config);
-        self.kv_cache.read_from(&mut reader, fingerprint)?;
-        Ok(())
+        self.kv_cache.read_from(
+            &mut reader,
+            kv_cache_fingerprint(&self.config),
+            kv_cache_fingerprint_v1(&self.config),
+            &crate::semantics::RUNNING_SEMANTICS_ID,
+            policy,
+        )
     }
 
     /// Current cached token position (0-based). Callable after
@@ -22698,12 +22855,24 @@ mod tests {
 
         // Serialise to a `Vec<u8>` (skips filesystem for a hermetic test).
         let mut bytes = Vec::new();
-        cache.write_to(&mut bytes, fingerprint).expect("write ok");
+        cache
+            .write_to(
+                &mut bytes,
+                fingerprint,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+            )
+            .expect("write ok");
 
         // Deserialise into a fresh cache of matching shape.
         let mut restored = KvCache::new(num_layers, max_seq_len, kv_dim);
         restored
-            .read_from(&mut bytes.as_slice(), fingerprint)
+            .read_from(
+                &mut bytes.as_slice(),
+                fingerprint,
+                0,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+                KvCachePolicy::RequirePinned,
+            )
             .expect("read ok");
 
         assert_eq!(cache.seq_len, restored.seq_len);
@@ -22725,7 +22894,13 @@ mod tests {
         let mut buf: Vec<u8> = b"NOTMAGIC".to_vec();
         buf.extend_from_slice(&[0u8; 64]);
         let err = restored
-            .read_from(&mut buf.as_slice(), 0)
+            .read_from(
+                &mut buf.as_slice(),
+                0,
+                0,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+                KvCachePolicy::AcceptUnpinned,
+            )
             .expect_err("bad magic must fail");
         assert!(
             matches!(err, KvCacheLoadError::BadMagic { .. }),
@@ -22737,10 +22912,18 @@ mod tests {
     fn kv_cache_load_rejects_fingerprint_mismatch() {
         let cache = make_populated_kv_cache(2, 8, 16, 3, 7);
         let mut bytes = Vec::new();
-        cache.write_to(&mut bytes, 0x1111).expect("write ok");
+        cache
+            .write_to(&mut bytes, 0x1111, &crate::semantics::RUNNING_SEMANTICS_ID)
+            .expect("write ok");
         let mut restored = KvCache::new(2, 8, 16);
         let err = restored
-            .read_from(&mut bytes.as_slice(), 0x2222)
+            .read_from(
+                &mut bytes.as_slice(),
+                0x2222,
+                0x1111,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+                KvCachePolicy::AcceptUnpinned,
+            )
             .expect_err("fingerprint mismatch must fail");
         assert!(
             matches!(err, KvCacheLoadError::FingerprintMismatch { .. }),
@@ -22752,16 +22935,211 @@ mod tests {
     fn kv_cache_load_rejects_shape_mismatch() {
         let cache = make_populated_kv_cache(4, 16, 32, 3, 7);
         let mut bytes = Vec::new();
-        cache.write_to(&mut bytes, 0x1234).expect("write ok");
+        cache
+            .write_to(&mut bytes, 0x1234, &crate::semantics::RUNNING_SEMANTICS_ID)
+            .expect("write ok");
         // Cache with a different num_layers must reject the load.
         let mut restored = KvCache::new(8, 16, 32);
         let err = restored
-            .read_from(&mut bytes.as_slice(), 0x1234)
+            .read_from(
+                &mut bytes.as_slice(),
+                0x1234,
+                0,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+                KvCachePolicy::AcceptUnpinned,
+            )
             .expect_err("shape mismatch must fail");
         assert!(
             matches!(err, KvCacheLoadError::ShapeMismatch(_)),
             "expected ShapeMismatch, got {err:?}"
         );
+    }
+
+    /// `write_to` of alice-llm 2.0.1 (format 1) for
+    /// `make_populated_kv_cache(2, 4, 3, 2, 5)` with fingerprint
+    /// 0x1234_5678_9abc_def0: bytes written by that release, kept here
+    const KV_V1_FIXTURE_HEX: &str = "414c4943454b563101000000f0debc9a78563412020000000000000004000000000000000300000000000000020000000000000000000000010000000bd7a33ba69bc43b4260e53ba69b443cf4fd543c4260653c0bd7a33ba69bc43b4260e53b6f12833c96438b3cbd74933c6f12033cbd74133c0bd7233c90c2753c6f12833c96438b3c0bd7233c5939343ca69b443c3208ac3c5939b43c806abc3c";
+    const KV_V1_FINGERPRINT: u64 = 0x1234_5678_9abc_def0;
+
+    fn kv_v1_fixture() -> Vec<u8> {
+        (0..KV_V1_FIXTURE_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&KV_V1_FIXTURE_HEX[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// An identifier no build reproduces
+    const KV_FOREIGN: [u8; 32] = [0x22; 32];
+
+    #[test]
+    fn kv_cache_v2_header_holds_the_semantics_id() {
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        let mut bytes = Vec::new();
+        cache
+            .write_to(&mut bytes, 7, &crate::semantics::RUNNING_SEMANTICS_ID)
+            .unwrap();
+        assert_eq!(&bytes[0..8], b"ALICEKV1");
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&bytes[12..44], &crate::semantics::RUNNING_SEMANTICS_ID);
+        assert_eq!(&bytes[44..52], &7u64.to_le_bytes());
+        // the rest is the version 1 body after its fingerprint
+        assert_eq!(&bytes[52..], &kv_v1_fixture()[20..]);
+    }
+
+    #[test]
+    fn kv_cache_v2_reads_back_as_current() {
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        let mut bytes = Vec::new();
+        let run = crate::semantics::RUNNING_SEMANTICS_ID;
+        cache.write_to(&mut bytes, 7, &run).unwrap();
+        for policy in [KvCachePolicy::AcceptUnpinned, KvCachePolicy::RequirePinned] {
+            let mut restored = KvCache::new(2, 4, 3);
+            let got = restored
+                .read_from(&mut bytes.as_slice(), 7, 0, &run, policy)
+                .unwrap();
+            assert_eq!(got, KvCacheSemantics::Current);
+            assert_eq!(restored.keys, cache.keys);
+        }
+    }
+
+    #[test]
+    fn kv_cache_foreign_semantics_is_refused_naming_both() {
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, 7, &KV_FOREIGN).unwrap();
+        let run = crate::semantics::RUNNING_SEMANTICS_ID;
+        for policy in [KvCachePolicy::AcceptUnpinned, KvCachePolicy::RequirePinned] {
+            let mut restored = KvCache::new(2, 4, 3);
+            let err = restored
+                .read_from(&mut bytes.as_slice(), 7, 0, &run, policy)
+                .unwrap_err();
+            assert!(
+                matches!(err, KvCacheLoadError::SemanticsMismatch { stored, running }
+                    if stored == KV_FOREIGN && running == run),
+                "{err:?}"
+            );
+            let shown = err.to_string();
+            let hex = |id: &[u8; 32]| {
+                use std::fmt::Write as _;
+                id.iter().fold(String::new(), |mut out, b| {
+                    let _ = write!(out, "{b:02x}");
+                    out
+                })
+            };
+            assert!(
+                shown.contains(&hex(&KV_FOREIGN)) && shown.contains(&hex(&run)),
+                "{shown}"
+            );
+            // nothing was loaded
+            assert_eq!(restored.seq_len, 0);
+        }
+    }
+
+    /// A cache written by the other build mode is refused: the Law build's
+    /// identifier and the platform-math build's differ
+    #[test]
+    fn kv_cache_of_the_other_build_mode_is_refused() {
+        use crate::semantics::{LLM_PLATFORM_SEMANTICS_ID, LLM_SEMANTICS_ID};
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        for (writer, reader) in [
+            (LLM_SEMANTICS_ID, LLM_PLATFORM_SEMANTICS_ID),
+            (LLM_PLATFORM_SEMANTICS_ID, LLM_SEMANTICS_ID),
+        ] {
+            let mut bytes = Vec::new();
+            cache.write_to(&mut bytes, 7, &writer).unwrap();
+            let mut restored = KvCache::new(2, 4, 3);
+            let err = restored
+                .read_from(
+                    &mut bytes.as_slice(),
+                    7,
+                    0,
+                    &reader,
+                    KvCachePolicy::AcceptUnpinned,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, KvCacheLoadError::SemanticsMismatch { .. }),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_v1_fixture_reads_as_unpinned_or_is_refused() {
+        let run = crate::semantics::RUNNING_SEMANTICS_ID;
+        let bytes = kv_v1_fixture();
+        let mut restored = KvCache::new(2, 4, 3);
+        let got = restored
+            .read_from(
+                &mut bytes.as_slice(),
+                0,
+                KV_V1_FINGERPRINT,
+                &run,
+                KvCachePolicy::AcceptUnpinned,
+            )
+            .unwrap();
+        assert_eq!(got, KvCacheSemantics::Unpinned);
+        let want = make_populated_kv_cache(2, 4, 3, 2, 5);
+        assert_eq!(restored.seq_len, 2);
+        assert_eq!(restored.keys, want.keys);
+        assert_eq!(restored.values, want.values);
+        let mut refused = KvCache::new(2, 4, 3);
+        let err = refused
+            .read_from(
+                &mut bytes.as_slice(),
+                0,
+                KV_V1_FINGERPRINT,
+                &run,
+                KvCachePolicy::RequirePinned,
+            )
+            .unwrap_err();
+        assert!(matches!(err, KvCacheLoadError::Unpinned), "{err:?}");
+        assert_eq!(KvCachePolicy::default(), KvCachePolicy::AcceptUnpinned);
+    }
+
+    #[test]
+    fn kv_cache_unknown_version_is_refused() {
+        let mut bytes = kv_v1_fixture();
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let mut restored = KvCache::new(2, 4, 3);
+        let err = restored
+            .read_from(
+                &mut bytes.as_slice(),
+                0,
+                KV_V1_FINGERPRINT,
+                &crate::semantics::RUNNING_SEMANTICS_ID,
+                KvCachePolicy::AcceptUnpinned,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, KvCacheLoadError::UnsupportedVersion { got: 3, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The version 2 fingerprint is FNV-1a 64 over fixed fields, written out
+    /// here independently (unlike `DefaultHasher`, it cannot change with the
+    /// Rust release)
+    #[test]
+    fn kv_cache_fingerprint_is_fnv_1a_of_the_shape_fields() {
+        let c = Llama3Config::llama3_8b();
+        // FNV-1a 64 written out here over the same bytes
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut bytes = Vec::new();
+        for v in [
+            c.num_layers,
+            c.num_kv_heads,
+            c.head_dim,
+            c.hidden_dim,
+            c.max_seq_len,
+        ] {
+            bytes.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+        bytes.extend_from_slice(format!("{:?}", c.arch).as_bytes());
+        for b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(kv_cache_fingerprint(&c), h);
     }
 
     #[test]
