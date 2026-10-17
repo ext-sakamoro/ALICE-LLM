@@ -26,8 +26,22 @@ impl BpeTokenizer {
     /// Create a new tokenizer from merge rules and a vocabulary map.
     #[must_use]
     pub fn new(merges: Vec<MergeRule>, vocab: HashMap<String, u32>) -> Self {
-        let inverse_vocab: HashMap<u32, String> =
-            vocab.iter().map(|(k, &v)| (v, k.clone())).collect();
+        // Several strings may share an id; the smallest one is kept, so the
+        // result does not depend on the order the map is iterated in
+        // (`HashMap` iteration order differs between instances)
+        let mut inverse_vocab: HashMap<u32, String> = HashMap::with_capacity(vocab.len());
+        for (k, &v) in &vocab {
+            match inverse_vocab.entry(v) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(k.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if k < e.get() {
+                        e.insert(k.clone());
+                    }
+                }
+            }
+        }
         Self {
             merges,
             vocab,

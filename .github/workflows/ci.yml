@@ -194,9 +194,11 @@ jobs:
         run: cargo test --test analytic_oracle
       # ALICE-Law G1 / G2: ln_1p against an f64 reference, and the bit-level tie tests of
       # the max / min / clamp sites (scripts/run_tests.sh fails on a binary that ran 0 tests)
-      - name: Law tests (lawmath ln_1p, max / min ties)
+      - name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)
         if: matrix.features == 'default'
-        run: scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5 -- cargo test --test lawmath_ln_1p --test law_max_min_ties
+        run: |
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=6,llm_semantics_id=9 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id
+          scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
         if: matrix.features == 'default'

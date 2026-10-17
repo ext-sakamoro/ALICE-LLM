@@ -215,8 +215,9 @@ step "ci.yml / test: cargo test (--features simd)"
 step "ci.yml / test: Analytic oracle tests (closed-form laws)"
 ( export CARGO_TERM_COLOR="always"; cargo test --test analytic_oracle )
 
-step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties)"
-scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5 -- cargo test --test lawmath_ln_1p --test law_max_min_ties
+step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)"
+scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=6,llm_semantics_id=9 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id
+scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
 
 step "ci.yml / test: Non-Law build compiles (platform-math)"
 cargo check --all-targets --features platform-math
