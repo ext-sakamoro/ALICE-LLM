@@ -4,7 +4,9 @@
 //! on quantized weights without materializing full FP32 tensors.
 //! Supports Q4_K, Q8_0, F16, and F32.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+use crate::lookup::LookupMap;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -427,8 +429,8 @@ impl<'a> Reader<'a> {
 /// A parsed GGUF file. Holds metadata and raw data references for
 /// zero-copy tensor access.
 pub struct GgufFile<'a> {
-    pub metadata: HashMap<String, MetaValue>,
-    pub tensors: HashMap<String, TensorInfo>,
+    pub metadata: BTreeMap<String, MetaValue>,
+    pub tensors: BTreeMap<String, TensorInfo>,
     tensor_data_start: usize,
     data: &'a [u8],
     _alignment: usize,
@@ -453,7 +455,7 @@ impl<'a> GgufFile<'a> {
         let metadata_count = r.read_u64()? as usize;
 
         // Parse metadata
-        let mut metadata = HashMap::with_capacity(metadata_count);
+        let mut metadata = BTreeMap::new();
         for _ in 0..metadata_count {
             let key = r.read_string()?;
             let vtype = r.read_u32()?;
@@ -462,7 +464,7 @@ impl<'a> GgufFile<'a> {
         }
 
         // Parse tensor info
-        let mut tensors = HashMap::with_capacity(tensor_count);
+        let mut tensors = BTreeMap::new();
         for _ in 0..tensor_count {
             let name = r.read_string()?;
             let n_dims = r.read_u32()?;
@@ -640,7 +642,7 @@ impl<'a> GgufFile<'a> {
 pub struct GgufMultiFile<'a> {
     shards: Vec<GgufFile<'a>>,
     /// `tensor_name` → index into `shards` of the shard that owns it.
-    tensor_shard_idx: HashMap<String, usize>,
+    tensor_shard_idx: LookupMap<String, usize>,
 }
 
 impl<'a> GgufMultiFile<'a> {
@@ -655,7 +657,7 @@ impl<'a> GgufMultiFile<'a> {
         for bytes in shard_bytes {
             shards.push(GgufFile::parse(bytes)?);
         }
-        let mut tensor_shard_idx: HashMap<String, usize> = HashMap::new();
+        let mut tensor_shard_idx: LookupMap<String, usize> = LookupMap::new();
         for (idx, shard) in shards.iter().enumerate() {
             for name in shard.tensors.keys() {
                 // First shard wins on duplicate names (should not happen
@@ -4704,9 +4706,9 @@ fn gpt2_byte_to_char() -> [char; 256] {
 }
 
 /// Build reverse mapping: GPT-2 unicode char → original byte value.
-fn gpt2_char_to_byte() -> HashMap<char, u8> {
+fn gpt2_char_to_byte() -> LookupMap<char, u8> {
     let table = gpt2_byte_to_char();
-    let mut map = HashMap::with_capacity(256);
+    let mut map = LookupMap::with_capacity(256);
     for (b, &ch) in table.iter().enumerate() {
         map.insert(ch, b as u8);
     }
@@ -4791,7 +4793,7 @@ pub struct GgufTokenizer {
     merges: Vec<(Vec<u8>, Vec<u8>)>,
     /// Per-token scores (SPM only). Populated when `model_type == Spm`.
     scores: Vec<f32>,
-    token_to_id: HashMap<Vec<u8>, u32>,
+    token_to_id: LookupMap<Vec<u8>, u32>,
     /// Byte fallback tokens `<0x00>`..`<0xFF>` → token id (SPM only).
     byte_to_id: [Option<u32>; 256],
     /// Special tokens (e.g. `<|begin_of_text|>`, `<start_of_turn>`) sorted by
@@ -4800,7 +4802,7 @@ pub struct GgufTokenizer {
     /// GPT-2 byte→char mapping (for encoding input text, BPE only).
     byte_encoder: [char; 256],
     /// GPT-2 char→byte mapping (for decoding tokens to text, BPE only).
-    byte_decoder: HashMap<char, u8>,
+    byte_decoder: LookupMap<char, u8>,
     /// Tokenizer model type (BPE vs SPM). Determines encode/decode path.
     model_type: TokenizerModel,
     pub bos_id: u32,
@@ -4869,7 +4871,7 @@ impl GgufTokenizer {
         };
 
         let mut tokens = Vec::with_capacity(token_strs.len());
-        let mut token_to_id = HashMap::with_capacity(token_strs.len());
+        let mut token_to_id = LookupMap::with_capacity(token_strs.len());
         let mut special_tokens = Vec::new();
 
         // Prefer GGUF `tokenizer.ggml.token_type`: 3 = CONTROL, 4 = USER_DEFINED

@@ -33,7 +33,7 @@
 //! rank 到達で下位 bucket を drop) 完全 top-K が必要な場合は Phase 2 で
 //! full-count sketch を追加する
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[cfg(feature = "dspark-serde")]
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,7 @@ pub trait BigramBias {
 pub struct MarkovBigramBias {
     vocab_size: u32,
     rank: u32,
-    entries: HashMap<TokenId, Vec<(TokenId, u32)>>,
+    entries: BTreeMap<TokenId, Vec<(TokenId, u32)>>,
 }
 
 impl MarkovBigramBias {
@@ -245,7 +245,7 @@ impl MarkovBigramBias {
         Ok(Self {
             vocab_size,
             rank,
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
         })
     }
 
@@ -395,13 +395,13 @@ impl BigramBias for MarkovBigramBias {
 /// top-K を選ぶ apply コストは `O(N_unique_next * log N_unique_next)` per call で
 /// [`MarkovBigramBias`] より遅いが、正確な top-K を保証する
 ///
-/// storage: `HashMap<TokenId, HashMap<TokenId, u32>>` (sparse)
+/// storage: `BTreeMap<TokenId, BTreeMap<TokenId, u32>>` (sparse, serialized in key order)
 #[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct FullCountBigramBias {
     vocab_size: u32,
     rank: u32,
-    counts: HashMap<TokenId, HashMap<TokenId, u32>>,
+    counts: BTreeMap<TokenId, BTreeMap<TokenId, u32>>,
 }
 
 impl FullCountBigramBias {
@@ -419,7 +419,7 @@ impl FullCountBigramBias {
         Ok(Self {
             vocab_size,
             rank,
-            counts: HashMap::new(),
+            counts: BTreeMap::new(),
         })
     }
 
@@ -459,7 +459,7 @@ impl FullCountBigramBias {
 
     /// 特定 prev に対して観測された unique next の種類数 (未観測 prev は 0)
     pub fn unique_next_count(&self, prev: TokenId) -> usize {
-        self.counts.get(&prev).map_or(0, HashMap::len)
+        self.counts.get(&prev).map_or(0, BTreeMap::len)
     }
 
     /// prev → next の観測 count を返す (未観測は 0)

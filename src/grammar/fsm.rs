@@ -28,7 +28,7 @@
 //! - Grammar authoring (LOL / JSON / tool-call payloads) is out of scope
 //!   for this module.
 
-use std::collections::HashSet;
+use crate::lookup::LookupSet;
 use std::fmt;
 
 use super::gbnf::{CharClass, Grammar, Symbol};
@@ -341,7 +341,7 @@ impl<'g> Fsm<'g> {
     fn expand_all(&mut self) -> Result<(), FsmError> {
         let mut result: Vec<Cursor> = Vec::new();
         let mut work: Vec<(Cursor, usize)> = self.active.drain(..).map(|c| (c, 0usize)).collect();
-        let mut seen: HashSet<Cursor> = HashSet::new();
+        let mut seen: LookupSet<Cursor> = LookupSet::new();
         let mut hit_cap = false;
 
         while let Some((cursor, depth)) = work.pop() {
@@ -493,10 +493,10 @@ mod tests {
     fn empty_root_rejected() {
         // Build a Grammar manually with a root rule that has no alternatives.
         // parse_gbnf itself rejects such input, so construct directly.
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         let grammar = Grammar {
             rules: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("root".to_string(), Vec::new());
                 m
             },
@@ -700,10 +700,10 @@ mod tests {
         // `root ::= root "a"` — no base case, every path exceeds depth.
         // Constructed manually since parse_gbnf itself is happy with it.
         use super::super::gbnf::{Alternative, Symbol};
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         let grammar = Grammar {
             rules: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert(
                     "root".to_string(),
                     vec![Alternative(vec![

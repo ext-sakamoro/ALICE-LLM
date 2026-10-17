@@ -63,7 +63,7 @@ pub fn top_p_filter(logits: &mut [f32], p: f32) {
         }
     }
 
-    let keep: std::collections::HashSet<usize> =
+    let keep: crate::lookup::LookupSet<usize> =
         indexed[..cutoff_idx].iter().map(|&(i, _)| i).collect();
 
     for (i, l) in logits.iter_mut().enumerate() {

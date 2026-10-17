@@ -1,6 +1,8 @@
 //! tokenizer.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+use crate::lookup::LookupMap;
 
 // ---------------------------------------------------------------------------
 // BPE Tokenizer
@@ -18,33 +20,34 @@ pub struct MergeRule {
 #[derive(Debug, Clone)]
 pub struct BpeTokenizer {
     merges: Vec<MergeRule>,
-    vocab: HashMap<String, u32>,
-    inverse_vocab: HashMap<u32, String>,
+    vocab: LookupMap<String, u32>,
+    inverse_vocab: LookupMap<u32, String>,
 }
 
 impl BpeTokenizer {
-    /// Create a new tokenizer from merge rules and a vocabulary map.
+    /// Create a new tokenizer from merge rules and `(string, id)` pairs (a
+    /// `HashMap<String, u32>` or any other map or list of pairs).
+    ///
+    /// The result does not depend on the order of the pairs: a string given
+    /// more than once keeps its smallest id, and an id shared by several
+    /// strings decodes to the smallest string.
     #[must_use]
-    pub fn new(merges: Vec<MergeRule>, vocab: HashMap<String, u32>) -> Self {
-        // Several strings may share an id; the smallest one is kept, so the
-        // result does not depend on the order the map is iterated in
-        // (`HashMap` iteration order differs between instances)
-        let mut inverse_vocab: HashMap<u32, String> = HashMap::with_capacity(vocab.len());
-        for (k, &v) in &vocab {
-            match inverse_vocab.entry(v) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(k.clone());
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if k < e.get() {
-                        e.insert(k.clone());
-                    }
-                }
-            }
+    pub fn new(merges: Vec<MergeRule>, vocab: impl IntoIterator<Item = (String, u32)>) -> Self {
+        let mut ordered: BTreeMap<String, u32> = BTreeMap::new();
+        for (k, v) in vocab {
+            ordered
+                .entry(k)
+                .and_modify(|id| *id = (*id).min(v))
+                .or_insert(v);
+        }
+        // strings in ascending order, so the first one stored for an id is the smallest
+        let mut inverse_vocab: LookupMap<u32, String> = LookupMap::with_capacity(ordered.len());
+        for (k, &v) in &ordered {
+            inverse_vocab.entry(v).or_insert_with(|| k.clone());
         }
         Self {
             merges,
-            vocab,
+            vocab: ordered.into_iter().collect(),
             inverse_vocab,
         }
     }
@@ -52,11 +55,11 @@ impl BpeTokenizer {
     /// Build a simple character-level tokenizer with optional merges.
     #[must_use]
     pub fn from_chars(text: &str, merges: Vec<MergeRule>) -> Self {
-        let mut vocab = HashMap::new();
+        let mut vocab = BTreeMap::new();
         let mut id = 0u32;
         for ch in text.chars() {
             let s = ch.to_string();
-            if let std::collections::hash_map::Entry::Vacant(e) = vocab.entry(s) {
+            if let std::collections::btree_map::Entry::Vacant(e) = vocab.entry(s) {
                 e.insert(id);
                 id += 1;
             }

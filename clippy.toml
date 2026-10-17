@@ -70,3 +70,27 @@ disallowed-methods = [
     { path = "f64::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min64" },
     { path = "f64::clamp", reason = "NaN passes through with its payload and inverted bounds panic; write it with crate::lawmath::max64 / min64" },
 ]
+
+# ALICE-Law G13: hash collections iterate in an order that differs between runs,
+# and a thread whose results are combined makes the order depend on scheduling.
+# src/lookup.rs is the one module allowed to name the hash collections (keyed
+# access only, no iteration); scripts/order_guard.py is the source-reading half.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::HashSet", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::Iter", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::IterMut", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::Keys", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::Values", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::ValuesMut", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::IntoIter", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::IntoKeys", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::IntoValues", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_map::Drain", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_set::Iter", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_set::IntoIter", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::collections::hash_set::Drain", reason = "iteration order is unspecified and differs between runs (ALICE-Law G13); use BTreeMap / BTreeSet, or crate::lookup::LookupMap / LookupSet for keyed access only" },
+    { path = "std::thread::Builder", reason = "a thread whose results are combined makes the order depend on scheduling and thread count (ALICE-Law G13)" },
+    { path = "std::thread::JoinHandle", reason = "a thread whose results are combined makes the order depend on scheduling and thread count (ALICE-Law G13)" },
+    { path = "std::thread::ScopedJoinHandle", reason = "a thread whose results are combined makes the order depend on scheduling and thread count (ALICE-Law G13)" },
+]

@@ -220,13 +220,18 @@ pub fn kvouter_forward(
     };
 
     // --- Walk work units. Parallelized under `parallel` feature. ---------
+    // every unit runs and the first error in unit order is returned, as the
+    // single-threaded loop returns it (try_for_each would return whichever
+    // failing unit a thread reached first)
     #[cfg(feature = "parallel")]
-    let result: Result<(), SparseAttentionError> =
-        tasks
-            .par_iter_mut()
-            .try_for_each(|(unit, o_slice, m_slice, l_slice)| {
-                process_work_unit(&ctx, unit, o_slice, m_slice, l_slice)
-            });
+    let result: Result<(), SparseAttentionError> = tasks
+        .par_iter_mut()
+        .map(|(unit, o_slice, m_slice, l_slice)| {
+            process_work_unit(&ctx, unit, o_slice, m_slice, l_slice)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
     #[cfg(not(feature = "parallel"))]
     let result: Result<(), SparseAttentionError> =
         tasks

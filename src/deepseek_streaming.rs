@@ -42,7 +42,7 @@
 //!
 //! - [`StreamingExpertPool`] — owns a byte source and an LRU cache of decoded
 //!   expert slabs. Cache eviction is byte-budget-driven.
-//! - [`LruExpertCache`] — MRU-first `VecDeque` order + `HashMap` slot map, with
+//! - [`LruExpertCache`] — MRU-first `VecDeque` order + `LookupMap` slot map, with
 //!   `Arc<Vec<u8>>` so a caller can safely hold a slab reference across an
 //!   eviction of the same key.
 //! - [`ExpertByteSource`] — trait abstracting the underlying storage; the two
@@ -67,7 +67,9 @@
 //! - **Real DeepSeek-V3 GGUF benchmarks** — blocked on local disk budget
 //!   (~370 GB) and dedicated multi-day slot.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use crate::lookup::{LookupMap, LookupSet};
 use std::sync::{Arc, Mutex};
 
 use crate::gguf::GgmlType;
@@ -242,7 +244,7 @@ pub struct ExpertLayerInfo {
 /// then returned to finish its matvec still holds valid bytes — the `Arc`
 /// keeps the eviction-victim `Vec` alive until the last handle drops.
 pub struct LruExpertCache {
-    entries: HashMap<ExpertKey, Arc<Vec<u8>>>,
+    entries: LookupMap<ExpertKey, Arc<Vec<u8>>>,
     /// Front = most-recently used; back = eviction candidate.
     lru: VecDeque<ExpertKey>,
     /// Phase 4b.3 hot-pinning set: keys in here are skipped by the LRU
@@ -251,7 +253,7 @@ pub struct LruExpertCache {
     /// top-N most-frequent experts identified by offline profiling —
     /// pinning them costs a fixed amount of RAM but eliminates the miss
     /// penalty every time the router picks them.
-    pinned: HashSet<ExpertKey>,
+    pinned: LookupSet<ExpertKey>,
     current_bytes: usize,
     budget_bytes: usize,
     hits: u64,
@@ -263,9 +265,9 @@ impl LruExpertCache {
     /// (every lookup misses, useful for cold-cache micro-benchmarks).
     pub fn with_budget(budget_bytes: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: LookupMap::new(),
             lru: VecDeque::new(),
-            pinned: HashSet::new(),
+            pinned: LookupSet::new(),
             current_bytes: 0,
             budget_bytes,
             hits: 0,

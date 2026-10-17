@@ -1,0 +1,72 @@
+# scripts/order_guard.py (ALICE-Law G13): production sites whose order cannot
+# reach a Law-bearing output, with the exact line count, the SHA-256 of each
+# allowed line (stripped, in file order; the comment shows the line) and the reason
+
+[allow]
+"src/deepseek_streaming.rs::parallel" = { count = 2, lines = [
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "d1d51bc35777eb226afc293eaceda150fbf2341dafcbf0fc36d4a0823554a165", # keys.par_iter().for_each(|&k| {
+], reason = "prefetch_parallel only warms the expert cache: every key loads the same bytes from the file whatever thread runs it; the completion order changes which slab the LRU evicts later, never a value a forward pass reads (a miss reloads the same bytes); it returns nothing" }
+"src/gguf.rs::parallel" = { count = 20, lines = [
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "c084d789e8ed7b8a6315b83838f3f818e5b1904e5cefe3871011b7c812aa5e0e", # output.par_iter_mut().enumerate().for_each(|(r, out)| {
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "c084d789e8ed7b8a6315b83838f3f818e5b1904e5cefe3871011b7c812aa5e0e", # output.par_iter_mut().enumerate().for_each(|(r, out)| {
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "8a8f40ab26cbd009770435d1560596005d854b7bc324921e9e612ba45a0476ef", # .par_chunks_mut(8)
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "c084d789e8ed7b8a6315b83838f3f818e5b1904e5cefe3871011b7c812aa5e0e", # output.par_iter_mut().enumerate().for_each(|(r, out)| {
+], reason = "row-parallel matvec kernels: par_iter_mut / par_chunks_mut over the output rows (or 8-row chunks), each output element computed by one thread with a sequential inner loop in a fixed order; no partial sums are combined across threads (tests/order_independence.rs ternary_matvec_is_the_same_on_one_and_four_threads)" }
+"src/llama3.rs::HashMap" = { count = 1, lines = [
+    "a5575eb149828b98d8a7e84bcf977e8ce362b8df870d1e9d76e6782e5cfd06b7", # let mut hasher = std::collections::hash_map::DefaultHasher::new();
+], reason = "std::collections::hash_map::DefaultHasher::new() in kv_cache_fingerprint_v1: SipHash with fixed zero keys, used only to read KV cache files written before 3.0.0; no hash collection and no iteration order is involved" }
+"src/llama3.rs::parallel" = { count = 7, lines = [
+    "9c1a87f7c791848b031f6be05aee32bc68995fc6a45c4e4887d6b9b9501e4dee", # use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    "8ed62c740e13fabe7859b02a0fd7aa65c4393e849653d5d78d6661cf3999c204", # use rayon::slice::ParallelSliceMut;
+    "d969f54cfad67d5b34326e87102c62eab19d01db9d7735b64e06582fa711d7a2", # .par_chunks_mut(state_stride)
+    "132140314a48aed99a09f21c6b242e9383851b35f16725f6e9cda0e56027c272", # .zip(out.par_chunks_mut(v_dim))
+    "b829a5e79dc6a42d2923ba38bb7579f89902de040e7b624aa02e8ea887efc679", # use rayon::iter::ParallelBridge;
+    "7c2b578e911c180cb4ac0c74711c234b9682b98dc48c5fca83ccc1f0f85a3101", # head_iter.par_bridge()
+    "ee0fcc8812d8914e2908fe88bfdfc3614e800e94741ad4c62300220ac25edeed", # use rayon::iter::ParallelIterator;
+], reason = "two per-unit splits with no cross-thread combination: the state update zips par_chunks_mut of the state rows with par_chunks_mut of the output rows (one row pair per task), and the KDA heads go through par_bridge with each head writing only its own cache and its own output slice; the order tasks finish in cannot reach a value" }
+"src/lookup.rs::HashMap" = { count = 5, lines = [
+    "e0bfc18c40a9bfb68629f777a53fae4a70a82618b6941527960b9a0604d39f91", # use std::collections::hash_map::Entry;
+    "f8f716380985be153256f5fea9c3afc812cd38996e46e652285ecf9731da8856", # use std::collections::{HashMap, HashSet};
+    "4d2b1f102f9609813ea8ee1e42d9d7567706a48963bc1fa5a5937cffd385d2e6", # pub(crate) struct LookupMap<K, V>(HashMap<K, V>);
+    "a525631c55e56db79be9eae476351b03e62115f511609a5d0ee208db68fc4c01", # Self(HashMap::new())
+    "df4fd53ef4121116ad46f241a54e600e6e222f482a3b34a0d6ea17ec78c7b973", # Self(HashMap::with_capacity(capacity))
+], reason = "the one module allowed to name std HashMap: LookupMap wraps it with keyed get / insert / remove / entry / len only, no iteration method or iterating trait (tests/lookup_surface.rs), and Debug prints the length only" }
+"src/lookup.rs::HashSet" = { count = 3, lines = [
+    "f8f716380985be153256f5fea9c3afc812cd38996e46e652285ecf9731da8856", # use std::collections::{HashMap, HashSet};
+    "343cbbddd883691cb908385b9b0bec869c2ededc62400dbe6b91e7eb10644e0e", # pub(crate) struct LookupSet<T>(HashSet<T>);
+    "2febe4b41e75f0144e5ad0f4db0ab7758efe57a60fcd6ca820cbdb5528addce5", # Self(HashSet::new())
+], reason = "the one module allowed to name std HashSet: LookupSet wraps it with contains / insert / remove / len only, no iteration method or iterating trait (tests/lookup_surface.rs), and Debug prints the length only" }
+"src/sparse_attention/combine.rs::parallel" = { count = 2, lines = [
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "702ab464f8df5f14779f6a1928c0c4588d51928848091d96b9bc363d5e7dae4c", # out.par_chunks_mut(row_stride)
+], reason = "row-parallel: par_chunks_mut over the output rows, each row combined by one thread in a fixed order; no partial sums are combined across threads" }
+"src/sparse_attention/forward.rs::parallel" = { count = 2, lines = [
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "4c1a728fb197e6fdba9f7806f3ef5cd4242572b00486c092b49a084d64e1a24b", # .par_iter_mut()
+], reason = "row-parallel: par_iter_mut over per-query output slots, each computed by one thread in a fixed order; no partial sums are combined across threads" }
+"src/sparse_attention/proxy.rs::parallel" = { count = 2, lines = [
+    "bbef5897b670253dbae5f0572a5fbcd6a96df7a626792cd336705a6031f28990", # use rayon::prelude::*;
+    "702ab464f8df5f14779f6a1928c0c4588d51928848091d96b9bc363d5e7dae4c", # out.par_chunks_mut(row_stride)
+], reason = "row-parallel: par_chunks_mut over the output rows, each row computed by one thread in a fixed order; no partial sums are combined across threads" }
+"src/speculative_dspark.rs::parallel" = { count = 2, lines = [
+    "38436b7ee7b7d9a43fc17241b8c611eef64893548df30001820682762ca42edc", # pub struct DFlashParallelDraft {
+    "08aba4d82f885a97ec475ffea67a2ce96c55cbc5ea6f6f6261d46a376147387b", # impl DFlashParallelDraft {
+], reason = "the type name DFlashParallelDraft matches the Parallel trait pattern; no rayon and no thread is used in this file" }
+"Cargo.toml::rayon" = { count = 1, reason = "optional, behind the parallel feature; every use in src/ is a row-parallel or per-unit split listed above, with no combination across threads" }

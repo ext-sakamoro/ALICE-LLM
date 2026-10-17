@@ -174,10 +174,16 @@ pub fn compute_proxy_block_max_scores(
         Ok(())
     };
 
+    // every row runs and the first error in row order is returned, as the
+    // single-threaded loop below returns it (try_for_each would return
+    // whichever failing row a thread reached first)
     #[cfg(feature = "parallel")]
     out.par_chunks_mut(row_stride)
         .enumerate()
-        .try_for_each(|(i, row)| fill_row(i, row))?;
+        .map(|(i, row)| fill_row(i, row))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<(), _>>()?;
     #[cfg(not(feature = "parallel"))]
     for (i, row) in out.chunks_mut(row_stride).enumerate() {
         fill_row(i, row)?;

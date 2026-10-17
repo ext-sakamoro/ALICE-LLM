@@ -69,6 +69,7 @@ pub mod kv_cache;
 pub mod lawmath;
 pub mod linalg;
 pub mod llama3;
+mod lookup;
 pub mod matrix;
 pub mod prelude;
 pub mod quantization;

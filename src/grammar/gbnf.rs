@@ -25,7 +25,7 @@
 //! - `{n,m}` repeat — express with `*`/`+`/`?`.
 //! - Lookahead / lookbehind.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A character class such as `[a-z]` or `[^abc]`.
@@ -62,7 +62,7 @@ pub struct Alternative(pub Vec<Symbol>);
 /// A parsed grammar. The rule named `root` is the entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grammar {
-    pub rules: HashMap<String, Vec<Alternative>>,
+    pub rules: BTreeMap<String, Vec<Alternative>>,
     pub root: String,
 }
 
@@ -174,7 +174,7 @@ pub fn parse_gbnf(src: &str) -> Result<Grammar, GbnfError> {
 
 fn validate_symbol(
     sym: &Symbol,
-    rules: &HashMap<String, Vec<Alternative>>,
+    rules: &BTreeMap<String, Vec<Alternative>>,
 ) -> Result<(), GbnfError> {
     match sym {
         Symbol::RuleRef(name) => {
@@ -308,7 +308,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_grammar(&mut self) -> Result<Grammar, GbnfError> {
-        let mut rules: HashMap<String, Vec<Alternative>> = HashMap::new();
+        let mut rules: BTreeMap<String, Vec<Alternative>> = BTreeMap::new();
         loop {
             self.skip_ws_and_comments();
             if self.peek().is_none() {

@@ -216,8 +216,8 @@ jobs:
       - name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)
         if: matrix.features == 'default'
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
-          scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=10,float_edge_golden=6,running_semantics_id=1,lookup_surface=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id --test lookup_surface
+          scripts/run_tests.sh order_independence=9 -- cargo test --features gguf,parallel,dspark,dspark-serde,grammar --test order_independence
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
         if: matrix.features == 'default'
@@ -256,8 +256,8 @@ jobs:
         run: cargo test --release --test analytic_oracle
       - name: Law tests (release)
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
-          scripts/run_tests.sh order_independence=3 -- cargo test --release --features gguf,parallel,dspark --test order_independence
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=10,float_edge_golden=6 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
+          scripts/run_tests.sh order_independence=9 -- cargo test --release --features gguf,parallel,dspark,dspark-serde,grammar --test order_independence
 
   float-environment:
     # ALICE-Law G14 on each OS: round-to-nearest-even and no flush-to-zero at run
@@ -288,6 +288,8 @@ jobs:
           "$PY" scripts/test_run_tests.py
           "$PY" scripts/test_entropy_guard.py
           "$PY" scripts/entropy_guard.py
+          "$PY" scripts/test_order_guard.py
+          "$PY" scripts/order_guard.py
           "$PY" scripts/test_build_config_guard.py
           "$PY" scripts/build_config_guard.py
           "$PY" scripts/test_build_flags_check.py

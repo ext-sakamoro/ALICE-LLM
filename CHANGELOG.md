@@ -7,9 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `alice-law-conformance.toml` の G13 を fail-known に戻した 根拠は箇所ごとの監査と順序に依らない試験 3 本だけで、新しい `HashMap` / `HashSet` の反復や並列の組み合わせを src に足しても CI が止めない (clippy の禁止も、許可した箇所を数える走査器も無い)
-
 ### Added
 - CI (ALICE-Law G9): `scripts/id_move_check.py` (ALICE の識別子を持つ crate で共有、ALICE-Zip と同じ file) を追加 最新の release tag の公開版と作業 tree で `LLM_SEMANTICS_ID` と `LLM_PLATFORM_SEMANTICS_ID` の値を読み、動いたのに破壊的な版になっていない / 公開版の値が以前の識別子の一覧に無い / CHANGELOG が両方の値を書いていない時に fail する (ci.yml の clippy job と preflight) `RUNNING_SEMANTICS_ID` は cfg の別名として除外し、`tests/running_semantics_id.rs` (既定と platform-math の両方で実行) でどちらか 1 つと等しいことを固定する
 - `tests/float_edge_golden.rs` (ALICE-Law G4): 正負のゼロと厳密な打ち消しを公開の kernel で固定の bit と比べる (±0 の silu / gelu、一定値の layer_norm は +0、符号付きゼロの rms_norm、等しい logits の softmax はちょうど 0.25、位置 0 の RoPE は各ゼロの符号を test の中で導いて固定、一定値の量子化)
@@ -45,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **破壊的:** KV キャッシュの file を形式 2 にした (ALICE-Law G7 / G8) header の版の後に書いた build の `RUNNING_SEMANTICS_ID` 32 byte を持ち、読み込みは実行中の build の値と比べて、違えば `KvCacheLoadError::SemanticsMismatch` (両方の識別子を表示) で断る 既定の build と `platform-math` の build の file は互換でない 形式 1 の file (3.0.0 より前) は `KvCacheSemantics::Unpinned` として読め、`load_kv_cache_with(path, KvCachePolicy::RequirePinned)` は断る 形状の fingerprint を `DefaultHasher` (算法が Rust の版で変わりうる) から FNV-1a 64 に替えた
 - `BpeTokenizer::new`: 複数の文字列が同じ id を持つ時、map の走査順で最後のものでなく最小の文字列を復号に使う
 - `alice-law-conformance.toml`: G1 / G2 / G3 / G6 / G7 / G8 / G13 を pass にした
+- **破壊的:** `GgufFile.metadata` / `GgufFile.tensors` と `gbnf::Grammar.rules` を `HashMap` から `BTreeMap` にした (ALICE-Law G13) 走査は key の順になり、実行ごとに順が変わらない
+- `BpeTokenizer::new` は `(String, u32)` の組を `IntoIterator` で受ける (`HashMap<String, u32>` はそのまま渡せる) 同じ文字列が複数回来た時は最小の id を使い、組の順に依らない `BpeTokenizer` の `Debug` は表の中身でなく件数を出す
+- ALICE-Law G13: hash 表は crate 内の `LookupMap` / `LookupSet` (key での参照・挿入・削除と件数だけで走査できない、`src/lookup.rs`) か `BTreeMap` だけにした clippy.toml で std の `HashMap` / `HashSet` とその iterator、`std::thread` の `Builder` / `JoinHandle` / `ScopedJoinHandle` を禁止し (許すのは `src/lookup.rs` だけ)、`scripts/order_guard.py` (ALICE-Analytics と同一) が src の hash 表・rayon・thread を数え、許可した 47 行は行ごとの hash と理由つきで `scripts/order_allowlist.toml` に置く (CI の float-environment job と preflight) `tests/lookup_surface.rs` が `src/lookup.rs` に走査の method や trait が足されたら失敗する `alice-law-conformance.toml` の G13 は一度 fail-known に戻し (新しい反復を止める検査が無かった)、これらを入れて pass にした
+- `alice-law-conformance.toml`: G9 / G12 の note を実測 (crates.io の公開版、`id_move_check.py` の出力) で書き直し、G1 / G3 の evidence を CI の行番号でなく step 名で指すようにした G6 の試験数を 10 に直した (CI の必要数も 9 から 10 に)
+
+### Fixed
+- `parse_gbnf`: 未定義の rule が 2 つ以上ある時、error が名指す rule が実行ごとに変わっていた (rule の表を hash の順に検査していた) rule 名の順に検査する
+- `dspark-serde`: `MarkovBigramBias` / `FullCountBigramBias` を直列化した bytes が、同じ内容でも instance ごとに違っていた (hash の順に書いていた) token の順に書く 読み込みは従来の bytes も読める
+- `sparse_attention` の proxy score と forward: `parallel` で複数の行が不正な page id を持つ時、返す error が thread の進み方で変わっていた 全ての行を処理して行の順で最初の error を返す (単一 thread と同じ)
 
 - CI: every job now has a job-level `timeout-minutes` (21 of 22 jobs had none, so a hung step could hold a shared runner for GitHub's 6-hour limit). Each bound is the larger of 2× the slowest and 4× the median of the last 12 successful runs, rounded up to 5 minutes, with a floor of 15 minutes for jobs that run cargo (a cache miss rebuilds) and 10 for the rest; the release build gets 30 against a 4.6-minute maximum. Existing bounds (quality-deep's mutants) are unchanged, and the release workflow changes only by these lines. `scripts/workflow_timeouts.py` (tests: `scripts/test_workflow_timeouts.py`, byte-identical to ALICE-LOL's) checks every job and fails when it reads none; it runs in CI (the actionlint job) and in preflight.
 - CI: 公開 API の互換性の検査を `.github/workflows/semver-checks.yml` (`scripts/semver_gate.py`、ALICE-Law / ALICE-DB ほかと同一) に置き換えた crates.io の最新の alice-llm (2.0.0) を baseline にし、既定・既定なし・全 feature の 3 組で cargo semver-checks を走らせ、Cargo.toml の 2.0.1 が許す patch の段を超える変更を失敗させる 旧 job (security-audit.yml) は直前の commit (`HEAD~1`) と比べ、結果を問わない informational だった
