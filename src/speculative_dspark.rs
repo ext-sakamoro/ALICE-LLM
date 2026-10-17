@@ -345,10 +345,6 @@ impl MarkovBigramBias {
     /// # Errors
     /// - `logits.len() != vocab_size` の場合
     /// - `prev >= vocab_size` の場合
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn apply(
         &self,
         prev: TokenId,
@@ -375,7 +371,7 @@ impl MarkovBigramBias {
         };
         for &(next, count) in bucket {
             let idx = next as usize;
-            let bias = strength * (count as f32).ln_1p();
+            let bias = strength * crate::lawmath::ln_1p(count as f32);
             logits[idx] += bias;
         }
         Ok(())
@@ -517,10 +513,6 @@ impl FullCountBigramBias {
     /// # Errors
     /// - `logits.len() != vocab_size` の場合
     /// - `prev >= vocab_size` の場合
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn apply(
         &self,
         prev: TokenId,
@@ -551,7 +543,7 @@ impl FullCountBigramBias {
         ranked.truncate(rank);
         for (next, count) in ranked {
             let idx = next as usize;
-            let bias = strength * (count as f32).ln_1p();
+            let bias = strength * crate::lawmath::ln_1p(count as f32);
             logits[idx] += bias;
         }
         Ok(())
@@ -736,29 +728,21 @@ impl PositionConfidenceHead {
 }
 
 // 数値安定 sigmoid: z >= 0 は 1/(1+exp(-z))、z < 0 は exp(z)/(1+exp(z))
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn stable_sigmoid(z: f32) -> f32 {
     if z >= 0.0 {
-        let e = (-z).exp();
+        let e = crate::lawmath::exp(-z);
         1.0 / (1.0 + e)
     } else {
-        let e = z.exp();
+        let e = crate::lawmath::exp(z);
         e / (1.0 + e)
     }
 }
 
 // BCE loss: p を [eps, 1-eps] で clamp してから log (log(0) 回避)
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn stable_bce(p: f32, y: f32) -> f32 {
     let eps = 1e-7_f32;
     let p_clamped = p.clamp(eps, 1.0 - eps);
-    -(y * p_clamped.ln() + (1.0 - y) * (1.0 - p_clamped).ln())
+    -(y * crate::lawmath::ln(p_clamped) + (1.0 - y) * crate::lawmath::ln(1.0 - p_clamped))
 }
 
 // NaN skip 版 argmax +inf は正当な argmax として通す、全 NaN で Err

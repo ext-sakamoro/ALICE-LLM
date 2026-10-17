@@ -66,6 +66,7 @@ pub mod grammar;
 pub mod imatrix;
 pub mod iq1_s;
 pub mod kv_cache;
+pub mod lawmath;
 pub mod linalg;
 pub mod llama3;
 pub mod matrix;

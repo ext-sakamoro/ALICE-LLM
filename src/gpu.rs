@@ -67,10 +67,6 @@ const GATED_DELTANET_SHADER: &str = include_str!("shaders/gated_deltanet.wgsl");
 /// # Panics
 ///
 /// Panics if `attn_out.len() != gate.len()`.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
     assert_eq!(
         attn_out.len(),
@@ -80,7 +76,7 @@ pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
     for (a, &g) in attn_out.iter_mut().zip(gate.iter()) {
         // silu(g) = g / (1 + exp(-g)) = g * sigmoid(g)
         // attn_out[i] *= silu(g)
-        *a = *a * g / (1.0 + (-g).exp());
+        *a = *a * g / (1.0 + crate::lawmath::exp(-g));
     }
 }
 
@@ -89,14 +85,10 @@ pub fn silu_gate_apply_cpu(attn_out: &mut [f32], gate: &[f32]) {
 /// Computes `buf[i] = silu(buf[i])` in-place, matching
 /// `src/shaders/silu_inplace.wgsl` line-by-line. Used by Bonsai / Qwen
 /// 3.6-27B DeltaNet post-conv1d silu (Phase X.3.e.3 Gap A).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn silu_inplace_cpu(buf: &mut [f32]) {
     for x in buf.iter_mut() {
         // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
-        *x = *x / (1.0 + (-*x).exp());
+        *x = *x / (1.0 + crate::lawmath::exp(-*x));
     }
 }
 
@@ -107,14 +99,10 @@ pub fn silu_inplace_cpu(buf: &mut [f32]) {
 /// 3.6-27B DeltaNet layers to bring the raw beta projection into the
 /// stable delta-rule integration range (0, 1). Reference: llama.cpp
 /// PrismML fork `qwen35.cpp:440-441` (`ggml_sigmoid(beta)`).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn beta_sigmoid_cpu(beta: &mut [f32]) {
     for b in beta.iter_mut() {
         // sigmoid(x) = 1 / (1 + exp(-x))
-        *b = 1.0 / (1.0 + (-*b).exp());
+        *b = 1.0 / (1.0 + crate::lawmath::exp(-*b));
     }
 }
 
@@ -196,10 +184,6 @@ pub fn ssm_norm_per_head_cpu(input: &mut [f32], weight: &[f32], v_dim: usize, ep
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f32]) {
     assert_eq!(
         alpha.len(),
@@ -217,12 +201,12 @@ pub fn ssm_discretisation_cpu(alpha: &mut [f32], ssm_dt_bias: &[f32], ssm_a: &[f
         let a_softplus = if a_biased > 20.0 {
             a_biased
         } else if a_biased < -20.0 {
-            a_biased.exp()
+            crate::lawmath::exp(a_biased)
         } else {
-            a_biased.exp().ln_1p()
+            crate::lawmath::ln_1p(crate::lawmath::exp(a_biased))
         };
         let gate = a_softplus * ssm_a[h];
-        alpha[h] = gate.exp();
+        alpha[h] = crate::lawmath::exp(gate);
     }
 }
 

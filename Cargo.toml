@@ -60,8 +60,16 @@ imatrix = ["gguf", "dep:serde", "dep:serde_json"]
 # never references the excluded files; only a git checkout (where those
 # files physically exist) is expected to build with this feature on.
 internal-kernel-oracle = ["gpu"]
+# Non-Law build: `lawmath` calls the platform libm instead of alice-det-math
+# (faster on some targets, bits differ by OS / CPU / compiler). It reports
+# another semantics identifier and the KV cache reader refuses files written
+# by the other mode. Off by default.
+platform-math = []
 
 [dependencies]
+# Law helpers: transcendental functions and max / min that return the same
+# bits on every target (ALICE-Law G1 / G2), through src/lawmath.rs
+alice-det-math = "0.5.1"
 memmap2 = { version = "0.9", optional = true }
 libc = { version = "0.2", optional = true }
 rayon = { version = "1.10", optional = true }

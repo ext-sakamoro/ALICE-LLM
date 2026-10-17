@@ -132,10 +132,6 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
 /// caller should never see a NaN in a well-formed cache.
 #[inline]
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn e4m3_to_f32(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let magnitude = b & 0x7F;
@@ -153,7 +149,7 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
     } else {
         // Normal: (1 + m/8) * 2**(exp - 7).
         let base = 1.0 + mant / 8.0;
-        let scale = 2.0f32.powi(exp - 7);
+        let scale = crate::lawmath::powi(2.0, exp - 7);
         sign * base * scale
     }
 }

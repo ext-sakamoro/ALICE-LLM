@@ -249,10 +249,6 @@ pub fn kvouter_forward(
 // Per-unit compute
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn process_work_unit(
     ctx: &WorkCtx<'_>,
     unit: &WorkSplit,
@@ -373,7 +369,11 @@ fn process_work_unit(
 
             let mut l = 0.0f32;
             for (pos, &s) in scores.iter().enumerate() {
-                let p = if s.is_finite() { (s - m).exp() } else { 0.0 };
+                let p = if s.is_finite() {
+                    crate::lawmath::exp(s - m)
+                } else {
+                    0.0
+                };
                 l += p;
                 let v_off = pos * ctx.head_dim;
                 let v_row = &v_block[v_off..v_off + ctx.head_dim];

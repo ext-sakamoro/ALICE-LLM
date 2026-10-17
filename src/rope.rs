@@ -9,20 +9,16 @@
 /// `position` is the token position in the sequence.
 /// `base` is the `RoPE` base frequency (typically 10000).
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn apply_rope(vec: &[f32], position: usize, base: f32) -> Vec<f32> {
     let dim = vec.len();
     let mut out = vec![0.0f32; dim];
     let half = dim / 2;
 
     for i in 0..half {
-        let freq = 1.0 / base.powf(2.0 * i as f32 / dim as f32);
+        let freq = 1.0 / crate::lawmath::powf(base, 2.0 * i as f32 / dim as f32);
         let angle = position as f32 * freq;
-        let cos_a = angle.cos();
-        let sin_a = angle.sin();
+        let cos_a = crate::lawmath::cos(angle);
+        let sin_a = crate::lawmath::sin(angle);
 
         out[i] = vec[i].mul_add(cos_a, -(vec[i + half] * sin_a));
         out[i + half] = vec[i].mul_add(sin_a, vec[i + half] * cos_a);

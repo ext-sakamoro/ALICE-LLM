@@ -1577,16 +1577,12 @@ pub fn kimi_delta_read(state: &KimiDeltaState, q: &[f32]) -> Vec<f32> {
 /// path can inline the two lines (`exp(log_scale_a) * z_i` → sigmoid
 /// → `× g_min` → exp) to avoid the allocation.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn kimi_delta_lower_bounded_decay(z: &[f32], log_scale_a: f32, g_min: f32) -> Vec<f32> {
-    let a = log_scale_a.exp();
+    let a = crate::lawmath::exp(log_scale_a);
     z.iter()
         .map(|&zi| {
             let g = g_min * sigmoid(a * zi);
-            g.exp()
+            crate::lawmath::exp(g)
         })
         .collect()
 }
@@ -3115,10 +3111,6 @@ impl BlockAttnResState {
 /// from `query.len()`, or if `rms_gamma` (when `Some`) has a
 /// different length from `query`.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn block_attnres_softmax_attention(
     query: &[f32],
     keys_values: &[&[f32]],
@@ -3165,7 +3157,7 @@ pub fn block_attnres_softmax_attention(
     let mut exp_logits = Vec::with_capacity(logits.len());
     let mut sum_exp = 0.0_f64;
     for &l in &logits {
-        let e = (l - max_logit).exp();
+        let e = crate::lawmath::exp(l - max_logit);
         exp_logits.push(e);
         sum_exp += f64::from(e);
     }
@@ -5344,15 +5336,11 @@ fn apply_qk_norm(buf: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
 
 // ─── RoPE ───────────────────────────────────────────────────────────────────
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
     for i in (0..head_dim).step_by(2) {
-        let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
+        let freq = 1.0 / crate::lawmath::powf(theta, i as f32 / head_dim as f32);
         let angle = position as f32 * freq;
-        let (sin_val, cos_val) = angle.sin_cos();
+        let (sin_val, cos_val) = crate::lawmath::sin_cos(angle);
         let x0 = vec[i];
         let x1 = vec[i + 1];
         vec[i] = x0 * cos_val - x1 * sin_val;
@@ -5364,10 +5352,6 @@ fn apply_rope(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
 /// `freq_factors` has `head_dim / 2` entries — base frequency is divided by each factor.
 /// freq[i] = (1/theta^(2i/d)) / freq_factors[i]
 /// (llama.cpp convention: higher factor = slower rotation = longer effective context)
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn apply_rope_scaled(
     vec: &mut [f32],
     position: usize,
@@ -5377,7 +5361,7 @@ fn apply_rope_scaled(
 ) {
     for i in (0..head_dim).step_by(2) {
         let freq_idx = i / 2;
-        let base_freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
+        let base_freq = 1.0 / crate::lawmath::powf(theta, i as f32 / head_dim as f32);
         let factor = if freq_idx < freq_factors.len() {
             freq_factors[freq_idx]
         } else {
@@ -5385,7 +5369,7 @@ fn apply_rope_scaled(
         };
         let freq = base_freq / factor;
         let angle = position as f32 * freq;
-        let (sin_val, cos_val) = angle.sin_cos();
+        let (sin_val, cos_val) = crate::lawmath::sin_cos(angle);
         let x0 = vec[i];
         let x1 = vec[i + 1];
         vec[i] = x0 * cos_val - x1 * sin_val;
@@ -5396,16 +5380,12 @@ fn apply_rope_scaled(
 /// NEOX RoPE (GPT-NeoX / HF convention): rotate pairs (i, i + head_dim/2).
 /// Used by Qwen 2/3 and Gemma 2. Q/K weights in GGUF are stored in HF layout
 /// (not permuted like Llama family), so we apply the half rotation directly.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn apply_rope_neox(vec: &mut [f32], position: usize, head_dim: usize, theta: f32) {
     let half = head_dim / 2;
     for i in 0..half {
-        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let freq = 1.0 / crate::lawmath::powf(theta, 2.0 * i as f32 / head_dim as f32);
         let angle = position as f32 * freq;
-        let (sin_val, cos_val) = angle.sin_cos();
+        let (sin_val, cos_val) = crate::lawmath::sin_cos(angle);
         let x0 = vec[i];
         let x1 = vec[i + half];
         vec[i] = x0 * cos_val - x1 * sin_val;
@@ -5414,10 +5394,6 @@ fn apply_rope_neox(vec: &mut [f32], position: usize, head_dim: usize, theta: f32
 }
 
 /// NEOX RoPE with per-dimension frequency factors (for NTK-aware scaling).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn apply_rope_scaled_neox(
     vec: &mut [f32],
     position: usize,
@@ -5427,7 +5403,7 @@ fn apply_rope_scaled_neox(
 ) {
     let half = head_dim / 2;
     for i in 0..half {
-        let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let base_freq = 1.0 / crate::lawmath::powf(theta, 2.0 * i as f32 / head_dim as f32);
         let factor = if i < freq_factors.len() {
             freq_factors[i]
         } else {
@@ -5435,7 +5411,7 @@ fn apply_rope_scaled_neox(
         };
         let freq = base_freq / factor;
         let angle = position as f32 * freq;
-        let (sin_val, cos_val) = angle.sin_cos();
+        let (sin_val, cos_val) = crate::lawmath::sin_cos(angle);
         let x0 = vec[i];
         let x1 = vec[i + half];
         vec[i] = x0 * cos_val - x1 * sin_val;
@@ -5468,10 +5444,6 @@ fn apply_rope_auto(
 /// Supports Mistral Sliding Window and Gemma-2 logit softcapping.
 /// When `attention_scale` is Some(x), uses x as the score-scaling factor
 /// instead of the default 1/sqrt(head_dim). Gemma 3n uses 1.0.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn gqa_attention(
     q_buf: &[f32],
     kv_cache: &KvCache,
@@ -5630,20 +5602,20 @@ fn gqa_attention(
                 score *= inv_sqrt_d;
 
                 if let Some(cap) = attn_logit_softcap {
-                    score = cap * (score / cap).tanh();
+                    score = cap * crate::lawmath::tanh(score / cap);
                 }
 
                 let m_old = m;
                 let (ms, vs) = if score > m {
                     m = score;
-                    let ms = (m_old - m).exp(); // rescale factor for VKQ
-                                                // Rescale existing VKQ accumulator.
+                    let ms = crate::lawmath::exp(m_old - m); // rescale factor for VKQ
+                                                             // Rescale existing VKQ accumulator.
                     for d in 0..head_dim {
                         attn_out[q_start + d] *= ms;
                     }
                     (ms, 1.0f32)
                 } else {
-                    (1.0f32, (score - m).exp())
+                    (1.0f32, crate::lawmath::exp(score - m))
                 };
 
                 // VKQ += V * vs
@@ -5682,7 +5654,7 @@ fn gqa_attention(
             };
 
             if let Some(cap) = attn_logit_softcap {
-                score = cap * (score / cap).tanh();
+                score = cap * crate::lawmath::tanh(score / cap);
             }
 
             scores.push(score);
@@ -5692,7 +5664,7 @@ fn gqa_attention(
         if use_f64_acc {
             let mut sum_f64 = 0.0f64;
             for s in &mut scores {
-                *s = (*s - max_score).exp();
+                *s = crate::lawmath::exp(*s - max_score);
                 sum_f64 += *s as f64;
             }
             if sum_f64 > 0.0 {
@@ -5704,7 +5676,7 @@ fn gqa_attention(
         } else {
             let mut sum = 0.0f32;
             for s in &mut scores {
-                *s = (*s - max_score).exp();
+                *s = crate::lawmath::exp(*s - max_score);
                 sum += *s;
             }
             if sum > 0.0 {
@@ -5734,10 +5706,6 @@ fn gqa_attention(
 }
 
 /// GQA attention using PagedKvCache (same logic as gqa_attention but reads from paged storage).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn gqa_attention_paged(
     q_buf: &[f32],
     kv_cache: &PagedKvCache,
@@ -5777,7 +5745,7 @@ fn gqa_attention_paged(
             score *= inv_sqrt_d;
 
             if let Some(cap) = attn_logit_softcap {
-                score = cap * (score / cap).tanh();
+                score = cap * crate::lawmath::tanh(score / cap);
             }
 
             scores.push(score);
@@ -5786,7 +5754,7 @@ fn gqa_attention_paged(
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for s in &mut scores {
-            *s = (*s - max_score).exp();
+            *s = crate::lawmath::exp(*s - max_score);
             sum += *s;
         }
         if sum > 0.0 {
@@ -5812,12 +5780,8 @@ fn gqa_attention_paged(
 /// SiLU (Swish) activation: `x / (1 + exp(-x))`. Used by Llama, Mistral,
 /// Qwen 2/3 for SwiGLU-style FFN.
 #[inline]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    x / (1.0 + crate::lawmath::exp(-x))
 }
 
 /// Softplus activation `softplus(x) = ln(1 + exp(x))`. Used by Bonsai /
@@ -5827,17 +5791,13 @@ fn silu(x: f32) -> f32 {
 /// avoided); for `x < -20` returns `exp(x)` (avoids `ln(1 + 0)` losing
 /// precision); otherwise evaluates the closed form directly.
 #[inline]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x
     } else if x < -20.0 {
-        x.exp()
+        crate::lawmath::exp(x)
     } else {
-        x.exp().ln_1p()
+        crate::lawmath::ln_1p(crate::lawmath::exp(x))
     }
 }
 
@@ -5848,12 +5808,8 @@ fn softplus(x: f32) -> f32 {
 /// already lives above; this helper exposes the bare sigmoid so the
 /// beta path can multiply by 1, not `x`.
 #[inline]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    1.0 / (1.0 + crate::lawmath::exp(-x))
 }
 
 /// Causal depthwise conv1d single-token step for Qwen 3.5 DeltaNet.
@@ -6240,13 +6196,9 @@ fn gated_deltanet_head_disjoint(
 /// GELU tanh approximation: `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`.
 /// Used by Gemma 2 (HF `gelu_pytorch_tanh` / llama.cpp `LLM_FFN_GELU`).
 #[inline]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn gelu_approx(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
+    0.5 * x * (1.0 + crate::lawmath::tanh(SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)))
 }
 
 // ─── Llama-3 model ──────────────────────────────────────────────────────────
@@ -7274,10 +7226,6 @@ fn kimi_k3_rms_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
 /// Panics on any weight-shape or config-dim mismatch via the
 /// underlying `WeightRef::matvec` / `rms_norm` asserts.
 #[allow(dead_code)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn kimi_k3_gated_mla_step(
     x: &[f32],
     attn_norm: &[f32],
@@ -7378,7 +7326,7 @@ fn kimi_k3_gated_mla_step(
         let max_logit = logits_buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum_exp = 0.0_f64;
         for l in &mut logits_buf {
-            *l = (*l - max_logit).exp();
+            *l = crate::lawmath::exp(*l - max_logit);
             sum_exp += f64::from(*l);
         }
         let inv_sum = (sum_exp as f32).recip();
@@ -7618,10 +7566,6 @@ impl KimiK3AttnResState {
 ///
 /// Panics if `prefix_sum.len() != state.d` or `score_w.len() != state.d`.
 #[allow(dead_code)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub(crate) fn kimi_k3_res_mix(
     state: &KimiK3AttnResState,
     prefix_sum: &[f32],
@@ -7670,7 +7614,7 @@ pub(crate) fn kimi_k3_res_mix(
     let mut exp_s = Vec::with_capacity(scores.len());
     let mut sum_exp = 0.0_f64;
     for &sc in &scores {
-        let e = (sc - max_s).exp();
+        let e = crate::lawmath::exp(sc - max_s);
         exp_s.push(e);
         sum_exp += f64::from(e);
     }
@@ -8510,14 +8454,10 @@ fn kimi_k3_shared_experts_forward(
 /// K3 defaults: `β_1 = situ_beta = 4.0`, `β_2 = situ_linear_beta = 25.0`.
 /// llama.cpp uses the same formula (`src/models/kimi-k3.cpp` L181-192).
 #[allow(dead_code)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
-    let g_tanh = (g / beta).tanh() * beta;
+    let g_tanh = crate::lawmath::tanh(g / beta) * beta;
     let g_sig = sigmoid(g);
-    let u_tanh = (u / linear_beta).tanh() * linear_beta;
+    let u_tanh = crate::lawmath::tanh(u / linear_beta) * linear_beta;
     g_tanh * g_sig * u_tanh
 }
 
@@ -13723,10 +13663,6 @@ impl<'a> Llama3Model<'a> {
     /// layers + GPU attention layers to bypass an ARM64 embedded board's `wgpu-hal` Vulkan
     /// weight duplication while keeping DeltaNet math on the CPU where
     /// the recurrent state and Bonsai Gap-B refinement already work.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn forward_with_layer_hook<F>(&mut self, token_id: u32, hook: F) -> Vec<f32>
     where
         F: FnMut(usize, &mut Vec<f32>) -> bool,
@@ -14013,7 +13949,7 @@ impl<'a> Llama3Model<'a> {
                             for h in 0..dn_num_v_heads {
                                 let alpha_biased = dn_alpha[h] + ssm_dt_bias[h];
                                 let gate = softplus(alpha_biased) * ssm_a[h];
-                                dn_alpha[h] = gate.exp();
+                                dn_alpha[h] = crate::lawmath::exp(gate);
                             }
 
                             // 2d. Beta sigmoid (Phase X.3.e.3.2 Gap B extra).
@@ -14704,7 +14640,7 @@ impl<'a> Llama3Model<'a> {
         // Gemma-2: final logit softcapping
         if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
-                *l = cap * (*l / cap).tanh();
+                *l = cap * crate::lawmath::tanh(*l / cap);
             }
         }
 
@@ -14724,10 +14660,6 @@ impl<'a> Llama3Model<'a> {
     ///
     /// # Panics
     /// Panics if `hidden.len() != config.hidden_dim`.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn project_hidden_to_logits(&self, hidden: &[f32]) -> Vec<f32> {
         let c = &self.config;
         assert_eq!(
@@ -14741,7 +14673,7 @@ impl<'a> Llama3Model<'a> {
         self.output_proj.matvec(&norm_buf, &mut logits);
         if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
-                *l = cap * (*l / cap).tanh();
+                *l = cap * crate::lawmath::tanh(*l / cap);
             }
         }
         logits
@@ -14757,10 +14689,6 @@ impl<'a> Llama3Model<'a> {
     /// # Panics
     /// Panics if the model was not loaded with Gemma 3n architecture (missing
     /// required per-layer / global tensors).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     fn forward_gemma3n(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -15067,7 +14995,7 @@ impl<'a> Llama3Model<'a> {
         // Final logit softcap (Gemma family)
         if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
-                *l = cap * (*l / cap).tanh();
+                *l = cap * crate::lawmath::tanh(*l / cap);
             }
         }
         logits
@@ -15146,10 +15074,6 @@ impl<'a> Llama3Model<'a> {
 
     /// AltUp router modalities: compute a per-altup-input activation vector
     /// from the active stream (per llama.cpp `altup_compute_router_modalities`).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     fn altup_router_modalities(
         &self,
         active: &[f32],
@@ -15182,7 +15106,7 @@ impl<'a> Llama3Model<'a> {
             &mut modalities,
         );
         for v in &mut modalities {
-            *v = v.tanh();
+            *v = crate::lawmath::tanh(*v);
         }
         modalities
     }
@@ -15469,10 +15393,6 @@ impl<'a> Llama3Model<'a> {
         );
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     fn forward_deepseek_v3(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -15677,7 +15597,7 @@ impl<'a> Llama3Model<'a> {
                 // Softmax stable in place.
                 let mut denom = 0.0f32;
                 for s in &mut scores {
-                    *s = (*s - max_score).exp();
+                    *s = crate::lawmath::exp(*s - max_score);
                     denom += *s;
                 }
                 for s in &mut scores {
@@ -15748,10 +15668,6 @@ impl<'a> Llama3Model<'a> {
         logits
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     fn forward_gemma4(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -15983,7 +15899,7 @@ impl<'a> Llama3Model<'a> {
         // Final logit softcap (Gemma family).
         if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
-                *l = cap * (*l / cap).tanh();
+                *l = cap * crate::lawmath::tanh(*l / cap);
             }
         }
         logits
@@ -16157,10 +16073,6 @@ impl<'a> Llama3Model<'a> {
     }
 
     /// Generate tokens autoregressively.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn generate(
         &mut self,
         tokenizer: &GgufTokenizer,
@@ -16237,7 +16149,7 @@ impl<'a> Llama3Model<'a> {
                 let max_val = indexed[0].1;
                 let mut sum = 0.0f32;
                 for (_, l) in &mut indexed {
-                    *l = (*l - max_val).exp();
+                    *l = crate::lawmath::exp(*l - max_val);
                     sum += *l;
                 }
                 for (_, l) in &mut indexed {
@@ -17727,10 +17639,6 @@ impl<'a> Llama3Model<'a> {
     // ─── Paged KV Cache forward ─────────────────────────────────────────────
 
     /// Forward pass using a per-request PagedKvCache instead of the model's flat cache.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     fn forward_paged(&self, token_id: u32, paged_cache: &mut PagedKvCache) -> Vec<f32> {
         let c = &self.config;
         let pos = paged_cache.seq_len();
@@ -17888,7 +17796,7 @@ impl<'a> Llama3Model<'a> {
 
         if let Some(cap) = c.final_logit_softcap() {
             for l in &mut logits {
-                *l = cap * (*l / cap).tanh();
+                *l = cap * crate::lawmath::tanh(*l / cap);
             }
         }
 
@@ -18362,13 +18270,12 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 /// Convert logits to probability distribution via softmax.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_val).exp()).collect();
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&l| crate::lawmath::exp(l - max_val))
+        .collect();
     let sum: f32 = probs.iter().sum();
     if sum > 0.0 {
         let inv = 1.0 / sum;
@@ -18653,10 +18560,6 @@ fn load_weight_ref_any_rows<'a>(
 ///
 /// Numerically-stable sigmoid: uses the branch `1/(1+exp(-x))` for x ≥ 0
 /// and `exp(x)/(1+exp(x))` for x < 0 to keep the exp argument non-positive.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn deepseek_moe_route(
     router_logits: &[f32],
     exp_probs_b: Option<&[f32]>,
@@ -18668,9 +18571,9 @@ fn deepseek_moe_route(
         .iter()
         .map(|&x| {
             if x >= 0.0 {
-                1.0 / (1.0 + (-x).exp())
+                1.0 / (1.0 + crate::lawmath::exp(-x))
             } else {
-                let e = x.exp();
+                let e = crate::lawmath::exp(x);
                 e / (1.0 + e)
             }
         })
@@ -18889,10 +18792,6 @@ fn forward_deepseek_moe_layer(
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn forward_moe_layer(
     c: &Llama3Config,
     layer: &LayerWeights<'_>,
@@ -18937,7 +18836,7 @@ fn forward_moe_layer(
         .fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = router_logits
         .iter()
-        .map(|&v| (v - max_logit).exp())
+        .map(|&v| crate::lawmath::exp(v - max_logit))
         .collect();
     let sum_exp: f32 = probs.iter().sum();
     for p in &mut probs {
@@ -19466,10 +19365,6 @@ impl SplitMix64 {
 /// * `top_p = None` or `Some(t) where t >= 1.0` disables top-p filtering.
 /// * `top_p = Some(t) where 0 < t < 1` keeps the smallest set of tokens
 ///   whose cumulative probability >= t (nucleus sampling).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f32>) -> Vec<f32> {
     assert!(
         temperature > 0.0 && temperature.is_finite(),
@@ -19482,7 +19377,7 @@ fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f
         .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
     let mut probs: Vec<f32> = logits
         .iter()
-        .map(|&l| ((l - max_logit) * inv_t).exp())
+        .map(|&l| crate::lawmath::exp((l - max_logit) * inv_t))
         .collect();
     let sum: f32 = probs.iter().sum();
     assert!(

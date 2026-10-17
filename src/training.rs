@@ -204,17 +204,13 @@ impl AdamW {
     }
 
     /// One optimizer step: update weights using accumulated gradients.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-    )]
     pub fn step(&mut self, weights: &mut [f32], grads: &[f32]) {
         assert_eq!(weights.len(), grads.len());
         assert_eq!(weights.len(), self.m.len());
 
         self.t += 1;
-        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+        let bc1 = 1.0 - crate::lawmath::powi(self.beta1, self.t as i32);
+        let bc2 = 1.0 - crate::lawmath::powi(self.beta2, self.t as i32);
 
         for i in 0..weights.len() {
             // AdamW: decouple weight decay

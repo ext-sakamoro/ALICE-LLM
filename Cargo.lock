@@ -3,9 +3,16 @@
 version = 4
 
 [[package]]
+name = "alice-det-math"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2857e06dcc3838a2138f4c8ed7b30cf8515a223eeb6d5fbd068dd13d45cb4ff4"
+
+[[package]]
 name = "alice-llm"
 version = "2.0.1"
 dependencies = [
+ "alice-det-math",
  "async-stream",
  "axum",
  "bincode",

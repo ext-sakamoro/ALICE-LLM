@@ -31,10 +31,6 @@ use rayon::prelude::*;
 /// Returns a flat `[Tq * Hq * head_dim]` FP32 output buffer.
 ///
 /// [`kvouter_forward`]: super::forward::kvouter_forward
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn lse_combine(
     partials: &ForwardPartials,
     idx: &KvOuterIndex,
@@ -102,7 +98,7 @@ pub fn lse_combine(
                     if !m_p.is_finite() {
                         continue;
                     }
-                    let scale = (m_p - m_final).exp();
+                    let scale = crate::lawmath::exp(m_p - m_final);
                     l_final += scale * l_p;
                     let o_off = p_idx * head_dim;
                     simd::axpy(

@@ -6420,17 +6420,13 @@ pub const E2M1_DECODE_TABLE: [f32; 16] = [
 /// `2^(byte - 127)`. Byte value `0xFF` is reserved for NaN. There is no
 /// mantissa field; all scales are exact powers of two.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn decode_e8m0_scale(byte: u8) -> f32 {
     if byte == 0xFF {
         return f32::NAN;
     }
     // `2^(byte - 127)` — use `powi` on the biased exponent so both very small
     // (byte=0 → 2^-127) and very large (byte=254 → 2^127) scales are exact.
-    2.0f32.powi(i32::from(byte) - 127)
+    crate::lawmath::powi(2.0, i32::from(byte) - 127)
 }
 
 /// Dequantize one MXFP4 block (17 bytes → 32 f32 values).

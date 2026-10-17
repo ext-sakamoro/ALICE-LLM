@@ -74,10 +74,6 @@ pub fn top_p_filter(logits: &mut [f32], p: f32) {
 }
 
 /// Softmax in-place.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "G1 debt: inference numerics call platform transcendentals; each call is listed in scripts/g1_debt_sites.tsv until it is decided whether this output is Law output"
-)]
 pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;
@@ -85,7 +81,7 @@ pub fn softmax_inplace(v: &mut [f32]) {
     let max_val = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for x in v.iter_mut() {
-        *x = (*x - max_val).exp();
+        *x = crate::lawmath::exp(*x - max_val);
         sum += *x;
     }
     if sum > 0.0 {
