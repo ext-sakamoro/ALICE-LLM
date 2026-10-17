@@ -1,6 +1,6 @@
 [package]
 name = "alice-llm"
-version = "2.0.1"
+version = "3.0.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
@@ -225,4 +225,7 @@ required-features = ["imatrix"]
 
 # DSpark Phase 4 serde roundtrip test 用 (dspark-serde feature 有効時のみ使用)
 [dev-dependencies]
+# SHA-256 of the recorded-bit scenarios (tests/semantics_golden.rs) and of the
+# semantics identifier fold (tests/llm_semantics_id.rs)
+sha2 = "0.10"
 bincode = "1"

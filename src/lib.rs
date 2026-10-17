@@ -74,6 +74,7 @@ pub mod prelude;
 pub mod quantization;
 pub mod rope;
 pub mod sampling;
+pub mod semantics;
 pub mod sparse_attention;
 pub mod speculative_dspark;
 pub mod tokenizer;
