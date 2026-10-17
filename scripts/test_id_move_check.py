@@ -271,6 +271,48 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(imc.check(d, None, "tag")[0], [])
         self.assertEqual(imc.check(d, None, "tag")[0], [])
 
+    def test_previous_tests_build_with_the_doc_features(self):
+        # two features that cannot be on together: the named test must build with doc-features
+        d = self.repo()
+        self.write(d, "0.3.1", "0x22", "[0x11; 32]")
+        cargo = (d / "Cargo.toml").read_text().replace("[workspace]", '[features]\na = []\nb = []\n\n[workspace]')
+        (d / "Cargo.toml").write_text(cargo)
+        with open(d / "src" / "lib.rs", "a") as f:
+            f.write('#[cfg(all(feature = "a", feature = "b"))]\ncompile_error!("a and b are mutually exclusive");\n')
+        self.golden(d, "11")
+        (d / "CHANGELOG.md").write_text("11111111 -> 22222222\n")
+        cfg = (d / "scripts" / "id_move.toml").read_text()
+        # every feature on: the crate does not build at all
+        with self.assertRaisesRegex(imc.CheckError, "rustdoc failed"):
+            imc.check(d, None, "tag")
+        (d / "scripts" / "id_move.toml").write_text('doc-features = ["a"]\n' + cfg)
+        self.assertEqual(imc.check(d, None, "tag")[0], [])
+
+    def test_an_empty_doc_features_list_builds_the_default_features_only(self):
+        d = self.repo()
+        self.write(d, "0.3.1", "0x22", "[0x11; 32]")
+        cargo = (d / "Cargo.toml").read_text().replace("[workspace]", '[features]\ndefault = []\na = []\nb = []\n\n[workspace]')
+        (d / "Cargo.toml").write_text(cargo)
+        with open(d / "src" / "lib.rs", "a") as f:
+            f.write('#[cfg(all(feature = "a", feature = "b"))]\ncompile_error!("a and b are mutually exclusive");\n')
+        self.golden(d, "11")
+        (d / "CHANGELOG.md").write_text("11111111 -> 22222222\n")
+        cfg = (d / "scripts" / "id_move.toml").read_text()
+        (d / "scripts" / "id_move.toml").write_text("doc-features = []\n" + cfg)
+        self.assertEqual(imc.check(d, None, "tag")[0], [])
+
+    def test_a_copy_that_does_not_build_without_the_value_is_not_a_dependence(self):
+        # a const assertion on the list breaks the build once the value is taken out: no test ran
+        d = self.repo()
+        self.write(d, "0.3.1", "0x22", "[0x11; 32]")
+        with open(d / "src" / "lib.rs", "a") as f:
+            f.write("const _: () = assert!(PREVIOUS_SEMANTICS_IDS[0][0] == 0x11);\n")
+        (d / "tests").mkdir(exist_ok=True)
+        (d / "tests" / "previous.rs").write_text("#[test]\nfn old() {}\n")
+        (d / "CHANGELOG.md").write_text("11111111 -> 22222222\n")
+        problems = imc.check(d, None, "tag")[0]
+        self.assertTrue(any("did not run with 11111111 taken out" in p for p in problems), problems)
+
     def test_moved_kept_with_a_test_that_only_names_the_value_fails(self):
         d = self.repo()
         self.write(d, "0.3.1", "0x22", "[0x11; 32]")
