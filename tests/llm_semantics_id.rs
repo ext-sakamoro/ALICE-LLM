@@ -46,24 +46,240 @@ fn fold(entries: &[(&str, [u8; 32])]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// 64-hex literals of the golden file that are not folded digests, each
+/// with its reason
+const UNFOLDED_DIGESTS: &[&str] = &[];
+
+/// Goldens whose digest is not a literal, with the exact number of such calls
+/// (none of them is a current output folded into the identifier)
+const UNFOLDED_GOLDENS: &[(&str, usize)] = &[];
+
 /// `scenario name -> recorded digest` of every `assert_golden(` call in
 /// `tests/semantics_golden.rs`
 fn recorded_goldens() -> BTreeMap<String, [u8; 32]> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/semantics_golden.rs");
     let src = std::fs::read_to_string(&path).expect("tests/semantics_golden.rs");
+    // every use of the identifier other than its definition must be a call
+    // this reads: a golden passed through a const, a macro or any other form
+    // fails here instead of being skipped (so it cannot escape the fold)
+    let src = code_only(&src);
     let mut out = BTreeMap::new();
-    let mut rest = src.as_str();
-    while let Some(at) = rest.find("assert_golden(") {
-        rest = &rest[at + "assert_golden(".len()..];
-        let call = &rest[..rest.find(");").expect("call ends")];
-        let quoted: Vec<&str> = call.split('"').skip(1).step_by(2).collect();
-        if let (Some(name), Some(digest)) = (quoted.first(), quoted.last()) {
-            if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-                out.insert((*name).to_string(), unhex32(digest));
+    let mut unfolded: BTreeMap<String, usize> = BTreeMap::new();
+    let bytes = src.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut uses = 0;
+    let mut from = 0;
+    while let Some(off) = src[from..].find("assert_golden") {
+        let at = from + off;
+        from = at + "assert_golden".len();
+        if (at > 0 && ident(bytes[at - 1])) || bytes.get(from).is_some_and(|&b| ident(b)) {
+            continue;
+        }
+        let before = src[..at].trim_end();
+        if before.ends_with("fn")
+            && !before[..before.len() - 2]
+                .bytes()
+                .next_back()
+                .is_some_and(ident)
+        {
+            continue;
+        }
+        uses += 1;
+        let args = call_args(&src[from..]).unwrap_or_else(|| {
+            panic!("the assert_golden use at byte {at} is not a call this test can read")
+        });
+        let (name, digest) = match args.as_slice() {
+            [name, .., digest] => (literal(name), literal(digest)),
+            _ => (None, None),
+        };
+        let Some(name) = name else {
+            panic!("the assert_golden call at byte {at} does not name its scenario with a literal")
+        };
+        let Some(digest) = digest else {
+            // a digest that is not a literal is allowed only for a listed name,
+            // counted exactly below
+            assert!(
+                UNFOLDED_GOLDENS.iter().any(|(n, _)| *n == name),
+                "the assert_golden call {name:?} at byte {at} does not pass its digest \
+                 as a string literal"
+            );
+            *unfolded.entry(name.to_string()).or_insert(0usize) += 1;
+            continue;
+        };
+        assert!(
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+            "the digest of {name:?} is not 64 hex digits"
+        );
+        assert!(
+            out.insert(name.to_string(), unhex32(digest)).is_none(),
+            "two goldens are named {name:?}"
+        );
+    }
+    assert!(uses > 0, "no assert_golden call found");
+    for (name, count) in UNFOLDED_GOLDENS {
+        assert_eq!(
+            unfolded.get(*name).copied().unwrap_or(0),
+            *count,
+            "calls of {name:?} with a digest that is not a literal"
+        );
+    }
+    assert_eq!(
+        out.len() + unfolded.values().sum::<usize>(),
+        uses,
+        "every assert_golden use is read"
+    );
+    // and a digest written anywhere else in the file (a helper that compares
+    // without naming assert_golden) is one of the folded ones or listed
+    let folded: Vec<String> = out.values().map(|d| hex(d)).collect();
+    let mut extra: Vec<&str> = string_literals(&src)
+        .into_iter()
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|s| !folded.iter().any(|f| f == s))
+        .collect();
+    extra.sort_unstable();
+    extra.dedup();
+    let mut listed = UNFOLDED_DIGESTS.to_vec();
+    listed.sort_unstable();
+    assert_eq!(
+        extra, listed,
+        "the 64-hex literals of the golden file that are not folded digests"
+    );
+    out
+}
+
+/// The top-level arguments of the call whose `(` starts `rest` (after
+/// whitespace), None when `rest` is not a call
+fn call_args(rest: &str) -> Option<Vec<&str>> {
+    let rest = rest.trim_start();
+    let body = rest.strip_prefix('(')?;
+    let (mut depth, mut in_str, mut escaped, mut start) = (0usize, false, false, 0);
+    let mut args = Vec::new();
+    for (i, c) in body.char_indices() {
+        if in_str {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
             }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' if depth == 0 => {
+                let last = body[start..i].trim();
+                if !last.is_empty() {
+                    args.push(last);
+                }
+                return Some(args);
+            }
+            ')' | ']' | '}' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                args.push(body[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The contents of the string literals of `code` (comments already blank)
+fn string_literals(code: &str) -> Vec<&str> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                out.extend(code.get(start..i));
+                i += 1;
+            }
+            b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+            _ => i += 1,
         }
     }
     out
+}
+
+/// `src` with every comment replaced by spaces (same byte offsets), so a
+/// mention in a comment is not a use and a comment cannot hide a call; string
+/// and char literals are kept as they are
+fn code_only(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = b.to_vec();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] != b'\n' {
+                            out[i] = b' ';
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).expect("only ASCII bytes were replaced")
+}
+
+/// The content of a plain string literal (no escapes), None for anything else
+fn literal(arg: &str) -> Option<&str> {
+    arg.strip_prefix('"')?
+        .strip_suffix('"')
+        .filter(|s| !s.contains('"') && !s.contains('\\'))
 }
 
 fn check_entries(pins: &[(&str, [u8; 32])], minimum: usize) {
@@ -205,4 +421,38 @@ fn the_pins_were_checked_on_this_version_and_toolchain() {
         "running {version:?}, pins checked on {}",
         LLM_SEMANTICS_CHECKED_AT.1
     );
+}
+
+/// Goldens live in `tests/semantics_golden.rs` only: no other test file uses `assert_golden`, so a
+/// scenario cannot be recorded where the fold does not look (a helper with
+/// another name in another file is outside what a source scan can see)
+#[test]
+fn no_other_test_file_records_a_golden() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).expect("tests/") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+            || name == "semantics_golden.rs"
+            || name == "llm_semantics_id.rs"
+        {
+            continue;
+        }
+        seen += 1;
+        let code = code_only(&std::fs::read_to_string(&path).expect("test file"));
+        let bytes = code.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut from = 0;
+        while let Some(off) = code[from..].find("assert_golden") {
+            let at = from + off;
+            from = at + "assert_golden".len();
+            let part_of_another =
+                (at > 0 && ident(bytes[at - 1])) || bytes.get(from).is_some_and(|&b| ident(b));
+            assert!(part_of_another, "{name} uses assert_golden at byte {at}");
+        }
+    }
+    assert!(seen > 0, "no other test file was read");
 }
