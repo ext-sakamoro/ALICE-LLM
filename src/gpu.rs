@@ -6469,6 +6469,34 @@ impl GpuModel {
     }
 }
 
+/// Adapter policy for GPU unit tests.
+///
+/// Without an adapter a GPU test is skipped (it prints
+/// `[test] SKIP: no GPU adapter available`). When `ALICE_LLM_REQUIRE_GPU` is
+/// set (the GPU job of CI sets it) a missing adapter panics instead, so a
+/// runner that loses its adapter fails rather than passing every GPU test as
+/// a skip. `ALICE_LLM_TEST_FORCE_NO_ADAPTER` makes the adapter look missing;
+/// CI uses it to check that the requirement actually fails the run. The
+/// SUBGROUP gap of the windows-latest adapter is a separate, named skip and
+/// is not affected.
+#[cfg(test)]
+pub(crate) mod test_adapter {
+    /// True when the test run must behave as if no adapter existed.
+    pub(crate) fn hidden() -> bool {
+        std::env::var_os("ALICE_LLM_TEST_FORCE_NO_ADAPTER").is_some()
+    }
+
+    /// Record that `what` found no adapter: panics under
+    /// `ALICE_LLM_REQUIRE_GPU`, otherwise prints the skip line.
+    pub(crate) fn no_adapter(what: &str) {
+        assert!(
+            std::env::var_os("ALICE_LLM_REQUIRE_GPU").is_none(),
+            "{what}: ALICE_LLM_REQUIRE_GPU is set but no GPU adapter is available"
+        );
+        eprintln!("[test] SKIP: no GPU adapter available ({what})");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6956,6 +6984,7 @@ mod tests {
     #[test]
     fn smoke_test_gpu_pipeline_creation_all_pipelines_valid() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(!test_adapter::hidden(), "no GPU adapter found (hidden)");
             let _engine = GpuEngine::new();
             // If we reach this line, all pipelines compiled successfully on
             // the runtime backend. GpuEngine::new() creates all pipelines
@@ -6981,11 +7010,7 @@ mod tests {
                 // `SUBGROUP_UNSUPPORTED_MARKER`) from actual shader /
                 // pipeline compilation failure.
                 if msg.contains("no GPU adapter found") {
-                    eprintln!(
-                        "[smoke_test] SKIP: no GPU adapter available on this runner \
-                         (this is expected on headless Linux CI without lavapipe). \
-                         Pipeline creation validation deferred to macOS / Linux+lavapipe runners."
-                    );
+                    test_adapter::no_adapter("smoke_test");
                     // Test passes — the intent is to catch pipeline compilation
                     // errors, not adapter availability.
                 } else if msg.contains("Capabilities(SUBGROUP)") {
@@ -7012,6 +7037,10 @@ mod tests {
     /// `SUBGROUP_UNSUPPORTED_MARKER` below), so callers can `return` to skip
     /// the test cleanly in both cases.
     fn try_gpu_engine() -> Option<GpuEngine> {
+        if test_adapter::hidden() {
+            test_adapter::no_adapter("try_gpu_engine");
+            return None;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(GpuEngine::new));
         match result {
             Ok(e) => Some(e),
@@ -7024,7 +7053,7 @@ mod tests {
                     "(non-string panic payload)"
                 };
                 if msg.contains("no GPU adapter found") {
-                    eprintln!("[test] SKIP: no GPU adapter available");
+                    test_adapter::no_adapter("try_gpu_engine");
                     None
                 } else if msg.contains("Capabilities(SUBGROUP)") {
                     eprintln!("{SUBGROUP_UNSUPPORTED_MARKER}");
@@ -8121,6 +8150,7 @@ mod tests {
             // on that adapter — so it skips there too, honestly, rather
             // than claiming a confidence this query can't support.
             let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                test_adapter::no_adapter("probed_subgroup_size_range");
                 return;
             };
             if min_sg != max_sg {
@@ -8264,6 +8294,7 @@ mod tests {
             // on that adapter — so it skips there too, honestly, rather
             // than claiming a confidence this query can't support.
             let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                test_adapter::no_adapter("probed_subgroup_size_range");
                 return;
             };
             if min_sg != max_sg {
@@ -8774,6 +8805,7 @@ mod tests {
                 return;
             };
             let Some((min_sg, max_sg)) = probed_subgroup_size_range() else {
+                test_adapter::no_adapter("probed_subgroup_size_range");
                 return;
             };
             if min_sg != max_sg {

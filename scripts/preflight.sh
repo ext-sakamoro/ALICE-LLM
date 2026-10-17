@@ -241,7 +241,10 @@ step "ci.yml / test: Doc tests"
 ( export CARGO_TERM_COLOR="always"; cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )
 
 step "ci.yml / gpu_pipeline_smoke: cargo test --features gpu (pipeline smoke test)"
-( export CARGO_TERM_COLOR="always"; cargo test --lib --features gpu smoke_test_gpu_pipeline_creation )
+( export CARGO_TERM_COLOR="always" ALICE_LLM_REQUIRE_GPU=1; cargo test --lib --features gpu smoke_test_gpu_pipeline_creation )
+
+step "ci.yml / gpu_pipeline_smoke: self-test (a hidden adapter fails the GPU tests)"
+bash scripts/gpu_require_selftest.sh --lib --features gpu smoke_test_gpu_pipeline_creation
 
 step "security-audit.yml / audit: Run cargo audit"
 ( export CARGO_TERM_COLOR="always" CARGO_NET_RETRY="5" CARGO_HTTP_MULTIPLEXING="false"; cargo audit --deny yanked )

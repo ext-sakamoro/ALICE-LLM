@@ -461,9 +461,22 @@ mod tests {
     use super::*;
 
     fn setup_gpu() -> Option<SparseAttentionGpu> {
-        // CI / headless environments may not have a GPU adapter. Skip the
-        // test gracefully rather than fail.
-        SparseAttentionGpu::new_blocking().ok()
+        // Without an adapter the test is skipped, except under
+        // ALICE_LLM_REQUIRE_GPU (see `crate::gpu::test_adapter`).
+        if crate::gpu::test_adapter::hidden() {
+            crate::gpu::test_adapter::no_adapter("sparse_attention setup_gpu");
+            return None;
+        }
+        match SparseAttentionGpu::new_blocking() {
+            Ok(gpu) => {
+                eprintln!("[gpu] sparse attention device acquired");
+                Some(gpu)
+            }
+            Err(e) => {
+                crate::gpu::test_adapter::no_adapter(&format!("sparse_attention setup_gpu: {e}"));
+                None
+            }
+        }
     }
 
     #[test]
@@ -473,7 +486,6 @@ mod tests {
     )]
     fn gpu_forward_matches_cpu_forward_small() {
         let Some(gpu) = setup_gpu() else {
-            eprintln!("skip: no GPU adapter available");
             return;
         };
 
@@ -580,7 +592,6 @@ mod tests {
     )]
     fn gpu_forward_gqa_multi_batch() {
         let Some(gpu) = setup_gpu() else {
-            eprintln!("skip: no GPU adapter available");
             return;
         };
         // batch_size=2, cu_seqlens_q=[0,2,3], Hq=4, Hkv=2, qhead=2,
@@ -696,7 +707,6 @@ mod tests {
             include_str!("../../tests/ref_shaders/sparse_attention_forward_old.wgsl");
 
         let Some(gpu) = setup_gpu() else {
-            eprintln!("skip: no GPU adapter available");
             return;
         };
         let device = gpu.device.clone();
@@ -999,7 +1009,6 @@ mod tests {
     )]
     fn gpu_forward_matches_cpu_forward_large() {
         let Some(gpu) = setup_gpu() else {
-            eprintln!("skip: no GPU adapter available");
             return;
         };
 

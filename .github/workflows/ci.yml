@@ -355,6 +355,11 @@ jobs:
     name: GPU pipeline creation + dispatch correctness (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    # A missing adapter fails the GPU tests instead of skipping them (every
+    # runner in the matrix has one: Metal / lavapipe / WARP). The SUBGROUP gap
+    # of WARP stays a separate, named skip.
+    env:
+      ALICE_LLM_REQUIRE_GPU: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -470,11 +475,29 @@ jobs:
         run: |
           adapter_count=$(grep -c '\[gpu\] adapter:' test_output.log || true)
           marker_count=$(grep -c 'GpuEngine cannot be constructed (SUBGROUP unsupported)' test_output.log || true)
-          echo "adapter_count=$adapter_count marker_count=$marker_count"
+          sparse_count=$(grep -c '\[gpu\] sparse attention device acquired' test_output.log || true)
+          skip_count=$(grep -c 'SKIP: no GPU adapter available' test_output.log || true)
+          echo "adapter_count=$adapter_count marker_count=$marker_count sparse_count=$sparse_count skip_count=$skip_count"
           if [ "$adapter_count" -eq 0 ] && [ "$marker_count" -eq 0 ]; then
             echo "::error::this leg exercised 0 GPU tests (no adapter constructed, no named skip marker printed) — gate defect, not a legitimate pass"
             exit 1
           fi
+          # sparse attention needs no SUBGROUP, so it must run on every leg
+          if [ "$sparse_count" -eq 0 ]; then
+            echo "::error::no sparse attention GPU device was acquired on this leg"
+            exit 1
+          fi
+          # unreachable under ALICE_LLM_REQUIRE_GPU (a missing adapter panics);
+          # kept so that a skip path which bypasses the policy is still caught
+          if [ "$skip_count" -ne 0 ]; then
+            echo "::error::$skip_count GPU test(s) skipped for a missing adapter"
+            exit 1
+          fi
+      # The requirement has teeth: with the adapter hidden the smoke test must
+      # fail on the ALICE_LLM_REQUIRE_GPU panic.
+      - name: "Self-test: a hidden adapter fails the GPU tests"
+        shell: bash
+        run: bash scripts/gpu_require_selftest.sh --lib --features gpu smoke_test_gpu_pipeline_creation
 
   build_release:
     name: Build (release)
