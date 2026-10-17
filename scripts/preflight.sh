@@ -198,6 +198,14 @@ python3 scripts/build_flags_check.py -- cargo check --release --lib
 python3 scripts/build_flags_check.py -- cargo check --release --lib --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
 python3 scripts/build_flags_check.py -- cargo check --release --lib --no-default-features
 
+step "ci.yml / float-environment: No negated fma result (syntax tree, tests then check)"
+cargo test --quiet --locked --manifest-path tools/no-outer-fneg-of-fma/Cargo.toml
+cargo run --quiet --locked --release --manifest-path tools/no-outer-fneg-of-fma/Cargo.toml -- --root .
+
+step "g3-ir.yml / ir: probe tests + no negated fma result in alice-llm's release IR (host build; the per-target floors are checked in CI)"
+python3 scripts/test_fneg_fma_ir_check.py
+python3 scripts/fneg_fma_ir_check.py --package alice-llm --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" --findings-only
+
 step "ci.yml / test: cargo test (default features)"
 ( export CARGO_TERM_COLOR="always"; cargo test --lib )
 
@@ -206,6 +214,12 @@ step "ci.yml / test: cargo test (--features simd)"
 
 step "ci.yml / test: Analytic oracle tests (closed-form laws)"
 ( export CARGO_TERM_COLOR="always"; cargo test --test analytic_oracle )
+
+step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties)"
+scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5 -- cargo test --test lawmath_ln_1p --test law_max_min_ties
+
+step "ci.yml / test: Non-Law build compiles (platform-math)"
+cargo check --all-targets --features platform-math
 
 step "ci.yml / test: Doc tests"
 ( export CARGO_TERM_COLOR="always"; cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )

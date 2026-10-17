@@ -1,0 +1,27 @@
+# tools/no-outer-fneg-of-fma (syntax-tree pre-check) and scripts/fneg_fma_ir_check.py
+# (optimised-IR gate), ALICE-Law G3. Both read this file (copied byte-identical from
+# ALICE-LOL with the two checks; this file itself is per repository).
+#
+# expected-fma-calls / expected-src-fma-calls: the fma-family calls the syntax-tree
+# check finds in every scanned file / in src/. Both must equal what it finds: update
+# them in the commit that adds or removes a call.
+expected-fma-calls = 22
+expected-src-fma-calls = 21
+
+# [[ir]]: per target and package, the floor of fma-family calls in the optimised IR.
+# The floor's job is non-vacuity: measured with the CPU feature set the IR gate builds
+# (scripts/fneg_fma_ir_check.py --features gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix),
+# the platform-math and gpu features excluded (platform-math is not Law-bearing, the
+# gpu kernels are WGSL).
+
+# [[allow]]: none. Only tests/ and examples/ could carry one; src/ has no exception.
+
+[[ir]]
+target = "x86_64-unknown-linux-gnu"
+package = "alice-llm"
+min-fma-calls = 65
+
+[[ir]]
+target = "aarch64-unknown-linux-gnu"
+package = "alice-llm"
+min-fma-calls = 42

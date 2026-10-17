@@ -1,0 +1,87 @@
+name: G3 IR
+
+# ALICE-Law G3, IR half: no negation of a whole fused multiply-add result in the optimised
+# LLVM IR of alice-llm (scripts/fneg_fma_ir_check.py, byte-identical to ALICE-LOL's). The
+# syntax-tree pre-check (tools/no-outer-fneg-of-fma) runs in ci.yml's float-environment job
+# on every push; this workflow builds the release IR, so it runs when a path that can change
+# the IR changed, and weekly (a dependency inlined into the crate can change it too)
+
+on:
+  push:
+    branches: [main, 'ci/**']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'tools/no-outer-fneg-of-fma/**'
+      - 'tools/fneg-fma-ir-probes/**'
+      - 'scripts/fneg_fma_ir_check.py'
+      - 'scripts/test_fneg_fma_ir_check.py'
+      - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
+      - '.github/workflows/g3-ir.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'tools/no-outer-fneg-of-fma/**'
+      - 'tools/fneg-fma-ir-probes/**'
+      - 'scripts/fneg_fma_ir_check.py'
+      - 'scripts/test_fneg_fma_ir_check.py'
+      - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
+      - '.github/workflows/g3-ir.yml'
+  schedule:
+    - cron: '53 5 * * 1'
+  workflow_dispatch:
+
+# a superseded run on a branch is cancelled; on main each commit has a group of its own
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ir:
+    name: fneg of fma in the release IR (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # each target runs on a runner native to it (dependencies with a C build script
+        # need a C toolchain for the target)
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      # the toolchain is rust-toolchain.toml's (the IR text depends on the LLVM version);
+      # both targets are installed for the probe tests, which build for each architecture
+      - name: Targets for the pinned toolchain
+        run: |
+          rustc -vV
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/g3-ir
+          key: g3-ir-${{ matrix.target }}
+      - name: Probe tests (each probe compiled for both architectures, expected verdicts)
+        run: python3 scripts/test_fneg_fma_ir_check.py
+      # runs even when the probe tests failed, so both results are reported
+      - name: No negated fma result in alice-llm's release IR
+        if: ${{ !cancelled() }}
+        env:
+          CARGO_TARGET_DIR: target/g3-ir
+        run: python3 scripts/fneg_fma_ir_check.py --package alice-llm --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" --target ${{ matrix.target }}

@@ -1,0 +1,31 @@
+[workspace]
+# own workspace: this tool is not a member of the repo's main workspace, so
+# its deps (syn, proc-macro2) and MSRV never constrain the library crates.
+
+[package]
+name = "no-outer-fneg-of-fma"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "AST check: forbid negating the whole result of a mul_add call (unstable signed-zero bits across opt-level, see src/main.rs)"
+
+[[bin]]
+name = "no-outer-fneg-of-fma"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+# not used directly in source: declared only to turn on its "span-locations"
+# feature, which syn's fallback (non-proc-macro) lexer needs to report real
+# line numbers instead of call_site() — cargo-machete cannot see that, hence
+# the ignore entry below.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# the allowlist (scripts/no-outer-fneg-of-fma-allowlist.toml) and the root manifest
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.cargo-machete]
+ignored = ["proc-macro2"]
