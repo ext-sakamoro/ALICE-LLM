@@ -191,34 +191,64 @@ fn gguf_metadata_and_tensors_iterate_in_key_order() {
     assert_eq!(got, ["c.weight", "k.weight", "w.weight"]);
 }
 
-/// With a bad page id in every sequence, the error names the first sequence's
-/// id on any number of threads (the first error in row order, as the
-/// single-threaded build reports it)
+/// With a bad page id in every sequence but the first, the error names the
+/// second sequence's id on any number of threads (the first error in row
+/// order, as the single-threaded build reports it). Row 0 is valid and long
+/// (256 blocks), so while it runs the other threads take later rows, fail on
+/// their first block and stop the parallel walk; a run that returned the first
+/// failure to happen instead of the first in row order would skip row 1 and
+/// name a later row's id
 #[cfg(feature = "parallel")]
 #[test]
 fn the_proxy_score_error_is_the_first_in_row_order() {
     use alice_llm::sparse_attention::proxy::compute_proxy_block_max_scores;
     use alice_llm::sparse_attention::types::{BlockTables, CuSeqlensQ, SparseAttentionError};
-    let batch = 64_usize;
-    let q = [1.0_f32, 0.0].repeat(batch);
-    let k = vec![1.0_f32, 0.0, 0.0, 1.0]; // one physical page
-    let table: Vec<i32> = (0..batch)
-        .map(|b| 1000 + i32::try_from(b).unwrap())
+    let (batch, pages, page, dim) = (16_usize, 256_usize, 64_usize, 128_usize);
+    let q: Vec<f32> = (0..batch * dim)
+        .map(|i| f32::from(u8::try_from(i % 7).unwrap()) / 7.0)
         .collect();
-    let tbl = BlockTables::new(table, batch, 1).unwrap();
+    let k: Vec<f32> = (0..pages * page * dim)
+        .map(|i| f32::from(u8::try_from(i % 11).unwrap()) / 11.0)
+        .collect();
+    let table: Vec<i32> = (0..batch * pages)
+        .map(|n| {
+            let (b, p) = (n / pages, n % pages);
+            if b == 0 {
+                i32::try_from(p).unwrap()
+            } else if p == 0 {
+                1000 + i32::try_from(b).unwrap()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let tbl = BlockTables::new(table, batch, pages).unwrap();
     let cu = CuSeqlensQ::new((0..=batch).map(|b| i64::try_from(b).unwrap()).collect()).unwrap();
+    let used = vec![i32::try_from(pages * page).unwrap(); batch];
     for threads in [1, 3, 8] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap();
-        for _ in 0..50 {
+        for _ in 0..20 {
             let err = pool
-                .install(|| compute_proxy_block_max_scores(&q, &k, &tbl, &cu, None, 1, 2, 2, 2))
+                .install(|| {
+                    compute_proxy_block_max_scores(
+                        &q,
+                        &k,
+                        &tbl,
+                        &cu,
+                        Some(&used),
+                        1,
+                        dim,
+                        page,
+                        page,
+                    )
+                })
                 .unwrap_err();
             match err {
                 SparseAttentionError::ShapeMismatch { got, .. } => {
-                    assert_eq!(got, 1000, "{threads} threads")
+                    assert_eq!(got, 1001, "{threads} threads")
                 }
                 other => panic!("expected ShapeMismatch, got {other:?}"),
             }
@@ -227,8 +257,10 @@ fn the_proxy_score_error_is_the_first_in_row_order() {
 }
 
 /// The sparse attention forward pass reports the first failing work unit's
-/// page id on any number of threads (one sequence, one work unit per selected
-/// block, every block mapped to a missing page)
+/// page id on any number of threads: one sequence, one work unit per selected
+/// block; unit 0 is valid and long (256 pages), every later unit fails on its
+/// first page, so a run that returned the first failure to happen would skip
+/// unit 1 and name a later unit's id
 #[cfg(feature = "parallel")]
 #[test]
 fn the_sparse_forward_error_is_the_first_in_unit_order() {
@@ -237,15 +269,28 @@ fn the_sparse_forward_error_is_the_first_in_unit_order() {
     use alice_llm::sparse_attention::types::{
         BlockTables, CuSeqlensQ, SparseAttentionError, SparseSelection,
     };
-    let blocks = 256_usize;
-    let q = [1.0_f32, 0.0].repeat(blocks);
-    let kv = vec![1.0_f32, 0.0, 0.0, 1.0]; // one physical page
-    let table: Vec<i32> = (0..blocks)
-        .map(|j| 1000 + i32::try_from(j).unwrap())
+    let (blocks, ppb, page, dim) = (16_usize, 256_usize, 64_usize, 128_usize);
+    let q: Vec<f32> = (0..blocks * dim)
+        .map(|i| f32::from(u8::try_from(i % 7).unwrap()) / 7.0)
         .collect();
-    let tbl = BlockTables::new(table, 1, blocks).unwrap();
+    let kv: Vec<f32> = (0..ppb * page * dim)
+        .map(|i| f32::from(u8::try_from(i % 11).unwrap()) / 11.0)
+        .collect();
+    let table: Vec<i32> = (0..blocks * ppb)
+        .map(|n| {
+            let (j, p) = (n / ppb, n % ppb);
+            if j == 0 {
+                i32::try_from(p).unwrap()
+            } else if p == 0 {
+                1000 + i32::try_from(j).unwrap()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let tbl = BlockTables::new(table, 1, blocks * ppb).unwrap();
     let cu = CuSeqlensQ::new(vec![0, i64::try_from(blocks).unwrap()]).unwrap();
-    let used = vec![i32::try_from(2 * blocks).unwrap()];
+    let used = vec![i32::try_from(blocks * ppb * page).unwrap()];
     // query token j selects block j
     let sel = SparseSelection::new(
         (0..blocks).map(|j| i32::try_from(j).unwrap()).collect(),
@@ -254,13 +299,14 @@ fn the_sparse_forward_error_is_the_first_in_unit_order() {
         1,
     )
     .unwrap();
-    let idx = build_kvouter_index(&sel, &tbl, &cu, Some(&used), 2, 2).unwrap();
+    let block = ppb * page;
+    let idx = build_kvouter_index(&sel, &tbl, &cu, Some(&used), block, page).unwrap();
     for threads in [1, 3, 8] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap();
-        for _ in 0..50 {
+        for _ in 0..20 {
             let err = pool
                 .install(|| {
                     kvouter_forward(
@@ -273,9 +319,9 @@ fn the_sparse_forward_error_is_the_first_in_unit_order() {
                         Some(&used),
                         1,
                         1,
-                        2,
-                        2,
-                        2,
+                        dim,
+                        block,
+                        page,
                         1.0,
                         false,
                     )
@@ -283,7 +329,7 @@ fn the_sparse_forward_error_is_the_first_in_unit_order() {
                 .unwrap_err();
             match err {
                 SparseAttentionError::ShapeMismatch { got, .. } => {
-                    assert_eq!(got, 1000, "{threads} threads")
+                    assert_eq!(got, 1001, "{threads} threads")
                 }
                 other => panic!("expected ShapeMismatch, got {other:?}"),
             }

@@ -126,6 +126,32 @@ fn the_wrappers_have_only_keyed_access() {
             "the inner collection of {name} must stay private: `{decl}` not found"
         );
     }
+    // Debug: the impl heads carry no `Debug` bound on the keys or values, so
+    // no entry can be formatted, and the body reads the inner collection only
+    // for its length
+    for head in [
+        "impl<K, V> fmt::Debug for LookupMap<K, V> {",
+        "impl<T> fmt::Debug for LookupSet<T> {",
+    ] {
+        assert!(
+            code.contains(head),
+            "Debug impl head changed: `{head}` not found"
+        );
+    }
+    let mut fmt_bodies = 0;
+    for (i, _) in code.match_indices("fn fmt(") {
+        let body = &code[i..];
+        let end = body.find("\n    }").expect("end of fmt");
+        let body = &body[..end];
+        fmt_bodies += 1;
+        let uses = body.matches("self.0").count();
+        let len_uses = body.matches("self.0.len()").count();
+        assert_eq!(
+            uses, len_uses,
+            "a Debug body reads the inner collection beyond its length: {body}"
+        );
+    }
+    assert_eq!(fmt_bodies, 2, "expected the two Debug bodies");
     for forbidden in [
         ".iter(",
         ".keys(",
