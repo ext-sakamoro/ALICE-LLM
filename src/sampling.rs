@@ -78,7 +78,10 @@ pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;
     }
-    let max_val = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = v
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, crate::lawmath::max);
     let mut sum = 0.0f32;
     for x in v.iter_mut() {
         *x = crate::lawmath::exp(*x - max_val);

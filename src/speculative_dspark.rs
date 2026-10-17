@@ -741,7 +741,7 @@ fn stable_sigmoid(z: f32) -> f32 {
 // BCE loss: p を [eps, 1-eps] で clamp してから log (log(0) 回避)
 fn stable_bce(p: f32, y: f32) -> f32 {
     let eps = 1e-7_f32;
-    let p_clamped = p.clamp(eps, 1.0 - eps);
+    let p_clamped = crate::lawmath::clamp(p, eps, 1.0 - eps);
     -(y * crate::lawmath::ln(p_clamped) + (1.0 - y) * crate::lawmath::ln(1.0 - p_clamped))
 }
 
@@ -2131,7 +2131,7 @@ mod tests {
         let vocab = bias.vocab_size() as usize;
         let mut logits = vec![0.0_f32; vocab];
         bias.apply(prev, &mut logits, 1.0).expect("valid");
-        logits.iter().copied().fold(0.0_f32, f32::max)
+        logits.iter().copied().fold(0.0_f32, crate::lawmath::max)
     }
 
     #[test]

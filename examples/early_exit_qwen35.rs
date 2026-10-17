@@ -179,7 +179,7 @@ impl RunSummary {
             self.ppl(),
             self.nll_per_token(),
             self.wall_sec,
-            self.n_scored as f64 / self.wall_sec.max(1e-6)
+            self.n_scored as f64 / alice_llm::lawmath::max64(self.wall_sec, 1e-6)
         )
     }
 }
@@ -494,7 +494,7 @@ References:
             b.nll_per_token(),
             b.n_scored,
             b.wall_sec,
-            b.n_scored as f64 / b.wall_sec.max(1e-6)
+            b.n_scored as f64 / alice_llm::lawmath::max64(b.wall_sec, 1e-6)
         );
         println!(
             "{}",
@@ -518,7 +518,7 @@ References:
             e.n_fast_path,
             e.fast_path_rate() * 100.0,
             e.wall_sec,
-            e.n_scored as f64 / e.wall_sec.max(1e-6)
+            e.n_scored as f64 / alice_llm::lawmath::max64(e.wall_sec, 1e-6)
         );
         println!(
             "{}",

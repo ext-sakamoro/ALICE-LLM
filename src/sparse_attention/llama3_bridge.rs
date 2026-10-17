@@ -409,7 +409,7 @@ mod tests {
         let dense_out = naive_dense_reference(&q, &kv, tq, hq);
         assert_eq!(bridge_out.len(), dense_out.len());
         for (i, (a, b)) in bridge_out.iter().zip(&dense_out).enumerate() {
-            let rel = (a - b).abs() / b.abs().max(1e-6);
+            let rel = (a - b).abs() / crate::lawmath::max(b.abs(), 1e-6);
             assert!(rel < 1e-4, "elem {i}: bridge={a}, dense={b}, rel={rel}");
         }
     }
@@ -439,7 +439,7 @@ mod tests {
         let bridge_out = llama3_sparse_attention(&q, &kv, tq, &cfg).unwrap();
         let dense_out = naive_dense_reference(&q, &kv, tq, hq);
         for (i, (a, b)) in bridge_out.iter().zip(&dense_out).enumerate() {
-            let rel = (a - b).abs() / b.abs().max(1e-6);
+            let rel = (a - b).abs() / crate::lawmath::max(b.abs(), 1e-6);
             assert!(rel < 1e-4, "elem {i}: bridge={a}, dense={b}, rel={rel}");
         }
     }

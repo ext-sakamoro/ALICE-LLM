@@ -201,3 +201,26 @@ pub fn max(a: f32, b: f32) -> f32 {
 pub fn min(a: f32, b: f32) -> f32 {
     alice_det_math::min(a, b)
 }
+
+/// `x` restricted to `[low, high]`: a NaN in any argument gives the
+/// canonical NaN (`f32::clamp` passes a NaN `x` through with its payload),
+/// and with `low > high` the low bound wins (`f32::clamp` panics)
+#[inline]
+#[must_use]
+pub fn clamp(x: f32, low: f32, high: f32) -> f32 {
+    alice_det_math::metric::clamp(x, low, high)
+}
+
+/// [`max`] for `f64`
+#[inline]
+#[must_use]
+pub fn max64(a: f64, b: f64) -> f64 {
+    alice_det_math::max64(a, b)
+}
+
+/// [`min`] for `f64`
+#[inline]
+#[must_use]
+pub fn min64(a: f64, b: f64) -> f64 {
+    alice_det_math::min64(a, b)
+}

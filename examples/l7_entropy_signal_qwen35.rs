@@ -165,7 +165,8 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
         var_x += dx * dx;
         var_y += dy * dy;
     }
-    let denom = (var_x.max(0.0) * var_y.max(0.0)).sqrt();
+    let denom =
+        (alice_llm::lawmath::max64(var_x, 0.0) * alice_llm::lawmath::max64(var_y, 0.0)).sqrt();
     if denom > 1e-12 {
         cov / denom
     } else {

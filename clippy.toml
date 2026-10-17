@@ -64,4 +64,10 @@ disallowed-methods = [
     { path = "f64::cbrt", reason = "platform libm is not cross-platform bit-exact; use alice_det_math" },
     { path = "f64::hypot", reason = "platform libm is not cross-platform bit-exact; use alice_det_math" },
     { path = "f64::powi", reason = "lowers to a multiplication tree of unspecified association order; write the multiplications out" },
+    { path = "f32::max", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::max" },
+    { path = "f32::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min" },
+    { path = "f32::clamp", reason = "NaN passes through with its payload and inverted bounds panic; use crate::lawmath::clamp" },
+    { path = "f64::max", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::max" },
+    { path = "f64::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min" },
+    { path = "f64::clamp", reason = "NaN passes through with its payload and inverted bounds panic; use crate::lawmath::clamp" },
 ]

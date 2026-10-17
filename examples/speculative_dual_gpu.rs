@@ -267,7 +267,8 @@ fn main() {
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob =
+                    alice_llm::lawmath::min(p_x / alice_llm::lawmath::max(q_x, 1e-10), 1.0);
 
                 let r = rng.next_f32();
                 if r < accept_prob {
@@ -278,7 +279,7 @@ fn main() {
                     let mut adjusted = vec![0.0f32; verify_vocab];
                     let mut adj_sum = 0.0f32;
                     for j in 0..verify_vocab.min(draft_vocab) {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = alice_llm::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     // Verifier vocab may be larger — keep p for extra tokens

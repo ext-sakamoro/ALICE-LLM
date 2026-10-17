@@ -225,7 +225,7 @@ fn main() {
         .iter()
         .zip(&model_3l_logits)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, alice_llm::lawmath::max);
     let mean_diff: f32 = logits
         .iter()
         .zip(&model_3l_logits)

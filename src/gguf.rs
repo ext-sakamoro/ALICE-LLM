@@ -5830,7 +5830,7 @@ unsafe fn quantize_activation_i8_neon(
     }
     let mut abs_max = vmaxvq_f32(max_vec);
     while i < n {
-        abs_max = abs_max.max(input[i].abs());
+        abs_max = crate::lawmath::max(abs_max, input[i].abs());
         i += 1;
     }
 
@@ -5867,7 +5867,10 @@ unsafe fn quantize_activation_i8_neon(
     }
     // Scalar tail
     while i < n {
-        quant[i] = (input[i] * inv_scale).round().max(-127.0).min(127.0) as i8;
+        quant[i] = crate::lawmath::min(
+            crate::lawmath::max((input[i] * inv_scale).round(), -127.0),
+            127.0,
+        ) as i8;
         i += 1;
     }
 
@@ -7658,7 +7661,7 @@ mod tests {
         // With n_keep=16 (all), sparse should match dense
         // Tolerance widened for i8 activation quantization (~2% relative error)
         for i in 0..num_rows {
-            let tol = dense_out[i].abs().max(0.01) * 0.05;
+            let tol = crate::lawmath::max(dense_out[i].abs(), 0.01) * 0.05;
             assert!(
                 (dense_out[i] - sparse_out[i]).abs() < tol,
                 "row {i}: dense={} sparse={}",
@@ -8132,7 +8135,7 @@ mod tests {
             // will pick AVX2 on this test's precondition).
             q8_0_matvec(&input, row_data, 1, COLS, &mut simd_out);
             let diff = (scalar_out[0] - simd_out[0]).abs();
-            let rel = diff / scalar_out[0].abs().max(1.0);
+            let rel = diff / crate::lawmath::max(scalar_out[0].abs(), 1.0);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={} simd={} rel={rel}",
@@ -8196,7 +8199,7 @@ mod tests {
             // covers AVX-512 skip via feature detection above).
             let simd = ternary_dot_row(&row, &input);
             let diff = (scalar - simd).abs();
-            let rel = diff / scalar.abs().max(1e-6);
+            let rel = diff / crate::lawmath::max(scalar.abs(), 1e-6);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
@@ -8219,7 +8222,7 @@ mod tests {
             let input = make_ternary_input(seed.wrapping_mul(11), COLS);
             let scalar = ternary_dot_row_scalar(&row, &input);
             let simd = ternary_dot_row(&row, &input);
-            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            let rel = (scalar - simd).abs() / crate::lawmath::max(scalar.abs(), 1e-6);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
@@ -8241,7 +8244,7 @@ mod tests {
             let input = make_ternary_input(seed.wrapping_mul(7), COLS);
             let scalar = ternary_dot_row_scalar(&row, &input);
             let simd = ternary_dot_row(&row, &input);
-            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            let rel = (scalar - simd).abs() / crate::lawmath::max(scalar.abs(), 1e-6);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
@@ -8356,7 +8359,7 @@ mod tests {
             let input = make_ternary_input(seed.wrapping_mul(7), COLS);
             let scalar = ternary_dot_row_scalar(&row, &input);
             let simd = ternary_dot_row(&row, &input);
-            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            let rel = (scalar - simd).abs() / crate::lawmath::max(scalar.abs(), 1e-6);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"
@@ -8375,7 +8378,7 @@ mod tests {
             let input = make_ternary_input(seed.wrapping_mul(11), COLS);
             let scalar = ternary_dot_row_scalar(&row, &input);
             let simd = ternary_dot_row(&row, &input);
-            let rel = (scalar - simd).abs() / scalar.abs().max(1e-6);
+            let rel = (scalar - simd).abs() / crate::lawmath::max(scalar.abs(), 1e-6);
             assert!(
                 rel < 1e-4,
                 "seed={seed}: scalar={scalar} simd={simd} rel={rel}"

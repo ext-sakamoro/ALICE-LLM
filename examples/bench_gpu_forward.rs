@@ -139,7 +139,7 @@ fn main() {
                 .iter()
                 .zip(first_batch_logits.iter())
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+                .fold(0.0f32, alice_llm::lawmath::max);
             let valid_single = single_logits.iter().filter(|v| !v.is_nan()).count();
             let valid_batch = first_batch_logits.iter().filter(|v| !v.is_nan()).count();
             println!(

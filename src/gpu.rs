@@ -7184,7 +7184,7 @@ mod tests {
 
         for r in 0..rows {
             let diff = (gpu_out[r] - expected[r]).abs();
-            let scale = expected[r].abs().max(1.0);
+            let scale = crate::lawmath::max(expected[r].abs(), 1.0);
             assert!(
                 diff < 5e-3 * scale,
                 "row {r}: gpu={} expected={} diff={} scale={scale}",
@@ -9374,8 +9374,8 @@ mod tests {
                 for (i, (g, e)) in gpu_out.iter().zip(expected.iter()).enumerate() {
                     assert_finite(*g, "gpu output");
                     assert_finite(*e, "cpu reference output");
-                    let rel = (g - e).abs() / e.abs().max(1e-6);
-                    worst_rel = worst_rel.max(rel);
+                    let rel = (g - e).abs() / crate::lawmath::max(e.abs(), 1e-6);
+                    worst_rel = crate::lawmath::max(worst_rel, rel);
                     assert!(
                         rel < TOL,
                         "num_heads={num_heads} seq_len={seq_len} idx={i}: gpu={g} cpu={e} rel={rel} tol={TOL}"

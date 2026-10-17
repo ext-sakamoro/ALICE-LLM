@@ -275,7 +275,7 @@ References:
 
         if (token_idx + 1) % progress_every == 0 {
             let elapsed = t_forward.elapsed().as_secs_f32();
-            let tok_per_sec = (token_idx + 1) as f32 / elapsed.max(1e-6);
+            let tok_per_sec = (token_idx + 1) as f32 / alice_llm::lawmath::max(elapsed, 1e-6);
             eprintln!(
                 "  {}/{} tokens ({:.2} tok/s, {:.1}s elapsed)",
                 token_idx + 1,
@@ -295,7 +295,7 @@ References:
         "Forward complete: {} tokens in {:.1}s ({:.2} tok/s)",
         tokens.len(),
         total_elapsed.as_secs_f32(),
-        tokens.len() as f32 / total_elapsed.as_secs_f32().max(1e-6)
+        tokens.len() as f32 / alice_llm::lawmath::max(total_elapsed.as_secs_f32(), 1e-6)
     );
 
     // Per-layer averages (stderr, human-readable).

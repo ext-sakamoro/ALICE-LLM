@@ -3153,7 +3153,10 @@ pub fn block_attnres_softmax_attention(
     }
 
     // 2. Softmax with log-sum-exp stability.
-    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, crate::lawmath::max);
     let mut exp_logits = Vec::with_capacity(logits.len());
     let mut sum_exp = 0.0_f64;
     for &l in &logits {
@@ -4592,7 +4595,7 @@ impl Llama3Config {
         let cutoff = mean + scale * std;
         // ReLU shift in-place
         for x in gate_buf.iter_mut() {
-            *x = (*x - cutoff).max(0.0);
+            *x = crate::lawmath::max(*x - cutoff, 0.0);
         }
     }
 
@@ -5660,7 +5663,10 @@ fn gqa_attention(
             scores.push(score);
         }
 
-        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_score = scores
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, crate::lawmath::max);
         if use_f64_acc {
             let mut sum_f64 = 0.0f64;
             for s in &mut scores {
@@ -5751,7 +5757,10 @@ fn gqa_attention_paged(
             scores.push(score);
         }
 
-        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_score = scores
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, crate::lawmath::max);
         let mut sum = 0.0f32;
         for s in &mut scores {
             *s = crate::lawmath::exp(*s - max_score);
@@ -6145,13 +6154,13 @@ fn gated_deltanet_head_disjoint(
         q_sum_sq += val * val;
     }
     let q_scale = 1.0 / (qk_dim as f32).sqrt();
-    let q_norm = q_scale / q_sum_sq.sqrt().max(1e-12);
+    let q_norm = q_scale / crate::lawmath::max(q_sum_sq.sqrt(), 1e-12);
 
     let mut k_sum_sq = 0.0f32;
     for &val in k {
         k_sum_sq += val * val;
     }
-    let k_norm = 1.0 / k_sum_sq.sqrt().max(1e-12);
+    let k_norm = 1.0 / crate::lawmath::max(k_sum_sq.sqrt(), 1e-12);
 
     for j in 0..v_dim {
         // Column j of `S^T @ k` = sum_i state[i, j] * k_i.
@@ -7323,7 +7332,10 @@ fn kimi_k3_gated_mla_step(
         }
 
         // Softmax (log-sum-exp stable).
-        let max_logit = logits_buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_logit = logits_buf
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, crate::lawmath::max);
         let mut sum_exp = 0.0_f64;
         for l in &mut logits_buf {
             *l = crate::lawmath::exp(*l - max_logit);
@@ -7610,7 +7622,10 @@ pub(crate) fn kimi_k3_res_mix(
     scores.push(s_cur as f32);
 
     // Step 3-4: softmax over (n_ckpt + 1) with log-sum-exp stability.
-    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_s = scores
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, crate::lawmath::max);
     let mut exp_s = Vec::with_capacity(scores.len());
     let mut sum_exp = 0.0_f64;
     for &sc in &scores {
@@ -7700,8 +7715,8 @@ mod kimi_k3_attnres_tests {
         let out = kimi_k3_res_mix(&state, &prefix, &score_w, 1e-6);
         assert_eq!(out.len(), 3);
         for i in 0..3 {
-            let lo = bank[i].min(prefix[i]);
-            let hi = bank[i].max(prefix[i]);
+            let lo = crate::lawmath::min(bank[i], prefix[i]);
+            let hi = crate::lawmath::max(bank[i], prefix[i]);
             assert!(
                 out[i] >= lo - 1e-4 && out[i] <= hi + 1e-4,
                 "out[{i}]={} must lie in [{lo}, {hi}]",
@@ -16296,7 +16311,7 @@ impl<'a> Llama3Model<'a> {
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob = crate::lawmath::min(p_x / crate::lawmath::max(q_x, 1e-10), 1.0);
 
                 let r = rng.next_f32();
                 if r < accept_prob {
@@ -16310,7 +16325,7 @@ impl<'a> Llama3Model<'a> {
                     let mut adjusted = vec![0.0f32; p.len()];
                     let mut adj_sum = 0.0f32;
                     for j in 0..p.len() {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = crate::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     let resampled = if adj_sum > 0.0 {
@@ -16468,7 +16483,7 @@ impl<'a> Llama3Model<'a> {
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob = crate::lawmath::min(p_x / crate::lawmath::max(q_x, 1e-10), 1.0);
 
                 let r = rng.next_f32();
                 if r < accept_prob {
@@ -16483,7 +16498,7 @@ impl<'a> Llama3Model<'a> {
                     let mut adjusted = vec![0.0f32; p.len()];
                     let mut adj_sum = 0.0f32;
                     for j in 0..p.len() {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = crate::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     let resampled = if adj_sum > 0.0 {
@@ -16713,7 +16728,7 @@ impl<'a> Llama3Model<'a> {
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob = crate::lawmath::min(p_x / crate::lawmath::max(q_x, 1e-10), 1.0);
 
                 let r = rng.next_f32();
                 if r < accept_prob {
@@ -16726,7 +16741,7 @@ impl<'a> Llama3Model<'a> {
                     let mut adjusted = vec![0.0f32; p.len()];
                     let mut adj_sum = 0.0f32;
                     for j in 0..p.len() {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = crate::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     let resampled = if adj_sum > 0.0 {
@@ -16895,7 +16910,7 @@ impl<'a> Llama3Model<'a> {
                 let x = draft_tokens[i] as usize;
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob = crate::lawmath::min(p_x / crate::lawmath::max(q_x, 1e-10), 1.0);
                 let r = rng.next_f32();
                 let accepted = r < accept_prob;
                 // ここで label 付与 (verify した position のみ)
@@ -16915,7 +16930,7 @@ impl<'a> Llama3Model<'a> {
                     let mut adjusted = vec![0.0f32; p.len()];
                     let mut adj_sum = 0.0f32;
                     for j in 0..p.len() {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = crate::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     let resampled = if adj_sum > 0.0 {
@@ -17562,7 +17577,7 @@ impl<'a> Llama3Model<'a> {
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
-                let accept_prob = (p_x / q_x.max(1e-10)).min(1.0);
+                let accept_prob = crate::lawmath::min(p_x / crate::lawmath::max(q_x, 1e-10), 1.0);
 
                 let r = rng.next_f32();
                 if r < accept_prob {
@@ -17575,7 +17590,7 @@ impl<'a> Llama3Model<'a> {
                     let mut adjusted = vec![0.0f32; p.len()];
                     let mut adj_sum = 0.0f32;
                     for j in 0..p.len() {
-                        adjusted[j] = (p[j] - q[j]).max(0.0);
+                        adjusted[j] = crate::lawmath::max(p[j] - q[j], 0.0);
                         adj_sum += adjusted[j];
                     }
                     let resampled = if adj_sum > 0.0 {
@@ -18271,7 +18286,10 @@ fn argmax(logits: &[f32]) -> u32 {
 
 /// Convert logits to probability distribution via softmax.
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, crate::lawmath::max);
     let mut probs: Vec<f32> = logits
         .iter()
         .map(|&l| crate::lawmath::exp(l - max_val))
@@ -18833,7 +18851,7 @@ fn forward_moe_layer(
     let max_logit = router_logits
         .iter()
         .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f32::NEG_INFINITY, crate::lawmath::max);
     let mut probs: Vec<f32> = router_logits
         .iter()
         .map(|&v| crate::lawmath::exp(v - max_logit))
@@ -19449,7 +19467,7 @@ fn residual_dist(p_main: &[f32], p_draft: &[f32]) -> Vec<f32> {
     let mut r: Vec<f32> = p_main
         .iter()
         .zip(p_draft.iter())
-        .map(|(&m, &d)| (m - d).max(0.0))
+        .map(|(&m, &d)| crate::lawmath::max(m - d, 0.0))
         .collect();
     let sum: f32 = r.iter().sum();
     if sum > 0.0 {
@@ -19550,7 +19568,11 @@ pub fn speculative_decode_v2(
             let p_draft = &draft_dists[idx];
             let p_m = p_main[draft_tok as usize];
             let p_d = draft_probs_at_pick[idx];
-            let ratio = if p_d > 0.0 { (p_m / p_d).min(1.0) } else { 0.0 };
+            let ratio = if p_d > 0.0 {
+                crate::lawmath::min(p_m / p_d, 1.0)
+            } else {
+                0.0
+            };
             let u = rng.next_unit_f32();
             if u < ratio {
                 result.tokens.push(draft_tok);
@@ -22331,7 +22353,7 @@ mod tests {
             .iter()
             .zip(out_bonsai.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::lawmath::max);
         assert!(
             max_diff > 1e-4,
             "legacy vs Bonsai output max_diff={max_diff}, expected > 1e-4",

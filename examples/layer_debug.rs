@@ -7,8 +7,14 @@ use std::fs;
 
 fn vec_stats(v: &[f32]) -> (f32, f32, f32, f32) {
     let sum: f32 = v.iter().sum();
-    let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min = v
+        .iter()
+        .cloned()
+        .fold(f32::INFINITY, alice_llm::lawmath::min);
+    let max = v
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, alice_llm::lawmath::max);
     let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     (sum, min, max, l2)
 }

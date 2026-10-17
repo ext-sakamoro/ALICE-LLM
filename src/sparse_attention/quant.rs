@@ -359,9 +359,9 @@ mod tests {
         let mut sum_sq = 0.0f64;
         let mut count = 0usize;
         for (i, (a, b)) in src.iter().zip(&back).enumerate() {
-            let denom = a.abs().max(1e-3);
+            let denom = crate::lawmath::max(a.abs(), 1e-3);
             let rel = (a - b).abs() / denom;
-            max_rel = max_rel.max(rel);
+            max_rel = crate::lawmath::max(max_rel, rel);
             sum_sq += f64::from(rel) * f64::from(rel);
             count += 1;
             assert!(rel < 0.15, "elem {i}: src={a}, back={b}, rel={rel}");

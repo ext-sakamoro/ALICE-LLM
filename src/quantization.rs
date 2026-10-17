@@ -22,8 +22,14 @@ impl QuantizedInt8 {
                 zero_point: 0.0,
             };
         }
-        let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
-        let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = values
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, crate::lawmath::min);
+        let max_val = values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, crate::lawmath::max);
 
         let mid = (min_val + max_val) * 0.5;
         let half_range = (max_val - min_val) * 0.5;
@@ -37,7 +43,7 @@ impl QuantizedInt8 {
             .iter()
             .map(|&v| {
                 let q = ((v - mid) / scale).round();
-                q.clamp(-127.0, 127.0) as i8
+                crate::lawmath::clamp(q, -127.0, 127.0) as i8
             })
             .collect();
 
@@ -91,8 +97,14 @@ impl QuantizedInt4 {
                 len: 0,
             };
         }
-        let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
-        let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = values
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, crate::lawmath::min);
+        let max_val = values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, crate::lawmath::max);
 
         let range = max_val - min_val;
         let scale = if range < f32::EPSILON {
@@ -106,7 +118,7 @@ impl QuantizedInt4 {
             .iter()
             .map(|&v| {
                 let q = ((v - zero_point) / scale).round();
-                q.clamp(0.0, 15.0) as u8
+                crate::lawmath::clamp(q, 0.0, 15.0) as u8
             })
             .collect();
 

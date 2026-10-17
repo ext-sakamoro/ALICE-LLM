@@ -83,7 +83,9 @@ impl StraightThroughEstimator {
     #[inline]
     pub fn backward(&self, grad: &[f32], clip: bool) -> Vec<f32> {
         if clip {
-            grad.iter().map(|g| g.clamp(-1.0, 1.0)).collect()
+            grad.iter()
+                .map(|g| crate::lawmath::clamp(*g, -1.0, 1.0))
+                .collect()
         } else {
             grad.to_vec()
         }

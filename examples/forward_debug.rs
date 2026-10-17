@@ -76,11 +76,11 @@ fn main() {
     let max = emb[0..dim0.min(emb.len())]
         .iter()
         .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f32::NEG_INFINITY, alice_llm::lawmath::max);
     let min = emb[0..dim0.min(emb.len())]
         .iter()
         .cloned()
-        .fold(f32::INFINITY, f32::min);
+        .fold(f32::INFINITY, alice_llm::lawmath::min);
     println!("  token 0 stats: sum={sum:.4}, min={min:.4}, max={max:.4}");
 
     // Check norm weights
@@ -111,8 +111,14 @@ fn main() {
     let logits = model.forward(tokenizer.bos_id);
     println!("  logits len: {}", logits.len());
     let logits_sum: f32 = logits.iter().sum();
-    let logits_max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let logits_min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+    let logits_max = logits
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, alice_llm::lawmath::max);
+    let logits_min = logits
+        .iter()
+        .cloned()
+        .fold(f32::INFINITY, alice_llm::lawmath::min);
     let argmax = logits
         .iter()
         .enumerate()
