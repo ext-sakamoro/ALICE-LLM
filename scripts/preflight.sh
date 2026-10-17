@@ -57,6 +57,10 @@ python3 scripts/test_build_config_guard.py
 python3 scripts/build_config_guard.py
 python3 scripts/test_build_flags_check.py
 
+step "ci.yml / clippy: Identifier moves (tests, then against the published release)"
+python3 scripts/test_id_move_check.py
+python3 scripts/id_move_check.py
+
 step "ci.yml / clippy: cargo clippy (default features, all targets)"
 relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets -- -D warnings )
@@ -218,7 +222,7 @@ step "ci.yml / test: Analytic oracle tests (closed-form laws)"
 ( export CARGO_TERM_COLOR="always"; cargo test --test analytic_oracle )
 
 step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)"
-scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
+scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
 scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
 
 step "ci.yml / release: release profile tests (library, oracles, Law tests)"
@@ -229,6 +233,9 @@ scripts/run_tests.sh order_independence=3 -- cargo test --release --features ggu
 
 step "ci.yml / test: Non-Law build compiles (platform-math)"
 cargo check --all-targets --features platform-math
+
+step "ci.yml / test: Running identifier under platform-math"
+scripts/run_tests.sh running_semantics_id=1 -- cargo test --features platform-math --test running_semantics_id
 
 step "ci.yml / test: Doc tests"
 ( export CARGO_TERM_COLOR="always"; cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" )

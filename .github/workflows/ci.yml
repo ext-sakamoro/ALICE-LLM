@@ -114,6 +114,9 @@ jobs:
         features: [default, simd, full, gpu-oracle]
     steps:
       - uses: actions/checkout@v5
+        with:
+          # the release tags: scripts/id_move_check.py compares with the newest one
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -130,6 +133,22 @@ jobs:
       - name: cargo clippy (full feature set + internal-kernel-oracle, all targets)
         if: matrix.features == 'gpu-oracle'
         run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings
+      # G9: an identifier (LLM_SEMANTICS_ID, LLM_PLATFORM_SEMANTICS_ID) moves only with a breaking version, with the
+      # released value in its previous list (when it has one) and both values named in
+      # CHANGELOG.md; the released value is read from the published crate at the newest
+      # release tag (scripts/id_move_check.py, shared with the other ALICE crates). A
+      # registry that cannot be read fails on main and warns on ci/ branches and PRs
+      - name: Identifier moves (tests)
+        run: python3 scripts/test_id_move_check.py
+      - name: Identifier moves (the release compared with)
+        id: id-base
+        run: echo "crate=$(python3 scripts/id_move_check.py --print-base)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry/cache/*/${{ steps.id-base.outputs.crate }}.crate
+          key: id-move-${{ steps.id-base.outputs.crate }}
+      - name: Identifier moves (against the published release)
+        run: python3 scripts/id_move_check.py
 
   g1:
     # ALICE-Law G1. clippy.toml bans the f32 / f64 methods platform libm may
@@ -197,12 +216,17 @@ jobs:
       - name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)
         if: matrix.features == 'default'
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
           scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
         if: matrix.features == 'default'
         run: cargo check --all-targets --features platform-math
+      # G9: in the platform-math build RUNNING_SEMANTICS_ID is the platform identifier, one of
+      # the two scripts/id_move_check.py reads (counted: a test compiled out fails the step)
+      - name: Running identifier under platform-math
+        if: matrix.features == 'default'
+        run: scripts/run_tests.sh running_semantics_id=1 -- cargo test --features platform-math --test running_semantics_id
       - name: Doc tests
         if: matrix.features == 'default'
         run: cargo test --doc --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"

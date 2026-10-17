@@ -136,6 +136,11 @@ reference_repo = "ALICE-DB"
 
 [G9]
 status = "unverified"
+evidence = [
+    "scripts/id_move_check.py (shared with the other ALICE crates that carry an identifier; tests scripts/test_id_move_check.py; config scripts/id_move.toml): builds a probe against the published release of the newest release tag (alice-llm 2.0.0 today) and against the working tree, reads semantics::LLM_SEMANTICS_ID and semantics::LLM_PLATFORM_SEMANTICS_ID (the one a platform-math build stamps into KV cache files) as values and fails when one moved without a breaking version, without the released value in LLM_PREVIOUS_SEMANTICS_IDS, or without CHANGELOG.md naming both; every const / static / associated const of type [u8; 32] and every public re-export of another crate's constant must be listed or exempt; .github/workflows/ci.yml clippy job and scripts/preflight.sh; today: both are new since 2.0.0 (32957f18, 269ade8f)",
+    "tests/running_semantics_id.rs (RUNNING_SEMANTICS_ID, exempt in the config as a cfg alias, equals exactly one of the two checked identifiers and the right one per build; ci.yml runs it in the default test leg and under platform-math, counted by scripts/run_tests.sh)",
+]
+mutant = "measured 2026-10-17, reverted: dropping the [exempt] entry makes scripts/id_move_check.py exit 1 (`RUNNING_SEMANTICS_ID (src/semantics.rs:128): a [u8; 32] item that is neither an [[id]] ...`); RUNNING_SEMANTICS_ID made LLM_SEMANTICS_ID under platform-math fails tests/running_semantics_id.rs in the platform-math step"
 note = "unverified: both identifiers are introduced in 3.0.0 (LLM_SEMANTICS_ID for G6, the KV cache file identifier for G8), so there is no history to audit yet and no identifier-history test; LLM_PREVIOUS_SEMANTICS_IDS is empty. The first move has to be a major release with both values named in CHANGELOG.md and a test that loads a file stamped with the earlier value."
 
 [G10]

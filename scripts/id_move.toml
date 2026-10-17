@@ -1,0 +1,18 @@
+# scripts/id_move_check.py (ALICE-Law G9): the identifiers whose value may move only with a
+# breaking version, the previous-identifier list that must keep the released value, and the
+# release tags the base is read from (its values come from the published crate)
+package = "alice-llm"
+manifest = "Cargo.toml"
+tags = ["v{version}", "alice-llm-v{version}"]
+
+[exempt]
+RUNNING_SEMANTICS_ID = "a cfg alias: LLM_SEMANTICS_ID, or LLM_PLATFORM_SEMANTICS_ID with platform-math, both checked below; tests/running_semantics_id.rs asserts it equals exactly one of them in each build (CI runs it in both)"
+
+[[id]]
+path = "alice_llm::semantics::LLM_SEMANTICS_ID"
+previous = "alice_llm::semantics::LLM_PREVIOUS_SEMANTICS_IDS"
+
+[[id]]
+# persisted: a platform-math build stamps it into the KV cache files (as RUNNING_SEMANTICS_ID,
+# src/llama3.rs); its value is the SHA-256 of a fixed sentence, so it moves only if that changes
+path = "alice_llm::semantics::LLM_PLATFORM_SEMANTICS_ID"

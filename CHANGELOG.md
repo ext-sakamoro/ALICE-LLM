@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- CI (ALICE-Law G9): `scripts/id_move_check.py` (ALICE の識別子を持つ crate で共有、ALICE-Zip と同じ file) を追加 最新の release tag の公開版と作業 tree で `LLM_SEMANTICS_ID` と `LLM_PLATFORM_SEMANTICS_ID` の値を読み、動いたのに破壊的な版になっていない / 公開版の値が以前の識別子の一覧に無い / CHANGELOG が両方の値を書いていない時に fail する (ci.yml の clippy job と preflight) `RUNNING_SEMANTICS_ID` は cfg の別名として除外し、`tests/running_semantics_id.rs` (既定と platform-math の両方で実行) でどちらか 1 つと等しいことを固定する
 - `tests/float_edge_golden.rs` (ALICE-Law G4): 正負のゼロと厳密な打ち消しを公開の kernel で固定の bit と比べる (±0 の silu / gelu、一定値の layer_norm は +0、符号付きゼロの rms_norm、等しい logits の softmax はちょうど 0.25、位置 0 の RoPE は各ゼロの符号を test の中で導いて固定、一定値の量子化)
 - CI (ALICE-Law G4 / G5): 新しい release job が ubuntu (x86_64) と macOS (aarch64) で `cargo test --release --lib`、閉形式の oracle、Law の試験 (lawmath_ln_1p / law_max_min_ties / semantics_golden / llm_semantics_id / float_edge_golden / order_independence) を release の profile で走らせる debug の Law 試験の step にも float_edge_golden を足した preflight も同じ
 - CI (ALICE-Law G10): `scripts/entropy_guard.py` と試験 (ALICE-DB から、許可表はこの repository のもの) が src/ の時計と OS 乱数の呼び出しを数える 許可は生成の統計 (prefill_ms など)・trace の出力・server の応答の時刻と request id で、どれも token を決めない float-environment job (ubuntu / macOS / Windows) と preflight で走る
