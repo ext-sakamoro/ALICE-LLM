@@ -196,6 +196,53 @@ class SignMask(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    def test_a_build_without_cargo_target_dir_runs(self):
+        # without CARGO_TARGET_DIR the check builds into a fresh temporary directory; it
+        # must not ask cargo to clean that directory first (cargo refuses one without a
+        # CACHEDIR.TAG), so a local run without the variable completes
+        with tempfile.TemporaryDirectory() as d:
+            crate = Path(d) / "g3_fixture"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "g3_fixture"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n',
+                encoding="utf-8")
+            (crate / "src" / "lib.rs").write_text(
+                "pub fn f(a: f32, b: f32, c: f32) -> f32 { a * b + c }\n", encoding="utf-8")
+            (crate / "scripts").mkdir()
+            (crate / "scripts" / "no-outer-fneg-of-fma-allowlist.toml").write_text(
+                "expected-fma-calls = 0\nexpected-src-fma-calls = 0\n", encoding="utf-8")
+            env = {k: v for k, v in __import__("os").environ.items() if k != "CARGO_TARGET_DIR"}
+            r = subprocess.run([sys.executable, str(ROOT / "scripts" / "fneg_fma_ir_check.py"),
+                                "--findings-only"], cwd=crate, env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("g3_fixture", r.stdout + r.stderr)
+            self.assertIn("0 negated", r.stdout + r.stderr)
+
+    def test_a_shared_cargo_target_dir_rebuilds_on_every_run(self):
+        # with CARGO_TARGET_DIR the check cleans the package first: a second run on the same
+        # target directory has nothing left to compile and would find no .ll, so it must
+        # rebuild and report the same negated fma as the first
+        with tempfile.TemporaryDirectory() as d:
+            crate = Path(d) / "g3_fixture"
+            (crate / "src").mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "g3_fixture"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n',
+                encoding="utf-8")
+            (crate / "src" / "lib.rs").write_text(
+                "pub fn f(a: f32, b: f32, c: f32) -> f32 { -(a.mul_add(b, c)) }\n", encoding="utf-8")
+            (crate / "scripts").mkdir()
+            (crate / "scripts" / "no-outer-fneg-of-fma-allowlist.toml").write_text(
+                "expected-fma-calls = 1\nexpected-src-fma-calls = 1\n", encoding="utf-8")
+            env = dict(__import__("os").environ, CARGO_TARGET_DIR=str(Path(d) / "target"))
+            outs = []
+            for _ in range(2):
+                r = subprocess.run([sys.executable, str(ROOT / "scripts" / "fneg_fma_ir_check.py"),
+                                    "--findings-only"], cwd=crate, env=env, capture_output=True,
+                                   text=True)
+                outs.append(r.stdout + r.stderr)
+                self.assertIn("1 negated", outs[-1], outs[-1])
+                self.assertNotIn("found 0", outs[-1], outs[-1])
+
     def test_a_missing_or_empty_ll_fails(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(g.main(["--ll", str(Path(d) / "absent.ll")]), 1)

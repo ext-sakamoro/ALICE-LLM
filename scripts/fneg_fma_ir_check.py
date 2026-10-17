@@ -266,12 +266,17 @@ def _cargo_metadata(package: str | None) -> tuple[str, str]:
 
 def build_ll(args: argparse.Namespace) -> Path:
     package, crate = _cargo_metadata(args.package)
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR") or tempfile.mkdtemp(prefix="g3-ir-"))
+    shared = os.environ.get("CARGO_TARGET_DIR")
+    target_dir = Path(shared or tempfile.mkdtemp(prefix="g3-ir-"))
     profile_dir = target_dir / (args.target or "") / "release" / "deps"
     sel = ["-p", package]
     tgt = ["--target", args.target] if args.target else []
-    subprocess.run(["cargo", "clean", "--release", *sel, *tgt, "--target-dir", str(target_dir)],
-                   check=True, capture_output=True)
+    # a shared target directory may hold an older build of the package: clean it so the IR
+    # is emitted again; a fresh temporary directory holds nothing, and cargo refuses to
+    # clean a directory that has no CACHEDIR.TAG yet
+    if shared:
+        subprocess.run(["cargo", "clean", "--release", *sel, *tgt, "--target-dir", str(target_dir)],
+                       check=True, capture_output=True)
     for old in profile_dir.glob(f"{crate}-*.ll"):
         old.unlink()
     feat: list[str] = []
