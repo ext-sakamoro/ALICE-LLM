@@ -87,6 +87,15 @@ fn check_entries(pins: &[(&str, [u8; 32])], minimum: usize) {
         compared >= minimum,
         "compared {compared} entries: the table lost its pins"
     );
+    // and the other way: every recorded golden is folded (a scenario added
+    // to tests/semantics_golden.rs without an entry here would not move the
+    // identifier)
+    for name in goldens.keys() {
+        assert!(
+            pins.iter().any(|(n, _)| n == name),
+            "the golden {name:?} of tests/semantics_golden.rs is not folded"
+        );
+    }
 }
 
 #[test]
@@ -184,4 +193,16 @@ fn the_pins_were_checked_on_this_version_and_toolchain() {
         .expect("a channel line")
         .trim_matches('"');
     assert_eq!(LLM_SEMANTICS_CHECKED_AT.1, channel, "toolchain channel");
+    // the rustc that runs the test, so an override of the file is caught too
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let out = std::process::Command::new(rustc)
+        .arg("-V")
+        .output()
+        .expect("rustc -V");
+    let version = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        version.starts_with(&format!("rustc {} ", LLM_SEMANTICS_CHECKED_AT.1)),
+        "running {version:?}, pins checked on {}",
+        LLM_SEMANTICS_CHECKED_AT.1
+    );
 }
