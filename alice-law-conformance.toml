@@ -174,7 +174,7 @@ since = ""
 reference_repo = "ALICE-DB"
 
 [G13]
-status = "pass"
+status = "fail-known"
 evidence = [
     "audit of every HashMap / HashSet in src/ (2026-10-17): lookups or membership only in src/gguf.rs (metadata, tensors, the byte decoder and token map), src/sampling.rs (top-p keep set), src/grammar/fsm.rs (seen set), src/deepseek_streaming.rs (expert cache), src/speculative_dspark.rs (bigram counts); iterated only where the order cannot reach a result: src/gguf.rs line 660 (shard index, first shard by index wins), src/grammar/gbnf.rs line 165 (validation), src/speculative_dspark.rs line 541 (sorted by count then token id, a total order), src/tokenizer.rs BpeTokenizer::new (now keeps the smallest string for a shared id instead of the last one iterated)",
     "audit of the rayon sites: row-parallel (par_iter_mut / par_chunks_mut over output rows in src/gguf.rs, src/sparse_attention, src/llama3.rs line 6193) or one task per attention head writing its own slice (src/llama3.rs line 8131); no parallel reduction combines partial sums across threads",
@@ -182,7 +182,7 @@ evidence = [
 ]
 mutant = "measured 2026-10-17, each reverted: BpeTokenizer::new building the inverse map by iteration order fails a_shared_token_id_decodes_to_the_smallest_string; the bigram rank without the token-id tie-break fails bigram_bias_does_not_depend_on_observation_order"
 since = "3.0.0"
-note = "no lint stops a new HashMap iteration from reaching an output; the audit above is per site and has to be repeated for new ones (the clippy disallowed-types route would ban the type outright, which the GGUF reader and the tokenizer use for lookups). The thread-count test covers one row-parallel kernel; the other rayon sites have the same shape."
+note = "unmet: no checker stops a new unspecified-order iteration from reaching an output. The evidence is a per-site audit (2026-10-17) and three order-independence tests; clippy.toml bans no hash-collection iteration and no thread API, and there is no source scan with counted allowed sites, so a new `HashMap` / `HashSet` iteration or a new parallel combination in src/ passes CI unseen and the audit has to be redone by hand. Closing it needs a type-resolved ban of hash-collection iteration and of thread APIs in clippy.toml, a source scan (scripts/order_guard.py, the shared copy) with every allowed site counted and reasoned, both wired into CI and scripts/preflight.sh with a zero-compared canary, and each iterated map that can reach an output converted to an ordered collection. The audit and tests named in the evidence stand for the sites they name. no lint stops a new HashMap iteration from reaching an output; the audit above is per site and has to be repeated for new ones (the clippy disallowed-types route would ban the type outright, which the GGUF reader and the tokenizer use for lookups). The thread-count test covers one row-parallel kernel; the other rayon sites have the same shape."
 reference_repo = "ALICE-DB"
 
 [G14]
