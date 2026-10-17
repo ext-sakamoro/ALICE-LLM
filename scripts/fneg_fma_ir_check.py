@@ -31,6 +31,15 @@ What it does, per invocation:
    (`[[ir]]` entries): fewer than the floor fails, and so does 0 calls when the
    library's sources contain a fma call (`expected-src-fma-calls` >= 1). 0 is
    allowed only where both the floor and `expected-src-fma-calls` are 0.
+   `expected-src-fma-calls` counts the library's own calls (the syntax-tree check
+   leaves out items under `#[test]` / `#[cfg(test)]`, which are not in the release
+   build). When it is 0, the IR must hold no fma call either (one the source does
+   not show is a finding), and the 0 findings must not be vacuous: the shared
+   probes in tools/fneg-fma-ir-probes/ are compiled for the same target and each
+   must get its expected verdict (`// expect-ir:`), with at least one probe run.
+   Measured before this rule (2026-10-18, the G3 IR jobs of each carrier's main):
+   every carrier whose library holds no fma call (ALICE-ML, -Crypto, -Kinematics,
+   -DetMath, -Sync, -Zip) has 0 fma calls in its release IR on both targets.
 
 A finding is reported with the source location from the `!dbg` attachment of the
 negation (for inlined code, the location in the callee, which is the line to fix).
@@ -348,7 +357,51 @@ def check_counts(analysis: Analysis, floor: int | None, src_calls: int | None) -
         problems.append("0 fma calls in IR, but the floor or expected-src-fma-calls is not 0")
     if src_calls and analysis.fma_calls == 0:
         problems.append(f"the sources hold {src_calls} fma call(s) but the IR holds none")
+    if src_calls == 0 and analysis.fma_calls > 0:
+        problems.append(f"the library's sources hold no fma call but the IR holds {analysis.fma_calls}"
+                        " (a fma the source does not show)")
     return problems
+
+
+PROBES_REL = Path("tools/fneg-fma-ir-probes")
+
+
+def probe_proof(root: Path, target: str, compile_ll=None) -> tuple[list[str], int]:
+    """(problems, probes run): every shared probe that applies to `target`'s architecture, compiled for it,
+    gets the verdict its `// expect-ir:` line names; none run, or a wrong verdict, is a problem. This is what
+    makes a run with 0 fma calls and 0 findings non-vacuous: the detector flags what it must on this target."""
+    arch = target.split("-", 1)[0]
+    probes = sorted((root / PROBES_REL).glob("*.rs"))
+    if compile_ll is None:
+        def compile_ll(probe: Path, out: Path) -> str:
+            subprocess.run(["rustc", "--edition", "2021", "--crate-type", "lib", "-C", "opt-level=3",
+                            *IR_FLAGS[1:], "--emit=llvm-ir", "--target", target, "-o", str(out), str(probe)],
+                           check=True, capture_output=True, text=True, cwd=root)
+            return out.read_text(encoding="utf-8")
+    problems: list[str] = []
+    ran = 0
+    with tempfile.TemporaryDirectory() as d:
+        for probe in probes:
+            text = probe.read_text(encoding="utf-8")
+            where = re.search(r"^// targets: (\S+)", text, re.M)
+            want = re.search(r"^// expect-ir: (\S+)", text, re.M)
+            if not where or not want:
+                problems.append(f"{probe.name}: no `// targets:` / `// expect-ir:` line")
+                continue
+            if where.group(1) not in ("any", arch):
+                continue
+            try:
+                a = analyse(compile_ll(probe, Path(d) / f"{probe.stem}.ll"))
+            except subprocess.CalledProcessError as e:
+                problems.append(f"{probe.name}: does not compile for {target}: {e.stderr.strip()[-300:]}")
+                continue
+            ran += 1
+            got = "flag" if a.findings else "clean"
+            if got != want.group(1):
+                problems.append(f"{probe.name} on {target}: expect {want.group(1)}, got {got}")
+    if ran == 0:
+        problems.append(f"no probe of {root / PROBES_REL} ran for {target} (the 0 findings would be vacuous)")
+    return problems, ran
 
 
 def report(analysis: Analysis, label: str) -> None:
@@ -419,8 +472,12 @@ def run_one(args: argparse.Namespace, root: Path, manifest: dict, package: str) 
         write_floor(root, target, package, analysis.fma_calls)
         print(f"fneg_fma_ir_check: recorded floor {analysis.fma_calls} for {package} {target}")
         return 1 if analysis.findings else 0
-    problems = check_counts(analysis, floor_for(manifest, target, package),
-                            manifest.get("expected-src-fma-calls"))
+    src_calls = manifest.get("expected-src-fma-calls")
+    problems = check_counts(analysis, floor_for(manifest, target, package), src_calls)
+    if src_calls == 0:
+        probe_problems, ran = probe_proof(root, target)
+        problems += probe_problems
+        print(f"fneg_fma_ir_check: probes for {target}: {ran} ran, {len(probe_problems)} problem(s)")
     for p in problems:
         print(f"error: {p}")
     return 1 if analysis.findings or problems else 0

@@ -137,6 +137,63 @@ class Probes(unittest.TestCase):
                         found[0].location)
 
 
+class ProbeProof(unittest.TestCase):
+    """with no fma call in the library, the 0 findings are made non-vacuous by the shared probes"""
+
+    def probes(self, files: dict[str, str]) -> Path:
+        d = Path(self.tmp.name) / "repo"
+        (d / "tools/fneg-fma-ir-probes").mkdir(parents=True)
+        for name, text in files.items():
+            (d / "tools/fneg-fma-ir-probes" / name).write_text(text, encoding="utf-8")
+        return d
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    FLAG = "// expect-ir: flag\n// targets: any\npub fn p(a: f32) -> f32 { -a.mul_add(a, a) }\n"
+    CLEAN = "// expect-ir: clean\n// targets: any\npub fn p(a: f32) -> f32 { a.mul_add(a, a) }\n"
+
+    def fake(self, verdicts: dict[str, bool]):
+        # flagged probes analyse to one finding, clean ones to none
+        def compile_ll(probe, out):
+            if verdicts[probe.stem]:
+                return ('define float @p(float %a) {\n  %f = call float @llvm.fma.f32(float %a, float %a, float %a)\n'
+                        '  %n = fneg float %f\n  ret float %n\n}\n')
+            return ('define float @p(float %a) {\n  %f = call float @llvm.fma.f32(float %a, float %a, float %a)\n'
+                    '  ret float %f\n}\n')
+        return compile_ll
+
+    def test_the_expected_verdicts_pass(self):
+        d = self.probes({"a.rs": self.FLAG, "b.rs": self.CLEAN})
+        problems, ran = g.probe_proof(d, "x86_64-unknown-linux-gnu", self.fake({"a": True, "b": False}))
+        self.assertEqual((problems, ran), ([], 2))
+
+    def test_no_probe_run_fails(self):
+        problems, ran = g.probe_proof(self.probes({}), "x86_64-unknown-linux-gnu", self.fake({}))
+        self.assertEqual(ran, 0)
+        self.assertTrue(any("vacuous" in p for p in problems), problems)
+
+    def test_a_probe_for_another_architecture_does_not_count(self):
+        d = self.probes({"a.rs": self.FLAG.replace("targets: any", "targets: aarch64")})
+        problems, ran = g.probe_proof(d, "x86_64-unknown-linux-gnu", self.fake({"a": True}))
+        self.assertEqual(ran, 0)
+        self.assertTrue(problems)
+
+    def test_a_wrong_verdict_fails(self):
+        d = self.probes({"a.rs": self.FLAG})
+        problems, ran = g.probe_proof(d, "x86_64-unknown-linux-gnu", self.fake({"a": False}))
+        self.assertEqual(ran, 1)
+        self.assertTrue(any("expect flag, got clean" in p for p in problems), problems)
+
+    def test_the_real_probes_hold_on_the_host(self):
+        problems, ran = g.probe_proof(ROOT, g.host_triple())
+        self.assertGreaterEqual(ran, 40)
+        self.assertEqual(problems, [])
+
+
 class Counts(unittest.TestCase):
     def analysis(self, fma: int, functions: int = 3) -> g.Analysis:
         return g.Analysis(fma_calls=fma, functions=functions)
@@ -156,6 +213,12 @@ class Counts(unittest.TestCase):
         self.assertEqual(g.check_counts(self.analysis(0), 0, 0), [])
         self.assertTrue(g.check_counts(self.analysis(0), 0, 3))
         self.assertTrue(g.check_counts(self.analysis(0), 5, 0))
+
+    def test_an_ir_fma_the_library_does_not_show_fails(self):
+        # the library's own sources hold no fma call (test-only items are not counted) but the IR has one
+        problems = g.check_counts(self.analysis(2), 0, 0)
+        self.assertTrue(any("a fma the source does not show" in p for p in problems), problems)
+        self.assertEqual(g.check_counts(self.analysis(0), 0, 0), [])
 
     def test_a_module_without_functions_fails(self):
         self.assertTrue(g.check_counts(self.analysis(0, functions=0), 0, 0))

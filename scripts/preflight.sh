@@ -205,6 +205,7 @@ python3 scripts/build_flags_check.py -- cargo check --release --lib --features "
 python3 scripts/build_flags_check.py -- cargo check --release --lib --no-default-features
 
 step "ci.yml / float-environment: No negated fma result (syntax tree, tests then check)"
+cargo fmt --manifest-path tools/no-outer-fneg-of-fma/Cargo.toml -- --check
 cargo test --quiet --locked --manifest-path tools/no-outer-fneg-of-fma/Cargo.toml
 cargo run --quiet --locked --release --manifest-path tools/no-outer-fneg-of-fma/Cargo.toml -- --root .
 
