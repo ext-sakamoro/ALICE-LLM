@@ -43,6 +43,13 @@ reference_repo = "ALICE-DB"
 
 [G2]
 status = "pass"
+tie_tests = [
+    "INT8 quantize min / max folds, a pair of zeros (src/quantization.rs): tests/law_max_min_ties.rs::quantize_of_a_pair_of_zeros_has_a_positive_zero_point",
+    "INT8 quantize min / max folds, a NaN in the range: tests/law_max_min_ties.rs::quantize_skips_a_nan_in_the_range",
+    "INT4 folds whose zero point is the min: tests/law_max_min_ties.rs::int4_zero_point_is_the_signed_min",
+    "softmax max fold: tests/law_max_min_ties.rs::softmax_skips_a_nan_in_the_maximum",
+    "gradient clip: tests/law_max_min_ties.rs::gradient_clip_of_nan_and_negative_zero",
+]
 evidence = [
     "clippy.toml lines 67 to 72: f32 / f64 max, min and clamp banned in every target, no exception and so no raw_* manifest",
     "src/lawmath.rs max / min / max64 / min64 / clamp (alice-det-math: an equal pair of zeros gives +0 from max and -0 from min, a NaN operand the other operand, clamp a canonical NaN and the low bound for inverted bounds); every library, test and example site goes through them",
@@ -112,6 +119,12 @@ reference_repo = "ALICE-DB"
 
 [G8]
 status = "pass"
+writers = [
+    "src/llama3.rs::save_kv_cache",
+    "src/llama3.rs::write_to",
+]
+legacy_status = "src/llama3.rs::Unpinned"
+legacy_policy = "src/llama3.rs::RequirePinned"
 evidence = [
     "src/llama3.rs KV cache format 2 (layout comment above KV_MAGIC): magic, version, the 32-byte semantics identifier, the shape fingerprint (FNV-1a 64, line 4989, instead of DefaultHasher, whose algorithm is not fixed across Rust releases), shape, layer map, keys and values; load_kv_cache returns KvCacheSemantics (line 4885: Current / VerifiedPrevious / Unpinned), load_kv_cache_with takes KvCachePolicy (line 4898: AcceptUnpinned, the default, or RequirePinned)",
     "src/llama3.rs unit tests: kv_cache_v2_header_holds_the_semantics_id (line 22975), kv_cache_v2_reads_back_as_current (line 22990), kv_cache_v1_fixture_reads_as_unpinned_or_is_refused (line 23068: a format 1 file written by alice-llm 2.0.1, kept as bytes, loads as Unpinned and is refused under RequirePinned), kv_cache_unknown_version_is_refused (line 23101)",
