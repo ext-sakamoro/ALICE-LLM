@@ -5,14 +5,15 @@
 //! The recorded-bit tests in `tests/semantics_golden.rs` pin the kernels the
 //! inference computes with: the `lawmath` transcendentals, the activations
 //! and norms, softmax and the sampling filters, rotary embeddings, the Kimi
-//! delta gates and quantization. [`LLM_SEMANTICS_ID`] folds those digests and
+//! delta gates, quantization and a forward pass of the reference transformer
+//! (`TransformerModel::new_test`). [`LLM_SEMANTICS_ID`] folds those digests and
 //! the semantics identifier of `alice-det-math`. Two builds with the same
 //! identifier compute every pinned scenario to the same bits.
 //!
 //! # Hex form (with `alice-det-math` 0.5.1)
 //!
 //! ```text
-//! LLM_SEMANTICS_ID           bbbba7c06e136da0636626a7bb88511b8c90c346e389399850c3e0db1f5b330d
+//! LLM_SEMANTICS_ID           32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d
 //! LLM_PLATFORM_SEMANTICS_ID  269ade8fc103bb500c378ba0b10b61f2da534968ffd4c987a818e577aa033fac
 //! ```
 //!
@@ -88,6 +89,10 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
         "quantization",
         hex32("6e1c07817d9a764ef413e63ffd9d8780bbcaba2352860c91796a671227df4c62"),
     ),
+    (
+        "reference transformer forward",
+        hex32("849a960d7721d3fc2e34ef7196a2c18222bb81cfa0b00c5810678945b16d911e"),
+    ),
     // the resolved alice-det-math's own identifier, not a copy of it: the
     // identifier below is looked up by it
     ("alice-det-math", alice_det_math::SEMANTICS_ID),
@@ -103,7 +108,7 @@ pub const LLM_SEMANTICS_BY_DET_MATH: &[([u8; 32], [u8; 32])] = &[
     // alice-det-math 0.5.1
     (
         hex32("85e0884623b154a3b2b264374907b6cbac09307ca3f9a08339e48c567d3cb315"),
-        hex32("bbbba7c06e136da0636626a7bb88511b8c90c346e389399850c3e0db1f5b330d"),
+        hex32("32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d"),
     ),
 ];
 

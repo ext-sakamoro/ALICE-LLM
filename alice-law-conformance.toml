@@ -18,44 +18,55 @@
 # probe counts below (the CI clippy commands do build them), and any Linux or
 # Windows target.
 #
-# Premise shared by G6, G7 and G8: this crate is treated as Law-bearing until its
-# owner decides the scope question (docs/CONFORMANCE.md lists inference numerics
-# and ML activations under 'Out of scope'); a required identifier that is absent
-# is therefore fail-known at the place it is absent.
+# Scope: inference output is Law output. The Law claims below hold for the default
+# features on the CPU paths; the platform-math feature (platform libm, off by
+# default) and the gpu feature's WGSL kernels are outside them.
 #
-# A `pass` needs committed evidence and a named mutant that turns it red. G12
-# and G14 have one; the other gates do not yet (no clippy.toml, no alice-det-math
-# dependency, no identifier, no release or aarch64 test leg, no scan).
+# A `pass` needs committed evidence and a named mutant that turns it red.
 # `fail-known` says where the requirement is
 # absent or unmet. `unverified` means not checked yet, and says what is missing.
 #
 # Checked at: f8c0927 (origin/main, 2026-10-15).
 
 [G1]
-status = "fail-known"
+status = "pass"
 evidence = [
-    "clippy.toml disallowed-methods: every f32 and f64 method gates.toml marks banned, plus powi (the pending default) for both; the entries are the f32 / f64 method part of the ALICE-DB and alice-zip lists (52 entries); the crate has no libm dependency (Cargo.lock), so no libm free function can be named",
-    ".github/workflows/ci.yml clippy job (default, simd, full, full + internal-kernel-oracle, all targets, -D warnings) and the g1 job: scripts/clippy_canary.py plants every entry in a throwaway crate (scripts/clippy_canary_calls.tsv, 52 planted, generated from clippy.toml by scripts/gen_clippy_canary_calls.py) and fails unless clippy flags each one, outside the reach of the crate's own #[expect]s; scripts/test_clippy_canary.py and scripts/test_gen_clippy_canary_calls.py (all four byte-identical to ALICE-DB)",
-    "scripts/g1_debt_pin.py (tests scripts/test_g1_debt_pin.py), run by the g1 job and scripts/preflight.sh: it runs clippy with `--force-warn clippy::disallowed_methods`, which rustc applies over every lint-level attribute in the source (#[allow], #[expect], lint groups, cfg_attr, inner attributes), over every feature set of the clippy job on x86_64 and aarch64 Linux, with --lib --bins and with --all-targets, and fails unless the calls found equal scripts/g1_debt_sites.tsv (68 calls in library and binary code) and scripts/g1_reference_sites.tsv (126 calls in tests, examples and #[cfg(test)] code); it also fails when no feature set was read from ci.yml or no call was found; the test builds a throwaway crate with this clippy.toml whose calls sit under #[allow], an #[expect] on clippy::style, a cfg_attr expect, an inner #![allow] and #[allow(warnings)], and requires every one of them to be reported (the count relies on --force-warn overriding source lint levels, so this test is the canary for that assumption); it also refuses any attribute in src/, tests/, examples/ or benches/ that lowers the lint or a group containing it (clippy::style, clippy::all, warnings) other than the outer #[expect(clippy::disallowed_methods, reason = ...)]: an #[allow], a cfg_attr, an inner attribute or a multi-lint #[expect] fails, so an #[allow] swapped in for an #[expect] cannot stay silent after its call is removed (112 #[expect] in 85 files today; 0 files or 0 #[expect] fails)",
+    "clippy.toml disallowed-methods: every f32 and f64 method gates.toml marks banned, plus powi for both (52 entries) and the G2 entries below; the crate has no libm dependency, so no libm free function can be named",
+    "src/lawmath.rs: every transcendental the library and binaries compute with goes through it, and with the default features it is alice-det-math 0.5.1 (exp, ln, tanh, powf, sin_cos, sin, cos, powi); ln_1p (line 172) is Kahan's form over alice-det-math's ln (alice-det-math 0.5 has none), measured against f64::ln_1p by tests/lawmath_ln_1p.rs: at most 2 ulps for |x| < 1e-6, 1 ulp over the softplus range, the bigram counts and x near -1",
+    "scripts/g1_debt_sites.tsv is empty: scripts/g1_debt_pin.py (clippy with --force-warn clippy::disallowed_methods over the four CI feature sets on x86_64 and aarch64 Linux) finds 0 banned calls in library and binary code and 175 in tests, examples and cfg(test) code (scripts/g1_reference_sites.tsv); run by the g1 job (.github/workflows/ci.yml line 166) and scripts/preflight.sh",
+    ".github/workflows/ci.yml clippy job (default, simd, full, full + internal-kernel-oracle, -D warnings) and the g1 job's canary (scripts/clippy_canary.py, 58 planted, generated from clippy.toml)",
 ]
-mutant = "measured 2026-10-17, each reverted: adding `let _bypass = x.sin();` to silu in src/linalg.rs (an item that already carries the #[expect]) leaves the CI default clippy command green (rc 0) and makes scripts/g1_debt_pin.py exit 1 with `not listed in g1_debt_sites.tsv: src/linalg.rs:81:21 f32::sin`; appending a row for a call that does not exist to scripts/g1_debt_sites.tsv makes it exit 1 with `listed ... but not called`; replacing --force-warn with -W in the pin's clippy command makes the fixture test fail (the silenced calls are no longer reported); replacing the #[expect] above silu in src/linalg.rs with #[allow(clippy::disallowed_methods)] makes the pin exit 1 at src/linalg.rs:76; accepting any attribute that names the lint, or ignoring the groups, turns 7 of the marking test cases red; the canary plants all 52 entries and gets 52 diagnostics"
-since = ""
-note = "fail-known: the ban list and its canary are in place, but the library calls banned methods. 68 calls in library and binary code (scripts/g1_debt_sites.tsv: f32::exp, tanh, powf, sin_cos, powi, ln_1p, ln, sin, cos in the inference code, for example src/linalg.rs silu / gelu, src/rope.rs, src/sampling.rs, src/llama3.rs, src/gpu.rs) are recorded debt: each enclosing item carries #[expect(clippy::disallowed_methods)] whose reason says so, and the pin fails on a new call or a listed call that is gone. Whether this inference output is Law output, and so whether these calls move to alice-det-math (which changes every output bit and the performance of the hot paths), is an open decision. The 126 reference calls are test oracles and example code. Arch-gated code is linted on both Linux targets; the only OS-gated code (src/gpu.rs:2554 and :2566, query_available_memory_bytes under target_os = linux / not linux) calls no banned method, so no call is outside what the ubuntu runner lints today; a call added later under cfg(target_os = \"macos\") or cfg(windows) would be outside the pin, since both of its targets are Linux. The WGSL kernels (src/shaders) are not reached by a Rust lint."
+mutant = "measured 2026-10-17, each reverted: ln_1p as `ln(1.0 + x)` is off by 8368067 ulps at 5.98e-8 and fails tiny_arguments_keep_full_relative_accuracy and the_softplus_range_is_within_the_bound; a direct `x.exp()` call in library code is listed by scripts/g1_debt_pin.py as an unlisted debt site (exit 1, measured 2026-10-17 for the r2 pin, unchanged here)"
+since = "3.0.0"
+note = "the default features are the Law build. The platform-math feature (off by default, not Law-bearing) makes lawmath call the platform libm instead; it is built in CI (cargo check --all-targets --features platform-math) and reports another semantics identifier (G6), so its KV cache files are refused by the Law build (G8). The gpu feature's WGSL kernels (exp in silu / sigmoid shaders) are outside clippy and outside the Law claims: the Law claims of this manifest hold for the default features on the CPU paths. Measured accuracy of the routing, arm64, 1e6 points per range, against f64 std rounded to f32 (max / mean ulp, alice-det-math vs std): exp 1 / 0.099 vs 1 / 0.006; tanh 0 / 0 vs 1 / 0.003; ln 1 / 0.007 vs 1 / 0; ln_1p 2 / 0.182 vs 1 / 0.002; powf 0 / 0 vs 1 / 0.006; sin and cos 2 ulp up to |x| = 4096, then 4.9e-7 absolute at 32768 and 1.9e-6 at 131072 (std 3.0e-8) — the single-precision range reduction of alice-det-math 0.5; for the rotary angles this is below the rounding of the f32 angle itself."
 reference_repo = "ALICE-DB"
 
 [G2]
-status = "fail-known"
-note = "no Law helper for max/min, no default-deny manifest of raw_* exceptions and no clippy ban on f32::max / f32::min exist. The probe reports 35 f32 max/min sites in library code (not #[cfg(test)]) on aarch64-apple-darwin (32 on x86_64-apple-darwin: src/gguf.rs:5833 and :5870 are aarch64-only), for example src/gguf.rs:5833 (`abs_max.max(..)`) and :5870 (`.max(-127.0).min(127.0)`), src/quantization.rs:25,26,94,95, src/sampling.rs:81 (`fold(f32::NEG_INFINITY, f32::max)`) and 27 sites in src/llama3.rs (16275, 18250, 19425 and others); a planted `x.max(y).min(2.0)` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). f32::clamp (4 calls in src) is not in the probe. SIMD widths the crate builds: NEON 4-lane intrinsics (src/gguf.rs:1384), AVX2 8-lane intrinsics (src/gguf.rs:2034) and wide::f32x8 (src/matrix.rs:209, feature simd); no test feeds a (+0, -0) or (-0, +0) pair through a max/min at any width (the only -0.0 literals in library code are the E2M1 decode table at src/gguf.rs:6414; the others are inside test modules, src/gguf.rs:6735 in `mod tests` from :6696 and the f16 round-trip input at src/llama3.rs:11949)."
-reference_repo = "ALICE-Analytics"
+status = "pass"
+evidence = [
+    "clippy.toml lines 67 to 72: f32 / f64 max, min and clamp banned in every target, no exception and so no raw_* manifest",
+    "src/lawmath.rs max / min / max64 / min64 / clamp (alice-det-math: an equal pair of zeros gives +0 from max and -0 from min, a NaN operand the other operand, clamp a canonical NaN and the low bound for inverted bounds); every library, test and example site goes through them",
+    "tests/law_max_min_ties.rs, bit-level tie tests at the public API for each site class a tie input reaches: the INT8 min / max folds (quantize_of_a_pair_of_zeros_has_a_positive_zero_point, quantize_skips_a_nan_in_the_range), the INT4 folds whose zero point is the min itself (int4_zero_point_is_the_signed_min), the softmax max fold (softmax_skips_a_nan_in_the_maximum), the gradient clip (gradient_clip_of_nan_and_negative_zero); run by the test job's Law tests step (.github/workflows/ci.yml line 197, scripts/run_tests.sh law_max_min_ties=5)",
+]
+mutant = "measured 2026-10-17, each reverted: the INT8 max fold as `if m > x {m} else {x}` (2 red), the INT8 min fold passing NaN (1), the INT4 min fold keeping the first of a tie, passing NaN, and the INT4 max fold passing NaN (1 each), the softmax max fold passing NaN (1), the gradient clip as comparisons in two forms (1 each); not red: the INT8 min fold keeping the first of a tie, because the INT8 zero point is the midpoint (min + max) / 2 and the +0 max erases the min's sign — that site class has no tie input reaching the public API"
+since = "3.0.0"
+note = "the clippy ban sees calls, not comparisons written out by hand; the tie tests cover the site classes where a -0 or a NaN reaches a public result. The other max / min sites are thresholds against a non-zero constant (`max(1e-12)` / `max(1e-6)` of a norm, `min(1.0)` of a probability ratio, `max(0.0)` of a residual distribution that is renormalised) or folds whose result feeds only a subtraction inside exp (softmax), where no tie input changes a result bit. The crate's SIMD max / min: none (the wide::f32x8 paths in src/matrix.rs and src/sparse_attention/simd.rs multiply and add only), so there is no per-width tie test."
+reference_repo = "ALICE-Kinematics"
 
 [G3]
-status = "fail-known"
-note = "no checker for an outer negation of an fma result exists (no script in scripts/, no ci.yml step). The probe reports 6 f32::mul_add calls in library code (src/linalg.rs:84, src/matrix.rs:148,240, src/quantization.rs:56, src/rope.rs:23,24); a read of each finds negation only on an operand (src/rope.rs:23 negates the third argument, `-(vec[i + half] * sin_a)`), none on a whole fma result, and the NEON intrinsics vfmaq_f32 (src/gguf.rs:1633 and others) are not mul_add. That is an audit of today's tree, not a gate: a planted `-(a.mul_add(b, c))` in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted), so a later outer negation would not turn anything red. The WGSL kernels use fma( (108 calls in src/shaders/*.wgsl, counted with grep -o; 80 lines contain one) and are not read by any checker. Not n/a: that status needs a scanner that finds zero sites and the mutant of adding one, and there is no scanner."
-reference_repo = "ALICE-LOL"
+status = "pass"
+evidence = [
+    "tools/no-outer-fneg-of-fma (syntax-tree pre-check, byte-identical to ALICE-LOL's) over src/ tests/ examples/ benches/: 22 fma calls (21 in src/), 0 under a negation, the counts pinned in scripts/no-outer-fneg-of-fma-allowlist.toml; run by ci.yml line 250 and scripts/preflight.sh",
+    "scripts/fneg_fma_ir_check.py (optimised LLVM IR, byte-identical to ALICE-LOL's) with its probe set tools/fneg-fma-ir-probes (47 probes, each compiled for x86_64 and aarch64): .github/workflows/g3-ir.yml on native x86_64 and aarch64 Linux runners with the CPU feature set; floors 65 (x86_64) and 42 (aarch64) fma calls, 0 negated, measured 2026-10-17",
+]
+mutant = "the probe set is the checker's mutant suite (the negated forms 01 to 33 and 43 to 47 must be reported, the safe forms 34 to 42 must not); a changed fma count in the sources fails the allowlist's expected-fma-calls (the syntax-tree check printed `expected-fma-calls = 0 だが見つけた数は 22` before the counts were recorded, 2026-10-17)"
+since = "3.0.0"
+note = "the 6 mul_add sites of src/ (src/linalg.rs, src/matrix.rs, src/quantization.rs, src/rope.rs) negate operands only. The IR gate builds the CPU feature set (gguf, parallel, simd, grammar, quant, hf-config, dspark, dspark-serde, imatrix); platform-math and gpu are not Law-bearing."
+reference_repo = "ALICE-Kinematics"
 
 [G4]
 status = "fail-known"
-note = "no signed-zero or exact-cancellation golden test exists: tests/ holds tests/analytic_oracle.rs (12 tests, closed-form identities and tolerances, its own header says no golden values) and tests/ref_shaders (WGSL sources), and no test in tests/ compares to_bits or from_bits against a fixed pattern (grep: 0). CI runs the tests only in the debug profile (.github/workflows/ci.yml:134,144,149,152): matrix ubuntu-latest and macos-latest (Apple Silicon, see the comment at ci.yml:209) with default and simd features, so a debug leg exists on x86_64 and on aarch64, but no release leg runs a test (see G5), so the {debug, release} x {x86_64, aarch64} matrix is half present, and no case is built to hit a signed zero or an exact cancellation."
+note = "unmet: tests/semantics_golden.rs (3.0.0) compares recorded bits of seven scenarios and tests/law_max_min_ties.rs compares signed zeros and NaN payloads, both run by the test job on ubuntu x86_64 and macOS aarch64, but only in the debug profile; no step runs them under --release, so the debug / release clause is unmet. no signed-zero or exact-cancellation golden test exists: tests/ holds tests/analytic_oracle.rs (12 tests, closed-form identities and tolerances, its own header says no golden values) and tests/ref_shaders (WGSL sources), and no test in tests/ compares to_bits or from_bits against a fixed pattern (grep: 0). CI runs the tests only in the debug profile (.github/workflows/ci.yml:134,144,149,152): matrix ubuntu-latest and macos-latest (Apple Silicon, see the comment at ci.yml:209) with default and simd features, so a debug leg exists on x86_64 and on aarch64, but no release leg runs a test (see G5), so the {debug, release} x {x86_64, aarch64} matrix is half present, and no case is built to hit a signed zero or an exact cancellation."
 reference_repo = "ALICE-LOL"
 
 [G5]
@@ -64,21 +75,43 @@ note = "no CI step runs the test suite under the release profile: .github/workfl
 reference_repo = "ALICE-LOL"
 
 [G6]
-status = "fail-known"
-note = "the crate exports no semantics identifier: src/lib.rs has no SEMANTICS_ID (or equivalent) and Cargo.toml [dependencies] holds no alice-det-math or other Law-bearing crate whose identifier it could fold, so there is no hex test and no pin-change test. The only fingerprint in the crate is the KV cache file's model-shape hash (src/llama3.rs:4911: std DefaultHasher over the layer, kv-head, head-dimension, hidden-dimension and max_seq_len counts and the Debug string of the arch), which says nothing about arithmetic; the std hasher is not guaranteed stable across Rust releases yet its value is written into the KV cache file (src/llama3.rs:4934), so a file may be refused after a toolchain change. Whether inference arithmetic is meant to be a Law-bearing quantity of this crate is a scope question the tree does not answer (docs/CONFORMANCE.md lists inference numerics and ML activations under 'Out of scope')."
+status = "pass"
+evidence = [
+    "src/semantics.rs line 118 (LLM_SEMANTICS_ID, 32957f18...25c3f9d with alice-det-math 0.5.1: the fold of LLM_SEMANTICS_PINS at line 67, the seven recorded-bit scenarios of tests/semantics_golden.rs — lawmath functions, activations and norms, softmax and sampling, rope, Kimi delta gates, quantization, a forward pass of the reference transformer (TransformerModel::new_test, 32-token prefill + 8 steps) — plus alice_det_math::SEMANTICS_ID; fold of alice-det-math)",
+    "src/semantics.rs line 107 (LLM_SEMANTICS_BY_DET_MATH: a generation with no row stops the compile), line 102 (LLM_SEMANTICS_CHECKED_AT = 3.0.0, toolchain 1.98.1), line 123 (LLM_PLATFORM_SEMANTICS_ID, the SHA-256 of a fixed sentence) and line 128 (RUNNING_SEMANTICS_ID: the Law id, or the platform id with platform-math)",
+    "tests/llm_semantics_id.rs (9 tests: every entry is the golden its scenario records, read from the test source; the det-math entry; the fold; the recorded value; one changed bit moves it; no cfg; the platform id and the running id by mode; version and toolchain)",
+    ".github/workflows/ci.yml test job (ubuntu x86_64 and macOS aarch64) Law tests step: scripts/run_tests.sh semantics_golden=7,llm_semantics_id=9",
+]
+mutant = "measured 2026-10-17, each reverted: the reference transformer entry changed without its golden fails every_semantics_entry_is_the_golden_its_scenario_records and the_identifiers_are_the_folds_of_their_tables; the golden re-recorded without the entry fails the first; LLM_SEMANTICS_CHECKED_AT at 2.0.1 fails the_pins_were_checked_on_this_version_and_toolchain; ln_1p returning x * 1.0000001 below half an ulp of 1 fails lawmath_functions_are_the_recorded_bits"
+since = "3.0.0"
+note = "the scenarios are public kernels of the default build and one forward pass of the crate's reference transformer; a GGUF model forward is not pinned (no model file in the repository). The identifier attests the fingerprint of the pinned scenarios, not that every call site routes through them (G1 / G2 cover that)."
+reference_repo = "ALICE-DB"
 
 [G7]
-status = "unverified"
-note = "audit: the type-erasing boundaries are the GGUF reader (src/gguf.rs, bytes of a file the user supplies), the KV cache reader (src/llama3.rs:4962 read_from, file), and the HTTP server (src/bin/server.rs, JSON); the crate has no extern \"C\" or no_mangle item, no pyo3 or wasm-bindgen export, no dyn Any registry (the only downcast_ref calls, src/gpu.rs:6963,7011 and src/llama3.rs:11776, read panic payloads) and no build.rs or procedural macro (grep over src and Cargo.toml, file listing at f8c0927). No boundary receives another crate's Law-bearing value: Cargo.toml has no dependency on a Law-bearing crate, so the list of such boundaries is empty; the boundaries above only carry this crate's own data, and the durable file is G8's. Without a G6 identifier there is also nothing to compare. Not claimed as n/a: that status needs a scanner that finds zero such sites with the mutant of adding one, and there is none."
+status = "pass"
+evidence = [
+    "src/llama3.rs: the KV cache file is the one Law-bearing value this crate hands across a boundary (a later process, another build, another machine); it carries the writer's RUNNING_SEMANTICS_ID (format 2, const KV_FORMAT_VERSION at line 4878) and a load refuses another identifier with KvCacheLoadError::SemanticsMismatch { stored, running } (line 4920), whose Display names both in hex",
+    "src/llama3.rs unit tests kv_cache_foreign_semantics_is_refused_naming_both (line 23006) and kv_cache_of_the_other_build_mode_is_refused (line 23041: a Law-build file is refused by the platform-math build and the reverse)",
+]
+mutant = "measured 2026-10-17, each reverted: dropping the comparison (`if true || stored == running`) and turning a mismatch into Unpinned each fail kv_cache_foreign_semantics_is_refused_naming_both and kv_cache_of_the_other_build_mode_is_refused; RUNNING_SEMANTICS_ID equal to the Law id in the platform-math build fails the_running_identifier_follows_the_build_mode"
+since = "3.0.0"
+note = "audited type-erasing boundaries: the GGUF reader (src/gguf.rs) reads model weights, which are input, not this crate's Law output; the HTTP server (src/bin/server.rs) returns generated text and token ids as JSON (no float Law values cross it); the crate has no extern C, pyo3, wasm-bindgen or dyn Any boundary. The KV cache file is both the handshake (another build) and the durable form (G8)."
+reference_repo = "ALICE-DB"
 
 [G8]
-status = "fail-known"
-note = "the durable forms the crate writes carry no identifier of arithmetic meaning (premise in the header): the KV cache file (src/llama3.rs:4931 write_to: magic ALICEKV1 at :4851, KV_FORMAT_VERSION 1 at :4852, a model-shape fingerprint from std DefaultHasher at :4911, then the f32 key and value data) and the reader refuses only a magic, version or shape-fingerprint mismatch (src/llama3.rs:4969,4976 and the fingerprint error at :4888); there is no field to compare and no check_semantics. The layer assignment JSON of src/bin/imatrix.rs:127 holds tensor names and tier names, not float values, and is not counted; the dspark example's bincode file (examples/dspark_train_confidence_head.rs:199) writes a trained head and is an example, not library code, and was not audited."
-reference_repo = "ALICE-Zip"
+status = "pass"
+evidence = [
+    "src/llama3.rs KV cache format 2 (layout comment above KV_MAGIC): magic, version, the 32-byte semantics identifier, the shape fingerprint (FNV-1a 64, line 4989, instead of DefaultHasher, whose algorithm is not fixed across Rust releases), shape, layer map, keys and values; load_kv_cache returns KvCacheSemantics (line 4885: Current / VerifiedPrevious / Unpinned), load_kv_cache_with takes KvCachePolicy (line 4898: AcceptUnpinned, the default, or RequirePinned)",
+    "src/llama3.rs unit tests: kv_cache_v2_header_holds_the_semantics_id (line 22975), kv_cache_v2_reads_back_as_current (line 22990), kv_cache_v1_fixture_reads_as_unpinned_or_is_refused (line 23068: a format 1 file written by alice-llm 2.0.1, kept as bytes, loads as Unpinned and is refused under RequirePinned), kv_cache_unknown_version_is_refused (line 23101)",
+]
+mutant = "measured 2026-10-17, each reverted: RequirePinned accepting a format 1 file, and reading a format 1 file with the format 2 fingerprint, each fail kv_cache_v1_fixture_reads_as_unpinned_or_is_refused; the writer storing 32 zero bytes fails 6 tests, among them kv_cache_save_load_roundtrip_bit_exact and kv_cache_foreign_semantics_is_refused_naming_both"
+since = "3.0.0"
+note = "the identifier describes the arithmetic the cached keys and values were computed with (RUNNING_SEMANTICS_ID), not the platform that wrote them; a format 1 file has none and its result says so (Unpinned). LLM_PREVIOUS_SEMANTICS_IDS is empty, so VerifiedPrevious is not reachable yet. GGUF files are read, not written."
+reference_repo = "ALICE-DB"
 
 [G9]
 status = "unverified"
-note = "depends on G8 and G6: the persisted identifier whose history G9 audits does not exist (both are fail-known), so the crate has no identifier whose history could be audited. CHANGELOG.md records no identifier move (grep for SEMANTICS and identifier: 0)."
+note = "unverified: both identifiers are introduced in 3.0.0 (LLM_SEMANTICS_ID for G6, the KV cache file identifier for G8), so there is no history to audit yet and no identifier-history test; LLM_PREVIOUS_SEMANTICS_IDS is empty. The first move has to be a major release with both values named in CHANGELOG.md and a test that loads a file stamped with the earlier value."
 
 [G10]
 status = "fail-known"
@@ -87,7 +120,7 @@ reference_repo = "ALICE-Analytics"
 
 [G11]
 status = "fail-known"
-note = "the G1 ban list has a canary and a compared-nothing failure (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py --check, scripts/g1_debt_pin.py; see G1); no other Law gate is implemented in this repository (see G2 to G5, G10, G12, G13, G14). Clause (c) has a located absence: scripts/test_workflow_timeouts.py is stated in CHANGELOG.md:16 to be byte-identical to a sibling repository's copy, and no CI step or script compares the two (no such step in .github/workflows/ci.yml or scripts/). The checkers that exist (scripts/docs_lint.py with scripts/test_docs_lint.py, scripts/no_return_before_barrier.py with its test, scripts/workflow_timeouts.py with its test) carry tests and fail when they compared nothing, but they are not the gates G11 enumerates. For clause (c), scripts/semver_gate.py and scripts/test_semver_gate.py, and the four clippy canary scripts (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py, scripts/test_clippy_canary.py, scripts/test_gen_clippy_canary_calls.py), are byte-identical copies shared with ALICE-Law, ALICE-DB and other crates, and nothing in this repository or its CI compares them with their source."
+note = "the G1 ban list has a canary and a compared-nothing failure (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py --check, scripts/g1_debt_pin.py; see G1); the G2 ban shares that canary (clippy.toml rows generated into scripts/clippy_canary_calls.tsv), the G3 checker carries its own probe tests, and the G14 scripts their tests. Clause (c) has a located absence: scripts/test_workflow_timeouts.py is stated in CHANGELOG.md:16 to be byte-identical to a sibling repository's copy, and no CI step or script compares the two (no such step in .github/workflows/ci.yml or scripts/). The checkers that exist (scripts/docs_lint.py with scripts/test_docs_lint.py, scripts/no_return_before_barrier.py with its test, scripts/workflow_timeouts.py with its test) carry tests and fail when they compared nothing, but they are not the gates G11 enumerates. For clause (c), scripts/semver_gate.py and scripts/test_semver_gate.py, and the four clippy canary scripts (scripts/clippy_canary.py, scripts/gen_clippy_canary_calls.py, scripts/test_clippy_canary.py, scripts/test_gen_clippy_canary_calls.py), are byte-identical copies shared with ALICE-Law, ALICE-DB and other crates, and nothing in this repository or its CI compares them with their source."
 
 [G12]
 status = "pass"
@@ -103,8 +136,16 @@ since = ""
 reference_repo = "ALICE-DB"
 
 [G13]
-status = "fail-known"
-note = "machine half: the lint is absent, there is no clippy.toml (so no disallowed-types / disallowed-methods for HashMap, HashSet and RandomState), no allowlist of membership-only sites and no ordered-reduction test at two thread counts (grep for num_threads, ThreadPool and RAYON_NUM_THREADS over src, tests and .github: 0); a planted `HashMap::values()` summed in src/linalg.rs passed the CI default and full clippy commands (rc 0, measured 2026-10-15, reverted). The probe reports 41 uses of HashMap or HashSet types in library and binary code (33 in the default build), and iteration calls at src/gguf.rs:660 (keys), src/gpu.rs:2571 (values), src/grammar/gbnf.rs:165 (values), src/speculative_dspark.rs:541 and src/tokenizer.rs:30 (iter), src/bin/imatrix.rs:90 and :95; a `for x in &map` loop is not in the probe. The one that sorts its result with an explicit tie-break is src/speculative_dspark.rs:541-542; the others were not traced to an output. The parallel feature uses rayon (par_iter_mut at src/gguf.rs:3486 and others, par_iter at src/deepseek_streaming.rs:512); a grep for lines combining par_iter or rayon with reduce, sum or fold found none (multi-line chains were not traced), and no test runs those paths at two thread counts. Not n/a: that status needs a scanner that finds zero sites with the mutant of adding one, and there is none."
+status = "pass"
+evidence = [
+    "audit of every HashMap / HashSet in src/ (2026-10-17): lookups or membership only in src/gguf.rs (metadata, tensors, the byte decoder and token map), src/sampling.rs (top-p keep set), src/grammar/fsm.rs (seen set), src/deepseek_streaming.rs (expert cache), src/speculative_dspark.rs (bigram counts); iterated only where the order cannot reach a result: src/gguf.rs line 660 (shard index, first shard by index wins), src/grammar/gbnf.rs line 165 (validation), src/speculative_dspark.rs line 541 (sorted by count then token id, a total order), src/tokenizer.rs BpeTokenizer::new (now keeps the smallest string for a shared id instead of the last one iterated)",
+    "audit of the rayon sites: row-parallel (par_iter_mut / par_chunks_mut over output rows in src/gguf.rs, src/sparse_attention, src/llama3.rs line 6193) or one task per attention head writing its own slice (src/llama3.rs line 8131); no parallel reduction combines partial sums across threads",
+    "tests/order_independence.rs: a_shared_token_id_decodes_to_the_smallest_string (32 map instances, each with its own seed), bigram_bias_does_not_depend_on_observation_order (the rank-3 cut inside a tie), ternary_matvec_is_the_same_on_one_and_four_threads (1, 4 and 7 rayon threads, bit-identical); run by the Law tests step with gguf, parallel and dspark (scripts/run_tests.sh order_independence=3)",
+]
+mutant = "measured 2026-10-17, each reverted: BpeTokenizer::new building the inverse map by iteration order fails a_shared_token_id_decodes_to_the_smallest_string; the bigram rank without the token-id tie-break fails bigram_bias_does_not_depend_on_observation_order"
+since = "3.0.0"
+note = "no lint stops a new HashMap iteration from reaching an output; the audit above is per site and has to be repeated for new ones (the clippy disallowed-types route would ban the type outright, which the GGUF reader and the tokenizer use for lookups). The thread-count test covers one row-parallel kernel; the other rayon sites have the same shape."
+reference_repo = "ALICE-DB"
 
 [G14]
 status = "pass"
@@ -123,16 +164,20 @@ reference_repo = "ALICE-DB"
 
 [features.simd]
 guarantee = "outside"
-note = "enables the wide::f32x8 paths (src/matrix.rs:209, src/sparse_attention/simd.rs). Condition 1 is unmet: the crate has no arithmetic identifier to compare (G6), and the G1 and G2 sites above apply to this build as well."
+note = "enables the wide::f32x8 paths (src/matrix.rs:209, src/sparse_attention/simd.rs), which multiply and add in another association order than the scalar code; no test compares the simd build's bits with the default build's, so it is not covered by the identifier (G6) yet."
 
 [features.parallel]
 guarantee = "outside"
-note = "enables rayon (par_iter_mut at src/gguf.rs:3486 and others). Condition 1 is unmet (no arithmetic identifier, G6) and no test runs the parallel paths at two thread counts (G13)."
+note = "enables rayon (par_iter_mut at src/gguf.rs:3486 and others): row-parallel, and tests/order_independence.rs shows one kernel bit-identical on 1, 4 and 7 threads (G13); the parallel build is not part of the G6 scenarios yet."
 
 [features.gguf]
 guarantee = "outside"
-note = "enables the GGUF reader and the NEON and AVX2 intrinsic matvec kernels (src/gguf.rs:1384, :2034). Condition 1 is unmet (no arithmetic identifier, G6) and the probe sites of G1 and G2 in src/gguf.rs apply."
+note = "enables the GGUF reader and the NEON and AVX2 intrinsic matvec kernels (src/gguf.rs:1384, :2034), which differ by architecture in association order; no cross-architecture bit test covers them yet."
 
 [features.gpu]
 guarantee = "outside"
-note = "enables the wgpu engine and the WGSL kernels (src/gpu.rs, src/shaders). Condition 1 is unmet (no arithmetic identifier, G6); the WGSL arithmetic is not reached by any Rust lint, and the CI gpu legs compare kernels with tolerances and with the previous kernels, not with a recorded bit pattern on every architecture (G4)."
+note = "enables the wgpu engine and the WGSL kernels (src/gpu.rs, src/shaders), outside the Law claims; the WGSL arithmetic is not reached by any Rust lint, and the CI gpu legs compare kernels with tolerances and with the previous kernels, not with a recorded bit pattern on every architecture (G4)."
+
+[features.platform-math]
+guarantee = "outside"
+note = "lawmath calls the platform libm instead of alice-det-math: not Law-bearing by design. It reports LLM_PLATFORM_SEMANTICS_ID, and the KV cache of one mode is refused by the other (G7 / G8). Measured on the reference transformer (vocab 4096, d 512, 8 layers, arm64): 77.1 / 67.0 tok/s prefill / decode against 72.6 / 62.7 for the Law build; logits bit-identical in 264456 of 266240, max difference 2.3e-10, same argmax in 65 of 65 steps."

@@ -12,6 +12,8 @@
 
 #![cfg(not(feature = "platform-math"))]
 
+use alice_llm::batch_inference::{ModelConfig, TransformerModel};
+use alice_llm::kv_cache::KvCache;
 use alice_llm::lawmath;
 use alice_llm::linalg::{gelu, layer_norm, rms_norm, silu};
 use alice_llm::llama3::{kimi_delta_lower_bounded_decay, kimi_delta_output_gate};
@@ -161,5 +163,35 @@ fn quantization_is_the_recorded_bits() {
         "quantization",
         &out,
         "6e1c07817d9a764ef413e63ffd9d8780bbcaba2352860c91796a671227df4c62",
+    );
+}
+
+/// The reference transformer of `TransformerModel::new_test` (fixed weights):
+/// a 32-token prefill, then 8 single-token steps on the same cache
+#[test]
+fn reference_transformer_forward_is_the_recorded_bits() {
+    let config = ModelConfig {
+        vocab_size: 256,
+        hidden_dim: 64,
+        num_heads: 4,
+        num_layers: 2,
+        max_seq_len: 64,
+        rope_base: 10_000.0,
+    };
+    let model = TransformerModel::new_test(config);
+    let mut cache = KvCache::new(2, 64, 64);
+    let prompt: Vec<u32> = (0..32_u32).map(|i| (i * 37 + 5) % 256).collect();
+    let mut out = Vec::new();
+    bits(&mut out, model.forward(&prompt, &mut cache));
+    for step in 0..8_u32 {
+        bits(
+            &mut out,
+            model.forward(&[(step * 53 + 11) % 256], &mut cache),
+        );
+    }
+    assert_golden(
+        "reference transformer forward",
+        &out,
+        "849a960d7721d3fc2e34ef7196a2c18222bb81cfa0b00c5810678945b16d911e",
     );
 }

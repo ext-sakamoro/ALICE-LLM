@@ -91,7 +91,7 @@ fn check_entries(pins: &[(&str, [u8; 32])], minimum: usize) {
 
 #[test]
 fn every_semantics_entry_is_the_golden_its_scenario_records() {
-    check_entries(LLM_SEMANTICS_PINS, 6);
+    check_entries(LLM_SEMANTICS_PINS, 7);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn the_identifiers_are_the_folds_of_their_tables() {
 fn the_identifiers_are_the_recorded_values() {
     assert_eq!(
         hex(&LLM_SEMANTICS_ID),
-        "bbbba7c06e136da0636626a7bb88511b8c90c346e389399850c3e0db1f5b330d"
+        "32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d"
     );
 }
 

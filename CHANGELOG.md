@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `alice_llm::lawmath` (ALICE-Law G1 / G2): 推論が使う超越関数 (exp / ln / tanh / powf / sin_cos / sin / cos / powi) と max / min / clamp を `alice-det-math` 0.5.1 に通す ln_1p は `alice-det-math` 0.5 に無いので Kahan の形 (`u = 1 + x`、`u == 1` なら `x`、それ以外は `ln(u) * (x / (u - 1))`) で計算し、f64 の `ln_1p` を f32 に丸めた値と比べて |x| < 1e-6 で 2 ulp 以内、softplus の範囲・bigram の件数・-1 付近で 1 ulp 以内 (`tests/lawmath_ln_1p.rs`) library と binary の 68 件の呼び出しを置き換え、`scripts/g1_debt_sites.tsv` は空になった f32 / f64 の max / min / clamp を `clippy.toml` で禁止し、81 件 (src 57、examples 24) を置き換えた `tests/law_max_min_ties.rs` は量子化の min / max、softmax の max、勾配の clip について正負のゼロと NaN で bit を比べる
+- 測った精度と速度 (arm64、release、各範囲 100 万点、基準は f64 の std を f32 に丸めた値): 下表 sin / cos は |x| ≤ 4096 で 2 ulp (絶対誤差 9.3e-8 以下) だが、`alice-det-math` 0.5 の単精度の範囲縮小のため |x| = 32768 で 4.9e-7、131072 で 1.9e-6 (std は 3.0e-8) RoPE の角度ではこの差は f32 の角度自体の丸め (131072 で 1 ulp = 0.0156) より 4 桁小さい
+
+  | 関数 (範囲) | alice-det-math 最大 / 平均 ulp | std 最大 / 平均 ulp | ns/呼び出し (det / std) |
+  |---|---|---|---|
+  | exp ([-88, 0]) | 1 / 0.099 | 1 / 0.006 | 4.70 / 2.01 |
+  | exp ([-20, 20]) | 1 / 0.099 | 1 / 0.006 | 4.59 / 1.92 |
+  | tanh ([-10, 10]) | 0 / 0.000 | 1 / 0.003 | 7.56 / 2.30 |
+  | ln ([1e-6, 1]) | 1 / 0.007 | 1 / 0.000 | 3.86 / 2.44 |
+  | ln_1p ([2e-9, 4.85e8]) | 2 / 0.182 | 1 / 0.002 | 5.07 / 3.05 |
+  | powf (10000^y、y ∈ [0, 1]) | 0 / 0.000 | 1 / 0.006 | 8.76 / 4.09 |
+  | sin / cos ([0, 4096]) | 2 / — | 1 / — | 7.99 / 2.62 (sin) |
+
+  参照 transformer (`TransformerModel::new_test`、vocab 4096、隠れ次元 512、8 層、256 token の prefill と 64 step の decode、5 回の中央値): 既定 72.6 / 62.7 tok/s、`platform-math` 77.1 / 67.0 tok/s (-5.8% / -6.4%) 2 つの build の logits は 266240 個中 264456 個が bit 一致、最大差 2.3e-10、64 + 1 step の argmax はすべて一致
+- `alice_llm::semantics` (ALICE-Law G6): `LLM_SEMANTICS_ID` (alice-det-math 0.5.1 で `32957f18…25c3f9d`)、`tests/semantics_golden.rs` が bit を記録する 7 場面 (lawmath の関数 / 活性化と正規化 / softmax と sampling / RoPE / Kimi delta の gate / 量子化 / 参照 transformer の forward) と `alice_det_math::SEMANTICS_ID` を alice-det-math と同じ手順で畳んだ値 `platform-math` の build は別の値 (`LLM_PLATFORM_SEMANTICS_ID`) を `RUNNING_SEMANTICS_ID` として報告する 版と toolchain を試験で照合する
+- `platform-math` feature (既定で無効): `lawmath` が platform の libm を呼ぶ build 決定論でない
+- CI (ALICE-Law G3): fma の結果全体を negate する形の検査 (構文木の前段 `tools/no-outer-fneg-of-fma` と最適化後の IR の `scripts/fneg_fma_ir_check.py`、ALICE-LOL と同一) fma の呼び出し 22 件 (src 21) と IR の floor (x86_64 65 / aarch64 42) を記録した 新しい `g3-ir.yml`
+- `tests/order_independence.rs` (ALICE-Law G13): token id を共有する語彙、bigram の偏りの観測順、行並列の matvec の thread 数 (1 / 4 / 7) で出力の bit が変わらないことを確かめる
 - CI (ALICE-Law G1): `clippy.toml` に platform の libm に依存する f32 / f64 の超越関数と `powi` の禁止を置いた (ALICE-DB と alice-zip の一覧のうち f32 / f64 の method の 52 件) 推論の code はこれらを呼んでいるので、呼ぶ item に理由つきの `#[expect(clippy::disallowed_methods)]` を付け、呼び出しを 1 件ずつ記録した (`scripts/g1_debt_sites.tsv` に library と binary の 68 件、`scripts/g1_reference_sites.tsv` に test・example・`#[cfg(test)]` の 126 件) `scripts/g1_debt_pin.py` (試験 `scripts/test_g1_debt_pin.py`) は clippy を `--force-warn clippy::disallowed_methods` 付きで clippy の job の全 feature 組 × x86_64 / aarch64 Linux で走らせ、見つかった呼び出しが一覧と一致しなければ失敗する (`--force-warn` は source の `#[allow]` / `#[expect]` / lint group / `cfg_attr` / 内側の `#![allow]` より強いので、同じ item に足した新しい呼び出しも、属性で黙らせた呼び出しも検出する) この lint を下げてよい属性は外側の `#[expect(clippy::disallowed_methods, reason = ...)]` だけで、`#[allow]` / `cfg_attr` / 内側の属性 / lint group (`clippy::style` / `clippy::all` / `warnings`) / 他の lint と並べた `#[expect]` は src・tests・examples・benches のどこでも失敗にする clippy の canary (`scripts/clippy_canary.py` / `scripts/gen_clippy_canary_calls.py` と試験、ALICE-DB と同一) が一覧の各項目の検出を確かめる 新しい g1 job と preflight で走る CI の workflow を `ci/**` の branch でも走らせ、同じ branch の古い run は止める `alice-law-conformance.toml` の G1 は fail-known のまま (68 件は記録した負債)
 - CI (ALICE-Law G14): 浮動小数点の結果を変える build の flag を静的と動的の 2 段で検査し、round-to-nearest-even と subnormal が flush されないことを実行時に確かめる (ALICE-DB と同一の `scripts/build_config_guard.py` / `scripts/build_flags_check.py` / `tests/float_environment.rs` と test、`scripts/run_tests.sh` / `scripts/test_run_tests.py`) 新しい float-environment job (ubuntu / macOS / Windows) で test を debug と release で `scripts/run_tests.sh float_environment=2` を通して実行し (2 本とも通らなければ失敗)、静的な検査を走らせ、ubuntu / macOS では新しい target dir で `cargo check -v` を走らせて rustc に実際に渡った flag を読む (default / docs.rs feature set / no-default) example の表示文 1 行は `scripts/build_config_allowlist.toml` に理由付きで許可した `alice-law-conformance.toml` の G14 を fail-known から pass にした
 
@@ -15,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: 公開する文面の検査 (`Public text` workflow、`scripts/public_text.sh`) を追加 ALICE-Law の `scripts/public_text_check.py` を `.github/public-text-pin` の revision (779fa44) で取得し、SHA-256 が一致した時だけ使って、HEAD の全 tracked file (path と本文) と送った commit (message・追加行・追加 path) を読む 何も比較できなければ失敗する preflight でも走る
 
 ### Changed
+- **破壊的:** 版を 2.0.1 から 3.0.0 に `Llama3Model::load_kv_cache` は `Result<(), _>` から `Result<KvCacheSemantics, _>` を返す
+- **破壊的:** KV キャッシュの file を形式 2 にした (ALICE-Law G7 / G8) header の版の後に書いた build の `RUNNING_SEMANTICS_ID` 32 byte を持ち、読み込みは実行中の build の値と比べて、違えば `KvCacheLoadError::SemanticsMismatch` (両方の識別子を表示) で断る 既定の build と `platform-math` の build の file は互換でない 形式 1 の file (3.0.0 より前) は `KvCacheSemantics::Unpinned` として読め、`load_kv_cache_with(path, KvCachePolicy::RequirePinned)` は断る 形状の fingerprint を `DefaultHasher` (算法が Rust の版で変わりうる) から FNV-1a 64 に替えた
+- `BpeTokenizer::new`: 複数の文字列が同じ id を持つ時、map の走査順で最後のものでなく最小の文字列を復号に使う
+- `alice-law-conformance.toml`: G1 / G2 / G3 / G6 / G7 / G8 / G13 を pass にした
 
 - CI: every job now has a job-level `timeout-minutes` (21 of 22 jobs had none, so a hung step could hold a shared runner for GitHub's 6-hour limit). Each bound is the larger of 2× the slowest and 4× the median of the last 12 successful runs, rounded up to 5 minutes, with a floor of 15 minutes for jobs that run cargo (a cache miss rebuilds) and 10 for the rest; the release build gets 30 against a 4.6-minute maximum. Existing bounds (quality-deep's mutants) are unchanged, and the release workflow changes only by these lines. `scripts/workflow_timeouts.py` (tests: `scripts/test_workflow_timeouts.py`, byte-identical to ALICE-LOL's) checks every job and fails when it reads none; it runs in CI (the actionlint job) and in preflight.
 - CI: 公開 API の互換性の検査を `.github/workflows/semver-checks.yml` (`scripts/semver_gate.py`、ALICE-Law / ALICE-DB ほかと同一) に置き換えた crates.io の最新の alice-llm (2.0.0) を baseline にし、既定・既定なし・全 feature の 3 組で cargo semver-checks を走らせ、Cargo.toml の 2.0.1 が許す patch の段を超える変更を失敗させる 旧 job (security-audit.yml) は直前の commit (`HEAD~1`) と比べ、結果を問わない informational だった

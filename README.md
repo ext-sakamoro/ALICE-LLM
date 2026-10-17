@@ -722,6 +722,9 @@ curl http://localhost:8090/v1/models
 | `dspark-serde` | Serde serialization for DSpark snapshots |
 | `imatrix` | ALICE-Dynamic-v1 tier-decision CLI (`layer_assignments.json` emitter, Phase I.0 + I.3, Unsloth-baseline heuristics) |
 | `server` | HTTP inference server (axum), includes `gpu` + `gguf` + `grammar` |
+| `platform-math` | Non-deterministic build: the transcendentals come from the platform libm instead of `alice-det-math`. Off by default; its KV cache files are not interchangeable with the default build's |
+
+**Determinism.** With the default features every transcendental and max / min the CPU inference computes with goes through `alice_llm::lawmath` (`alice-det-math`), so the same model and input give the same logits bits on every target. `alice_llm::semantics::LLM_SEMANTICS_ID` identifies that arithmetic; KV cache files (format 2) carry it, and a load refuses a file written with other arithmetic (`KvCacheLoadError::SemanticsMismatch`). Files from before 3.0.0 load as `KvCacheSemantics::Unpinned`. The GPU (WGSL) kernels are outside this.
 
 ## Performance
 

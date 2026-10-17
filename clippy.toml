@@ -67,7 +67,7 @@ disallowed-methods = [
     { path = "f32::max", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::max" },
     { path = "f32::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min" },
     { path = "f32::clamp", reason = "NaN passes through with its payload and inverted bounds panic; use crate::lawmath::clamp" },
-    { path = "f64::max", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::max" },
-    { path = "f64::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min" },
-    { path = "f64::clamp", reason = "NaN passes through with its payload and inverted bounds panic; use crate::lawmath::clamp" },
+    { path = "f64::max", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::max64" },
+    { path = "f64::min", reason = "std documents that either zero may be returned for an equal pair of zeros, which differs by target and optimisation; use crate::lawmath::min64" },
+    { path = "f64::clamp", reason = "NaN passes through with its payload and inverted bounds panic; write it with crate::lawmath::max64 / min64" },
 ]

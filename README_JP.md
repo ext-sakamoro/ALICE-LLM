@@ -715,6 +715,9 @@ curl http://localhost:8090/v1/models
 | `dspark-serde` | DSpark スナップショット用 serde シリアライズ |
 | `imatrix` | ALICE-Dynamic-v1 tier-decision CLI（`layer_assignments.json` 生成、Phase I.0 + I.3、Unsloth ベースライン heuristics） |
 | `server` | HTTP 推論サーバー（axum）、`gpu` + `gguf` + `grammar` を含む |
+| `platform-math` | 決定論でない build: 超越関数を `alice-det-math` でなく platform の libm で計算する 既定では無効 KV キャッシュの file は既定の build と互換でない |
+
+**決定論** 既定の feature では、CPU の推論が使う超越関数と max / min はすべて `alice_llm::lawmath` (`alice-det-math`) を通るので、同じ model と入力からどの target でも同じ bit の logits が出る その算術を `alice_llm::semantics::LLM_SEMANTICS_ID` が識別し、KV キャッシュの file (形式 2) はそれを持つ 別の算術で書かれた file の読み込みは `KvCacheLoadError::SemanticsMismatch` で断る 3.0.0 より前の file は `KvCacheSemantics::Unpinned` として読める GPU (WGSL) のカーネルは対象外
 
 ## 性能
 
