@@ -216,7 +216,7 @@ jobs:
       - name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)
         if: matrix.features == 'default'
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=8,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
           scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
@@ -256,7 +256,7 @@ jobs:
         run: cargo test --release --test analytic_oracle
       - name: Law tests (release)
         run: |
-          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=7,llm_semantics_id=9,float_edge_golden=6 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
+          scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=8,llm_semantics_id=9,float_edge_golden=6 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden
           scripts/run_tests.sh order_independence=3 -- cargo test --release --features gguf,parallel,dspark --test order_independence
 
   float-environment:
@@ -291,6 +291,15 @@ jobs:
           "$PY" scripts/test_build_config_guard.py
           "$PY" scripts/build_config_guard.py
           "$PY" scripts/test_build_flags_check.py
+      # ALICE-Law G11 (c): the files shared with the other crates are the bytes ALICE-Law's
+      # table records (table and checker fetched at .github/shared-files-pin, both SHA-256
+      # pinned); a difference, an unlisted shared path or nothing compared fails
+      - name: Shared files equal ALICE-Law's table
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" scripts/test_shared_files.py
+          scripts/shared_files.sh
       - name: Effective rustc flags (default, docs.rs feature set, no default features)
         if: runner.os != 'Windows'
         run: |
