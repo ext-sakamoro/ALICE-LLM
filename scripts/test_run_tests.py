@@ -6,7 +6,8 @@ at all), a failing command, Windows output (backslash paths, CRLF, ANSI
 colour), doctests counted under their own key and not under the binary that
 ran last, a test printing "Running" in its output, and a per-binary minimum (`name=N`: met, missed because a test is
 ignored, a missing binary, and the refused forms `=0`, `=`, a non-number and
-an empty name). The script itself is shared byte for byte with ALICE-DB and
+an empty name), and `lib`, the library's unit-test section (counted, absent,
+below its minimum, not an integration file tests/lib.rs, the Windows header). The script itself is shared byte for byte with ALICE-DB and
 is not modified in only one of them."""
 import os
 import shutil
@@ -176,6 +177,33 @@ class RunTests(unittest.TestCase):
         self.assertIn("beta passed 2 test(s), needs at least 3", err)
         self.assertNotIn("alpha", err)
         rc, _, err = self.run_log("alpha,beta=2", lines)
+        self.assertEqual(rc, 0, err)
+
+    # `lib` names the library's unit tests (cargo's "Running unittests src/lib.rs" section), so a leg can
+    # require a canary that is a unit test; an integration file tests/lib.rs is not that section
+    def test_lib_counts_the_unit_test_section(self):
+        rc, out, err = self.run_log("lib=7,alpha", UNIT + [running("alpha"), result(3)])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("7 in lib", out)
+
+    def test_lib_without_the_unit_test_section_fails(self):
+        rc, _, err = self.run_log("lib", [running("alpha"), result(3)])
+        self.assertEqual(rc, 1)
+        self.assertIn("lib did not run any test", err)
+
+    def test_lib_below_its_minimum_fails(self):
+        rc, _, err = self.run_log("lib=8", UNIT)
+        self.assertEqual(rc, 1)
+        self.assertIn("lib passed 7 test(s), needs at least 8", err)
+
+    def test_an_integration_file_named_lib_is_not_the_unit_test_section(self):
+        rc, _, err = self.run_log("lib", [running("lib"), result(4)])
+        self.assertEqual(rc, 1)
+        self.assertIn("lib did not run any test", err)
+
+    def test_windows_unit_test_header_is_recognised(self):
+        rc, _, err = self.run_log("lib=7", ["     Running unittests src\\lib.rs (target\\debug\\deps\\x-0123abcd.exe)",
+                                            result(7)], newline="\r\n")
         self.assertEqual(rc, 0, err)
 
     def test_refused_minimums_exit_2_before_the_command_runs(self):

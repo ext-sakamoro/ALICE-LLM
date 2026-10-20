@@ -49,3 +49,17 @@ checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min 
 canary = "tests/order_independence.rs::a_shared_token_id_decodes_to_the_smallest_string"
 zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
 shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G7"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh lib=12"
+canary = "src/llama3.rs::kv_cache_foreign_semantics_is_refused_naming_both"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G8"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh lib=12"
+canary = "src/llama3.rs::kv_cache_v2_header_holds_the_semantics_id"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]

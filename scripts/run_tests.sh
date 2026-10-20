@@ -5,7 +5,9 @@
 #   - the command itself succeeds,
 #   - at least one test passed in total, and
 #   - every named integration test binary ran and passed at least its minimum
-#     number of tests (1 when no minimum is given).
+#     number of tests (1 when no minimum is given). The name `lib` is the
+#     library's unit tests (the `Running unittests src/lib.rs` section), not an
+#     integration file tests/lib.rs.
 # A feature or target mismatch otherwise turns a test step into a silent
 # no-op that still reports success.
 #
@@ -87,7 +89,12 @@ while IFS= read -r line; do
       fi
       for i in "${!required[@]}"; do
         name="${required[$i]}"
-        if [[ "$current" == *"tests/${name}.rs"* || "$current" == *"tests\\${name}.rs"* ]]; then
+        if [[ "$name" == "lib" ]]; then
+          # the library's unit tests: cargo's `Running unittests src/lib.rs` section
+          if [[ "$current" == *"unittests src/lib.rs"* || "$current" == *"unittests src\\lib.rs"* ]]; then
+            required_passed[$i]=$((required_passed[$i] + n))
+          fi
+        elif [[ "$current" == *"tests/${name}.rs"* || "$current" == *"tests\\${name}.rs"* ]]; then
           required_passed[$i]=$((required_passed[$i] + n))
         fi
       done
