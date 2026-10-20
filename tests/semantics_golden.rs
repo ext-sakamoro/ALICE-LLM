@@ -30,11 +30,25 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-fn assert_golden(name: &str, bytes: &[u8], expected: &str) {
+/// The SHA-256 of `bytes` when it is not `expected`
+fn golden_mismatch(bytes: &[u8], expected: &str) -> Option<String> {
     let got = hex(&Sha256::digest(bytes));
-    assert_eq!(
-        got, expected,
-        "scenario {name:?} moved: re-record only for an intended change"
+    (got != expected).then_some(got)
+}
+
+fn assert_golden(name: &str, bytes: &[u8], expected: &str) {
+    if let Some(got) = golden_mismatch(bytes, expected) {
+        panic!("scenario {name:?} moved to {got}: re-record only for an intended change");
+    }
+}
+
+#[test]
+fn checker_rejects_a_wrong_digest() {
+    let recorded = hex(&Sha256::digest(b"recorded bits"));
+    assert_eq!(golden_mismatch(b"recorded bits", &recorded), None);
+    assert!(
+        golden_mismatch(b"moved bits", &recorded).is_some(),
+        "a scenario whose bits moved must not match its recorded digest"
     );
 }
 

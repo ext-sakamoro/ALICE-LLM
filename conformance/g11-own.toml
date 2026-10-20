@@ -1,0 +1,48 @@
+# ALICE-Law G11: this repository's own rows of conformance/g11.toml (the rows of the checkers the ALICE
+# crates share are generated from ALICE-Law). scripts/g11_table.sh --write writes the table from both.
+#
+# The Law suites are run by scripts/run_tests.sh, which fails a step when a named test binary ran fewer
+# tests than named; its zero test is therefore the compared-nothing test of each leg, and each canary is
+# a test of a binary the leg names.
+
+[[row]]
+gate = "G2"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh"
+canary = "tests/law_max_min_ties.rs::quantize_of_a_pair_of_zeros_has_a_positive_zero_point"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G4"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh"
+canary = "tests/semantics_golden.rs::checker_rejects_a_wrong_digest"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G5"
+checker = ".github/workflows/ci.yml#- name: Law tests (release)>scripts/run_tests.sh"
+canary = "tests/semantics_golden.rs::checker_rejects_a_wrong_digest"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G6"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh"
+canary = "tests/llm_semantics_id.rs::one_changed_bit_in_any_entry_changes_the_identifier"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
+
+[[row]]
+gate = "G10"
+checker = "scripts/entropy_guard.py"
+canary = "scripts/test_entropy_guard.py::EntropyGuard.test_every_source_in_production_code_is_reported"
+zero = "scripts/test_entropy_guard.py::EntropyGuard.test_no_source_file_compares_nothing"
+shared = "n/a: this crate's guard over src/ with its own allowed sites; no other crate carries it"
+
+[[row]]
+gate = "G13"
+checker = ".github/workflows/ci.yml#- name: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)>scripts/run_tests.sh order_independence=3"
+canary = "tests/order_independence.rs::a_shared_token_id_decodes_to_the_smallest_string"
+zero = "scripts/test_run_tests.py::RunTests.test_a_named_file_that_ran_zero_fails"
+shared = ["scripts/run_tests.sh", "scripts/test_run_tests.py"]
