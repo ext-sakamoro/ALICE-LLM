@@ -678,9 +678,23 @@ cargo run --bin alice-llm-server --features server --release -- \
   --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --port 8090
 ```
 
+Server options:
+
+```
+--model <path>         GGUF model file (required)
+--host <addr>          Address to listen on (default: 127.0.0.1, loopback only;
+                       pass 0.0.0.0 to listen on every interface)
+--port <n>             Port (default: 8000)
+--hybrid               Run inference on the CPU instead of the GPU
+--exit-on-stdin-eof    Exit when stdin closes (a parent that keeps the write end
+                       of a piped stdin stops the server however it ends)
+```
+
+The server binds before it reads the model and prints `Bound to http://<addr>`.
+
 ```bash
 # Text completion
-curl http://localhost:8090/v1/completions -H "Content-Type: application/json" \
+curl http://127.0.0.1:8090/v1/completions -H "Content-Type: application/json" \
   -d '{"prompt":"What is the capital of Japan?","max_tokens":32,"temperature":0}'
 
 # Response:
@@ -688,10 +702,10 @@ curl http://localhost:8090/v1/completions -H "Content-Type: application/json" \
 #  "usage":{"tokens_per_second":14.8,"decode_ms":473}}
 
 # Health check
-curl http://localhost:8090/health
+curl http://127.0.0.1:8090/health
 
 # List models
-curl http://localhost:8090/v1/models
+curl http://127.0.0.1:8090/v1/models
 ```
 
 ## CLI Options

@@ -46,18 +46,36 @@ fn start(model: &std::path::Path, extra: &[&str]) -> (Child, std::net::SocketAdd
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let bound = lines
-        .by_ref()
-        .map_while(Result::ok)
-        .find_map(|l| l.strip_prefix("Bound to http://").map(str::to_string))
-        .expect("the server did not report its bound address");
-    let addr: std::net::SocketAddr = bound.parse().unwrap();
-    let loading = lines
-        .by_ref()
-        .map_while(Result::ok)
-        .find(|l| l.starts_with("Loading:"));
-    assert!(loading.is_some(), "the server did not reach the model read");
+    // Lines arrive through a thread, so a server that never prints a line
+    // (it blocks on the FIFO with stdout open) fails the test after a bound
+    // wait instead of hanging it; the thread keeps draining the pipe
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut wait_for = |marker: &str| -> String {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(line) => {
+                    if let Some(rest) = line.strip_prefix(marker) {
+                        return rest.trim().to_string();
+                    }
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the server did not print `{marker}` within 10 s");
+                }
+            }
+        }
+    };
+    let addr: std::net::SocketAddr = wait_for("Bound to http://").parse().unwrap();
+    wait_for("Loading:");
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         child.try_wait().unwrap().is_none(),
