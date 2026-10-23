@@ -5,7 +5,10 @@
 //!
 //! Usage:
 //!   cargo run --bin alice-llm-server --features server --release -- \
-//!     --model path/to/model.gguf --port 8000 [--hybrid]
+//!     --model path/to/model.gguf [--host 127.0.0.1] [--port 8000] [--hybrid] [--exit-on-stdin-eof]
+//!
+//! The server listens on 127.0.0.1 unless `--host` names another address.
+//! `--exit-on-stdin-eof` stops it when stdin closes (see `alice_llm::server_cli`).
 //!
 //! `--hybrid` bypasses GPU allocation and runs inference on CPU via
 //! `Llama3Model`. Purpose: ARM64 embedded board (8 GB) unified memory has a wgpu-hal Vulkan
@@ -793,29 +796,31 @@ fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    let model_path = args
-        .iter()
-        .position(|a| a == "--model")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            eprintln!("Usage: alice-llm-server --model <path.gguf> [--port 8000] [--hybrid]");
-            std::process::exit(1);
-        });
-
-    let port: u16 = args
-        .iter()
-        .position(|a| a == "--port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opts = alice_llm::server_cli::parse_args(&args).unwrap_or_else(|e| {
+        eprintln!("{e}\n{}", alice_llm::server_cli::USAGE);
+        std::process::exit(1);
+    });
+    // Start before the model read: a parent that dies during a long load
+    // must not leave the server behind
+    if opts.exit_on_stdin_eof {
+        alice_llm::server_cli::watch_until_eof(std::io::stdin(), || std::process::exit(0))
+            .expect("Failed to start the stdin watch");
+    }
+    let std_listener = alice_llm::server_cli::bind(&opts).unwrap_or_else(|e| {
+        eprintln!("Failed to bind {}: {e}", opts.bind_addr());
+        std::process::exit(1);
+    });
+    let addr = std_listener
+        .local_addr()
+        .expect("Failed to read the bound address");
+    println!("Bound to http://{addr}");
+    let model_path = opts.model.clone();
 
     // --hybrid: skip GPU allocation, run inference on CPU via Llama3Model.
     // Purpose: ARM64 embedded board (8 GB) Vulkan weight 2× duplication makes Bonsai 27B tight;
     // hybrid mode halves memory footprint. Also avoids Qwen 3.5-4B GPU PAD248319.
-    let hybrid = args.iter().any(|a| a == "--hybrid");
+    let hybrid = opts.hybrid;
 
     println!(
         "ALICE-LLM Server v1.1{}",
@@ -957,7 +962,6 @@ fn main() {
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{port}");
     println!("\nListening on http://{addr}");
     println!("  POST /v1/chat/completions — Chat");
     println!("  POST /v1/completions      — Text completion");
@@ -966,9 +970,11 @@ fn main() {
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .expect("Failed to bind");
+        std_listener
+            .set_nonblocking(true)
+            .expect("Failed to set the listener non-blocking");
+        let listener =
+            tokio::net::TcpListener::from_std(std_listener).expect("Failed to adopt the listener");
         axum::serve(listener, app).await.expect("Server error");
     });
 }

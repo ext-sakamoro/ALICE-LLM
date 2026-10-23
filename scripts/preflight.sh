@@ -118,6 +118,10 @@ step "ci.yml / examples_build: cargo build --example lol_gen --features "grammar
 step "ci.yml / examples_build: cargo build --bin alice-llm-server --features server"
 ( export CARGO_TERM_COLOR="always"; cargo build --bin alice-llm-server --features server )
 
+step "ci.yml / examples_build: server lifecycle tests"
+( export CARGO_TERM_COLOR="always"; scripts/run_tests.sh server_lifecycle=3 -- cargo test --features server --test server_lifecycle )
+( export CARGO_TERM_COLOR="always"; scripts/run_tests.sh lib=6 -- cargo test --lib server_cli )
+
 step "security-audit.yml / deny: Run cargo deny check all"
 ( export CARGO_TERM_COLOR="always" CARGO_NET_RETRY="5" CARGO_HTTP_MULTIPLEXING="false"; cargo deny --all-features check all )
 

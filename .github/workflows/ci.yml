@@ -543,6 +543,12 @@ jobs:
         run: cargo build --example lol_gen --features "grammar gguf"
       - name: cargo build --bin alice-llm-server --features server
         run: cargo build --bin alice-llm-server --features server
+      # The real server binary: default bind on loopback, and exit on stdin
+      # close with --exit-on-stdin-eof (model path is a FIFO, no model file)
+      - name: server lifecycle tests
+        run: |
+          scripts/run_tests.sh server_lifecycle=3 -- cargo test --features server --test server_lifecycle
+          scripts/run_tests.sh lib=6 -- cargo test --lib server_cli
 
   notify_failure:
     # Open (or comment on existing) a GitHub Issue automatically when any
