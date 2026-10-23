@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- tokio を 1.53.3 に上げる (RUSTSEC-2026-0386、`AsyncFd` の unsound、1.53.3 で修正) Cargo.lock の変更は tokio の版と checksum だけ
+
 ### Added
 - `conformance/g11-own.toml`: ALICE-Law G11 の表のうち、この crate 固有の行 (G2 の max / min の tie、G4 / G5 の golden、G6 の識別子、G13 の順序、比較 0 件は `scripts/run_tests.sh` の試験、G10 の `scripts/entropy_guard.py` とその試験) 共有の検査器の行は ALICE-Law の `conformance/g11-shared-rows.toml` から生成する
 - CI (ALICE-Law G11): `scripts/run_tests.sh` が名前 `lib` で library の単体試験 (`Running unittests src/lib.rs` の節) を数える版に更新し (ALICE の crate で同じ中身)、test job と release job の Law tests に `scripts/run_tests.sh lib=12 -- cargo test --lib llama3::tests::kv_cache` を足した KV cache の識別子の照合の単体試験 12 本が走らなければ step が落ちる `conformance/g11-own.toml` に G7 (`kv_cache_foreign_semantics_is_refused_naming_both`) と G8 (`kv_cache_v2_header_holds_the_semantics_id`) の行を足した
