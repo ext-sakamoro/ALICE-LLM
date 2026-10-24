@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- 試験 `tests/gguf_untrusted_counts.rs` (修正前、この版では失敗する): GGUF の header が名乗る metadata の数・tensor の数・次元の数・metadata 配列の長さで、残りの bytes を超えて確保しないこと (上限つきの global allocator、1 回の要求が 16 MiB を超えたら拒み、確保しない)、配列の中の配列が深く入れ子になった切れた file で stack を使い切らずに `None` を返すこと 今の parser は数だけで 125344325566472 byte を要求し、入れ子 200000 段で stack overflow する 配列の長さは固定の上限 1000000 で縛っているが、それでも 16 MiB を超える
 - tokio を 1.53.3 に上げる (RUSTSEC-2026-0386、`AsyncFd` の unsound、1.53.3 で修正) Cargo.lock の変更は tokio の版と checksum だけ
 - `alice-llm-server` の待ち受けを既定で 127.0.0.1 にした これまでは `0.0.0.0` 固定で host の指定口が無く、同じ network の誰からでも推論の endpoint に届いた 別の address で待ち受けるには `--host` で明示する (例: `--host 0.0.0.0`)
 - `alice-llm-server --exit-on-stdin-eof`: stdin が閉じたら終了する 親 process が server を stdin を piped にして起動し書き込み側を持っておけば、親が正常終了・signal・異常終了のどれで止まっても OS が pipe を閉じるので server も止まる 監視は model の読込より前に始まる
