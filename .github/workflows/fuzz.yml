@@ -18,13 +18,6 @@ on:
       - 'fuzz/**'
       - '.github/workflows/fuzz.yml'
       - '.github/actions/**'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'fuzz/**'
-      - '.github/workflows/fuzz.yml'
-      - '.github/actions/**'
   schedule:
     # 毎日 03:00 UTC = 12:00 JST (idle 時間帯)
     - cron: '0 3 * * *'

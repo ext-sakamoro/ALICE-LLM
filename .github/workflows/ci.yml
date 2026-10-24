@@ -4,8 +4,6 @@ on:
   push:
     # ci/**: the same checks on a branch before it is fast-forwarded to main
     branches: [main, 'ci/**']
-  pull_request:
-    branches: [main]
 
 # a newer commit on the same branch stops the older run; on main every commit
 # gets its own group and is not stopped

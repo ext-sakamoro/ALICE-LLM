@@ -21,20 +21,6 @@ on:
       - 'scripts/test_fneg_fma_ir_check.py'
       - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
       - '.github/workflows/g3-ir.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tools/no-outer-fneg-of-fma/**'
-      - 'tools/fneg-fma-ir-probes/**'
-      - 'scripts/fneg_fma_ir_check.py'
-      - 'scripts/test_fneg_fma_ir_check.py'
-      - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
-      - '.github/workflows/g3-ir.yml'
   schedule:
     - cron: '53 5 * * 1'
   workflow_dispatch:

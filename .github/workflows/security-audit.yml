@@ -20,15 +20,6 @@ on:
       - 'deny.toml'
       - '.github/workflows/security-audit.yml'
       - '.github/actions/**'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'src/**'
-      - 'deny.toml'
-      - '.github/workflows/security-audit.yml'
-      - '.github/actions/**'
   schedule:
     # 毎週月曜 09:00 UTC = 18:00 JST
     - cron: '0 9 * * 1'
