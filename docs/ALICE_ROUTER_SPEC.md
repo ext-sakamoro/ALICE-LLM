@@ -54,7 +54,7 @@ Rust, edge deployment, and explicit cost accounting.
 
 | Project | Layer | Openness | Rust-native | Verification built-in | Edge target | Cost accounting |
 |---|---|---|---|---|---|---|
-| **alice-router** (this) | Orchestrator | Open (planned AGPL-3.0) | ✓ | ✓ (Phase R.3) | ✓ | ✓ per-backend |
+| **alice-router** (this) | Orchestrator | Source published (LicenseRef-Proprietary, planned) | ✓ | ✓ (Phase R.3) | ✓ | ✓ per-backend |
 | Sakana Fugu | Orchestrator + verifier | Closed | ✗ (Python API) | ✓ | ✗ (cloud only) | ✗ (bundled pricing) |
 | LangChain / LangGraph | Orchestrator + planner + tool-use | Open | ✗ (Python primary) | Partial (via chains) | ✗ | Partial |
 | LiteLLM | Backend abstraction (proxy) | Open | ✗ (Python) | ✗ | ✗ | ✓ per-backend |
@@ -547,9 +547,8 @@ doc) and a `CHANGELOG.md` entry.
    spans model minor versions (e.g. K3 → K3.1). Should the router key
    caches by (BackendId, ModelVersion) tuple? Recommend yes — schema
    change in v0.2.
-5. **AGPL vs Apache-2.0 licence**: ALICE-LLM ships AGPL-3.0. Same for
-   this crate, or dual-licence to widen adoption? Deferred, user
-   judgement call at R.0 commit.
+5. **Licence**: ALICE-LLM is LicenseRef-Proprietary. This crate is
+   LicenseRef-Proprietary (planned) as well.
 
 ---
 

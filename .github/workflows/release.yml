@@ -13,7 +13,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # the documents every release archive carries (one list for the tar.gz and the zip steps)
-  RELEASE_DOCS: README.md CHANGELOG.md LICENSE-AGPL LICENSE-COMMERCIAL.md NOTICE
+  RELEASE_DOCS: README.md CHANGELOG.md LICENSE-Proprietary NOTICE
 
 jobs:
   build:

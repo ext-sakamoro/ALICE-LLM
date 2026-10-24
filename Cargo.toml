@@ -3,7 +3,8 @@ name = "alice-llm"
 version = "3.0.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
-license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
+license = "LicenseRef-Proprietary"
+publish = false
 description = "Pure Rust LLM inference engine — GGUF v3 parser, K-quants, hybrid CPU/GPU DeltaNet+Attention, wgpu compute shaders, speculative decoding, OpenAI-compatible HTTP server."
 readme = "README.md"
 # the published crate: the library and binary sources (shaders are under src/), the examples
@@ -15,8 +16,7 @@ include = [
     "/README.md",
     "/README_JP.md",
     "/CHANGELOG.md",
-    "/LICENSE-AGPL",
-    "/LICENSE-COMMERCIAL.md",
+    "/LICENSE-Proprietary",
     "/NOTICE",
 ]
 repository = "https://github.com/ext-sakamoro/ALICE-LLM"

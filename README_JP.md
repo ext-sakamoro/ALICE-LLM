@@ -6,7 +6,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/alice-llm.svg)](https://crates.io/crates/alice-llm)
 [![docs.rs](https://img.shields.io/docsrs/alice-llm)](https://docs.rs/alice-llm)
-[![License: AGPL-3.0-or-later](https://img.shields.io/crates/l/alice-llm.svg)](#license)
+[![License](https://img.shields.io/badge/license-Proprietary-lightgrey)](LICENSE-Proprietary)
 [![CI](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-LLM/actions/workflows/ci.yml)
 
 > **[ALICE-Eco-System](https://github.com/ext-sakamoro/ALICE-Eco-System)** の一部 — 260+ crate の Edge-to-Cloud データパイプライン (SDF / Physics / LLM / Motion / Font / TTS)
@@ -857,15 +857,8 @@ python3 scripts/docs_lint.py --check            # 公開文書の語彙、CHANGE
 
 ## ライセンス
 
-`AGPL-3.0-or-later OR LicenseRef-Commercial` — デュアルライセンス どちらかを選べる
+この版から `LicenseRef-Proprietary`: ソースは閲覧用に公開しており、利用・複製・改変・配布には
+著作権者との書面での合意が必要 条文は [LICENSE-Proprietary](LICENSE-Proprietary)
+それより前に公開した版は、公開時のライセンスのまま
 
-| 選択肢 | 条文 | こういう時 |
-|--------|------|-----------|
-| **AGPL-3.0-or-later** | [LICENSE-AGPL](LICENSE-AGPL) — 無償、報告義務なし | 自分の project も AGPL 互換の OSS、または社内利用のみ |
-| **商用ライセンス** | [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — 有償、コピーレフト義務を解除 | クローズドソース製品 / 商用 SaaS / エッジ・ファームウェア配布 / plugin 再配布 / ソース開示を禁じるプラットフォーム NDA |
-
-AGPL は強いコピーレフト: `alice-llm` を link して配布 / 提供する製品・ファームウェア・
-サービスは AGPL で公開する義務がある これはオープンなエコシステムのための意図的な
-選択で、それが実行できない場合のために商用ライセンスを用意している
-
-商用ライセンスの問い合わせ: <contact@extoria.co.jp>
+ライセンスの問い合わせ: <contact@extoria.co.jp>
