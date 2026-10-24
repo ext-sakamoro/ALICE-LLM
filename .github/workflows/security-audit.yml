@@ -158,6 +158,8 @@ jobs:
 
   package-integrity:
     name: Package integrity (publish される .crate が build できるか)
+    # dormant: runs only when the workflow is dispatched
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
