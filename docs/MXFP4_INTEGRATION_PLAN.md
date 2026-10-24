@@ -24,8 +24,8 @@ implementations exist (`microsoft/microxcaling`, llama.cpp/ik_llama.cpp).
 > `e9d8c36` as the code landing point.
 >
 > The docs commit `c81bc51` was made under the fallback author identity
-> `ext-sakamoro <ext-sakamoro@example.com>` instead of the intended
-> `Moroya Sakamoto <sakamoro@alicelaw.net>` (an author-flag
+> `ext-sakamoro` instead of the intended
+> `Moroya Sakamoto` (an author-flag
 > omission). Since amending would require a force-push to `main` and the
 > author string is a plain-text convention rather than a load-bearing
 > field, the mislabel is left in place and this note captures the intent.

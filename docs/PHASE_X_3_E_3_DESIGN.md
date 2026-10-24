@@ -422,7 +422,7 @@ Phase X.3.e.3 完了の判定 (2026-07-16 時点):
 - Predecessor:
   - [PR #66 — Phase X.3.e.2 DeltaNet forward wiring](https://github.com/ext-sakamoro/ALICE-LLM/pull/66)
   - [PR #67 — Phase X.5 ARM64 組込みボード load-and-run 動作証明](https://github.com/ext-sakamoro/ALICE-LLM/pull/67)
-- Landing commits (2026-07-16、all authored by `Moroya Sakamoto <sakamoro@alicelaw.net>`):
+- Landing commits (2026-07-16、all authored by `Moroya Sakamoto`):
   - `146ee22` — Gap A per-V-head loop
   - `005b3d0` — Gap C ssm_norm RMSNorm
   - `6d43602` — Gap B ssm_a / ssm_dt_bias SSM discretisation
