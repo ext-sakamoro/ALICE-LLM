@@ -1,0 +1,18 @@
+# the paths that run .github/workflows/g3-ir.yml (scripts/changed_paths.py decide)
+# on.pull_request.paths of the workflow must list the same patterns in the same order
+# (scripts/changed_paths.py sync)
+# every file that can change a job's result is listed: a missing one skips the job on a
+# change that alters it
+src/**
+tests/**
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+tools/no-outer-fneg-of-fma/**
+tools/fneg-fma-ir-probes/**
+scripts/fneg_fma_ir_check.py
+scripts/test_fneg_fma_ir_check.py
+scripts/no-outer-fneg-of-fma-allowlist.toml
+.github/workflows/g3-ir.yml
+scripts/changed_paths.py
+.github/paths/g3-ir.txt

@@ -46,6 +46,13 @@ jobs:
         run: |
           python3 scripts/test_workflow_timeouts.py
           python3 scripts/workflow_timeouts.py
+      # scripts/changed_paths.py decides whether the path-filtered workflows run (its own tests),
+      # then the trigger lint: no on.push paths off main, each pattern file equals its workflow's
+      # pull_request paths, the gate job needs every job
+      - name: Changed paths tests + trigger lint
+        run: |
+          python3 scripts/test_changed_paths.py
+          python3 scripts/changed_paths.py sync
 
   docs_lint:
     # Public documents and every tracked file: no development-process vocabulary,
