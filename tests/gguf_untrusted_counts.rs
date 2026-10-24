@@ -145,6 +145,15 @@ fn claimed_counts_are_not_reserved() {
     assert!(!parses(&b, "dimension count"));
     compared += 1;
 
+    // the same claim in a file that holds one whole tensor entry after it, so the tensor count fits
+    // and only the bound on the dimension count can refuse it
+    let mut b = header(1, 0);
+    string(&mut b, "t");
+    b.extend_from_slice(&u32::MAX.to_le_bytes()); // dimension count
+    b.extend_from_slice(&[0; 16]);
+    assert!(!parses(&b, "dimension count, room for one tensor"));
+    compared += 1;
+
     let mut b = header(0, 1);
     string(&mut b, "k");
     b.extend_from_slice(&9_u32.to_le_bytes()); // array
@@ -153,7 +162,7 @@ fn claimed_counts_are_not_reserved() {
     assert!(!parses(&b, "array length"));
     compared += 1;
 
-    assert_eq!(compared, 4);
+    assert_eq!(compared, 5);
 }
 
 /// A complete file with one metadata array nested `depth` levels (arrays of one array, ending in an
@@ -188,4 +197,70 @@ fn array_nesting_is_limited_to_a_fixed_depth() {
         !parses(&nested(1024), "nesting 1024"),
         "an array nested 1024 levels deep is refused by a depth limit"
     );
+}
+
+#[test]
+fn each_refusal_says_what_was_refused() {
+    use alice_llm::gguf::{GgufError, MAX_ARRAY_DEPTH};
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let err = |b: &[u8]| GgufFile::parse_checked(b).err();
+    let count = |e: Option<GgufError>, what: &str, claimed: u64| matches!(e, Some(GgufError::CountExceedsFile { what: w, claimed: c, .. }) if w == what && c == claimed);
+    let mut compared = 0;
+
+    assert!(count(err(&header(0, 1 << 40)), "metadata count", 1 << 40));
+    compared += 1;
+    assert!(count(err(&header(1 << 40, 0)), "tensor count", 1 << 40));
+    compared += 1;
+
+    let mut b = header(1, 0);
+    string(&mut b, "t");
+    b.extend_from_slice(&u32::MAX.to_le_bytes());
+    b.extend_from_slice(&[0; 16]);
+    assert!(count(err(&b), "dimension count", u64::from(u32::MAX)));
+    compared += 1;
+
+    let mut b = header(0, 1);
+    string(&mut b, "k");
+    b.extend_from_slice(&9_u32.to_le_bytes());
+    b.extend_from_slice(&4_u32.to_le_bytes());
+    b.extend_from_slice(&(1_u64 << 40).to_le_bytes());
+    assert!(count(err(&b), "metadata array length", 1 << 40));
+    compared += 1;
+
+    assert_eq!(
+        err(&nested(1024)),
+        Some(GgufError::NestingTooDeep {
+            max: MAX_ARRAY_DEPTH
+        })
+    );
+    compared += 1;
+
+    // general.alignment 0 would divide by zero when the data section is aligned
+    let mut b = header(0, 1);
+    string(&mut b, "general.alignment");
+    b.extend_from_slice(&4_u32.to_le_bytes());
+    b.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(err(&b), Some(GgufError::ZeroAlignment));
+    compared += 1;
+
+    let mut b = header(0, 1);
+    string(&mut b, "k");
+    b.extend_from_slice(&99_u32.to_le_bytes());
+    assert_eq!(err(&b), Some(GgufError::UnknownType { vtype: 99 }));
+    compared += 1;
+
+    let mut b = header(0, 0);
+    b[0] ^= 1;
+    assert!(matches!(err(&b), Some(GgufError::BadMagic { .. })));
+    let mut b = header(0, 0);
+    b[4] = 9;
+    assert_eq!(err(&b), Some(GgufError::UnsupportedVersion { got: 9 }));
+    assert_eq!(err(&header(0, 0)[..10]), Some(GgufError::Truncated));
+    compared += 3;
+
+    // parse is parse_checked without the reason
+    assert!(GgufFile::parse(&header(0, 1 << 40)).is_none());
+    assert_eq!(compared, 10);
 }
