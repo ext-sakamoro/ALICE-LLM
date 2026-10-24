@@ -238,6 +238,7 @@ step "ci.yml / test: Analytic oracle tests (closed-form laws)"
 step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)"
 scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=8,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
 scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
+scripts/run_tests.sh gguf_untrusted_counts=3 -- cargo test --test gguf_untrusted_counts
 scripts/run_tests.sh lib=12 -- cargo test --lib llama3::tests::kv_cache
 
 step "ci.yml / release: release profile tests (library, oracles, Law tests)"
