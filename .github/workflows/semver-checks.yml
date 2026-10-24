@@ -9,9 +9,8 @@ name: Semver checks
 # version until the next release is cut, and an equal version is checked as the
 # smallest next release (`equal-version` in .github/semver-gate.toml).
 #
-# Dormant: these crates are not published to crates.io or served to outside users,
-# so the check runs only when started by hand (workflow_dispatch). It has no changes
-# job and no gate: no push, pull request or schedule starts it.
+# Runs only when started by hand (workflow_dispatch): no push, pull request or schedule
+# starts it, and it has no changes job and no gate.
 #
 # scripts/preflight.sh (full run) runs the same command.
 
