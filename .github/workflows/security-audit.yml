@@ -12,14 +12,7 @@ name: Security & Hygiene
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'src/**'
-      - 'deny.toml'
-      - '.github/workflows/security-audit.yml'
-      - '.github/actions/**'
+    branches: [main, 'ci/**']
   pull_request:
     branches: [main]
     paths:
@@ -29,6 +22,7 @@ on:
       - 'deny.toml'
       - '.github/workflows/security-audit.yml'
       - '.github/actions/**'
+      - '.github/paths/security-audit.txt'
   schedule:
     # 毎週月曜 09:00 UTC = 18:00 JST
     - cron: '0 9 * * 1'
@@ -44,7 +38,38 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
+  # which files changed: a new or force-pushed branch is compared with merge-base(origin/main),
+  # another push with before..after, a pull request with base...head; schedule and manual
+  # runs always run; any error runs (fail-closed) — scripts/changed_paths.py
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after || github.sha }}
+          CREATED: ${{ github.event.created }}
+          FORCED: ${{ github.event.forced }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/changed_paths.py decide --event "$EVENT"
+          --before "$BEFORE" --after "$AFTER" --created "$CREATED" --forced "$FORCED"
+          --base "$PR_BASE" --head "$PR_HEAD"
+          --patterns-file .github/paths/security-audit.txt
+
   audit:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: cargo audit (RustSec CVE scan)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -62,6 +87,8 @@ jobs:
         run: cargo audit --deny yanked
 
   deny:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: cargo-deny (license + advisories + bans + sources)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -80,6 +107,8 @@ jobs:
         run: cargo deny --all-features check all
 
   unused-deps:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: cargo-machete (unused dependencies)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -91,6 +120,8 @@ jobs:
       - uses: bnjbvr/cargo-machete@main
 
   stub-guard:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Stub / mock / dbg guard (grep)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -156,47 +187,9 @@ jobs:
             echo "OK: No TODO/FIXME/XXX/HACK in src/"
           fi
 
-  package-integrity:
-    name: Package integrity (publish される .crate が build できるか)
-    # dormant: runs only when the workflow is dispatched
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-
-      # publish される .crate に必要な file が全部入っているかを見る
-      #
-      # include_str! / include_bytes! が package 境界を越える、exclude を効かせ過ぎる、
-      # 必要 file が漏れる — これらは repo / workspace に file がある限り
-      # cargo build も cargo test も clippy も preflight も全部通り、
-      # crates.io から取得した利用者だけが compile 不能になる
-      # (2026-09-28 ALICE-LOL lol.gbnf で発生)
-      #
-      # semver-checks は baseline を build するので結果的に検出するが、
-      # (a) 壊れた版を publish した後にしか分からない
-      # (b) 未 publish crate は baseline が無く発火しない ので予防にならない
-      - name: cargo package (.crate を作る)
-        # --no-verify: 未 publish の sibling に path dep がある repo では verify step が
-        #   registry 解決で落ちる 展開後の隔離 build が本体なので verify は不要
-        run: cargo package --no-verify --allow-dirty
-
-      - name: 展開して隔離 build
-        run: |
-          set -euo pipefail
-          crate=$(find target/package -maxdepth 1 -name '*.crate' | head -1)
-          [ -n "$crate" ] || { echo "::error::.crate が生成されていない"; exit 1; }
-          echo "packaged: $(basename "$crate") ($(du -h "$crate" | cut -f1))"
-          tmp=$(mktemp -d)
-          tar xzf "$crate" -C "$tmp"
-          cd "$tmp"/*/
-          # 親 workspace を継承すると member 扱いになり、境界を越えた file が
-          # 再び見えてしまう (検査の意味が消える) ので単独 package として build
-          printf '\n[workspace]\n' >> Cargo.toml
-          cargo check --all-features
-
   coverage:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Coverage (cargo-llvm-cov, informational)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -221,3 +214,16 @@ jobs:
           name: coverage-summary
           path: coverage-summary.txt
           retention-days: 30
+
+  gate:
+    name: Gate
+    if: always()
+    needs: [changes, audit, deny, unused-deps, stub-guard, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/changed_paths.py gate --needs-json "$NEEDS"

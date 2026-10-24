@@ -12,12 +12,7 @@ name: Fuzz
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'fuzz/**'
-      - '.github/workflows/fuzz.yml'
-      - '.github/actions/**'
+    branches: [main, 'ci/**']
   pull_request:
     branches: [main]
     paths:
@@ -25,6 +20,7 @@ on:
       - 'fuzz/**'
       - '.github/workflows/fuzz.yml'
       - '.github/actions/**'
+      - '.github/paths/fuzz.txt'
   schedule:
     # 毎日 03:00 UTC = 12:00 JST (idle 時間帯)
     - cron: '0 3 * * *'
@@ -44,7 +40,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # which files changed: a new or force-pushed branch is compared with merge-base(origin/main),
+  # another push with before..after, a pull request with base...head; schedule and manual
+  # runs always run; any error runs (fail-closed) — scripts/changed_paths.py
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after || github.sha }}
+          CREATED: ${{ github.event.created }}
+          FORCED: ${{ github.event.forced }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/changed_paths.py decide --event "$EVENT"
+          --before "$BEFORE" --after "$AFTER" --created "$CREATED" --forced "$FORCED"
+          --base "$PR_BASE" --head "$PR_HEAD"
+          --patterns-file .github/paths/fuzz.txt
+
   fuzz:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Fuzz — ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -107,3 +134,16 @@ jobs:
       - name: Report crash (informational)
         if: steps.run.outcome == 'failure'
         run: echo "::warning::fuzz target ${{ matrix.target }} found a crash — see fuzz-crash-${{ matrix.target }} artifact"
+
+  gate:
+    name: Gate
+    if: always()
+    needs: [changes, fuzz]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/changed_paths.py gate --needs-json "$NEEDS"
