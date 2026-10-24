@@ -67,6 +67,12 @@ jobs:
           python-version: "3.12"
       - name: Docs lint (tests)
         run: python scripts/test_docs_lint.py
+      # every tests/*.rs is run by a `cargo test` of some workflow, with the features its
+      # #![cfg] / #[cfg] lines need (a file no step names would run 0 tests and stay green)
+      - name: CI test coverage (tests)
+        run: python scripts/test_ci_test_coverage_check.py
+      - name: CI test coverage (every tests/*.rs is run by CI)
+        run: python scripts/ci_test_coverage_check.py
       - name: Docs lint (public documents, CHANGELOG structure)
         run: python scripts/docs_lint.py --check
 
@@ -555,85 +561,3 @@ jobs:
           scripts/run_tests.sh server_lifecycle=3 -- cargo test --features server --test server_lifecycle
           scripts/run_tests.sh lib=6 -- cargo test --lib server_cli
 
-  notify_failure:
-    # Open (or comment on existing) a GitHub Issue automatically when any
-    # upstream CI job fails, so pipeline regressions are surfaced as
-    # trackable issues rather than silently ignored. Dedupe by workflow
-    # name in issue title: multiple failures for the same workflow append
-    # comments to a single open issue instead of spamming new issues.
-    #
-    # Requires `issues: write` because default GITHUB_TOKEN in public
-    # repos is issue read-only. Scoped to this job only.
-    name: Open issue on CI failure
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs:
-      - fmt
-      - actionlint
-      - docs_lint
-      - wgsl_lint
-      - clippy
-      - test
-      - doc
-      - gpu_pipeline_smoke
-      - build_release
-      - examples_build
-    if: failure()
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Ensure ci-failure and auto-opened labels exist
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh label create ci-failure \
-            --repo "$REPO" \
-            --color d73a4a \
-            --description "CI pipeline failure auto-opened by GitHub Actions" \
-            2>/dev/null || true
-          gh label create auto-opened \
-            --repo "$REPO" \
-            --color 0e8a16 \
-            --description "Automatically opened by a workflow" \
-            2>/dev/null || true
-
-      - name: Create or comment on ci-failure issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WORKFLOW: ${{ github.workflow }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          existing=$(gh issue list \
-            --repo "$REPO" \
-            --label ci-failure \
-            --state open \
-            --json number,title \
-            --jq ".[] | select(.title | contains(\"$WORKFLOW\")) | .number" \
-            | head -1)
-          short_sha="${SHA:0:7}"
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" \
-              --repo "$REPO" \
-              --body "🔴 New failure — run [$RUN_URL]($RUN_URL) — commit \`$short_sha\` on \`$BRANCH\`"
-          else
-            gh issue create \
-              --repo "$REPO" \
-              --title "CI failure: $WORKFLOW" \
-              --label "ci-failure,auto-opened" \
-              --body-file - <<EOF
-          **Workflow**: $WORKFLOW
-          **Run**: $RUN_URL
-          **Commit**: \`$SHA\`
-          **Branch**: \`$BRANCH\`
-
-          Auto-opened by CI on failure. Investigate the workflow run URL above.
-          Additional failures for the same workflow will append comments to
-          this issue until it is closed manually.
-          EOF
-          fi

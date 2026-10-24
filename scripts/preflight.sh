@@ -19,8 +19,6 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1 ($2)" >&2; 
 has_toolchain() { rustup toolchain list | grep -q "^$1"; }
 
 # Steps CI runs that this file cannot reproduce locally (they can only fail remotely):
-#   - ci.yml:notify_failure:Ensure ci-failure and auto-opened labels exist (no cargo / grep)
-#   - ci.yml:notify_failure:Create or comment on ci-failure issue (no cargo / grep)
 #   - security-audit.yml:audit:Install cargo-audit (needs network / runner-only)
 #   - security-audit.yml:deny:Install cargo-deny (needs network / runner-only)
 #   - security-audit.yml:coverage (job is continue-on-error: informational in CI)
@@ -50,6 +48,8 @@ python3 scripts/workflow_timeouts.py
 
 step "ci.yml / docs_lint: docs lint (tests + public documents)"
 python3 scripts/test_docs_lint.py
+python3 scripts/test_ci_test_coverage_check.py
+python3 scripts/ci_test_coverage_check.py
 python3 scripts/docs_lint.py --check
 
 step "ci.yml / float-environment: run_tests.sh and build configuration guard (tests, then check)"

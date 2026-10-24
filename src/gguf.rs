@@ -313,8 +313,20 @@ impl<'a> Reader<'a> {
         Self { data, pos: 0 }
     }
 
+    /// The bytes not read yet
+    const fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    /// `count` items of at least `min_size` bytes each fit in what remains (a count read from the
+    /// file is checked against the file before anything is reserved for it)
+    const fn fits(&self, count: u64, min_size: usize) -> bool {
+        count <= (self.remaining() / min_size) as u64
+    }
+
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos + n > self.data.len() {
+        // `n` may come from the file: compare it with what remains (no `pos + n` overflow)
+        if n > self.remaining() {
             return None;
         }
         let slice = &self.data[self.pos..self.pos + n];
@@ -378,7 +390,7 @@ impl<'a> Reader<'a> {
     }
 
     fn read_string(&mut self) -> Option<String> {
-        let len = self.read_u64()? as usize;
+        let len = usize::try_from(self.read_u64()?).ok()?;
         let bytes = self.read_bytes(len)?;
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
@@ -388,6 +400,11 @@ impl<'a> Reader<'a> {
     }
 
     fn read_meta_value(&mut self, vtype: u32) -> Option<MetaValue> {
+        self.read_meta_value_at(vtype, 0)
+    }
+
+    /// `depth` is the number of arrays this value is inside of
+    fn read_meta_value_at(&mut self, vtype: u32, depth: usize) -> Option<MetaValue> {
         match vtype {
             0 => Some(MetaValue::U8(self.read_u8()?)),
             1 => Some(MetaValue::I8(self.read_i8()?)),
@@ -399,11 +416,24 @@ impl<'a> Reader<'a> {
             7 => Some(MetaValue::Bool(self.read_bool()?)),
             8 => Some(MetaValue::Str(self.read_string()?)),
             9 => {
+                if depth >= MAX_ARRAY_DEPTH {
+                    return None;
+                }
                 let arr_type = self.read_u32()?;
-                let arr_len = self.read_u64()? as usize;
-                let mut items = Vec::with_capacity(arr_len.min(1_000_000));
+                let arr_len = self.read_u64()?;
+                // every element takes at least its type's smallest encoding, so a length the
+                // remaining bytes cannot hold is refused before the array is reserved
+                // (an element type the parser does not know cannot be read, so only an empty
+                // array of it reads, as before)
+                let fits =
+                    meta_value_min_size(arr_type).map_or(arr_len == 0, |m| self.fits(arr_len, m));
+                if !fits {
+                    return None;
+                }
+                let arr_len = usize::try_from(arr_len).ok()?;
+                let mut items = Vec::with_capacity(arr_len);
                 for _ in 0..arr_len {
-                    items.push(self.read_meta_value(arr_type)?);
+                    items.push(self.read_meta_value_at(arr_type, depth + 1)?);
                 }
                 Some(MetaValue::Array(items))
             }
@@ -421,6 +451,28 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
+/// How many arrays a metadata value may be nested in (a model's metadata holds arrays of scalars or
+/// strings; the limit bounds the parser's recursion by the parser, not by the file)
+const MAX_ARRAY_DEPTH: usize = 8;
+
+/// The fewest bytes a metadata value of type `vtype` takes (`None` for an unknown type)
+const fn meta_value_min_size(vtype: u32) -> Option<usize> {
+    Some(match vtype {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4..=6 => 4,
+        // a string is its 8-byte length; an array is its 4-byte type and 8-byte length
+        8 | 10..=12 => 8,
+        9 => 12,
+        _ => return None,
+    })
+}
+
+/// The fewest bytes one metadata entry takes: its key (an 8-byte length), its type and a 1-byte value
+const META_ENTRY_MIN_SIZE: usize = 8 + 4 + 1;
+/// The fewest bytes one tensor entry takes: its name's length, its dimension count, its type and offset
+const TENSOR_ENTRY_MIN_SIZE: usize = 8 + 4 + 4 + 8;
 
 // ─── GGUF file ──────────────────────────────────────────────────────────────
 
@@ -449,8 +501,19 @@ impl<'a> GgufFile<'a> {
             return None;
         }
 
-        let tensor_count = r.read_u64()? as usize;
-        let metadata_count = r.read_u64()? as usize;
+        let tensor_count = r.read_u64()?;
+        let metadata_count = r.read_u64()?;
+        // the counts are the file's claims: both tables must fit in what the file holds after the
+        // header before anything is reserved for them
+        if !r.fits(metadata_count, META_ENTRY_MIN_SIZE)
+            || !r.fits(tensor_count, TENSOR_ENTRY_MIN_SIZE)
+        {
+            return None;
+        }
+        let (tensor_count, metadata_count) = (
+            usize::try_from(tensor_count).ok()?,
+            usize::try_from(metadata_count).ok()?,
+        );
 
         // Parse metadata
         let mut metadata = HashMap::with_capacity(metadata_count);
@@ -466,6 +529,9 @@ impl<'a> GgufFile<'a> {
         for _ in 0..tensor_count {
             let name = r.read_string()?;
             let n_dims = r.read_u32()?;
+            if !r.fits(u64::from(n_dims), 8) {
+                return None;
+            }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
                 dims.push(r.read_u64()?);

@@ -145,6 +145,15 @@ fn claimed_counts_are_not_reserved() {
     assert!(!parses(&b, "dimension count"));
     compared += 1;
 
+    // the same claim in a file that holds one whole tensor entry after it, so the tensor count fits
+    // and only the bound on the dimension count can refuse it
+    let mut b = header(1, 0);
+    string(&mut b, "t");
+    b.extend_from_slice(&u32::MAX.to_le_bytes()); // dimension count
+    b.extend_from_slice(&[0; 16]);
+    assert!(!parses(&b, "dimension count, room for one tensor"));
+    compared += 1;
+
     let mut b = header(0, 1);
     string(&mut b, "k");
     b.extend_from_slice(&9_u32.to_le_bytes()); // array
@@ -153,7 +162,7 @@ fn claimed_counts_are_not_reserved() {
     assert!(!parses(&b, "array length"));
     compared += 1;
 
-    assert_eq!(compared, 4);
+    assert_eq!(compared, 5);
 }
 
 /// A complete file with one metadata array nested `depth` levels (arrays of one array, ending in an
