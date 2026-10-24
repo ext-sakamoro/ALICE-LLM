@@ -20,12 +20,6 @@ on:
         description: "cargo mutants -f に渡す file (空白区切り、例: src/sampling.rs src/rope.rs)"
         required: true
         type: string
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'Cargo.toml'
-      - '.github/workflows/quality-deep.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
