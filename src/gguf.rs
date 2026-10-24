@@ -313,8 +313,20 @@ impl<'a> Reader<'a> {
         Self { data, pos: 0 }
     }
 
+    /// The bytes not read yet
+    const fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    /// `count` items of at least `min_size` bytes each fit in what remains (a count read from the
+    /// file is checked against the file before anything is reserved for it)
+    const fn fits(&self, count: u64, min_size: usize) -> bool {
+        count <= (self.remaining() / min_size) as u64
+    }
+
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos + n > self.data.len() {
+        // `n` may come from the file: compare it with what remains (no `pos + n` overflow)
+        if n > self.remaining() {
             return None;
         }
         let slice = &self.data[self.pos..self.pos + n];
@@ -378,7 +390,7 @@ impl<'a> Reader<'a> {
     }
 
     fn read_string(&mut self) -> Option<String> {
-        let len = self.read_u64()? as usize;
+        let len = usize::try_from(self.read_u64()?).ok()?;
         let bytes = self.read_bytes(len)?;
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
@@ -387,30 +399,56 @@ impl<'a> Reader<'a> {
         Some(self.read_u8()? != 0)
     }
 
-    fn read_meta_value(&mut self, vtype: u32) -> Option<MetaValue> {
-        match vtype {
-            0 => Some(MetaValue::U8(self.read_u8()?)),
-            1 => Some(MetaValue::I8(self.read_i8()?)),
-            2 => Some(MetaValue::U16(self.read_u16()?)),
-            3 => Some(MetaValue::I16(self.read_i16()?)),
-            4 => Some(MetaValue::U32(self.read_u32()?)),
-            5 => Some(MetaValue::I32(self.read_i32()?)),
-            6 => Some(MetaValue::F32(self.read_f32()?)),
-            7 => Some(MetaValue::Bool(self.read_bool()?)),
-            8 => Some(MetaValue::Str(self.read_string()?)),
+    /// `depth` is the number of arrays this value is inside of
+    fn read_meta_value_at(&mut self, vtype: u32, depth: usize) -> Result<MetaValue, GgufError> {
+        Ok(match vtype {
+            0 => MetaValue::U8(self.read_u8().ok_or(GgufError::Truncated)?),
+            1 => MetaValue::I8(self.read_i8().ok_or(GgufError::Truncated)?),
+            2 => MetaValue::U16(self.read_u16().ok_or(GgufError::Truncated)?),
+            3 => MetaValue::I16(self.read_i16().ok_or(GgufError::Truncated)?),
+            4 => MetaValue::U32(self.read_u32().ok_or(GgufError::Truncated)?),
+            5 => MetaValue::I32(self.read_i32().ok_or(GgufError::Truncated)?),
+            6 => MetaValue::F32(self.read_f32().ok_or(GgufError::Truncated)?),
+            7 => MetaValue::Bool(self.read_bool().ok_or(GgufError::Truncated)?),
+            8 => MetaValue::Str(self.read_string().ok_or(GgufError::Truncated)?),
             9 => {
-                let arr_type = self.read_u32()?;
-                let arr_len = self.read_u64()? as usize;
-                let mut items = Vec::with_capacity(arr_len.min(1_000_000));
-                for _ in 0..arr_len {
-                    items.push(self.read_meta_value(arr_type)?);
+                if depth >= MAX_ARRAY_DEPTH {
+                    return Err(GgufError::NestingTooDeep {
+                        max: MAX_ARRAY_DEPTH,
+                    });
                 }
-                Some(MetaValue::Array(items))
+                let arr_type = self.read_u32().ok_or(GgufError::Truncated)?;
+                let arr_len = self.read_u64().ok_or(GgufError::Truncated)?;
+                // every element takes at least its type's smallest encoding, so a length the
+                // remaining bytes cannot hold is refused before the array is reserved
+                // (an element type the parser does not know cannot be read, so only an empty
+                // array of it reads, as before)
+                let fits =
+                    meta_value_min_size(arr_type).map_or(arr_len == 0, |m| self.fits(arr_len, m));
+                if !fits {
+                    return Err(self.too_many("metadata array length", arr_len));
+                }
+                let arr_len = usize::try_from(arr_len)
+                    .map_err(|_| self.too_many("metadata array length", arr_len))?;
+                let mut items = Vec::with_capacity(arr_len);
+                for _ in 0..arr_len {
+                    items.push(self.read_meta_value_at(arr_type, depth + 1)?);
+                }
+                MetaValue::Array(items)
             }
-            10 => Some(MetaValue::U64(self.read_u64()?)),
-            11 => Some(MetaValue::I64(self.read_i64()?)),
-            12 => Some(MetaValue::F64(self.read_f64()?)),
-            _ => None,
+            10 => MetaValue::U64(self.read_u64().ok_or(GgufError::Truncated)?),
+            11 => MetaValue::I64(self.read_i64().ok_or(GgufError::Truncated)?),
+            12 => MetaValue::F64(self.read_f64().ok_or(GgufError::Truncated)?),
+            _ => return Err(GgufError::UnknownType { vtype }),
+        })
+    }
+
+    /// The error for a count the file declares that the bytes after it cannot hold
+    const fn too_many(&self, what: &'static str, claimed: u64) -> GgufError {
+        GgufError::CountExceedsFile {
+            what,
+            claimed,
+            remaining: self.remaining(),
         }
     }
 
@@ -421,6 +459,93 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
+/// Why a byte slice is not a GGUF file this parser reads ([`GgufFile::parse_checked`])
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GgufError {
+    /// The file does not start with the GGUF magic
+    BadMagic {
+        /// The first four bytes, read as a little-endian `u32`
+        got: u32,
+    },
+    /// The GGUF version is not 2 or 3
+    UnsupportedVersion {
+        /// The version in the header
+        got: u32,
+    },
+    /// A count the file declares (entries, tensors, dimensions, array elements) cannot fit in the
+    /// bytes that follow it; nothing was reserved for it
+    CountExceedsFile {
+        /// Which count
+        what: &'static str,
+        /// The count the file declares
+        claimed: u64,
+        /// The bytes left in the file where it was read
+        remaining: usize,
+    },
+    /// A metadata array is nested in more than [`MAX_ARRAY_DEPTH`] arrays
+    NestingTooDeep {
+        /// The limit
+        max: usize,
+    },
+    /// A metadata value has a type this parser does not know
+    UnknownType {
+        /// The type in the file
+        vtype: u32,
+    },
+    /// `general.alignment` is 0
+    ZeroAlignment,
+    /// The file ends inside a field
+    Truncated,
+}
+
+impl std::fmt::Display for GgufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic { got } => write!(f, "not a GGUF file (magic {got:#010x})"),
+            Self::UnsupportedVersion { got } => write!(f, "GGUF version {got} is not supported"),
+            Self::CountExceedsFile {
+                what,
+                claimed,
+                remaining,
+            } => write!(
+                f,
+                "the {what} {claimed} does not fit in the {remaining} bytes after it"
+            ),
+            Self::NestingTooDeep { max } => {
+                write!(f, "a metadata array is nested in more than {max} arrays")
+            }
+            Self::UnknownType { vtype } => write!(f, "unknown metadata value type {vtype}"),
+            Self::ZeroAlignment => write!(f, "general.alignment is 0"),
+            Self::Truncated => write!(f, "the file ends inside a field"),
+        }
+    }
+}
+
+impl std::error::Error for GgufError {}
+
+/// How many arrays a metadata value may be nested in (a model's metadata holds arrays of scalars or
+/// strings; the limit bounds the parser's recursion by the parser, not by the file)
+pub const MAX_ARRAY_DEPTH: usize = 8;
+
+/// The fewest bytes a metadata value of type `vtype` takes (`None` for an unknown type)
+const fn meta_value_min_size(vtype: u32) -> Option<usize> {
+    Some(match vtype {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4..=6 => 4,
+        // a string is its 8-byte length; an array is its 4-byte type and 8-byte length
+        8 | 10..=12 => 8,
+        9 => 12,
+        _ => return None,
+    })
+}
+
+/// The fewest bytes one metadata entry takes: its key (an 8-byte length), its type and a 1-byte value
+const META_ENTRY_MIN_SIZE: usize = 8 + 4 + 1;
+/// The fewest bytes one tensor entry takes: its name's length, its dimension count, its type and offset
+const TENSOR_ENTRY_MIN_SIZE: usize = 8 + 4 + 4 + 8;
 
 // ─── GGUF file ──────────────────────────────────────────────────────────────
 
@@ -435,43 +560,72 @@ pub struct GgufFile<'a> {
 }
 
 impl<'a> GgufFile<'a> {
-    /// Parse a GGUF file from a byte slice (typically mmap'd).
+    /// Parse a GGUF file from a byte slice (typically mmap'd); `None` when it does not read
+    /// ([`Self::parse_checked`] says why).
     pub fn parse(data: &'a [u8]) -> Option<Self> {
+        Self::parse_checked(data).ok()
+    }
+
+    /// Parse a GGUF file from a byte slice, or say why it does not read
+    ///
+    /// Every count the header and the tensor table declare is checked against the bytes that
+    /// remain before anything is reserved for it, and metadata arrays nest at most
+    /// [`MAX_ARRAY_DEPTH`] deep, so neither the memory nor the recursion is decided by the file.
+    ///
+    /// # Errors
+    /// [`GgufError`]: another magic or version, a count the file cannot hold, nesting too deep, an
+    /// unknown value type, an alignment of 0, or a file that ends inside a field.
+    pub fn parse_checked(data: &'a [u8]) -> Result<Self, GgufError> {
         let mut r = Reader::new(data);
 
-        let magic = r.read_u32()?;
+        let magic = r.read_u32().ok_or(GgufError::Truncated)?;
         if magic != GGUF_MAGIC {
-            return None;
+            return Err(GgufError::BadMagic { got: magic });
         }
 
-        let version = r.read_u32()?;
+        let version = r.read_u32().ok_or(GgufError::Truncated)?;
         if !(2..=3).contains(&version) {
-            return None;
+            return Err(GgufError::UnsupportedVersion { got: version });
         }
 
-        let tensor_count = r.read_u64()? as usize;
-        let metadata_count = r.read_u64()? as usize;
+        let tensor_count = r.read_u64().ok_or(GgufError::Truncated)?;
+        let metadata_count = r.read_u64().ok_or(GgufError::Truncated)?;
+        // the counts are the file's claims: both tables must fit in what the file holds after the
+        // header before anything is reserved for them
+        if !r.fits(metadata_count, META_ENTRY_MIN_SIZE) {
+            return Err(r.too_many("metadata count", metadata_count));
+        }
+        if !r.fits(tensor_count, TENSOR_ENTRY_MIN_SIZE) {
+            return Err(r.too_many("tensor count", tensor_count));
+        }
+        let metadata_count = usize::try_from(metadata_count)
+            .map_err(|_| r.too_many("metadata count", metadata_count))?;
+        let tensor_count =
+            usize::try_from(tensor_count).map_err(|_| r.too_many("tensor count", tensor_count))?;
 
         // Parse metadata
         let mut metadata = HashMap::with_capacity(metadata_count);
         for _ in 0..metadata_count {
-            let key = r.read_string()?;
-            let vtype = r.read_u32()?;
-            let value = r.read_meta_value(vtype)?;
+            let key = r.read_string().ok_or(GgufError::Truncated)?;
+            let vtype = r.read_u32().ok_or(GgufError::Truncated)?;
+            let value = r.read_meta_value_at(vtype, 0)?;
             metadata.insert(key, value);
         }
 
         // Parse tensor info
         let mut tensors = HashMap::with_capacity(tensor_count);
         for _ in 0..tensor_count {
-            let name = r.read_string()?;
-            let n_dims = r.read_u32()?;
+            let name = r.read_string().ok_or(GgufError::Truncated)?;
+            let n_dims = r.read_u32().ok_or(GgufError::Truncated)?;
+            if !r.fits(u64::from(n_dims), 8) {
+                return Err(r.too_many("dimension count", u64::from(n_dims)));
+            }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
-                dims.push(r.read_u64()?);
+                dims.push(r.read_u64().ok_or(GgufError::Truncated)?);
             }
-            let qtype = GgmlType::from_u32(r.read_u32()?);
-            let offset = r.read_u64()?;
+            let qtype = GgmlType::from_u32(r.read_u32().ok_or(GgufError::Truncated)?);
+            let offset = r.read_u64().ok_or(GgufError::Truncated)?;
             tensors.insert(
                 name.clone(),
                 TensorInfo {
@@ -488,12 +642,16 @@ impl<'a> GgufFile<'a> {
             .get("general.alignment")
             .and_then(MetaValue::as_u32)
             .unwrap_or(GGUF_DEFAULT_ALIGNMENT as u32) as usize;
+        // the alignment is the file's: 0 would divide by zero in `align`
+        if alignment == 0 {
+            return Err(GgufError::ZeroAlignment);
+        }
 
         // Align to data section
         r.align(alignment);
         let tensor_data_start = r.pos;
 
-        Some(Self {
+        Ok(Self {
             metadata,
             tensors,
             tensor_data_start,

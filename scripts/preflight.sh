@@ -19,8 +19,6 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1 ($2)" >&2; 
 has_toolchain() { rustup toolchain list | grep -q "^$1"; }
 
 # Steps CI runs that this file cannot reproduce locally (they can only fail remotely):
-#   - ci.yml:notify_failure:Ensure ci-failure and auto-opened labels exist (no cargo / grep)
-#   - ci.yml:notify_failure:Create or comment on ci-failure issue (no cargo / grep)
 #   - security-audit.yml:audit:Install cargo-audit (needs network / runner-only)
 #   - security-audit.yml:deny:Install cargo-deny (needs network / runner-only)
 #   - security-audit.yml:coverage (job is continue-on-error: informational in CI)
@@ -52,6 +50,8 @@ python3 scripts/changed_paths.py sync
 
 step "ci.yml / docs_lint: docs lint (tests + public documents)"
 python3 scripts/test_docs_lint.py
+python3 scripts/test_ci_test_coverage_check.py
+python3 scripts/ci_test_coverage_check.py
 python3 scripts/docs_lint.py --check
 
 step "ci.yml / float-environment: run_tests.sh and build configuration guard (tests, then check)"
@@ -238,7 +238,7 @@ step "ci.yml / test: Analytic oracle tests (closed-form laws)"
 step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties, semantics id, order independence)"
 scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=8,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id
 scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
-scripts/run_tests.sh gguf_untrusted_counts=3 -- cargo test --test gguf_untrusted_counts
+scripts/run_tests.sh gguf_untrusted_counts=4 -- cargo test --test gguf_untrusted_counts
 scripts/run_tests.sh lib=12 -- cargo test --lib llama3::tests::kv_cache
 
 step "ci.yml / release: release profile tests (library, oracles, Law tests)"
