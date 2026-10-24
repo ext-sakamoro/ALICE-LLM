@@ -2,7 +2,7 @@
 name = "alice-llm"
 version = "3.0.0"
 edition = "2021"
-authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
+authors = ["Moroya Sakamoto"]
 license = "LicenseRef-Proprietary"
 publish = false
 description = "Pure Rust LLM inference engine — GGUF v3 parser, K-quants, hybrid CPU/GPU DeltaNet+Attention, wgpu compute shaders, speculative decoding, OpenAI-compatible HTTP server."
