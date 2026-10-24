@@ -47,6 +47,8 @@ python3 scripts/test_check_eol.py
 python3 scripts/check_eol.py
 python3 scripts/test_workflow_timeouts.py
 python3 scripts/workflow_timeouts.py
+python3 scripts/test_changed_paths.py
+python3 scripts/changed_paths.py sync
 
 step "ci.yml / docs_lint: docs lint (tests + public documents)"
 python3 scripts/test_docs_lint.py
