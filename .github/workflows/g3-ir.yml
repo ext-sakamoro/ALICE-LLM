@@ -8,19 +8,10 @@ name: G3 IR
 
 on:
   push:
+    # no paths here: a branch created at a SHA another ref already has gets an empty
+    # diff from GitHub's filter and the run is skipped; the changes job below compares
+    # with merge-base(origin/main) instead (patterns: .github/paths/g3-ir.txt)
     branches: [main, 'ci/**']
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tools/no-outer-fneg-of-fma/**'
-      - 'tools/fneg-fma-ir-probes/**'
-      - 'scripts/fneg_fma_ir_check.py'
-      - 'scripts/test_fneg_fma_ir_check.py'
-      - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
-      - '.github/workflows/g3-ir.yml'
   pull_request:
     branches: [main]
     paths:
@@ -35,6 +26,8 @@ on:
       - 'scripts/test_fneg_fma_ir_check.py'
       - 'scripts/no-outer-fneg-of-fma-allowlist.toml'
       - '.github/workflows/g3-ir.yml'
+      - 'scripts/changed_paths.py'
+      - '.github/paths/g3-ir.txt'
   schedule:
     - cron: '53 5 * * 1'
   workflow_dispatch:
@@ -51,8 +44,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # which files changed: a new or force-pushed branch is compared with merge-base(origin/main),
+  # another push with before..after, a pull request with base...head; schedule and manual
+  # runs always run; any error runs (fail-closed) — scripts/changed_paths.py
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after || github.sha }}
+          CREATED: ${{ github.event.created }}
+          FORCED: ${{ github.event.forced }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 scripts/changed_paths.py decide --event "$EVENT"
+          --before "$BEFORE" --after "$AFTER" --created "$CREATED" --forced "$FORCED"
+          --base "$PR_BASE" --head "$PR_HEAD"
+          --patterns-file .github/paths/g3-ir.txt
+
   ir:
     name: fneg of fma in the release IR (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -85,3 +109,17 @@ jobs:
         env:
           CARGO_TARGET_DIR: target/g3-ir
         run: python3 scripts/fneg_fma_ir_check.py --package alice-llm --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix" --target ${{ matrix.target }}
+
+  # red when the changes job said run and a job was skipped, cancelled or failed
+  gate:
+    name: Gate
+    if: always()
+    needs: [changes, ir]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/changed_paths.py gate --needs-json "$NEEDS"
