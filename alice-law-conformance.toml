@@ -135,13 +135,14 @@ note = "the identifier describes the arithmetic the cached keys and values were 
 reference_repo = "ALICE-DB"
 
 [G9]
-status = "unverified"
+status = "pass"
 evidence = [
+    "the identifier-history audit (2026-10-25): `git log -S` and `git log -L` over the definitions of LLM_SEMANTICS_ID, RUNNING_SEMANTICS_ID, LLM_PREVIOUS_SEMANTICS_IDS and semantics_id_for in src/semantics.rs list one commit, 754e471 (2026-10-17, which introduces them); 7822e7d (2026-10-17) makes the KV cache file (format 2) carry LLM_SEMANTICS_ID and does not change a definition; the newest release, alice-llm 2.0.0 (tag v2.0.0, b3e9472, crates.io 2026-10-13), names none of them in src (`git grep -F -w` over the tag: 0 files); the working-tree version 3.0.0 is a breaking step from 2.0.0",
     "scripts/id_move_check.py (shared with the other ALICE crates that carry an identifier; tests scripts/test_id_move_check.py; config scripts/id_move.toml): builds a probe against the published release of the newest release tag (alice-llm 2.0.0 today) and against the working tree, reads semantics::LLM_SEMANTICS_ID and semantics::LLM_PLATFORM_SEMANTICS_ID (the one a platform-math build stamps into KV cache files) as values and fails when one moved without a breaking version, without the released value in LLM_PREVIOUS_SEMANTICS_IDS, or without CHANGELOG.md naming both; every const / static / associated const of type [u8; 32] and every public re-export of another crate's constant must be listed or exempt; .github/workflows/ci.yml clippy job and scripts/preflight.sh; today: both are new since 2.0.0 (32957f18, 269ade8f)",
     "tests/running_semantics_id.rs (RUNNING_SEMANTICS_ID, exempt in the config as a cfg alias, equals exactly one of the two checked identifiers and the right one per build; ci.yml runs it in the default test leg and under platform-math, counted by scripts/run_tests.sh)",
 ]
-mutant = "measured 2026-10-17, reverted: dropping the [exempt] entry makes scripts/id_move_check.py exit 1 (for RUNNING_SEMANTICS_ID, `src/semantics.rs#pub const RUNNING_SEMANTICS_ID:`: `a [u8; 32] item that is neither an [[id]] ...`); RUNNING_SEMANTICS_ID made LLM_SEMANTICS_ID under platform-math fails tests/running_semantics_id.rs in the platform-math step"
-note = "unverified: both identifiers are introduced in 3.0.0 (LLM_SEMANTICS_ID for G6, the KV cache file identifier for G8), so there is no history to audit yet and no identifier-history test; LLM_PREVIOUS_SEMANTICS_IDS is empty. The first move has to be a major release with both values named in CHANGELOG.md and a test that loads a file stamped with the earlier value."
+mutant = "none (a property of the history, CONFORMANCE §G9); the audit list is re-done at each major release"
+note = "pass by the audit: no release carries the identifier, so no released value has moved. LLM_SEMANTICS_ID (G6, and the KV cache file identifier for G8 since 7822e7d) was introduced in 754e471 after the newest release 2.0.0 and first ships in 3.0.0, a breaking step from it; it folds alice-det-math's SEMANTICS_ID, so a change of that dependency since 754e471 changes its value, and none of those has shipped either. LLM_PREVIOUS_SEMANTICS_IDS is empty, as nothing earlier was released. The audit is re-done at each major release; from 3.0.0 on, scripts/id_move_check.py compares against the published release."
 
 [G10]
 status = "pass"
