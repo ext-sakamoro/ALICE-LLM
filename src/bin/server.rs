@@ -814,7 +814,7 @@ fn main() {
     let addr = std_listener
         .local_addr()
         .expect("Failed to read the bound address");
-    println!("Bound to http://{addr}");
+    println!("{}", alice_llm::server_cli::bound_report(addr));
     let model_path = opts.model.clone();
 
     // --hybrid: skip GPU allocation, run inference on CPU via Llama3Model.
