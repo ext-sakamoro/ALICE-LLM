@@ -66,6 +66,9 @@ step "ci.yml / float-environment: Shared files equal ALICE-Law's table"
 python3 scripts/test_shared_files.py
 scripts/shared_files.sh
 
+step "ci.yml / float-environment: G11 table matches the declared gates"
+scripts/g11_table.sh
+
 step "ci.yml / clippy: Identifier moves (tests, then against the published release)"
 python3 scripts/test_id_move_check.py
 python3 scripts/id_move_check.py

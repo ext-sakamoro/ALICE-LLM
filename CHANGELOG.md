@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alice-llm-server --exit-on-stdin-eof`: stdin が閉じたら終了する 親 process が server を stdin を piped にして起動し書き込み側を持っておけば、親が正常終了・signal・異常終了のどれで止まっても OS が pipe を閉じるので server も止まる 監視は model の読込より前に始まる
 
 ### Added
+- `conformance/g11.toml` (ALICE-Law の `g11_table_gen.py` で生成した G11 の表) と `.github/g11-table-pin` / `scripts/g11_table.sh` (CI の float-environment job と preflight で表を検査)
 - `alice_llm::server_cli` (std のみ、feature 不要): server の引数の解析 (`parse_args`、`--host` / `--port` の不正な値は既定に戻さず error)、`bind`、`watch_until_eof` server は model の読込より前に bind し、`Bound to http://<addr>` を出す (使用中の port は読込を待たずに失敗する) README / README_JP に server の option を書き、curl の例を 127.0.0.1 にした
 - `tests/server_lifecycle.rs` (unix、`server` feature): 実 binary に model として FIFO を渡し、読込で止まった状態で、既定の待ち受けが loopback であること・`--exit-on-stdin-eof` で stdin を閉じると終了すること・flag 無しでは終了しないことを確かめる CI の examples_build job と preflight で `scripts/run_tests.sh server_lifecycle=3` と `lib=6` (`server_cli` の単体試験) を走らせる
 - `conformance/g11-own.toml`: ALICE-Law G11 の表のうち、この crate 固有の行 (G2 の max / min の tie、G4 / G5 の golden、G6 の識別子、G13 の順序、比較 0 件は `scripts/run_tests.sh` の試験、G10 の `scripts/entropy_guard.py` とその試験) 共有の検査器の行は ALICE-Law の `conformance/g11-shared-rows.toml` から生成する

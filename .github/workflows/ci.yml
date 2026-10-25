@@ -320,6 +320,12 @@ jobs:
           PY=$(command -v python3 || command -v python)
           "$PY" scripts/test_shared_files.py
           scripts/shared_files.sh
+      # ALICE-Law G11: every gate the manifest declares pass has a row in conformance/g11.toml naming its
+      # checker, the canary it must flag and the test that fails when it compared nothing (ALICE-Law's
+      # checker fetched at .github/g11-table-pin, SHA-256 pinned; 0 rows compared fails)
+      - name: G11 table matches the declared gates
+        shell: bash
+        run: scripts/g11_table.sh
       - name: Effective rustc flags (default, docs.rs feature set, no default features)
         if: runner.os != 'Windows'
         run: |
