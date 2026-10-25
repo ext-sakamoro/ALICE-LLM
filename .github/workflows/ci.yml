@@ -326,6 +326,13 @@ jobs:
       - name: G11 table matches the declared gates
         shell: bash
         run: scripts/g11_table.sh
+      - name: ALICE-Law G11 self-check (the four G11 checks at the pinned revision)
+        shell: bash
+        run: |
+          rev=$(awk '$1 == "rev" { print $2 }' .github/shared-files-pin)
+          git -c core.autocrlf=false clone --quiet --filter=blob:none https://github.com/ext-sakamoro/ALICE-Law.git "$RUNNER_TEMP/alice-law"
+          git -C "$RUNNER_TEMP/alice-law" checkout --quiet --detach "$rev"
+          python3 "$RUNNER_TEMP/alice-law/scripts/g11_self_check.py" --repo . --name ALICE-LLM
       - name: Effective rustc flags (default, docs.rs feature set, no default features)
         if: runner.os != 'Windows'
         run: |

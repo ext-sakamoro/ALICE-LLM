@@ -69,6 +69,17 @@ scripts/shared_files.sh
 step "ci.yml / float-environment: G11 table matches the declared gates"
 scripts/g11_table.sh
 
+step "ci.yml / float-environment: ALICE-Law G11 self-check (the four G11 checks at the pinned revision)"
+(
+  set -euo pipefail
+  rev=$(awk '$1 == "rev" { print $2 }' .github/shared-files-pin)
+  law=$(mktemp -d)
+  trap 'rm -rf "$law"' EXIT
+  git -c core.autocrlf=false clone --quiet --filter=blob:none https://github.com/ext-sakamoro/ALICE-Law.git "$law/alice-law"
+  git -C "$law/alice-law" checkout --quiet --detach "$rev"
+  python3 "$law/alice-law/scripts/g11_self_check.py" --repo . --name ALICE-LLM
+)
+
 step "ci.yml / clippy: Identifier moves (tests, then against the published release)"
 python3 scripts/test_id_move_check.py
 python3 scripts/id_move_check.py
