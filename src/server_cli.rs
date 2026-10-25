@@ -65,6 +65,14 @@ pub fn bind(opts: &ServerOptions) -> std::io::Result<std::net::TcpListener> {
     std::net::TcpListener::bind(opts.bind_addr())
 }
 
+/// The line the server prints to stdout right after it binds, naming the address
+/// it actually bound This line is a contract: a parent process that spawns the
+/// server with `--port 0` learns the chosen port by reading it
+#[must_use]
+pub fn bound_report(addr: SocketAddr) -> String {
+    format!("Bound to http://{addr}")
+}
+
 /// Value that follows `flag`, or an error when the flag is last
 fn value_of<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
     match args.iter().position(|a| a == flag) {
@@ -190,6 +198,12 @@ mod tests {
         let local = listener.local_addr().unwrap();
         assert!(local.ip().is_loopback(), "bound on {local}");
         assert_ne!(local.port(), 0);
+        // the stdout contract: the reported line names the resolved, non-zero port
+        // so a parent spawning with --port 0 can read it back
+        let line = bound_report(local);
+        assert_eq!(line, format!("Bound to http://{local}"));
+        assert!(line.starts_with("Bound to http://"));
+        assert!(!line.ends_with(":0"));
         let wide =
             parse_args(&args(&["--model", "m", "--host", "0.0.0.0", "--port", "0"])).unwrap();
         assert!(bind(&wide)
