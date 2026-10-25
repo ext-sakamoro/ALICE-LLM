@@ -41,6 +41,19 @@ What it does, per invocation:
    every carrier whose library holds no fma call (ALICE-ML, -Crypto, -Kinematics,
    -DetMath, -Sync, -Zip) has 0 fma calls in its release IR on both targets.
 
+What the IR half can and cannot see: it refuses a negation that reaches the IR. A
+negation whose only use the optimiser folds into the following arithmetic leaves no
+negation to find: `-(a.mul_add(b, c)) * C` becomes `fmul (fma), -C`, the same IR as
+the conforming `a.mul_add(b, c) * -C` (G3 bans negating the whole result, not
+multiplying it by a negative constant), and `x + -(fma) * C` becomes `fsub x,
+(fma * C)`. That is ALICE-Edge's `-(lat_deg.mul_add(100.0, -lat_raw))` used only as
+`lat_deg + lat_min * INV_60` (2026-10-18: the syntax-tree check refused it, the IR
+check found 0 negated fma calls on aarch64). G3 is defined on the source, so those
+forms are the syntax-tree checker's to refuse; the IR half claims only what the IR
+can distinguish. Probes 48 and 49 pin both folds as `expect-ir: clean` with
+`expect-syn: flag`, and probe 50 pins the other side: when the negated result is
+also used on its own, the negation survives as an fneg of the fma and is refused.
+
 A finding is reported with the source location from the `!dbg` attachment of the
 negation (for inlined code, the location in the callee, which is the line to fix).
 There is no allowlist for findings: the IR covers the library only, and G3 allows

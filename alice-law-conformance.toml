@@ -158,7 +158,7 @@ reference_repo = "ALICE-DB"
 
 [G11]
 status = "fail-known"
-note = "unmet: clause (c). The checkers carry canaries and zero-compared failures: the G1 / G2 clippy canary and call pin, the G3 checker probes, the G10 guard tests (scripts/test_entropy_guard.py), the G14 scripts, scripts/run_tests.sh. Clause (c) is not evidenced: the shared copies (the canary and run_tests scripts, the G3 tool and IR checker, the G14 scripts) are compared with their sources only by a pre-push check outside this repository, not by anything this repository or its CI carries; the cross-repository table is to come from ALICE-Law."
+note = "fail-known, located: clause (c) is checked by scripts/shared_files.sh against ALICE-Law 0a5de013 (81 copies, 0 findings), and every shared copy this crate carries is at the table's target except scripts/id_move_check.py and test_id_move_check.py (owner ALICE-Physics, whose target is being re-rolled); the cell becomes pass for (c) when those two copies take the new target. The checkers carry canaries and zero-compared failures: the G1 / G2 clippy canary and call pin, the G3 checker probes, the G10 guard tests (scripts/test_entropy_guard.py), the G14 scripts, scripts/run_tests.sh."
 
 [G12]
 status = "pass"

@@ -10,7 +10,10 @@ and '_' are equivalent). Every other entry becomes a skip row with the reason
 it cannot be planted.
 
 A method is planted as a bare path reference (`let _ = <path>;`), which clippy
-flags once whatever the method's arity. A type is planted as a `use` item
+flags once whatever the method's arity. A generic function cannot be named
+without its type arguments (E0282), so the paths in GENERIC_PLANTS are planted
+with the turbofish given there instead; clippy resolves the turbofish path to
+the same disallowed method. A type is planted as a `use` item
 (`#[allow(unused_imports)] use <path> as CanaryType;`), which clippy flags once
 whatever the type's generic parameters.
 
@@ -73,9 +76,20 @@ def skip_reason(path: str, lock: dict, own: set[str]) -> str | None:
     return f"{crate} is not in Cargo.lock: the canary crate cannot depend on it"
 
 
+# generic functions: a plant that compiles (type arguments given, lifetimes
+# only where they are early-bound); each was checked to draw exactly one
+# disallowed_methods diagnostic naming the path
+GENERIC_PLANTS = {
+    "std::thread::spawn": "let _ = std::thread::spawn::<fn(), ()>;",
+    "std::thread::scope": "let _ = std::thread::scope::<'static, for<'s> fn(&'s std::thread::Scope<'s, 'static>), ()>;",
+    "std::thread::Builder::spawn": "let _ = std::thread::Builder::spawn::<fn(), ()>;",
+    "std::thread::Builder::spawn_scoped": "let _ = std::thread::Builder::spawn_scoped::<fn(), ()>;",
+}
+
+
 def statement(key: str, path: str) -> str:
     if key == "disallowed-methods":
-        return f"let _ = {path};"
+        return GENERIC_PLANTS.get(path, f"let _ = {path};")
     return f"#[allow(unused_imports)] use {path} as CanaryType;"
 
 

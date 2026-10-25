@@ -100,6 +100,16 @@ class Render(unittest.TestCase):
         self.assertIn("disallowed-types\tstd::collections::HashMap\t"
                       "#[allow(unused_imports)] use std::collections::HashMap as CanaryType;", self.rows)
 
+    def test_generic_functions_are_planted_with_their_turbofish(self):
+        for path, plant in gen.GENERIC_PLANTS.items():
+            self.assertEqual(gen.statement("disallowed-methods", path), plant, path)
+            self.assertTrue(plant.startswith(f"let _ = {path}::<") and plant.endswith(">;"), plant)
+        self.assertEqual(set(gen.GENERIC_PLANTS), {"std::thread::spawn", "std::thread::scope",
+                                                   "std::thread::Builder::spawn",
+                                                   "std::thread::Builder::spawn_scoped"})
+        # a non-generic method keeps the bare path form
+        self.assertEqual(gen.statement("disallowed-methods", "f64::sin"), "let _ = f64::sin;")
+
     def test_skip_rows_name_the_reason(self):
         skips = {r.split("\t")[1]: r.split("\t")[3] for r in self.rows if r.split("\t")[2] == "skip"}
         self.assertEqual(set(skips), {"my_crate::inner::f", "local_dep::f", "nowhere::f", "nowhere::T"})

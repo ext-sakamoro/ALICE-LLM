@@ -268,6 +268,7 @@ step "security-audit.yml / audit: Run cargo audit"
 
 step "semver-checks.yml / semver-checks: semver gate (tests)"
 python3 scripts/test_semver_gate.py
+python3 scripts/test_release_baseline.py
 
 step "semver-checks.yml / semver-checks: semver gate (latest crates.io release, every consumer feature set)"
 need cargo-semver-checks "cargo install cargo-semver-checks --version 0.50.0 --locked"

@@ -58,5 +58,9 @@ jobs:
 
       # exit 1: a change the step does not allow, a run that compared nothing or named
       # another step; exit 2: crates.io or the configuration could not be read
+      # the bump base (git only, fixture repositories): what `baseline = bump / auto` compares against
+      - name: release baseline (tests)
+        run: python3 scripts/test_release_baseline.py
+
       - name: semver gate (latest crates.io release, every consumer feature set)
         run: python3 scripts/semver_gate.py --config .github/semver-gate.toml --target-dir target/semver
