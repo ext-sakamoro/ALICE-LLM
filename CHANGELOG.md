@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: 公開する文面の検査 (`Public text` workflow、`scripts/public_text.sh`) を追加 ALICE-Law の `scripts/public_text_check.py` を `.github/public-text-pin` の revision (779fa44) で取得し、SHA-256 が一致した時だけ使って、HEAD の全 tracked file (path と本文) と送った commit (message・追加行・追加 path) を読む 何も比較できなければ失敗する preflight でも走る
 
 ### Changed
+- CI (ALICE-Law G11): `scripts/id_move_check.py` と試験を ALICE-Law 0e8c14e の表の目標の bytes (決め直した版) にし、`.github/shared-files-pin` をその rev に移した
 - README / README_JP の licence の節を `LicenseRef-Proprietary` の一文と問い合わせ先にし、`fuzz/Cargo.toml` に `license = "LicenseRef-Proprietary"` を書いた
 - CI (ALICE-Law G11): 共有の file を ALICE-Law 0a5de013 の表の目標の bytes にし、`.github/shared-files-pin` をその rev に移した `scripts/semver_gate.py` が使う `scripts/release_baseline.py` と試験を足し、semver-checks の workflow と preflight でその試験を走らせる `scripts/id_move_check.py` と試験は目標の bytes が決まり直すまで今の bytes のまま
 - 依存: `alice-det-math` を crates.io の 0.5.1 から ALICE-DetMath の git の commit `6384856c8b00f1615e1cd6b5c74d88036c1a8706` (version 0.5.2) にした ALICE-Zip など他の ALICE の repository と同じ source なので、同じ build に入っても `alice-det-math` は 1 つ (`cargo tree -d -i alice-det-math` は重複なし) `deny.toml` の allow-git に ALICE-DetMath を足した `security-audit.yml` の package integrity job は手動起動 (workflow_dispatch) の時だけ走る 意味論の識別子と Law の試験 (lawmath_ln_1p / law_max_min_ties / semantics_golden / llm_semantics_id / float_edge_golden / running_semantics_id) は変わらず通る
