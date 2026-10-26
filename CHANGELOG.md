@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - CI (ALICE-Law G11): ALICE-Law の `scripts/g11_self_check.py` を pin の revision で全 OS の float-environment job と preflight で走らせる (表、表の行、共有の写し、自前の写しが目標か、manifest の 4 つ)
+- CI (ALICE-Law G11): shared-files と G11 の表の pin を ALICE-Law 9cb423c に上げた (self-check が pin と crate の tree を commit した bytes で読み、subprocess の出力を UTF-8 で読む) 共有の写しの bytes は同じ
 - CI (ALICE-Law G11): `scripts/id_move_check.py` と試験を ALICE-Law 0e8c14e の表の目標の bytes (決め直した版) にし、`.github/shared-files-pin` をその rev に移した
 - README / README_JP の licence の節を `LicenseRef-Proprietary` の一文と問い合わせ先にし、`fuzz/Cargo.toml` に `license = "LicenseRef-Proprietary"` を書いた
 - CI (ALICE-Law G11): 共有の file を ALICE-Law 0a5de013 の表の目標の bytes にし、`.github/shared-files-pin` をその rev に移した `scripts/semver_gate.py` が使う `scripts/release_baseline.py` と試験を足し、semver-checks の workflow と preflight でその試験を走らせる `scripts/id_move_check.py` と試験は目標の bytes が決まり直すまで今の bytes のまま
