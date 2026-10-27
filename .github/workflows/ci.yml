@@ -468,7 +468,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --lib --features gpu -- \
+          # stderr only goes to the log the next step counts in: the markers it counts are eprintln!
+          # lines, and the test harness's stdout (`test x ... ok`) merged into the same pipe with 2>&1
+          # can land inside one of them and hide it; stdout goes straight to the console
+          { cargo test --lib --features gpu -- \
             smoke_test_gpu_pipeline_creation \
             q5k_matvec_matches_cpu_dequant_reference \
             q8_0_matvec_matches_cpu_dequant_reference \
@@ -476,7 +479,7 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture 2>&1 | tee test_output.log
+            --nocapture 2>&1 1>&3 | tee test_output.log; } 3>&1
       - name: cargo test --features gpu (pipeline smoke + dispatch correctness + old-vs-new oracle, ubuntu/macos)
         if: matrix.os != 'windows-latest'
         env:
@@ -492,7 +495,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --lib --features gpu,internal-kernel-oracle -- \
+          # stderr only goes to the log the next step counts in: the markers it counts are eprintln!
+          # lines, and the test harness's stdout (`test x ... ok`) merged into the same pipe with 2>&1
+          # can land inside one of them and hide it; stdout goes straight to the console
+          { cargo test --lib --features gpu,internal-kernel-oracle -- \
             smoke_test_gpu_pipeline_creation \
             q5k_matvec_matches_cpu_dequant_reference \
             q8_0_matvec_matches_cpu_dequant_reference \
@@ -501,7 +507,7 @@ jobs:
             cpu_reference_oracle:: \
             integration_tests::test_attention \
             sparse_attention::gpu::tests:: \
-            --nocapture 2>&1 | tee test_output.log
+            --nocapture 2>&1 1>&3 | tee test_output.log; } 3>&1
       # A leg that silently found no adapter at all (lavapipe missing /
       # Metal unavailable) must not pass by default — ubuntu-latest ran 0.05s
       # for 18 "tests" before lavapipe was installed here, meaning every one
@@ -517,6 +523,12 @@ jobs:
         # Git for Windows) on every OS for consistency.
         shell: bash
         run: |
+          # the log holds stderr alone: a harness line in it means stdout was merged back in, and
+          # the counts below could miss a marker split by it
+          if grep -qE '^test .* \.\.\. (ok|FAILED|ignored)' test_output.log; then
+            echo "::error::test_output.log holds test harness lines (stdout merged into the stderr log)"
+            exit 1
+          fi
           adapter_count=$(grep -c '\[gpu\] adapter:' test_output.log || true)
           marker_count=$(grep -c 'GpuEngine cannot be constructed (SUBGROUP unsupported)' test_output.log || true)
           sparse_count=$(grep -c '\[gpu\] sparse attention device acquired' test_output.log || true)
