@@ -10,10 +10,10 @@
 //! the semantics identifier of `alice-det-math`. Two builds with the same
 //! identifier compute every pinned scenario to the same bits.
 //!
-//! # Hex form (with `alice-det-math` 0.5.1)
+//! # Hex form (with `alice-det-math` at the git rev 2d01c63, its `SEMANTICS_ID` `a2a11b9b`)
 //!
 //! ```text
-//! LLM_SEMANTICS_ID           32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d
+//! LLM_SEMANTICS_ID           c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf
 //! LLM_PLATFORM_SEMANTICS_ID  269ade8fc103bb500c378ba0b10b61f2da534968ffd4c987a818e577aa033fac
 //! ```
 //!
@@ -112,7 +112,8 @@ pub const LLM_SEMANTICS_BY_DET_MATH: &[([u8; 32], [u8; 32])] = &[
     ),
     // alice-det-math at the git rev 2d01c63 (sin / cos at |x| >= 2^13, powf of a negative
     // base, powf64 as fdlibm e_pow and hypot of two subnormals change bits; erf / erf64 added):
-    // the "rope" scenario moved with it (positions 4095 and 32767 reach angles past 2^13)
+    // the "rope" scenario moved with it (position 32767 reaches angles past 2^13; the
+    // angle is the position times a frequency of at most 1, so 4095 stays below)
     (
         hex32("a2a11b9b826227fa7a9ed8ab2c1ce63dbb07ad4c39aa2c46a363ddea6b47dbe9"),
         hex32("c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf"),

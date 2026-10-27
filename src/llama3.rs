@@ -23998,4 +23998,32 @@ mod tests {
         let converted: GrammarGenError = fsm_err.clone().into();
         assert_eq!(converted, GrammarGenError::Fsm(fsm_err));
     }
+
+    /// A cache stamped with the identifier of the `alice-det-math` 0.5.1
+    /// build (`32957f18`) is refused: `alice-det-math` 0.6 moved the rope
+    /// bits, so that identifier is not a previous one of the same bits
+    #[test]
+    fn kv_cache_of_the_det_math_0_5_1_build_is_refused() {
+        let old: [u8; 32] = [
+            0x32, 0x95, 0x7f, 0x18, 0xda, 0xc2, 0x83, 0x8d, 0x70, 0x5c, 0x03, 0x4d, 0x0e, 0x27,
+            0xbc, 0xfc, 0x23, 0xf9, 0x68, 0x0f, 0x40, 0x96, 0x73, 0x38, 0xea, 0x13, 0xd8, 0xe9,
+            0xd2, 0x5c, 0x3f, 0x9d,
+        ];
+        assert!(!crate::semantics::LLM_PREVIOUS_SEMANTICS_IDS.contains(&old));
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, 7, &old).unwrap();
+        let run = crate::semantics::LLM_SEMANTICS_ID;
+        for policy in [KvCachePolicy::AcceptUnpinned, KvCachePolicy::RequirePinned] {
+            let mut restored = KvCache::new(2, 4, 3);
+            let err = restored
+                .read_from(&mut bytes.as_slice(), 7, 0, &run, policy)
+                .unwrap_err();
+            assert!(
+                matches!(err, KvCacheLoadError::SemanticsMismatch { stored, .. } if stored == old),
+                "{err:?}"
+            );
+            assert_eq!(restored.seq_len, 0);
+        }
+    }
 }
