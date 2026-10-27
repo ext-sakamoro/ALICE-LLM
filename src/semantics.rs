@@ -79,7 +79,7 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
     ),
     (
         "rope",
-        hex32("e615f1f3efe0eb51a280d57dcd462f331a01612703a5a27f2d06792b18ba8647"),
+        hex32("5abde8f7b2926a6a0932c048cd37ca439470f5da6ddbd72862617afcbcdfd9d5"),
     ),
     (
         "kimi delta gates",
@@ -109,6 +109,13 @@ pub const LLM_SEMANTICS_BY_DET_MATH: &[([u8; 32], [u8; 32])] = &[
     (
         hex32("85e0884623b154a3b2b264374907b6cbac09307ca3f9a08339e48c567d3cb315"),
         hex32("32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d"),
+    ),
+    // alice-det-math at the git rev 2d01c63 (sin / cos at |x| >= 2^13, powf of a negative
+    // base, powf64 as fdlibm e_pow and hypot of two subnormals change bits; erf / erf64 added):
+    // the "rope" scenario moved with it (positions 4095 and 32767 reach angles past 2^13)
+    (
+        hex32("a2a11b9b826227fa7a9ed8ab2c1ce63dbb07ad4c39aa2c46a363ddea6b47dbe9"),
+        hex32("c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf"),
     ),
 ];
 

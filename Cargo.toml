@@ -70,7 +70,7 @@ platform-math = []
 # Law helpers: transcendental functions and max / min that return the same
 # bits on every target (ALICE-Law G1 / G2), through src/lawmath.rs; by git + rev, the source every
 # ALICE repository uses, so one build links one alice-det-math
-alice-det-math = { git = "https://github.com/ext-sakamoro/ALICE-DetMath", rev = "6384856c8b00f1615e1cd6b5c74d88036c1a8706", version = "0.5.2" }
+alice-det-math = { git = "https://github.com/ext-sakamoro/ALICE-DetMath", rev = "2d01c63ff0849cf0ab82eafb89f87f1b729bd2a8", version = "0.5.2" }
 memmap2 = { version = "0.9", optional = true }
 libc = { version = "0.2", optional = true }
 rayon = { version = "1.10", optional = true }

@@ -136,7 +136,7 @@ fn rope_is_the_recorded_bits() {
     assert_golden(
         "rope",
         &out,
-        "e615f1f3efe0eb51a280d57dcd462f331a01612703a5a27f2d06792b18ba8647",
+        "5abde8f7b2926a6a0932c048cd37ca439470f5da6ddbd72862617afcbcdfd9d5",
     );
 }
 
