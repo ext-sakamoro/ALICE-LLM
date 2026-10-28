@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: 公開する文面の検査 (`Public text` workflow、`scripts/public_text.sh`) を追加 ALICE-Law の `scripts/public_text_check.py` を `.github/public-text-pin` の revision (779fa44) で取得し、SHA-256 が一致した時だけ使って、HEAD の全 tracked file (path と本文) と送った commit (message・追加行・追加 path) を読む 何も比較できなければ失敗する preflight でも走る
 
 ### Changed
+- `alice-det-math` を 0.6.0 (rev b4e3d946) にした 0.6.0 は 2d01c63f と同じ算術と識別子 (`SEMANTICS_ID` a2a11b9b) に版の名前を付けた版で、この crate の `SEMANTICS_ID` と評価の bit は変わらない
+- CI (ALICE-Law G11): `.github/shared-files-pin` と `.github/g11-table-pin` を ALICE-Law 521d56df に上げ、共有の写し 10 件を表の目標 (各行の owner の main の bytes) にした
 - CI: GPU の試験 2 step (`cargo test --features gpu` / `gpu,internal-kernel-oracle`) は `test_output.log` に stderr だけを書くようにした 次の step が数える印 (`[gpu] adapter:` / SUBGROUP の印 / sparse attention / SKIP) はどれも `eprintln!` で、`2>&1` で test harness の stdout (`test x ... ok`) と同じ pipe に合流させると、harness の行が印の行の途中に入って数え損ねることがある stdout は console にそのまま出す 数える step は log に harness の行があれば失敗する (stdout がまた混ざった時に止める)
 - CI (ALICE-Law G11): ALICE-Law の `scripts/g11_self_check.py` を pin の revision で全 OS の float-environment job と preflight で走らせる (表、表の行、共有の写し、自前の写しが目標か、manifest の 4 つ)
 - CI (ALICE-Law G11): shared-files と G11 の表の pin を ALICE-Law 9cb423c に上げた (self-check が pin と crate の tree を commit した bytes で読み、subprocess の出力を UTF-8 で読む) 共有の写しの bytes は同じ

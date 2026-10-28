@@ -16,8 +16,9 @@ scripts/gen_clippy_canary_calls.py. A row is either planted (3 columns: key,
 path, Rust statement) or skipped (4 columns: key, path, `skip`, reason); a
 skipped row must give a non-empty reason and is not planted. A planted row whose
 path starts with an external crate makes the throwaway crate depend on that
-crate at the exact version locked in the repository's Cargo.lock (the highest
-one if several are locked).
+crate as the repository's Cargo.lock resolves it: a registry crate at the exact
+locked version (the highest one if several are locked), else a git crate at its
+locked commit, else a path crate at the path the root Cargo.toml declares.
 
 The script fails unless
 
@@ -163,7 +164,57 @@ def registry_version(lock: dict, crate: str) -> tuple[str, str, list[str]] | Non
     return found[-1][0], found[-1][1], [v for _, v in found]
 
 
-def dependencies(rows: list[Row], lock: dict) -> tuple[str, list[str]]:
+def git_dependency(lock: dict, crate: str) -> tuple[str, str, str] | None:
+    """(name, git URL, locked commit) of the highest locked git version, or None."""
+    found = [(n, v, s) for n, v, s in lock.get(norm(crate), []) if s and s.startswith("git+") and "#" in s]
+    if not found:
+        return None
+    found.sort(key=lambda nvs: _version_key(nvs[1]))
+    name, _, source = found[-1]
+    url, commit = source[len("git+"):].split("#", 1)
+    return name, url.split("?", 1)[0], commit
+
+
+def path_dependencies(root: Path) -> dict[str, str]:
+    """{normalised package name: absolute path} of the path dependencies the root Cargo.toml declares
+    (every dependency table, target-specific ones included)."""
+    cargo = root / "Cargo.toml"
+    if not cargo.exists():
+        return {}
+    data = tomllib.loads(cargo.read_text(encoding="utf-8"))
+    tables = []
+    for owner in (data, data.get("workspace", {})):
+        tables += [owner.get(k, {}) for k in ("dependencies", "dev-dependencies", "build-dependencies")]
+    for target in data.get("target", {}).values():
+        tables += [target.get(k, {}) for k in ("dependencies", "dev-dependencies", "build-dependencies")]
+    out: dict[str, str] = {}
+    for table in tables:
+        for key, spec in table.items():
+            if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                out[norm(spec.get("package", key))] = str((root / spec["path"]).resolve())
+    return out
+
+
+def dependency_line(lock: dict, crate: str, paths: dict[str, str] | None = None) -> list[str] | None:
+    """The `[dependencies]` line(s) that take `crate` the way Cargo.lock resolves it, or None: a registry
+    crate at its exact version, else a git crate at its locked commit, else a path crate the root
+    Cargo.toml declares."""
+    hit = registry_version(lock, crate)
+    if hit is not None:
+        name, version, versions = hit
+        note = [f"# {name}: Cargo.lock has {', '.join(versions)}; the highest is used"] if len(versions) > 1 else []
+        return note + [f'{name} = "={version}"']
+    git = git_dependency(lock, crate)
+    if git is not None:
+        name, url, commit = git
+        return [f'{name} = {{ git = "{url}", rev = "{commit}" }}']
+    local = [n for n, _, s in lock.get(norm(crate), []) if s is None]
+    if local and norm(crate) in (paths or {}):
+        return [f'{local[0]} = {{ path = "{(paths or {})[norm(crate)]}" }}']
+    return None
+
+
+def dependencies(rows: list[Row], lock: dict, paths: dict[str, str] | None = None) -> tuple[str, list[str]]:
     """The `[dependencies]` table for planted rows that name an external crate."""
     lines: list[str] = []
     problems: list[str] = []
@@ -172,16 +223,14 @@ def dependencies(rows: list[Row], lock: dict) -> tuple[str, list[str]]:
         crate = first_segment(row.path)
         if not row.planted or crate in BUILTIN_ROOTS or norm(crate) in seen:
             continue
-        hit = registry_version(lock, crate)
-        if hit is None:
+        dep = dependency_line(lock, crate, paths)
+        if dep is None:
             problems.append(f"data line {row.line}: `{row.path}` is planted but `{crate}` is not a "
-                            "registry crate in Cargo.lock, so the canary crate cannot depend on it")
+                            "registry crate in Cargo.lock, a git crate there or a path crate the root "
+                            "Cargo.toml declares, so the canary crate cannot depend on it")
             continue
         seen.add(norm(crate))
-        name, version, versions = hit
-        if len(versions) > 1:
-            lines.append(f"# {name}: Cargo.lock has {', '.join(versions)}; the highest is used")
-        lines.append(f'{name} = "={version}"')
+        lines += dep
     return ("[dependencies]\n" + "\n".join(lines) + "\n\n") if lines else "", problems
 
 
@@ -362,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     entries = clippy_toml_entries((args.root / "clippy.toml").read_text(encoding="utf-8"))
     lock_file = args.root / "Cargo.lock"
     lock = lock_packages(lock_file.read_text(encoding="utf-8")) if lock_file.exists() else {}
-    deps, dep_problems = dependencies(rows, lock)
+    deps, dep_problems = dependencies(rows, lock, path_dependencies(args.root))
     problems += dep_problems
     problems += static_problems(rows, entries)
     diags: list[tuple[str, int, str]] = []

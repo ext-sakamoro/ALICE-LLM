@@ -175,6 +175,85 @@ class Dependencies(unittest.TestCase):
         rows = [cc.Row(1, "disallowed-methods", "nowhere::f", None, "reason")]
         self.assertEqual(cc.dependencies(rows, {}), ("", []))
 
+    GIT = "a" * 40
+    GIT_LOCK = LOCK + (f'\n[[package]]\nname = "dep-g"\nversion = "0.6.0"\n'
+                       f'source = "git+https://example.invalid/dep-g?rev=aaaaaaa#{"a" * 40}"\n')
+
+    def test_a_git_source_is_taken_at_its_locked_commit(self):
+        deps, problems = cc.dependencies([self.row("dep_g::Key::generate")], cc.lock_packages(self.GIT_LOCK))
+        self.assertEqual(problems, [])
+        self.assertIn(f'dep-g = {{ git = "https://example.invalid/dep-g", rev = "{self.GIT}" }}', deps)
+        dep = tomllib.loads(cc.manifest("2021", deps, ""))["dependencies"]["dep-g"]
+        self.assertEqual(dep, {"git": "https://example.invalid/dep-g", "rev": self.GIT})
+
+    def test_a_registry_source_still_wins_over_a_git_one(self):
+        lock = self.GIT_LOCK + ('\n[[package]]\nname = "dep-g"\nversion = "0.5.0"\n'
+                                'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
+        deps, problems = cc.dependencies([self.row("dep_g::f")], cc.lock_packages(lock))
+        self.assertEqual(problems, [])
+        self.assertIn('dep-g = "=0.5.0"', deps)
+
+    def test_a_path_source_declared_by_the_root_manifest_is_taken_by_path(self):
+        deps, problems = cc.dependencies([self.row("local_dep::f")], cc.lock_packages(LOCK),
+                                         {"local_dep": "/r/local-dep"})
+        self.assertEqual(problems, [])
+        self.assertEqual(tomllib.loads(cc.manifest("2021", deps, ""))["dependencies"]["local-dep"],
+                         {"path": "/r/local-dep"})
+
+    def test_the_highest_locked_git_version_is_taken(self):
+        lock = self.GIT_LOCK + ('\n[[package]]\nname = "dep-g"\nversion = "0.10.0"\n'
+                                f'source = "git+https://example.invalid/dep-g#{"b" * 40}"\n')
+        deps, problems = cc.dependencies([self.row("dep_g::f")], cc.lock_packages(lock))
+        self.assertEqual(problems, [])
+        self.assertIn(f'rev = "{"b" * 40}"', deps)
+
+    def test_a_declared_path_that_cargo_lock_does_not_hold_fails(self):
+        deps, problems = cc.dependencies([self.row("dep_r::f")], cc.lock_packages(LOCK), {"dep_r": "/r/dep-r"})
+        self.assertEqual(deps, "")
+        self.assertEqual(len(problems), 1, problems)
+
+    def test_the_workspace_dependency_table_is_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = []\n\n[workspace.dependencies]\n'
+                                             'local-dep = { path = "vendor/local-dep" }\n', encoding="utf-8")
+            got = cc.path_dependencies(root)
+        self.assertEqual(got, {"local_dep": str((root / "vendor/local-dep").resolve())})
+
+    def test_main_gives_the_canary_crate_the_declared_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Cargo.toml").write_text('[package]\nname = "my-crate"\nversion = "0.1.0"\n\n'
+                                             '[dependencies]\nlocal-dep = { path = "../local-dep" }\n',
+                                             encoding="utf-8")
+            (root / "Cargo.lock").write_text(LOCK, encoding="utf-8")
+            (root / "clippy.toml").write_text('disallowed-methods = ["local_dep::f"]\n', encoding="utf-8")
+            calls = root / "calls.tsv"
+            calls.write_text("disallowed-methods\tlocal_dep::f\tlet _ = local_dep::f;\n", encoding="utf-8")
+            seen = []
+            real = cc.run_clippy
+            cc.run_clippy = lambda _root, _lib, deps: (seen.append(deps), (1, "", ""))[1]
+            try:
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    cc.main(["--calls", str(calls), "--root", str(root)])
+            finally:
+                cc.run_clippy = real
+        self.assertEqual(len(seen), 1, "the dependency check stopped before clippy")
+        self.assertEqual(tomllib.loads(seen[0])["dependencies"]["local-dep"],
+                         {"path": str((root / "../local-dep").resolve())})
+
+    def test_the_root_manifest_names_its_path_dependencies(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "x"\n\n[dependencies]\nlocal-dep = { path = "../local-dep" }\n'
+                'reg = "1"\n\n[dev-dependencies]\nother = { path = "crates/other", package = "other-dep" }\n'
+                "\n[target.'cfg(unix)'.dependencies]\nunixy = { path = \"../unixy\" }\n", encoding="utf-8")
+            got = cc.path_dependencies(root)
+        self.assertEqual(got, {"local_dep": str((root / "../local-dep").resolve()),
+                               "other_dep": str((root / "crates/other").resolve()),
+                               "unixy": str((root / "../unixy").resolve())})
+
 
 class Equality(unittest.TestCase):
     def setUp(self):
