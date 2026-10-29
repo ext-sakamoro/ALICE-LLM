@@ -35,7 +35,9 @@ For each identifier that exists at the base and has another value now:
   that starts with it) naming both values (their first 8 hex digits) in that one entry;
 - in both cases CHANGELOG.md must name both values (their first 8 hex digits).
 
-An identifier missing at the base is new and passes. Comparing no identifier fails, and
+An identifier missing at the base is new and passes (the probe's path does not resolve there, or, for
+an associated const `Type::NAME`, rustc reports exactly that item missing on exactly that type and
+nothing else). Comparing no identifier fails, and
 so does a config naming a constant the working tree does not have.
 
 Completeness: every `const` / `static` item of the crate whose type resolves to `[u8; 32]`
@@ -140,6 +142,38 @@ import release_baseline  # noqa: E402
 CONFIG = "scripts/id_move.toml"
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 MISSING_RE = re.compile(r"error\[E0(?:425|432|433)\]|cannot find|unresolved import|could not find")
+# an associated const the base's type does not have: rustc names the item and the type
+ASSOC_MISSING_RE = re.compile(
+    r"^error\[E0599\]: no (?:associated item|associated function or constant|function or associated item|"
+    r"variant or associated item|variant, associated function, or constant) named `([^`]+)` found for "
+    r"(?:struct|enum|union|type|trait) `([^`]+)`")
+ERROR_RE = re.compile(r"^error\[E\d+\]")
+
+
+def probe_says_absent(path: str, stderr: str) -> bool:
+    """True when a failed probe of `path` means the base does not have the identifier (it is new):
+    the path does not resolve (a segment of it named in a resolution error), or, for an associated
+    const `…::Type::NAME`, every compile error is rustc's E0599 for exactly that item of exactly
+    that type (both parsed from the message, the type without its path and generics). Any other
+    failure is an error, so a broken base cannot pass as "the identifier is new"."""
+    segs = path.split("::")[1:]
+    errs = [ln for ln in stderr.splitlines() if MISSING_RE.search(ln)]
+    if errs and "id-move-probe" in stderr and any(re.search(rf"`{re.escape(s)}`", ln) for ln in errs for s in segs):
+        return True
+    if len(segs) < 2:
+        return False
+    item, ty = segs[-1], segs[-2]
+    errors = [ln for ln in stderr.splitlines() if ERROR_RE.match(ln)]
+    if not errors:
+        return False
+    for ln in errors:
+        m = ASSOC_MISSING_RE.match(ln)
+        if not m:
+            return False
+        found_ty = re.sub(r"<.*$", "", m.group(2)).rsplit("::", 1)[-1]
+        if m.group(1) != item or found_ty != ty:
+            return False
+    return "id-move-probe" in stderr
 
 
 class CheckError(Exception):
@@ -613,13 +647,7 @@ def read_ids(source: Path | str, cfg: Config, target_dir: Path, with_previous: b
                 raise RegistryUnreachable(f"cannot read the base {package} {source} from the registry: "
                                           f"{r.stderr.strip()[-400:]}")
             if r.returncode != 0:
-                # absent only when the error is the probe's path not resolving (a segment of
-                # it named in a resolution error); any other build failure is an error, so a
-                # broken base cannot pass as "the identifier is new"
-                segs = spec.path.split("::")[1:]
-                errs = [ln for ln in r.stderr.splitlines() if MISSING_RE.search(ln)]
-                if errs and "id-move-probe" in r.stderr and any(
-                        re.search(rf"`{re.escape(s)}`", ln) for ln in errs for s in segs):
+                if probe_says_absent(spec.path, r.stderr):
                     out[spec.path] = None
                     continue
                 raise CheckError(f"the probe for {spec.path} did not run against {source}: {r.stderr.strip()[-800:]}")

@@ -196,6 +196,54 @@ pub const PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[{prev}];
 """
 
 
+E0599 = ("error[E0599]: no associated function or constant named `{item}` found for struct `{ty}` "
+         "in the current scope\n --> /tmp/id-move-probe-x/src/main.rs:3:61\n"
+         "error: could not compile `id-move-probe-1` (bin \"id-move-probe-1\") due to 1 previous error\n")
+
+
+class ProbeAbsent(unittest.TestCase):
+    """When a failed probe means the identifier is absent at the base (new), and when it is an error."""
+
+    def absent(self, path: str, stderr: str) -> bool:
+        try:
+            return imc.probe_says_absent(path, stderr)
+        except Exception as e:  # it judges, it never raises: a crash would be an error, not a verdict
+            self.fail(f"probe_says_absent raised {e!r}")
+
+    def test_a_missing_associated_const_of_the_named_type_is_absent(self):
+        self.assertTrue(self.absent("c::World::DOMAIN", E0599.format(item="DOMAIN", ty="World")))
+        # a generic or path-qualified type is the same type
+        self.assertTrue(self.absent("c::World::DOMAIN", E0599.format(item="DOMAIN", ty="c::World<T>")))
+        self.assertTrue(self.absent(
+            "c::World::DOMAIN", E0599.format(item="DOMAIN", ty="World").replace(
+                "no associated function or constant", "no associated item")))
+
+    def test_an_unrelated_e0599_is_not_absent(self):
+        # another item, another type, a substring of the name: each is an error, not a new identifier
+        self.assertFalse(self.absent("c::World::DOMAIN", E0599.format(item="OTHER", ty="World")))
+        self.assertFalse(self.absent("c::World::DOMAIN", E0599.format(item="DOMAIN", ty="Other")))
+        self.assertFalse(self.absent("c::World::DOMAIN", E0599.format(item="DOMAIN_V2", ty="World")))
+        self.assertFalse(self.absent("c::World::DOMAIN", E0599.format(item="DOMAIN", ty="MyWorld")))
+        # a free constant's path has no type segment to match
+        self.assertFalse(self.absent("c::DOMAIN", E0599.format(item="DOMAIN", ty="c")))
+
+    def test_a_failure_with_no_compile_error_or_not_from_the_probe_is_not_absent(self):
+        self.assertFalse(self.absent("c::World::DOMAIN", "error: linker `cc` not found\n"))
+        not_probe = E0599.format(item="DOMAIN", ty="World").replace("id-move-probe", "some-crate")
+        self.assertFalse(self.absent("c::World::DOMAIN", not_probe))
+
+    def test_a_matching_e0599_next_to_another_error_is_not_absent(self):
+        other = "error[E0308]: mismatched types\n --> src/lib.rs:2:1\n"
+        self.assertFalse(self.absent("c::World::DOMAIN", other + E0599.format(item="DOMAIN", ty="World")))
+
+    def test_an_unresolved_path_is_absent_and_a_build_error_is_not(self):
+        self.assertTrue(self.absent(
+            "c::SEMANTICS_ID",
+            "error[E0425]: cannot find value `SEMANTICS_ID` in crate `c`\n --> /tmp/id-move-probe-x/src/main.rs:3:1\n"))
+        self.assertFalse(self.absent(
+            "c::SEMANTICS_ID", "error[E0308]: mismatched types\nerror: could not compile `c`\n"))
+
+
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
 class EndToEnd(unittest.TestCase):
     """A crate released as v0.3.0 with SEMANTICS_ID = [0x11; 32], then changed in the working tree."""
@@ -399,6 +447,26 @@ class EndToEnd(unittest.TestCase):
             subprocess.run(["git", "-C", str(d), *args], check=True, env=env, capture_output=True)
         self.write(d, "0.3.1", "0x11", "")
         problems, report = imc.check(d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertIn("new since the base", report[1])
+
+    def test_an_associated_const_the_release_did_not_have_is_new(self):
+        d = self.repo()
+        # the release has the type but not its associated const; the working tree adds it as an id
+        (d / "src" / "lib.rs").write_text("pub struct World;\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        for args in (["commit", "-qam", "release without the const"], ["tag", "-f", "v0.3.0"]):
+            subprocess.run(["git", "-C", str(d), *args], check=True, env=env, capture_output=True)
+        (d / "scripts" / "id_move.toml").write_text(
+            'package = "probe-crate"\nmanifest = "Cargo.toml"\ntags = ["v{version}"]\n'
+            '[[id]]\npath = "probe_crate::World::DOMAIN"\n')
+        (d / "Cargo.toml").write_text('[package]\nname = "probe-crate"\nversion = "0.3.1"\nedition = "2021"\n\n[workspace]\n')
+        (d / "src" / "lib.rs").write_text("pub struct World;\nimpl World { pub const DOMAIN: [u8; 32] = [7; 32]; }\n")
+        try:
+            problems, report = imc.check(d, None, "tag")
+        except imc.CheckError as e:
+            self.fail(f"a new associated const was not taken as new: {e}")
         self.assertEqual(problems, [])
         self.assertIn("new since the base", report[1])
 
