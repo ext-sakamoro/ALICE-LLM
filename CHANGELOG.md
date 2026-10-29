@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: 公開する文面の検査 (`Public text` workflow、`scripts/public_text.sh`) を追加 ALICE-Law の `scripts/public_text_check.py` を `.github/public-text-pin` の revision (779fa44) で取得し、SHA-256 が一致した時だけ使って、HEAD の全 tracked file (path と本文) と送った commit (message・追加行・追加 path) を読む 何も比較できなければ失敗する preflight でも走る
 
 ### Changed
-- CI (ALICE-Law G9): 識別子の移動の検査器 (`scripts/id_move_check.py` と試験) を共有の新しい bytes にし、新しく足した associated const を受けるようにした shared-files と G11 の表の pin を ALICE-Law 5bb1bea9 に上げた
+- CI (ALICE-Law G9): 識別子の移動の検査器 (`scripts/id_move_check.py` と試験) を共有の新しい bytes にし、新しく足した associated const を受けるようにした shared-files と G11 の表の pin を ALICE-Law 7f5f4cbd に上げた
 - `alice-det-math` を 0.6.0 (rev b4e3d946) にした 0.6.0 は 2d01c63f と同じ算術と識別子 (`SEMANTICS_ID` a2a11b9b) に版の名前を付けた版で、この crate の `SEMANTICS_ID` と評価の bit は変わらない
 - CI (ALICE-Law G11): `.github/shared-files-pin` と `.github/g11-table-pin` を ALICE-Law 521d56df に上げ、共有の写し 10 件を表の目標 (各行の owner の main の bytes) にした
 - CI: GPU の試験 2 step (`cargo test --features gpu` / `gpu,internal-kernel-oracle`) は `test_output.log` に stderr だけを書くようにした 次の step が数える印 (`[gpu] adapter:` / SUBGROUP の印 / sparse attention / SKIP) はどれも `eprintln!` で、`2>&1` で test harness の stdout (`test x ... ok`) と同じ pipe に合流させると、harness の行が印の行の途中に入って数え損ねることがある stdout は console にそのまま出す 数える step は log に harness の行があれば失敗する (stdout がまた混ざった時に止める)
