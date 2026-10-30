@@ -81,7 +81,7 @@ step "ci.yml / float-environment: ALICE-Law G11 self-check (the four G11 checks 
 )
 
 step "ci.yml / clippy: Identifier moves (tests, then against the published release)"
-python3 scripts/test_id_move_check.py
+CARGO_TERM_COLOR=always python3 scripts/test_id_move_check.py
 python3 scripts/id_move_check.py
 
 step "ci.yml / clippy: cargo clippy (default features, all targets)"
