@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: `semver-checks.yml` runs only when started by hand (`workflow_dispatch`); it has no `changes` job or gate, and `.github/paths/semver-checks.txt` is removed. The full preflight run still runs the same command.
 
 ### Fixed
+- `sample_with_random`: 乱数が確率の和を超えた時 (丸めで和が 1 に届かない時を含む)、最後の token でなく確率を持つ最後の token を返す 確率 0 の token、たとえば grammar で mask した token を返していた (`[0.3, 0.3, 0.3, 0.0]` と 0.95 で 3) 結果が変わるのはこの場合だけ
 - **`NaN` の logit で `top_k_filter` / `top_p_filter` が panic していた** 比較関数が全順序でなく、標準 library の sort が検出する 定期 fuzz の crash 入力で再現 `total_cmp` にすると panic は止まるが、`softmax` が全部 `NaN` になり `sample_with_random` が最後の token を黙って返すので、拒否にした
 
 ### Security

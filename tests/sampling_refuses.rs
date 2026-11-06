@@ -72,6 +72,8 @@ fn argmax_ref(logits: &[f32]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+/// Word for word, but for the last line: the fallback changed on purpose, and only past the sum, and
+/// only when the last tokens have no probability.
 fn sample_ref(probs: &[f32], rand_val: f32) -> usize {
     let mut cumsum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
@@ -80,7 +82,7 @@ fn sample_ref(probs: &[f32], rand_val: f32) -> usize {
             return i;
         }
     }
-    probs.len().saturating_sub(1)
+    probs.iter().rposition(|&p| p > 0.0).unwrap_or(0)
 }
 
 /// A fixed sequence (splitmix64), so every run compares the same inputs.
@@ -258,6 +260,45 @@ fn probabilities_and_parameters() {
     assert_eq!(sample_with_random(&[0.5, 0.5], 1.0), Ok(1));
     let mut l = [1.0, 2.0];
     assert_eq!(top_p_filter(&mut l, NAN), Err(InvalidParameter));
+}
+
+/// A random value past the sum of the probabilities (they sum to a little under 1, or the value is
+/// not in `[0, 1)`) picks the last token that has any probability: a token with probability 0, such
+/// as one masked by a grammar, is never the answer.
+#[test]
+fn past_the_sum_is_the_last_token_with_any_probability() {
+    assert_eq!(sample_with_random(&[0.3, 0.3, 0.3, 0.0], 0.95), Ok(2));
+    assert_eq!(sample_with_random(&[0.3, 0.3, 0.3, 0.0], 1.0), Ok(2));
+    assert_eq!(sample_with_random(&[0.5, 0.0, 0.0], 0.75), Ok(0));
+    assert_eq!(sample_with_random(&[0.0, 0.5, -0.0], 0.75), Ok(1));
+    assert_eq!(sample_with_random(&[0.25, 0.25], 2.0), Ok(1));
+    // a negative value is below the first cumulative sum that is above it
+    assert_eq!(sample_with_random(&[0.0, 0.5], -1.0), Ok(0));
+}
+
+#[test]
+fn a_token_with_no_probability_is_never_sampled() {
+    let mut rng = Rng(0x5a45_524f);
+    let mut masked_seen = 0usize;
+    for _ in 0..200_000 {
+        let n = 1 + (rng.next() % 16) as usize;
+        let mut logits: Vec<f32> = (0..n).map(|_| (rng.unit() - 0.5) * 20.0).collect();
+        for l in &mut logits {
+            if rng.next() % 3 == 0 {
+                *l = MASK;
+                masked_seen += 1;
+            }
+        }
+        if logits.iter().all(|l| *l == MASK) {
+            continue;
+        }
+        let probs = softmax(&logits).unwrap();
+        // the top of the range is where rounding leaves the sum short
+        let r = if rng.next() % 2 == 0 { 1.0 - f32::EPSILON / 2.0 } else { rng.unit() };
+        let i = sample_with_random(&probs, r).unwrap();
+        assert!(probs[i] > 0.0, "token {i} of {probs:?} at {r}");
+    }
+    assert!(masked_seen > 100_000, "masked {masked_seen}");
 }
 
 #[test]

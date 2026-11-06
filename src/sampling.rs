@@ -194,6 +194,7 @@ pub fn sample_argmax(logits: &[f32]) -> Result<usize, SamplingError> {
 }
 
 /// Deterministic weighted sampling using a provided random value in `[0, 1)`. No tokens gives 0.
+/// A value past the sum of the probabilities gives the last token with any probability.
 ///
 /// # Errors
 ///
@@ -217,7 +218,8 @@ pub fn sample_with_random(probs: &[f32], rand_val: f32) -> Result<usize, Samplin
             return Ok(i);
         }
     }
-    Ok(probs.len().saturating_sub(1))
+    // past the sum, which rounding can leave a little under 1: never a token with no probability
+    Ok(probs.iter().rposition(|&p| p > 0.0).unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
