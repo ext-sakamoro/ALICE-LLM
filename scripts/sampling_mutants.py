@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Breaks the refusals of `sampling` one way at a time; tests/sampling_refuses.rs must go red.
+"""Breaks the refusals of `sampling` and of its callers in `llama3`, one way at a time; a test must go
+red for each.
 
 usage: python3 scripts/sampling_mutants.py
 exit 0 if every mutant applied, compiled and made a test report FAILED; exit 1 otherwise.
 
-Run by hand when src/sampling.rs changes: each mutant rebuilds the crate. A mutant that does not
+Run by hand when src/sampling.rs or the sampling of src/llama3.rs changes: each mutant rebuilds the crate. A mutant that does not
 compile or no longer applies counts against the result, since it tested nothing. The file is restored
 after each mutant, and at the end even after an interrupt.
 """
+import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src" / "sampling.rs"
-COMMAND = ["cargo", "test", "--test", "sampling_refuses"]
-FAILED = re.compile(r"^test .* \.\.\. .*FAILED", re.M)
+LLAMA3 = ROOT / "src" / "llama3.rs"
+COMMANDS = [
+    ["cargo", "test", "--test", "sampling_refuses"],
+    ["cargo", "test", "--lib", "llama3::"],
+]
+# a failed test or the test process dying
+FAILED = re.compile(r"^test .* \.\.\. .*FAILED|signal: \d+", re.M)
+# a mutant can make a test run forever: past this it is killed, and that counts as red
+TIMEOUT_SECS = 300
 
 CHECK = "    check_logits(logits)?;\n"
 # (what breaks, old text, new text)
@@ -46,34 +56,67 @@ MUTANTS = [
     ("argmax takes the first of a tie", ".max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))", ".max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal).then(std::cmp::Ordering::Greater))"),
 ]
 
+# (what breaks, old text, new text): in src/llama3.rs
+LLAMA3_MUTANTS = [
+    ("the replay ignores top-p", "        top_p_filter(&mut scaled, p)?;\n", "        let _ = p;\n"),
+    ("the replay does not check its temperature", "    if !(temperature > 0.0 && temperature.is_finite()) {\n        return Err(SamplingError::InvalidParameter);\n    }\n    let mut scaled", "    let mut scaled"),
+    ("the token ignores top-k", "    top_k_filter(&mut logits, top_k)?;\n", "    let _ = top_k;\n"),
+    ("a router sorts with the old comparator", "descending_nan_last(a.1, b.1));\n    indexed.truncate(top_k);\n\n    // Weights use the raw scores", "b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));\n    indexed.truncate(top_k);\n\n    // Weights use the raw scores"),
+    ("the other router sorts with the old comparator", "idx_biased.sort_by(|a, b| descending_nan_last(a.1, b.1));", "idx_biased.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));"),
+]
+
+
+def run_tests() -> tuple[int | None, str]:
+    """Exit status of the first command that fails, or 0, and the output; None when out of time (the
+    whole process group is killed: killing cargo alone would leave the test binary running)."""
+    output = ""
+    for command in COMMANDS:
+        p = subprocess.Popen(
+            command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = p.communicate(timeout=TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, _ = p.communicate()
+            return None, output + out
+        output += out
+        if p.returncode != 0:
+            return p.returncode, output
+    return 0, output
+
 
 def main() -> int:
     if sys.argv[1:]:
         print(__doc__, file=sys.stderr)
         return 2
-    original = SOURCE.read_text(encoding="utf-8")
     bad = []
-    try:
-        for name, old, new in MUTANTS:
-            if original.count(old) != 1:
-                bad.append(name)
-                print(f"NOT APPLIED  {name}", flush=True)
-                continue
-            SOURCE.write_text(original.replace(old, new), encoding="utf-8")
-            done = subprocess.run(COMMAND, cwd=ROOT, capture_output=True, text=True, check=False)
-            output = done.stdout + done.stderr
-            if "could not compile" in output:
-                bad.append(name)
-                print(f"BROKEN       {name}", flush=True)
-            elif done.returncode != 0 and FAILED.search(output):
-                print(f"red          {name}", flush=True)
-            else:
-                bad.append(name)
-                print(f"SURVIVED     {name} (rc {done.returncode})", flush=True)
-    finally:
-        SOURCE.write_text(original, encoding="utf-8")
-    print(f"{len(MUTANTS) - len(bad)} of {len(MUTANTS)} red")
-    return 1 if bad or not MUTANTS else 0
+    everything = [(SOURCE, m) for m in MUTANTS] + [(LLAMA3, m) for m in LLAMA3_MUTANTS]
+    for path, (name, old, new) in everything:
+        original = path.read_text(encoding="utf-8")
+        if original.count(old) != 1:
+            bad.append(name)
+            print(f"NOT APPLIED  {name}", flush=True)
+            continue
+        try:
+            path.write_text(original.replace(old, new), encoding="utf-8")
+            rc, output = run_tests()
+        finally:
+            path.write_text(original, encoding="utf-8")
+        if "could not compile" in output:
+            bad.append(name)
+            print(f"BROKEN       {name}", flush=True)
+        elif rc is None:
+            print(f"red (killed) {name}", flush=True)
+        elif rc != 0 and FAILED.search(output):
+            print(f"red          {name}", flush=True)
+        else:
+            bad.append(name)
+            print(f"SURVIVED     {name} (rc {rc})", flush=True)
+    total = len(everything)
+    print(f"{total - len(bad)} of {total} red")
+    return 1 if bad or not everything else 0
 
 
 if __name__ == "__main__":

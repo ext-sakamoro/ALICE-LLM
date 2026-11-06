@@ -11,7 +11,7 @@ use crate::gguf::{
 };
 use crate::sampling::{
     apply_temperature, descending_nan_last, sample_argmax, sample_with_random, softmax,
-    top_k_filter, SamplingError,
+    softmax_inplace, top_k_filter, top_p_filter, SamplingError,
 };
 use std::fmt::Write;
 use std::time::Instant;
@@ -19460,71 +19460,19 @@ fn apply_temperature_and_top_p(
     if !(temperature > 0.0 && temperature.is_finite()) {
         return Err(SamplingError::InvalidParameter);
     }
-    crate::sampling::check_logits(logits)?;
-    let inv_t = 1.0 / temperature;
-    let max_logit = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&l| crate::lawmath::exp((l - max_logit) * inv_t))
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    if !(sum > 0.0 && sum.is_finite()) {
-        return Err(SamplingError::AllMasked);
+    let mut scaled = logits.to_vec();
+    apply_temperature(&mut scaled, temperature);
+    if let Some(p) = top_p {
+        top_p_filter(&mut scaled, p)?;
     }
-    for p in &mut probs {
-        *p /= sum;
-    }
-
-    if let Some(p_thresh) = top_p {
-        if p_thresh > 0.0 && p_thresh < 1.0 - 1e-6 {
-            let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| descending_nan_last(a.1, b.1));
-            let mut cum = 0.0f32;
-            let mut keep_mask = vec![false; probs.len()];
-            for &(orig_idx, prob) in &indexed {
-                keep_mask[orig_idx] = true;
-                cum += prob;
-                if cum >= p_thresh {
-                    break;
-                }
-            }
-            for (i, p) in probs.iter_mut().enumerate() {
-                if !keep_mask[i] {
-                    *p = 0.0;
-                }
-            }
-            let sum: f32 = probs.iter().sum();
-            if sum > 0.0 {
-                for p in &mut probs {
-                    *p /= sum;
-                }
-            }
-        }
-    }
-    Ok(probs)
+    softmax_inplace(&mut scaled)?;
+    Ok(scaled)
 }
 
 /// Sample one index from a probability distribution using inverse CDF.
 /// The distribution must sum to (approximately) 1.0.
-fn sample_multinomial(dist: &[f32], rng: &mut SplitMix64) -> u32 {
-    let u = rng.next_unit_f32();
-    let mut cum = 0.0f32;
-    for (i, &p) in dist.iter().enumerate() {
-        cum += p;
-        if u < cum {
-            return u32::try_from(i).expect("index fits in u32");
-        }
-    }
-    // Fallback for float precision: return last non-zero index.
-    for (i, &p) in dist.iter().enumerate().rev() {
-        if p > 0.0 {
-            return u32::try_from(i).expect("index fits in u32");
-        }
-    }
-    0
+fn sample_multinomial(dist: &[f32], rng: &mut SplitMix64) -> Result<u32, SamplingError> {
+    Ok(sample_with_random(dist, rng.next_unit_f32())? as u32)
 }
 
 /// Residual distribution used when a draft sample is rejected.
@@ -19621,7 +19569,7 @@ pub fn speculative_decode_v2(
         for _ in 0..cfg.n_draft {
             let logits = draft.forward(curr);
             let dist = apply_temperature_and_top_p(&logits, temperature, top_p)?;
-            let sample = sample_multinomial(&dist, &mut rng);
+            let sample = sample_multinomial(&dist, &mut rng)?;
             let p_at = dist[sample as usize];
             draft_probs_at_pick.push(p_at);
             draft_dists.push(dist);
@@ -19658,7 +19606,7 @@ pub fn speculative_decode_v2(
                 }
             } else {
                 let residual = residual_dist(&p_main, p_draft);
-                let replacement = sample_multinomial(&residual, &mut rng);
+                let replacement = sample_multinomial(&residual, &mut rng)?;
                 result.tokens.push(replacement);
                 result.bonus_tokens += 1;
                 rejected_replacement = Some(replacement);
@@ -19681,7 +19629,7 @@ pub fn speculative_decode_v2(
             let _ = draft.forward(curr);
             let logits = main.forward(curr);
             let p_main = apply_temperature_and_top_p(&logits, temperature, top_p)?;
-            let bonus = sample_multinomial(&p_main, &mut rng);
+            let bonus = sample_multinomial(&p_main, &mut rng)?;
             result.tokens.push(bonus);
             result.bonus_tokens += 1;
             last_tok = bonus;
@@ -21694,7 +21642,7 @@ mod tests {
         let dist = [0.0f32, 0.0, 1.0, 0.0];
         let mut rng = SplitMix64::new(1234);
         for _ in 0..100 {
-            assert_eq!(sample_multinomial(&dist, &mut rng), 2);
+            assert_eq!(sample_multinomial(&dist, &mut rng), Ok(2));
         }
     }
 
@@ -21705,7 +21653,7 @@ mod tests {
         let mut rng = SplitMix64::new(1);
         let mut counts = [0usize; 4];
         for _ in 0..10_000 {
-            let idx = sample_multinomial(&dist, &mut rng) as usize;
+            let idx = sample_multinomial(&dist, &mut rng).unwrap() as usize;
             counts[idx] += 1;
         }
         assert!(counts[0].abs_diff(5000) < 300, "counts[0]={}", counts[0]);
@@ -23914,6 +23862,289 @@ mod tests {
             );
             assert_eq!(restored.seq_len, 0);
         }
+    }
+}
+
+/// A real model read from a small GGUF: the `generate` paths and the router run as they do in
+/// production, and only the numbers in the tensors are unusual.
+#[cfg(test)]
+mod a_model_that_produces_nan {
+    use super::*;
+    use crate::gguf::GgufFile;
+
+    fn string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// A tensor as GGUF stores it: `(name, dims, ggml type, bytes)`.
+    type Tensor = (String, Vec<u64>, u32, Vec<u8>);
+
+    const F32: u32 = 0;
+    const Q8_0: u32 = 8;
+
+    /// `kv_u32`, then the vocabulary, then each tensor.
+    fn gguf_bytes(arch: &str, kv_u32: &[(String, u32)], tensors: &[Tensor]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(kv_u32.len() as u64 + 3).to_le_bytes());
+
+        string(&mut buf, "general.alignment");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&32u32.to_le_bytes());
+
+        string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        string(&mut buf, arch);
+
+        string(&mut buf, "tokenizer.ggml.tokens");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&(VOCAB as u64).to_le_bytes());
+        for i in 0..VOCAB {
+            string(&mut buf, &format!("t{i}"));
+        }
+
+        for (k, v) in kv_u32 {
+            string(&mut buf, k);
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut offset = 0u64;
+        for (name, dims, ggml_type, bytes) in tensors {
+            string(&mut buf, name);
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&ggml_type.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+            offset += (bytes.len() as u64).next_multiple_of(32);
+        }
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        for (_, _, _, bytes) in tensors {
+            buf.extend_from_slice(bytes);
+            while !buf.len().is_multiple_of(32) {
+                buf.push(0);
+            }
+        }
+        buf
+    }
+
+    const VOCAB: usize = 4;
+    /// A `Q8_0` block holds 32 values, and the matrix kernels read whole blocks.
+    const HIDDEN: usize = 32;
+
+    fn f32_tensor(name: &str, dims: &[u64], values: &[f32]) -> Tensor {
+        let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        (name.to_string(), dims.to_vec(), F32, bytes)
+    }
+
+    /// `rows` rows of 32 columns: each block has the scale in half precision, then 32 `i8`.
+    fn q8_tensor(name: &str, rows: usize, scale_f16: u16) -> Tensor {
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            bytes.extend_from_slice(&scale_f16.to_le_bytes());
+            bytes.extend((0..HIDDEN).map(|c| if c % HIDDEN == r % HIDDEN { 100u8 } else { 3 }));
+        }
+        (
+            name.to_string(),
+            vec![HIDDEN as u64, rows as u64],
+            Q8_0,
+            bytes,
+        )
+    }
+
+    /// Half precision 0.01, near enough for a matrix of small weights.
+    const SMALL: u16 = 0x23d7;
+    const NAN_F16: u16 = 0x7e00;
+
+    /// A one-layer llama whose output projection has this scale.
+    fn llama_bytes(output_scale: u16) -> Vec<u8> {
+        let kv = [
+            ("llama.block_count".to_string(), 1),
+            ("llama.embedding_length".to_string(), HIDDEN as u32),
+            ("llama.feed_forward_length".to_string(), HIDDEN as u32),
+            ("llama.vocab_size".to_string(), VOCAB as u32),
+            ("llama.attention.head_count".to_string(), 1),
+        ];
+        let embedding: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let one = vec![1.0; HIDDEN];
+        let line = [HIDDEN as u64];
+        let mut tensors = vec![
+            f32_tensor(
+                "token_embd.weight",
+                &[HIDDEN as u64, VOCAB as u64],
+                &embedding,
+            ),
+            f32_tensor("output_norm.weight", &line, &one),
+            q8_tensor("output.weight", VOCAB, output_scale),
+            f32_tensor("blk.0.attn_norm.weight", &line, &one),
+            f32_tensor("blk.0.ffn_norm.weight", &line, &one),
+        ];
+        for name in [
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ] {
+            tensors.push(q8_tensor(&format!("blk.0.{name}.weight"), HIDDEN, SMALL));
+        }
+        gguf_bytes("llama", &kv, &tensors)
+    }
+
+    /// A one-layer llama with `n` experts, 8 active, whose router has `NaN` in every third expert's row.
+    fn moe_bytes(n: usize, nan_router: bool) -> Vec<u8> {
+        let kv = [
+            ("llama.block_count".to_string(), 1),
+            ("llama.embedding_length".to_string(), HIDDEN as u32),
+            ("llama.feed_forward_length".to_string(), HIDDEN as u32),
+            ("llama.vocab_size".to_string(), VOCAB as u32),
+            ("llama.attention.head_count".to_string(), 1),
+            ("llama.expert_count".to_string(), n as u32),
+            ("llama.expert_used_count".to_string(), 8),
+            (
+                "llama.expert_feed_forward_length".to_string(),
+                HIDDEN as u32,
+            ),
+        ];
+        let embedding: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let one = vec![1.0; HIDDEN];
+        let line = [HIDDEN as u64];
+        let router: Vec<f32> = (0..n * HIDDEN)
+            .map(|i| {
+                if nan_router && (i / HIDDEN) % 3 == 0 {
+                    f32::NAN
+                } else {
+                    (i % 11) as f32 * 0.01
+                }
+            })
+            .collect();
+        let mut tensors = vec![
+            f32_tensor(
+                "token_embd.weight",
+                &[HIDDEN as u64, VOCAB as u64],
+                &embedding,
+            ),
+            f32_tensor("output_norm.weight", &line, &one),
+            q8_tensor("output.weight", VOCAB, SMALL),
+            f32_tensor("blk.0.attn_norm.weight", &line, &one),
+            f32_tensor("blk.0.ffn_norm.weight", &line, &one),
+            f32_tensor(
+                "blk.0.ffn_gate_inp.weight",
+                &[HIDDEN as u64, n as u64],
+                &router,
+            ),
+        ];
+        for name in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+            tensors.push(q8_tensor(&format!("blk.0.{name}.weight"), HIDDEN, SMALL));
+        }
+        for name in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+            let mut t = q8_tensor(&format!("blk.0.{name}.weight"), HIDDEN * n, SMALL);
+            t.1 = vec![HIDDEN as u64, HIDDEN as u64, n as u64];
+            tensors.push(t);
+        }
+        gguf_bytes("llama", &kv, &tensors)
+    }
+
+    /// `forward_moe_layer` through the real path: one `NaN` makes the softmax normaliser `NaN`, so
+    /// every expert's score is `NaN` there, it reaches the logits, and the token is refused. The
+    /// sort there has only `NaN` to order, so this layer could not reach the panic of the other
+    /// routers; the test holds what it returns.
+    #[test]
+    fn a_moe_layer_with_nan_in_its_router_is_refused_at_any_size() {
+        for n in [8, 21, 32, 64, 192] {
+            let bytes = moe_bytes(n, true);
+            let gguf = GgufFile::parse(&bytes).expect("parse");
+            let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+            let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+            let got = model
+                .generate(&tokenizer, "t1", 2, 1.0, 2)
+                .map(|r| r.tokens_generated);
+            assert!(
+                matches!(got, Err(SamplingError::NonFinite { .. })),
+                "{n}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_healthy_moe_layer_generates() {
+        let bytes = moe_bytes(21, false);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        assert!(model.generate(&tokenizer, "t1", 2, 1.0, 2).is_ok());
+    }
+
+    #[test]
+    fn a_healthy_stub_generates() {
+        let bytes = llama_bytes(SMALL);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        let out = model.generate(&tokenizer, "t1", 2, 1.0, 2).unwrap();
+        assert!(out.tokens_generated <= 2);
+    }
+
+    #[test]
+    fn nan_logits_are_refused_on_every_generate_path() {
+        let bytes = llama_bytes(NAN_F16);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+        let nan = |r: Result<usize, SamplingError>, what: &str| {
+            assert!(
+                matches!(r, Err(SamplingError::NonFinite { .. })),
+                "{what}: {r:?}"
+            );
+        };
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        nan(
+            model
+                .generate(&tokenizer, "t1", 2, 1.0, 2)
+                .map(|r| r.tokens_generated),
+            "generate",
+        );
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        nan(
+            model
+                .generate(&tokenizer, "t1", 2, 0.5, 0)
+                .map(|r| r.tokens_generated),
+            "generate, no top-k",
+        );
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        nan(
+            model
+                .generate_speculative(&tokenizer, "t1", 2, 0.0, 2, 2, 1)
+                .map(|r| r.tokens_generated),
+            "generate_speculative, greedy",
+        );
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        nan(
+            model
+                .generate_speculative(&tokenizer, "t1", 2, 0.7, 2, 2, 1)
+                .map(|r| r.tokens_generated),
+            "generate_speculative, sampling",
+        );
+
+        let mut draft = Llama3Model::from_gguf(&gguf).expect("model");
+        let mut main = Llama3Model::from_gguf(&gguf).expect("model");
+        nan(
+            speculative_decode(&mut draft, &mut main, &[1], 2, 2, None).map(|r| r.tokens.len()),
+            "speculative_decode",
+        );
     }
 }
 
