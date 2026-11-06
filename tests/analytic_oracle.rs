@@ -201,16 +201,16 @@ fn rope_preserves_norm_rotates_first_pair_by_position_and_is_relative() {
 fn softmax_sums_to_one_is_shift_invariant_and_matches_two_element_formula() {
     for n in [1usize, 2, 3, 8, 9, 65] {
         let l = ramp(n);
-        let p = softmax(&l);
+        let p = softmax(&l).unwrap();
         assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5, "n={n}");
         let shifted: Vec<f32> = l.iter().map(|x| x + 9.5).collect();
-        for (a, b) in softmax(&shifted).iter().zip(&p) {
+        for (a, b) in softmax(&shifted).unwrap().iter().zip(&p) {
             assert!((a - b).abs() < 1e-6, "n={n}: {a} vs {b}");
         }
-        assert_eq!(sample_argmax(&l), n - 1);
+        assert_eq!(sample_argmax(&l).unwrap(), n - 1);
     }
     for d in [-3.0f32, -0.5, 0.0, 0.5, 3.0] {
-        let p = softmax(&[0.0, d]);
+        let p = softmax(&[0.0, d]).unwrap();
         let p1 = d.exp() / (1.0 + d.exp());
         assert!(
             (p[1] - p1).abs() < 1e-6 && (p[0] - (1.0 - p1)).abs() < 1e-6,
@@ -228,12 +228,12 @@ fn temperature_scales_logits_and_the_limits_are_argmax_and_uniform() {
     // T → 0: probability mass collapses on the argmax
     let mut cold = l;
     apply_temperature(&mut cold, 1e-3);
-    let p = softmax(&cold);
+    let p = softmax(&cold).unwrap();
     assert!(p[2] > 0.999, "{p:?}");
     // T → ∞: uniform
     let mut hot = l;
     apply_temperature(&mut hot, 1e6);
-    for q in softmax(&hot) {
+    for q in softmax(&hot).unwrap() {
         assert!((q - 0.25).abs() < 1e-4, "{q}");
     }
     // temperature 0 is a no-op (documented guard), not a division by zero; the
@@ -255,7 +255,7 @@ fn top_k_keeps_exactly_k_finite_logits_and_top_p_the_smallest_nucleus() {
     let l: Vec<f32> = (0..20).map(|i| ((i * 7) % 20) as f32 * 0.3).collect();
     for k in 1..=20usize {
         let mut f = l.clone();
-        top_k_filter(&mut f, k);
+        top_k_filter(&mut f, k).unwrap();
         let kept: Vec<usize> = (0..20).filter(|&i| f[i].is_finite()).collect();
         assert_eq!(kept.len(), k, "k={k}");
         // every kept logit ≥ every dropped one
@@ -268,28 +268,28 @@ fn top_k_keeps_exactly_k_finite_logits_and_top_p_the_smallest_nucleus() {
     }
     // k = 0 and k ≥ n are documented no-ops
     let mut f = l.clone();
-    top_k_filter(&mut f, 0);
+    top_k_filter(&mut f, 0).unwrap();
     assert_eq!(f, l);
     let mut f = l.clone();
-    top_k_filter(&mut f, 20);
+    top_k_filter(&mut f, 20).unwrap();
     assert_eq!(f, l);
 
     // top-p: probabilities 0.5, 0.3, 0.2 (logits ln p) → p = 0.6 keeps the first two
     let logits = [0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()];
     let mut f = logits;
-    top_p_filter(&mut f, 0.6);
+    top_p_filter(&mut f, 0.6).unwrap();
     assert!(
         f[0].is_finite() && f[1].is_finite() && f[2] == f32::NEG_INFINITY,
         "{f:?}"
     );
     let mut f = logits;
-    top_p_filter(&mut f, 0.4);
+    top_p_filter(&mut f, 0.4).unwrap();
     assert!(
         f[0].is_finite() && f[1] == f32::NEG_INFINITY && f[2] == f32::NEG_INFINITY,
         "{f:?}"
     );
     let mut f = logits;
-    top_p_filter(&mut f, 1.0);
+    top_p_filter(&mut f, 1.0).unwrap();
     assert_eq!(f, logits);
 }
 
@@ -297,19 +297,19 @@ fn top_k_keeps_exactly_k_finite_logits_and_top_p_the_smallest_nucleus() {
 fn sample_with_random_inverts_the_cdf() {
     let probs = [0.1f32, 0.2, 0.3, 0.4];
     // cdf = 0.1, 0.3, 0.6, 1.0
-    assert_eq!(sample_with_random(&probs, 0.0), 0);
-    assert_eq!(sample_with_random(&probs, 0.0999), 0);
-    assert_eq!(sample_with_random(&probs, 0.1001), 1);
-    assert_eq!(sample_with_random(&probs, 0.2999), 1);
-    assert_eq!(sample_with_random(&probs, 0.3001), 2);
-    assert_eq!(sample_with_random(&probs, 0.5999), 2);
-    assert_eq!(sample_with_random(&probs, 0.6001), 3);
-    assert_eq!(sample_with_random(&probs, 0.9999), 3);
+    assert_eq!(sample_with_random(&probs, 0.0).unwrap(), 0);
+    assert_eq!(sample_with_random(&probs, 0.0999).unwrap(), 0);
+    assert_eq!(sample_with_random(&probs, 0.1001).unwrap(), 1);
+    assert_eq!(sample_with_random(&probs, 0.2999).unwrap(), 1);
+    assert_eq!(sample_with_random(&probs, 0.3001).unwrap(), 2);
+    assert_eq!(sample_with_random(&probs, 0.5999).unwrap(), 2);
+    assert_eq!(sample_with_random(&probs, 0.6001).unwrap(), 3);
+    assert_eq!(sample_with_random(&probs, 0.9999).unwrap(), 3);
     // the boundary itself belongs to the next bin (r < cumsum is strict)
-    assert_eq!(sample_with_random(&probs, 0.1), 1);
+    assert_eq!(sample_with_random(&probs, 0.1).unwrap(), 1);
     // r ≥ Σp (rounding) → last index, never out of range
-    assert_eq!(sample_with_random(&probs, 1.0), 3);
-    assert_eq!(sample_with_random(&[], 0.5), 0);
+    assert_eq!(sample_with_random(&probs, 1.0).unwrap(), 3);
+    assert_eq!(sample_with_random(&[], 0.5).unwrap(), 0);
 }
 
 // ----------------------------------------------------------------------------

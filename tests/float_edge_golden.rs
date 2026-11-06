@@ -47,7 +47,7 @@ fn rms_norm_of_zeros_keeps_their_signs() {
 fn softmax_of_equal_logits_is_exactly_uniform() {
     for c in [0.0_f32, -0.0, 1.5, -88.0] {
         assert_eq!(
-            bits(&softmax(&[c; 4])),
+            bits(&softmax(&[c; 4]).unwrap()),
             vec![0.25_f32.to_bits(); 4],
             "logit {c}"
         );

@@ -27,6 +27,7 @@ use alice_llm::gpu::{GpuEngine, GpuModel, GpuModelConfig};
 use alice_llm::llama3::{Llama3Config, Llama3Model};
 use alice_llm::{
     apply_temperature, sample_argmax, sample_with_random, softmax_inplace, top_k_filter,
+    SamplingError,
 };
 use axum::{
     extract::State,
@@ -437,14 +438,13 @@ fn generate(
             alice_llm::sampling::mask_logits_by_grammar(f, &state.tokenizer, &mut logits);
         }
 
-        let next = if temperature < 1e-6 {
-            sample_argmax(&logits) as u32
-        } else {
-            apply_temperature(&mut logits, temperature);
-            top_k_filter(&mut logits, top_k);
-            softmax_inplace(&mut logits);
-            sample_with_random(&logits, next_rand()) as u32
-        };
+        let next = sample_next(&mut logits, temperature, top_k, next_rand()).map_err(|e| {
+            eprintln!(
+                "sampling refused at generated token {}: {e}",
+                generated.len()
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         if next == state.tokenizer.eos_id || state.stop_token_ids.contains(&next) {
             finish_reason = "stop".to_string();
@@ -487,6 +487,22 @@ fn generate(
         decode_ms,
         finish_reason,
     ))
+}
+
+/// One token from the logits of the last step.
+fn sample_next(
+    logits: &mut [f32],
+    temperature: f32,
+    top_k: usize,
+    rand_val: f32,
+) -> Result<u32, SamplingError> {
+    if temperature < 1e-6 {
+        return Ok(sample_argmax(logits)? as u32);
+    }
+    apply_temperature(logits, temperature);
+    top_k_filter(logits, top_k)?;
+    softmax_inplace(logits)?;
+    Ok(sample_with_random(logits, rand_val)? as u32)
 }
 
 fn make_req_id() -> String {
@@ -712,13 +728,17 @@ fn run_stream_generation(
     };
 
     for _ in 0..req.max_tokens {
-        let next = if req.temperature < 1e-6 {
-            sample_argmax(&logits) as u32
-        } else {
-            apply_temperature(&mut logits, req.temperature);
-            top_k_filter(&mut logits, req.top_k);
-            softmax_inplace(&mut logits);
-            sample_with_random(&logits, next_rand()) as u32
+        // the headers are out already: the client learns from the finish reason of the last chunk
+        let next = match sample_next(&mut logits, req.temperature, req.top_k, next_rand()) {
+            Ok(next) => next,
+            Err(e) => {
+                eprintln!(
+                    "sampling refused at generated token {}: {e}",
+                    generated.len()
+                );
+                finish_reason = "error".to_string();
+                break;
+            }
         };
 
         if next == state.tokenizer.eos_id || state.stop_token_ids.contains(&next) {

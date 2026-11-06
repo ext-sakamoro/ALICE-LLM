@@ -7,6 +7,9 @@ use crate::grammar::{Fsm, FsmError, TokenTrie};
 // ---------------------------------------------------------------------------
 
 /// Apply temperature scaling to logits (in-place).
+///
+/// A `NaN` temperature or a scale past the range of `f32` leaves `NaN` or `+inf` in the logits;
+/// the next function they reach refuses them.
 pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
     if temperature < f32::EPSILON {
         return;
@@ -17,41 +20,100 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
     }
 }
 
+/// Why a sampling function refused its input. Nothing was changed when it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SamplingError {
+    /// This logit is `NaN` or `+inf`: the model failed numerically, and no order or softmax exists.
+    NonFinite { index: usize },
+    /// Every token is masked (`-inf`) or has probability 0, so there is nothing to sample.
+    AllMasked,
+    /// This probability is not finite and at least 0.
+    InvalidProbability { index: usize },
+    /// `p` or the random value is `NaN`.
+    InvalidParameter,
+}
+
+impl core::fmt::Display for SamplingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NonFinite { index } => write!(f, "logit {index} is NaN or +inf"),
+            Self::AllMasked => f.write_str("every token is masked"),
+            Self::InvalidProbability { index } => write!(f, "probability {index} is invalid"),
+            Self::InvalidParameter => f.write_str("a sampling parameter is NaN"),
+        }
+    }
+}
+
+impl std::error::Error for SamplingError {}
+
+/// Logits are finite or `-inf` (a masked token), and at least one is not masked.
+fn check_logits(logits: &[f32]) -> Result<(), SamplingError> {
+    if let Some(index) = logits
+        .iter()
+        .position(|l| l.is_nan() || *l == f32::INFINITY)
+    {
+        return Err(SamplingError::NonFinite { index });
+    }
+    if !logits.is_empty() && logits.iter().all(|l| *l == f32::NEG_INFINITY) {
+        return Err(SamplingError::AllMasked);
+    }
+    Ok(())
+}
+
 /// Top-k filtering: keep only the top k logits, set the rest to -inf.
 ///
 /// Uses `select_nth_unstable_by` (partial sort, O(N)) to find the K-th
 /// largest logit without fully sorting the whole vocabulary — matters
 /// once `vocab_size` grows past 10k.
-pub fn top_k_filter(logits: &mut [f32], k: usize) {
+///
+/// # Errors
+///
+/// [`SamplingError::NonFinite`] or [`SamplingError::AllMasked`], also when `k` keeps every token.
+pub fn top_k_filter(logits: &mut [f32], k: usize) -> Result<(), SamplingError> {
+    check_logits(logits)?;
     if k == 0 || k >= logits.len() {
-        return;
+        return Ok(());
     }
     // O(N) partial sort: locate the K-th largest value.
     let mut vals: Vec<f32> = logits.to_vec();
     let kth = k - 1;
-    vals.select_nth_unstable_by(kth, |a, b| {
-        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    vals.select_nth_unstable_by(kth, f32_descending);
     let threshold = vals[kth];
     for l in logits.iter_mut() {
         if *l < threshold {
             *l = f32::NEG_INFINITY;
         }
     }
+    Ok(())
+}
+
+/// Descending order of values already checked to have no `NaN`.
+fn f32_descending(a: &f32, b: &f32) -> std::cmp::Ordering {
+    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Top-p (nucleus) filtering: keep smallest set of tokens whose
 /// cumulative probability exceeds p.
-pub fn top_p_filter(logits: &mut [f32], p: f32) {
+///
+/// # Errors
+///
+/// [`SamplingError::NonFinite`], [`SamplingError::AllMasked`], or
+/// [`SamplingError::InvalidParameter`] when `p` is `NaN`.
+pub fn top_p_filter(logits: &mut [f32], p: f32) -> Result<(), SamplingError> {
+    check_logits(logits)?;
+    if p.is_nan() {
+        return Err(SamplingError::InvalidParameter);
+    }
     if p >= 1.0 {
-        return;
+        return Ok(());
     }
 
     let mut probs = logits.to_vec();
-    softmax_inplace(&mut probs);
+    softmax_of_checked(&mut probs);
 
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| f32_descending(&a.1, &b.1));
 
     let mut cumsum = 0.0f32;
     let mut cutoff_idx = indexed.len();
@@ -71,10 +133,22 @@ pub fn top_p_filter(logits: &mut [f32], p: f32) {
             *l = f32::NEG_INFINITY;
         }
     }
+    Ok(())
 }
 
 /// Softmax in-place.
-pub fn softmax_inplace(v: &mut [f32]) {
+///
+/// # Errors
+///
+/// [`SamplingError::NonFinite`] or [`SamplingError::AllMasked`].
+pub fn softmax_inplace(v: &mut [f32]) -> Result<(), SamplingError> {
+    check_logits(v)?;
+    softmax_of_checked(v);
+    Ok(())
+}
+
+/// The softmax itself. Attention scores use it directly: they are not logits to sample from.
+pub(crate) fn softmax_of_checked(v: &mut [f32]) {
     if v.is_empty() {
         return;
     }
@@ -95,34 +169,55 @@ pub fn softmax_inplace(v: &mut [f32]) {
 }
 
 /// Softmax returning a new vector.
-#[must_use]
-pub fn softmax(logits: &[f32]) -> Vec<f32> {
+///
+/// # Errors
+///
+/// [`SamplingError::NonFinite`] or [`SamplingError::AllMasked`].
+pub fn softmax(logits: &[f32]) -> Result<Vec<f32>, SamplingError> {
     let mut v = logits.to_vec();
-    softmax_inplace(&mut v);
-    v
+    softmax_inplace(&mut v)?;
+    Ok(v)
 }
 
-/// Argmax sampling (greedy).
-#[must_use]
-pub fn sample_argmax(logits: &[f32]) -> usize {
-    logits
+/// Argmax sampling (greedy). No tokens gives 0.
+///
+/// # Errors
+///
+/// [`SamplingError::NonFinite`] or [`SamplingError::AllMasked`].
+pub fn sample_argmax(logits: &[f32]) -> Result<usize, SamplingError> {
+    check_logits(logits)?;
+    Ok(logits
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map_or(0, |(i, _)| i)
+        .map_or(0, |(i, _)| i))
 }
 
-/// Deterministic weighted sampling using a provided random value in `[0, 1)`.
-#[must_use]
-pub fn sample_with_random(probs: &[f32], rand_val: f32) -> usize {
+/// Deterministic weighted sampling using a provided random value in `[0, 1)`. No tokens gives 0.
+///
+/// # Errors
+///
+/// [`SamplingError::InvalidProbability`] for a value that is not finite and at least 0,
+/// [`SamplingError::AllMasked`] when all are 0, [`SamplingError::InvalidParameter`] when `rand_val`
+/// is `NaN`.
+pub fn sample_with_random(probs: &[f32], rand_val: f32) -> Result<usize, SamplingError> {
+    if let Some(index) = probs.iter().position(|p| !p.is_finite() || *p < 0.0) {
+        return Err(SamplingError::InvalidProbability { index });
+    }
+    if !probs.is_empty() && probs.iter().all(|p| *p == 0.0) {
+        return Err(SamplingError::AllMasked);
+    }
+    if rand_val.is_nan() {
+        return Err(SamplingError::InvalidParameter);
+    }
     let mut cumsum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumsum += p;
         if rand_val < cumsum {
-            return i;
+            return Ok(i);
         }
     }
-    probs.len().saturating_sub(1)
+    Ok(probs.len().saturating_sub(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,5 +514,19 @@ mod grammar_tests {
         let mut fsm2 = Fsm::start(&grammar).unwrap();
         advance_fsm_on_emit(&mut fsm2, &tok, 1).unwrap();
         assert!(fsm2.is_final());
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    /// The tie law of the max fold: a NaN is skipped, so the others are compared against the finite
+    /// maximum (the NaN entry and the sum stay NaN, and the row is then not normalised).
+    #[test]
+    fn the_softmax_fold_skips_a_nan_in_the_maximum() {
+        let mut v = [1.0_f32, 2.0, f32::from_bits(0x7fc0_dead)];
+        super::softmax_of_checked(&mut v);
+        assert_eq!(v[0].to_bits(), crate::lawmath::exp(-1.0).to_bits());
+        assert_eq!(v[1].to_bits(), 1.0_f32.to_bits());
+        assert!(v[2].is_nan());
     }
 }

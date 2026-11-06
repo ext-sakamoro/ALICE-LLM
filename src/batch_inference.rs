@@ -231,14 +231,17 @@ impl TransformerModel {
     }
 
     /// Generate tokens autoregressively.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate(
         &self,
         prompt: &[u32],
         max_new_tokens: usize,
         temperature: f32,
         top_k: usize,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, SamplingError> {
         let mut cache = KvCache::new(
             self.config.num_layers,
             self.config.hidden_dim / self.config.num_heads,
@@ -252,14 +255,14 @@ impl TransformerModel {
 
         for _ in 0..max_new_tokens {
             apply_temperature(&mut logits, temperature);
-            top_k_filter(&mut logits, top_k);
-            let next_token = sample_argmax(&logits) as u32;
+            top_k_filter(&mut logits, top_k)?;
+            let next_token = sample_argmax(&logits)? as u32;
             tokens.push(next_token);
 
             // Decode step (single token)
             logits = self.forward(&[next_token], &mut cache);
         }
 
-        tokens
+        Ok(tokens)
     }
 }

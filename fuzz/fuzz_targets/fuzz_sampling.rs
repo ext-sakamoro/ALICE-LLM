@@ -12,7 +12,7 @@
 //! - temperature=0 or NaN で division by zero
 //! - argmax([]) で empty slice unwrap panic
 //!
-//! 期待 behavior: どんな入力でも panic しない (結果の意味は不問、numerical error は許容)
+//! 期待 behavior: どんな入力でも panic しない 使えない logits は Err で、変更しない
 
 #![no_main]
 
@@ -53,20 +53,32 @@ fuzz_target!(|input: FuzzInput| {
     // top_k_filter must clamp k to logits.len() internally (or otherwise not panic).
     {
         let mut buf = logits.clone();
-        top_k_filter(&mut buf, input.top_k as usize);
+        if top_k_filter(&mut buf, input.top_k as usize).is_err() {
+            assert_eq!(buf.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        }
     }
 
     // top_p_filter must handle p outside [0,1] and NaN without panic.
     {
         let mut buf = logits.clone();
-        top_p_filter(&mut buf, input.top_p);
+        if top_p_filter(&mut buf, input.top_p).is_err() {
+            assert_eq!(buf.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        }
     }
 
     // softmax variants must not panic on NaN / empty / all-Inf inputs.
     let probs = softmax(&logits);
+    // what softmax accepts is a distribution sample_with_random accepts
+    if let Ok(ref probs) = probs {
+        let r = input.rand_val;
+        if !probs.is_empty() && !r.is_nan() {
+            let i = sample_with_random(probs, r);
+            assert!(i.is_ok_and(|i| i < probs.len()), "{probs:?} {r}");
+        }
+    }
     {
         let mut buf = logits.clone();
-        softmax_inplace(&mut buf);
+        let _ = softmax_inplace(&mut buf);
     }
 
     // argmax on empty slice would panic if unchecked — verify it doesn't.
@@ -74,9 +86,6 @@ fuzz_target!(|input: FuzzInput| {
         let _ = sample_argmax(&logits);
     }
 
-    // sample_with_random operates on probs (softmax output), must be robust
-    // to NaN / negative / sum-not-1 inputs.
-    if !probs.is_empty() {
-        let _ = sample_with_random(&probs, input.rand_val);
-    }
+    // sample_with_random itself, on values that may not be a distribution
+    let _ = sample_with_random(&logits, input.rand_val);
 });

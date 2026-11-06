@@ -167,7 +167,9 @@ fn main() {
 
         let mut baseline_tokens: Vec<u32> = Vec::new();
         for _ in 0..max_tokens {
-            let next = sample_argmax(&logits) as u32;
+            let next = sample_argmax(&logits)
+                .expect("the model produced logits it cannot sample from")
+                as u32;
             if is_stop(next, tokenizer.eos_id) {
                 break;
             }
@@ -217,7 +219,9 @@ fn main() {
 
         'outer: while spec_tokens.len() < max_tokens {
             // Sample current token from draft's logits
-            let current_token = sample_argmax(&draft_prev_logits) as u32;
+            let current_token = sample_argmax(&draft_prev_logits)
+                .expect("the model produced logits it cannot sample from")
+                as u32;
             if is_stop(current_token, tokenizer.eos_id) {
                 break;
             }
@@ -241,7 +245,9 @@ fn main() {
 
             for _ in 0..k {
                 let dl = draft.forward_and_read(draft_input);
-                draft_input = sample_argmax(&dl) as u32;
+                draft_input = sample_argmax(&dl)
+                    .expect("the model produced logits it cannot sample from")
+                    as u32;
                 draft_tokens.push(draft_input);
                 draft_logits.push(dl);
             }
@@ -261,8 +267,10 @@ fn main() {
             let mut all_accepted = true;
 
             for i in 0..k {
-                let p = softmax(&verify_logits_flat[i * verify_vocab..(i + 1) * verify_vocab]);
-                let q = softmax(&draft_logits[i][..draft_vocab]);
+                let p = softmax(&verify_logits_flat[i * verify_vocab..(i + 1) * verify_vocab])
+                    .expect("the model produced logits it cannot sample from");
+                let q = softmax(&draft_logits[i][..draft_vocab])
+                    .expect("the model produced logits it cannot sample from");
                 let x = draft_tokens[i] as usize;
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
@@ -292,9 +300,13 @@ fn main() {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_with_random(&adjusted, rng.next_f32()) as u32
+                        sample_with_random(&adjusted, rng.next_f32())
+                            .expect("the model produced logits it cannot sample from")
+                            as u32
                     } else {
-                        sample_with_random(&p, rng.next_f32()) as u32
+                        sample_with_random(&p, rng.next_f32())
+                            .expect("the model produced logits it cannot sample from")
+                            as u32
                     };
                     if is_stop(resampled, tokenizer.eos_id) {
                         break 'outer;
@@ -319,7 +331,9 @@ fn main() {
             if all_accepted && k == K_DRAFT {
                 // All accepted — bonus token from verify_logits[k]
                 let bonus_logits = &verify_logits_flat[k * verify_vocab..(k + 1) * verify_vocab];
-                let bonus = sample_argmax(bonus_logits) as u32;
+                let bonus = sample_argmax(bonus_logits)
+                    .expect("the model produced logits it cannot sample from")
+                    as u32;
                 if !is_stop(bonus, tokenizer.eos_id) && spec_tokens.len() < max_tokens {
                     spec_tokens.push(bonus);
                 }

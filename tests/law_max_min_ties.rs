@@ -10,7 +10,8 @@
 //! - min / max folds over a slice: `QuantizedInt8::quantize`
 //!   (src/quantization.rs; the same fold opens `softmax_inplace` and the
 //!   logit softmax of the decoder)
-//! - max fold before a softmax: `sampling::softmax_inplace`
+//! - max fold before a softmax: `sampling::softmax_of_checked`, in `src/sampling.rs` (the public
+//!   `softmax_inplace` refuses a NaN first; attention scores reach the fold unchecked)
 //! - clamp of a gradient: `StraightThroughEstimator::backward`
 //!   (src/training.rs)
 //!
@@ -76,19 +77,19 @@ fn int4_zero_point_is_the_signed_min() {
     }
 }
 
-/// The max fold skips a trailing NaN, so the finite entries are exponentiated
-/// against the finite maximum (the NaN entry and the sum stay NaN, and the
-/// row is then not normalised)
+/// `softmax_inplace` refuses a NaN before this fold. The fold itself keeps its tie test in
+/// `src/sampling.rs` (`the_softmax_fold_skips_a_nan_in_the_maximum`), since attention scores reach it
+/// unchecked.
 #[test]
-fn softmax_skips_a_nan_in_the_maximum() {
+fn softmax_refuses_a_nan_and_leaves_it() {
     let mut v = [1.0_f32, 2.0, payload_nan()];
-    softmax_inplace(&mut v);
-    assert_eq!(v[0].to_bits(), alice_llm::lawmath::exp(-1.0).to_bits());
-    assert_eq!(v[1].to_bits(), 1.0_f32.to_bits());
-    assert!(v[2].is_nan());
+    assert_eq!(
+        softmax_inplace(&mut v),
+        Err(alice_llm::sampling::SamplingError::NonFinite { index: 2 })
+    );
+    assert_eq!(v[2].to_bits(), payload_nan().to_bits());
 }
 
-/// A NaN gradient is clipped to the canonical NaN, -0 stays -0
 #[test]
 fn gradient_clip_of_nan_and_negative_zero() {
     let ste = StraightThroughEstimator::new(0.5);

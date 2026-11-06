@@ -227,7 +227,9 @@ fn main() {
         let mut generated: Vec<u32> = Vec::new();
         let eos_id = tokenizer.eos_id;
         for step in 0..max_tokens {
-            let next_token = sample_argmax(&logits) as u32;
+            let next_token = sample_argmax(&logits)
+                .expect("the model produced logits it cannot sample from")
+                as u32;
             if next_token == eos_id {
                 break;
             }

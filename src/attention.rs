@@ -1,6 +1,6 @@
 //! attention.
 
-use crate::sampling::softmax_inplace;
+use crate::sampling::softmax_of_checked;
 
 // Attention
 // ---------------------------------------------------------------------------
@@ -47,9 +47,10 @@ pub fn scaled_dot_product_attention(
         }
     }
 
-    // Softmax per row
+    // Softmax per row. Not checked: these are scores, not logits to sample from. A NaN here reaches
+    // the output, and the sampling functions refuse it there.
     for row in &mut scores {
-        softmax_inplace(row);
+        softmax_of_checked(row);
     }
 
     // Weighted sum of values

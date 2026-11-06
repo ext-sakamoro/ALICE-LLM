@@ -112,10 +112,10 @@ fn softmax_and_sampling_filters_are_the_recorded_bits() {
     let g = grid();
     let mut out = Vec::new();
     for chunk in g.chunks(97) {
-        bits(&mut out, softmax(chunk));
+        bits(&mut out, softmax(chunk).unwrap());
         let mut t = chunk.to_vec();
         apply_temperature(&mut t, 0.7);
-        top_p_filter(&mut t, 0.9);
+        top_p_filter(&mut t, 0.9).unwrap();
         bits(&mut out, t);
     }
     assert_golden(

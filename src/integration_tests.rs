@@ -374,7 +374,7 @@ fn test_temperature_zero() {
 #[test]
 fn test_top_k_filter() {
     let mut logits = vec![1.0, 5.0, 3.0, 2.0, 4.0];
-    top_k_filter(&mut logits, 2);
+    top_k_filter(&mut logits, 2).unwrap();
     let finite_count = logits.iter().filter(|x| x.is_finite()).count();
     assert!(finite_count <= 3); // top-2 plus ties
 }
@@ -383,7 +383,7 @@ fn test_top_k_filter() {
 fn test_top_k_zero() {
     let mut logits = vec![1.0, 2.0, 3.0];
     let original = logits.clone();
-    top_k_filter(&mut logits, 0);
+    top_k_filter(&mut logits, 0).unwrap();
     assert_eq!(logits, original);
 }
 
@@ -391,14 +391,14 @@ fn test_top_k_zero() {
 fn test_top_k_larger_than_len() {
     let mut logits = vec![1.0, 2.0];
     let original = logits.clone();
-    top_k_filter(&mut logits, 10);
+    top_k_filter(&mut logits, 10).unwrap();
     assert_eq!(logits, original);
 }
 
 #[test]
 fn test_top_p_filter() {
     let mut logits = vec![1.0, 2.0, 10.0, 0.5];
-    top_p_filter(&mut logits, 0.9);
+    top_p_filter(&mut logits, 0.9).unwrap();
     // The highest logit should remain
     assert!(logits[2].is_finite());
 }
@@ -407,13 +407,13 @@ fn test_top_p_filter() {
 fn test_top_p_one() {
     let mut logits = vec![1.0, 2.0, 3.0];
     let original = logits.clone();
-    top_p_filter(&mut logits, 1.0);
+    top_p_filter(&mut logits, 1.0).unwrap();
     assert_eq!(logits, original);
 }
 
 #[test]
 fn test_softmax_basic() {
-    let probs = softmax(&[0.0, 0.0, 0.0]);
+    let probs = softmax(&[0.0, 0.0, 0.0]).unwrap();
     let sum: f32 = probs.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5);
     assert!((probs[0] - probs[1]).abs() < 1e-5);
@@ -421,48 +421,48 @@ fn test_softmax_basic() {
 
 #[test]
 fn test_softmax_large_values() {
-    let probs = softmax(&[1000.0, 1000.0, 0.0]);
+    let probs = softmax(&[1000.0, 1000.0, 0.0]).unwrap();
     assert!((probs[0] - 0.5).abs() < 1e-3);
     assert!((probs[1] - 0.5).abs() < 1e-3);
 }
 
 #[test]
 fn test_softmax_empty() {
-    let probs = softmax(&[]);
+    let probs = softmax(&[]).unwrap();
     assert!(probs.is_empty());
 }
 
 #[test]
 fn test_softmax_single() {
-    let probs = softmax(&[5.0]);
+    let probs = softmax(&[5.0]).unwrap();
     assert!((probs[0] - 1.0).abs() < 1e-5);
 }
 
 #[test]
 fn test_sample_argmax() {
-    assert_eq!(sample_argmax(&[1.0, 5.0, 3.0]), 1);
-    assert_eq!(sample_argmax(&[10.0, 2.0, 3.0]), 0);
+    assert_eq!(sample_argmax(&[1.0, 5.0, 3.0]).unwrap(), 1);
+    assert_eq!(sample_argmax(&[10.0, 2.0, 3.0]).unwrap(), 0);
 }
 
 #[test]
 fn test_sample_argmax_single() {
-    assert_eq!(sample_argmax(&[42.0]), 0);
+    assert_eq!(sample_argmax(&[42.0]).unwrap(), 0);
 }
 
 #[test]
 fn test_sample_with_random() {
     let probs = vec![0.1, 0.2, 0.7];
-    assert_eq!(sample_with_random(&probs, 0.05), 0);
-    assert_eq!(sample_with_random(&probs, 0.25), 1);
-    assert_eq!(sample_with_random(&probs, 0.95), 2);
+    assert_eq!(sample_with_random(&probs, 0.05).unwrap(), 0);
+    assert_eq!(sample_with_random(&probs, 0.25).unwrap(), 1);
+    assert_eq!(sample_with_random(&probs, 0.95).unwrap(), 2);
 }
 
 #[test]
 fn test_sample_with_random_boundary() {
     let probs = vec![0.5, 0.5];
-    assert_eq!(sample_with_random(&probs, 0.0), 0);
-    assert_eq!(sample_with_random(&probs, 0.49), 0);
-    assert_eq!(sample_with_random(&probs, 0.51), 1);
+    assert_eq!(sample_with_random(&probs, 0.0).unwrap(), 0);
+    assert_eq!(sample_with_random(&probs, 0.49).unwrap(), 0);
+    assert_eq!(sample_with_random(&probs, 0.51).unwrap(), 1);
 }
 
 // ---- Linear algebra tests ----
@@ -676,7 +676,7 @@ fn test_generate() {
         rope_base: 10000.0,
     };
     let model = TransformerModel::new_test(config);
-    let output = model.generate(&[0, 1], 3, 1.0, 5);
+    let output = model.generate(&[0, 1], 3, 1.0, 5).unwrap();
     assert_eq!(output.len(), 5); // 2 prompt + 3 generated
 }
 
@@ -691,9 +691,9 @@ fn test_generate_deterministic() {
         rope_base: 10000.0,
     };
     let model = TransformerModel::new_test(config.clone());
-    let out1 = model.generate(&[0], 5, 1.0, 1);
+    let out1 = model.generate(&[0], 5, 1.0, 1).unwrap();
     let model2 = TransformerModel::new_test(config);
-    let out2 = model2.generate(&[0], 5, 1.0, 1);
+    let out2 = model2.generate(&[0], 5, 1.0, 1).unwrap();
     assert_eq!(out1, out2);
 }
 
@@ -751,7 +751,7 @@ fn test_tokenize_and_infer() {
     let mut cache = KvCache::new(1, 4, 16);
     let logits = model.forward(&ids, &mut cache);
     assert_eq!(logits.len(), 8);
-    let next_token = sample_argmax(&logits);
+    let next_token = sample_argmax(&logits).unwrap();
     assert!(next_token < 8);
 }
 
@@ -795,10 +795,10 @@ fn test_full_pipeline() {
 #[test]
 fn test_softmax_then_sample() {
     let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-    let probs = softmax(&logits);
+    let probs = softmax(&logits).unwrap();
     let sum: f32 = probs.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5);
-    let idx = sample_with_random(&probs, 0.5);
+    let idx = sample_with_random(&probs, 0.5).unwrap();
     assert!(idx < probs.len());
 }
 
@@ -808,8 +808,8 @@ fn test_temperature_affects_distribution() {
     let mut logits_cold = logits_hot.clone();
     apply_temperature(&mut logits_hot, 100.0);
     apply_temperature(&mut logits_cold, 0.01);
-    let probs_hot = softmax(&logits_hot);
-    let probs_cold = softmax(&logits_cold);
+    let probs_hot = softmax(&logits_hot).unwrap();
+    let probs_cold = softmax(&logits_cold).unwrap();
     // Hot temperature -> more uniform
     assert!((probs_hot[0] - probs_hot[2]).abs() < 0.1);
     // Cold temperature -> more peaked
@@ -903,7 +903,7 @@ fn test_default_model_config() {
 #[test]
 fn test_softmax_inplace_uniform() {
     let mut v = vec![0.0; 4];
-    softmax_inplace(&mut v);
+    softmax_inplace(&mut v).unwrap();
     for x in &v {
         assert!((x - 0.25).abs() < 1e-5);
     }
@@ -912,7 +912,7 @@ fn test_softmax_inplace_uniform() {
 #[test]
 fn test_softmax_inplace_peaked() {
     let mut v = vec![0.0, 0.0, 100.0];
-    softmax_inplace(&mut v);
+    softmax_inplace(&mut v).unwrap();
     assert!(v[2] > 0.99);
 }
 
@@ -972,9 +972,9 @@ fn test_int4_constant() {
 #[test]
 fn test_top_k_keeps_highest() {
     let mut logits = vec![1.0, 10.0, 2.0, 3.0, 4.0];
-    top_k_filter(&mut logits, 1);
+    top_k_filter(&mut logits, 1).unwrap();
     assert!(logits[1].is_finite());
-    assert_eq!(sample_argmax(&logits), 1);
+    assert_eq!(sample_argmax(&logits).unwrap(), 1);
 }
 
 #[test]
@@ -989,7 +989,7 @@ fn test_generate_prompt_preserved() {
     };
     let model = TransformerModel::new_test(config);
     let prompt = vec![3, 7, 11];
-    let output = model.generate(&prompt, 2, 1.0, 5);
+    let output = model.generate(&prompt, 2, 1.0, 5).unwrap();
     assert_eq!(&output[..3], &prompt);
     assert_eq!(output.len(), 5);
 }

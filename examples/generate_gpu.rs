@@ -122,12 +122,17 @@ fn main() {
 
         for _ in 0..max_tokens {
             let next_token = if temperature < 1e-6 {
-                sample_argmax(&logits) as u32
+                sample_argmax(&logits).expect("the model produced logits it cannot sample from")
+                    as u32
             } else {
                 apply_temperature(&mut logits, temperature);
-                top_k_filter(&mut logits, top_k);
-                softmax_inplace(&mut logits);
-                sample_with_random(&logits, next_rand()) as u32
+                top_k_filter(&mut logits, top_k)
+                    .expect("the model produced logits it cannot sample from");
+                softmax_inplace(&mut logits)
+                    .expect("the model produced logits it cannot sample from");
+                sample_with_random(&logits, next_rand())
+                    .expect("the model produced logits it cannot sample from")
+                    as u32
             };
 
             if next_token == eos_id || next_token == eot_id {
