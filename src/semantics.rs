@@ -170,19 +170,7 @@ pub const DET_MATH_PINS: &[(&str, [u8; 32])] = &[
     ),
 ];
 
-const _: () = {
-    let mut i = 0;
-    while i < DET_MATH_PINS.len() {
-        assert!(
-            same32(
-                &DET_MATH_PINS[i].1,
-                &alice_det_math::function_pin(DET_MATH_PINS[i].0)
-            ),
-            "a function this crate calls moved in alice-det-math: re-record DET_MATH_PINS and LLM_SEMANTICS_ID",
-        );
-        i += 1;
-    }
-};
+const _: () = alice_det_math::assert_function_pins(DET_MATH_PINS);
 
 /// Content hash of the Law build's arithmetic: the fold of
 /// [`LLM_SEMANTICS_PINS`] and [`DET_MATH_PINS`]
