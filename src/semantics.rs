@@ -99,7 +99,7 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
 ];
 
 /// The crate version and toolchain the pins were last checked against
-pub const LLM_SEMANTICS_CHECKED_AT: (&str, &str) = ("3.0.0", "1.98.1");
+pub const LLM_SEMANTICS_CHECKED_AT: (&str, &str) = ("4.0.0", "1.98.1");
 
 /// [`LLM_SEMANTICS_ID`] for each `alice-det-math` generation this crate
 /// knows: `(alice_det_math::SEMANTICS_ID, fold of LLM_SEMANTICS_PINS with that
