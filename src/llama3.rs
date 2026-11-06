@@ -23837,6 +23837,31 @@ mod tests {
         assert_eq!(converted, GrammarGenError::Fsm(fsm_err));
     }
 
+    /// A cache stamped with the identifier before the fold gained "sampling choices" (`c1eee96c`)
+    /// loads: what a cache holds is computed to the same bits, and the load says which it was
+    #[test]
+    fn kv_cache_of_the_previous_identifier_loads() {
+        let previous = crate::semantics::LLM_PREVIOUS_SEMANTICS_IDS[0];
+        assert_eq!(previous[..4], [0xc1, 0xee, 0xe9, 0x6c]);
+        assert_ne!(previous, crate::semantics::LLM_SEMANTICS_ID);
+        let cache = make_populated_kv_cache(2, 4, 3, 2, 5);
+        let mut bytes = Vec::new();
+        cache.write_to(&mut bytes, 7, &previous).unwrap();
+        let run = crate::semantics::LLM_SEMANTICS_ID;
+        let mut restored = KvCache::new(2, 4, 3);
+        let got = restored
+            .read_from(
+                &mut bytes.as_slice(),
+                7,
+                0,
+                &run,
+                KvCachePolicy::AcceptUnpinned,
+            )
+            .unwrap();
+        assert_eq!(got, KvCacheSemantics::VerifiedPrevious(previous));
+        assert_eq!(restored.seq_len, cache.seq_len);
+    }
+
     /// A cache stamped with the identifier of the `alice-det-math` 0.5.1
     /// build (`32957f18`) is refused: `alice-det-math` 0.6 moved the rope
     /// bits, so that identifier is not a previous one of the same bits
@@ -23868,6 +23893,12 @@ mod tests {
 
 /// A real model read from a small GGUF: the `generate` paths and the router run as they do in
 /// production, and only the numbers in the tensors are unusual.
+///
+/// Not driven here, since this fixture has no draft or quantized form for them:
+/// `generate_speculative_dual` and its variants, `generate_ternary`,
+/// `generate_sparse_ternary_speculative`, `generate_batch`, `speculative_decode_v2` and
+/// `generate_grammar`. They call the same `sample_token` / `sampling` functions, as the compiler
+/// sees; `sample_token` and the distribution of the replay are tested on their own below.
 #[cfg(test)]
 mod a_model_that_produces_nan {
     use super::*;

@@ -143,9 +143,10 @@ pub const RUNNING_SEMANTICS_ID: [u8; 32] = if cfg!(feature = "platform-math") {
     LLM_SEMANTICS_ID
 };
 
-/// Earlier values of [`LLM_SEMANTICS_ID`] whose KV cache files this build reads: their builds compute
-/// what a cache holds to the same bits. `c1eee96c...` differs only in the fold, which then gained
-/// the "sampling choices" scenario; the choice of a token is not in a cache.
+/// Earlier values of [`LLM_SEMANTICS_ID`] whose KV cache files this build reads
+///
+/// Their builds compute what a cache holds to the same bits. `c1eee96c` differs only in the fold,
+/// which then gained the "sampling choices" scenario; the choice of a token is not in a cache.
 pub const LLM_PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[hex32(
     "c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf",
 )];
