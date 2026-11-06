@@ -68,9 +68,10 @@ platform-math = []
 
 [dependencies]
 # Law helpers: transcendental functions and max / min that return the same
-# bits on every target (ALICE-Law G1 / G2), through src/lawmath.rs; by git + rev, the source every
-# ALICE repository uses, so one build links one alice-det-math
-alice-det-math = { git = "https://github.com/ext-sakamoro/ALICE-DetMath", rev = "b4e3d9464dcf1d32dcf56649b4546c73209fcb37", version = "0.6.0" }
+# bits on every target (ALICE-Law G1 / G2), through src/lawmath.rs. The branch, with Cargo.lock naming
+# the commit: src/semantics.rs folds the identifier of each function this crate calls, and stops the
+# compile when one of them moves.
+alice-det-math = { git = "https://github.com/ext-sakamoro/ALICE-DetMath", branch = "main", version = "0.6" }
 memmap2 = { version = "0.9", optional = true }
 libc = { version = "0.2", optional = true }
 rayon = { version = "1.10", optional = true }

@@ -864,7 +864,7 @@ step "ci.yml / test: Law tests (lawmath ln_1p, max / min ties, semantics id, ord
   gh_step ci.yml.test
 (
   export CARGO_TERM_COLOR="always"
-  scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=9,llm_semantics_id=9,float_edge_golden=6,running_semantics_id=1,sampling_refuses=9 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id --test sampling_refuses
+  scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=9,llm_semantics_id=11,float_edge_golden=6,running_semantics_id=1,sampling_refuses=9 -- cargo test --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test running_semantics_id --test sampling_refuses
   scripts/run_tests.sh order_independence=3 -- cargo test --features gguf,parallel,dspark --test order_independence
   scripts/run_tests.sh lib=12 -- cargo test --lib llama3::tests::kv_cache
 )
@@ -911,7 +911,7 @@ step "ci.yml / release: Law tests (release)"
   gh_step ci.yml.release
 (
   export CARGO_TERM_COLOR="always"
-  scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=9,llm_semantics_id=9,float_edge_golden=6,sampling_refuses=9 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test sampling_refuses
+  scripts/run_tests.sh lawmath_ln_1p=5,law_max_min_ties=5,semantics_golden=9,llm_semantics_id=11,float_edge_golden=6,sampling_refuses=9 -- cargo test --release --test lawmath_ln_1p --test law_max_min_ties --test semantics_golden --test llm_semantics_id --test float_edge_golden --test sampling_refuses
   scripts/run_tests.sh order_independence=3 -- cargo test --release --features gguf,parallel,dspark --test order_independence
   scripts/run_tests.sh lib=12 -- cargo test --release --lib llama3::tests::kv_cache
 )

@@ -1,5 +1,5 @@
 //! `LLM_SEMANTICS_ID` is the fold of the recorded-bit goldens of
-//! `tests/semantics_golden.rs` and the `alice-det-math` identifier; the
+//! `tests/semantics_golden.rs` and the identifier of each `alice-det-math` function this crate calls; the
 //! `platform-math` build reports another identifier.
 //!
 //! Every digest is read from the golden test that records it, so changing a
@@ -9,10 +9,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use alice_llm::semantics::{LLM_PLATFORM_SEMANTICS_ID, LLM_SEMANTICS_ID, RUNNING_SEMANTICS_ID};
 use alice_llm::semantics::{
-    LLM_SEMANTICS_BY_DET_MATH, LLM_SEMANTICS_CHECKED_AT, LLM_SEMANTICS_PINS,
+    DET_MATH_FUNCTIONS, DET_MATH_PINS, LLM_PREVIOUS_SEMANTICS_IDS, LLM_SEMANTICS_CHECKED_AT,
+    LLM_SEMANTICS_PINS,
 };
+use alice_llm::semantics::{LLM_PLATFORM_SEMANTICS_ID, LLM_SEMANTICS_ID, RUNNING_SEMANTICS_ID};
 use sha2::{Digest, Sha256};
 
 fn hex(bytes: &[u8]) -> String {
@@ -298,9 +299,6 @@ fn check_entries(pins: &[(&str, [u8; 32])], minimum: usize) {
     let goldens = recorded_goldens();
     let mut compared = 0;
     for (name, digest) in pins {
-        if *name == "alice-det-math" {
-            continue;
-        }
         let recorded = goldens.get(*name).unwrap_or_else(|| {
             panic!("no recorded golden named {name:?} in tests/semantics_golden.rs")
         });
@@ -331,48 +329,72 @@ fn every_semantics_entry_is_the_golden_its_scenario_records() {
     check_entries(LLM_SEMANTICS_PINS, 7);
 }
 
+/// Each det-math entry is the function's identifier at the commit this build resolves
 #[test]
-fn the_det_math_entry_is_the_det_math_identifier() {
-    let entry = LLM_SEMANTICS_PINS
+fn every_det_math_entry_is_the_resolved_function() {
+    assert!(!DET_MATH_PINS.is_empty());
+    assert_eq!(DET_MATH_FUNCTIONS.len(), DET_MATH_PINS.len());
+    for (want, (name, digest)) in DET_MATH_FUNCTIONS.iter().zip(DET_MATH_PINS) {
+        assert_eq!(want, name);
+        assert_eq!(
+            hex(digest),
+            hex(&alice_det_math::function_pin(name)),
+            "{name}"
+        );
+    }
+}
+
+/// The fold's entries: a det-math entry goes in under `det-math <function>`
+fn entries() -> Vec<(String, [u8; 32])> {
+    LLM_SEMANTICS_PINS
         .iter()
-        .find(|(name, _)| *name == "alice-det-math")
-        .expect("an alice-det-math entry");
-    assert_eq!(entry.1, alice_det_math::SEMANTICS_ID);
+        .map(|&(n, d)| (n.to_string(), d))
+        .chain(
+            DET_MATH_PINS
+                .iter()
+                .map(|&(n, d)| (format!("det-math {n}"), d)),
+        )
+        .collect()
+}
+
+fn fold_entries(entries: &[(String, [u8; 32])]) -> [u8; 32] {
+    let named: Vec<(&str, [u8; 32])> = entries.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+    fold(&named)
 }
 
 #[test]
 fn the_identifiers_are_the_folds_of_their_tables() {
-    assert_eq!(hex(&fold(LLM_SEMANTICS_PINS)), hex(&LLM_SEMANTICS_ID));
-    let row = LLM_SEMANTICS_BY_DET_MATH
-        .iter()
-        .find(|(det, _)| *det == alice_det_math::SEMANTICS_ID)
-        .expect("a row for the resolved alice-det-math");
-    assert_eq!(row.1, LLM_SEMANTICS_ID);
+    assert_eq!(hex(&fold_entries(&entries())), hex(&LLM_SEMANTICS_ID));
 }
 
 #[test]
 fn the_identifiers_are_the_recorded_values() {
     assert_eq!(
         hex(&LLM_SEMANTICS_ID),
-        "cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc"
+        "5e093a0494ac6bc0c7d07cee7de741ff63246e6c1b9925710d5257663079d1c6"
     );
 }
 
 #[test]
 fn one_changed_bit_in_any_entry_changes_the_identifier() {
-    for table in [LLM_SEMANTICS_PINS] {
-        let id = fold(table);
-        for i in 0..table.len() {
-            let mut entries = table.to_vec();
-            entries[i].1[0] ^= 1;
-            assert_ne!(
-                fold(&entries),
-                id,
-                "entry {} does not move the identifier",
-                entries[i].0
-            );
-        }
+    let all = entries();
+    for i in 0..all.len() {
+        let mut changed = all.clone();
+        changed[i].1[0] ^= 1;
+        assert_ne!(
+            fold_entries(&changed),
+            fold_entries(&all),
+            "entry {} does not move the identifier",
+            changed[i].0
+        );
     }
+}
+
+#[test]
+fn the_earlier_identifier_is_kept_and_is_not_this_one() {
+    let earlier = unhex32("cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc");
+    assert!(LLM_PREVIOUS_SEMANTICS_IDS.contains(&earlier));
+    assert!(!LLM_PREVIOUS_SEMANTICS_IDS.contains(&LLM_SEMANTICS_ID));
 }
 
 #[test]

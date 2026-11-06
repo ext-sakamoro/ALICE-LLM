@@ -7,13 +7,15 @@
 //! and norms, softmax and the sampling filters, the choice of a token, rotary embeddings, the Kimi
 //! delta gates, quantization and a forward pass of the reference transformer
 //! (`TransformerModel::new_test`). [`LLM_SEMANTICS_ID`] folds those digests and
-//! the semantics identifier of `alice-det-math`. Two builds with the same
-//! identifier compute every pinned scenario to the same bits.
+//! [`DET_MATH_PINS`], the identifier of each `alice-det-math` function this
+//! crate calls ([`DET_MATH_FUNCTIONS`]). Two builds with the same identifier
+//! compute every pinned scenario to the same bits. A function this crate does
+//! not call moves nothing; one it calls stops the compile.
 //!
-//! # Hex form (with `alice-det-math` at the git rev 2d01c63, its `SEMANTICS_ID` `a2a11b9b`)
+//! # Hex form
 //!
 //! ```text
-//! LLM_SEMANTICS_ID           cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc
+//! LLM_SEMANTICS_ID           5e093a0494ac6bc0c7d07cee7de741ff63246e6c1b9925710d5257663079d1c6
 //! LLM_PLATFORM_SEMANTICS_ID  269ade8fc103bb500c378ba0b10b61f2da534968ffd4c987a818e577aa033fac
 //! ```
 //!
@@ -30,15 +32,14 @@
 //! The procedure of the `SEMANTICS_ID` fold of `alice-det-math`: sort the
 //! entries by name (ascending byte order), then SHA-256 over, for each entry
 //! in that order, the name length as 4 bytes big-endian (`u32`), the name
-//! bytes and the 32 digest bytes.
+//! bytes and the 32 digest bytes. A [`DET_MATH_PINS`] entry goes in under the
+//! name `det-math <function>`.
 //!
 //! # Staleness
 //!
 //! [`LLM_SEMANTICS_CHECKED_AT`] names the crate version and toolchain the pins
 //! were last checked on; a different version or toolchain fails
-//! `tests/llm_semantics_id.rs` until they are checked again. An
-//! `alice-det-math` generation with no row in [`LLM_SEMANTICS_BY_DET_MATH`]
-//! does not compile.
+//! `tests/llm_semantics_id.rs` until they are checked again.
 
 /// Decodes 64 hex digits into 32 bytes at compile time; anything else is a
 /// compile error.
@@ -61,9 +62,9 @@ const fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// The entries [`LLM_SEMANTICS_ID`] folds: one per recorded-bit scenario of
-/// `tests/semantics_golden.rs`, named as that file names it, plus
-/// `"alice-det-math"` holding `alice_det_math::SEMANTICS_ID`
+/// The entries [`LLM_SEMANTICS_ID`] folds with [`DET_MATH_PINS`]: one per
+/// recorded-bit scenario of `tests/semantics_golden.rs`, named as that file
+/// names it
 pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
     (
         "lawmath functions",
@@ -97,37 +98,96 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
         "reference transformer forward",
         hex32("849a960d7721d3fc2e34ef7196a2c18222bb81cfa0b00c5810678945b16d911e"),
     ),
-    // the resolved alice-det-math's own identifier, not a copy of it: the
-    // identifier below is looked up by it
-    ("alice-det-math", alice_det_math::SEMANTICS_ID),
 ];
 
 /// The crate version and toolchain the pins were last checked against
 pub const LLM_SEMANTICS_CHECKED_AT: (&str, &str) = ("4.0.0", "1.98.1");
 
-/// [`LLM_SEMANTICS_ID`] for each `alice-det-math` generation this crate
-/// knows: `(alice_det_math::SEMANTICS_ID, fold of LLM_SEMANTICS_PINS with that
-/// det-math entry)`
-pub const LLM_SEMANTICS_BY_DET_MATH: &[([u8; 32], [u8; 32])] = &[
-    // alice-det-math 0.5.1
+/// The functions of `alice-det-math` this crate calls (ALICE-Law's
+/// `scripts/fold_set_check.py` compares this with the calls in the source and
+/// writes it)
+pub const DET_MATH_FUNCTIONS: &[&str] = &[
+    "clamp", "cos", "exp", "ln", "max", "max64", "min", "min64", "powf", "powi", "sin", "sin_cos",
+    "tanh",
+];
+
+/// The identifier of each function of [`DET_MATH_FUNCTIONS`], in that order,
+/// as recorded when [`LLM_SEMANTICS_ID`] was computed. A function whose
+/// identifier moves in the resolved `alice-det-math` stops the compile, rather
+/// than reporting an identifier computed from other bits.
+pub const DET_MATH_PINS: &[(&str, [u8; 32])] = &[
     (
-        hex32("85e0884623b154a3b2b264374907b6cbac09307ca3f9a08339e48c567d3cb315"),
-        hex32("32957f18dac2838d705c034d0e27bcfc23f9680f40967338ea13d8e9d25c3f9d"),
+        "clamp",
+        hex32("8a35afd329a733bcd0c771a8921fbf21a82491954fc8293881220944dc820455"),
     ),
-    // alice-det-math at the git rev 2d01c63 (sin / cos at |x| >= 2^13, powf of a negative
-    // base, powf64 as fdlibm e_pow and hypot of two subnormals change bits; erf / erf64 added):
-    // the "rope" scenario moved with it (position 32767 reaches angles past 2^13; the
-    // angle is the position times a frequency of at most 1, so 4095 stays below)
     (
-        hex32("a2a11b9b826227fa7a9ed8ab2c1ce63dbb07ad4c39aa2c46a363ddea6b47dbe9"),
-        hex32("cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc"),
+        "cos",
+        hex32("f7627941400acabe93c8dca4090eee12f8910fe4c14a8735ad456cef3c48ed7b"),
+    ),
+    (
+        "exp",
+        hex32("606918f2d637f46f9a792a29b3ee31a991ef3196064456caa7b3a7ca81700a63"),
+    ),
+    (
+        "ln",
+        hex32("6fe18bc0fba8b7e3e871c4cbe555ddb40a460be7b3c7690303ee30accdcb7291"),
+    ),
+    (
+        "max",
+        hex32("8bd32fcb313f7fb3d7a699fc3075273de7e5a4e083912d8dc7f4cc4016fc2286"),
+    ),
+    (
+        "max64",
+        hex32("aac586eacc9acd69cf5988ffe736283c71fad8146027e86034d3e9b881db28b6"),
+    ),
+    (
+        "min",
+        hex32("2939e83813b26c868ec3113fb1c25102f16f28d8f24c343a727d4b1bec5904fe"),
+    ),
+    (
+        "min64",
+        hex32("1bef418073152f5e1e76f41718aa29b2517de8966a8c8ea8c1c2b5ba92fab3cb"),
+    ),
+    (
+        "powf",
+        hex32("0f1f85adcfa801b4afbbf858cf4c30f4ed0abdd3b7163d71aa9aa2b6031d9117"),
+    ),
+    (
+        "powi",
+        hex32("d3d76ba59208f7b0151ccde9b63043f538bc6b7737d1f16ff02d918f5806be45"),
+    ),
+    (
+        "sin",
+        hex32("ee1b80d12df18ec0de5bce5a6bf05432484dabfc1cee1bb9b3f3291dd862cfec"),
+    ),
+    (
+        "sin_cos",
+        hex32("025acd2cdc900eff683e39ef1e71de115dafe8da8a1a4b02847b41d75cbd130f"),
+    ),
+    (
+        "tanh",
+        hex32("d8a147acf5f34b1072d5409f94cd6b9cadd06d77e484634d26c2a113011c0ea3"),
     ),
 ];
 
+const _: () = {
+    let mut i = 0;
+    while i < DET_MATH_PINS.len() {
+        assert!(
+            same32(
+                &DET_MATH_PINS[i].1,
+                &alice_det_math::function_pin(DET_MATH_PINS[i].0)
+            ),
+            "a function this crate calls moved in alice-det-math: re-record DET_MATH_PINS and LLM_SEMANTICS_ID",
+        );
+        i += 1;
+    }
+};
+
 /// Content hash of the Law build's arithmetic: the fold of
-/// [`LLM_SEMANTICS_PINS`], taken from [`LLM_SEMANTICS_BY_DET_MATH`] by the
-/// resolved `alice-det-math`
-pub const LLM_SEMANTICS_ID: [u8; 32] = semantics_id_for(&alice_det_math::SEMANTICS_ID);
+/// [`LLM_SEMANTICS_PINS`] and [`DET_MATH_PINS`]
+pub const LLM_SEMANTICS_ID: [u8; 32] =
+    hex32("5e093a0494ac6bc0c7d07cee7de741ff63246e6c1b9925710d5257663079d1c6");
 
 /// The identifier the `platform-math` build reports: SHA-256 of the sentence
 /// "alice-llm platform-math build: the platform libm computes the
@@ -147,28 +207,11 @@ pub const RUNNING_SEMANTICS_ID: [u8; 32] = if cfg!(feature = "platform-math") {
 ///
 /// Their builds compute what a cache holds to the same bits. `c1eee96c` differs only in the fold,
 /// which then gained the "sampling choices" scenario; the choice of a token is not in a cache.
-pub const LLM_PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[hex32(
-    "c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf",
-)];
-
-/// The [`LLM_SEMANTICS_ID`] of a build that resolved the `alice-det-math`
-/// with identifier `det_math`.
-///
-/// # Panics
-///
-/// When [`LLM_SEMANTICS_BY_DET_MATH`] has no row for `det_math` (in a const
-/// context this stops the compile).
-#[must_use]
-pub const fn semantics_id_for(det_math: &[u8; 32]) -> [u8; 32] {
-    let mut i = 0;
-    while i < LLM_SEMANTICS_BY_DET_MATH.len() {
-        if same32(&LLM_SEMANTICS_BY_DET_MATH[i].0, det_math) {
-            return LLM_SEMANTICS_BY_DET_MATH[i].1;
-        }
-        i += 1;
-    }
-    panic!("alice-det-math SEMANTICS_ID has no row in LLM_SEMANTICS_BY_DET_MATH: add its fold");
-}
+/// `cd0f624f` differs only in the fold too: it took alice-det-math's whole identifier.
+pub const LLM_PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[
+    hex32("c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf"),
+    hex32("cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc"),
+];
 
 /// Byte equality usable in a const context
 #[must_use]

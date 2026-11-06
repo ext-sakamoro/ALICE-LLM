@@ -111,3 +111,16 @@ fn a_stamp_of_the_previous_identifier_is_accepted() {
     let got = kv_check_semantics(previous, &crate::semantics::LLM_SEMANTICS_ID);
     assert!(matches!(got, Ok(KvCacheSemantics::VerifiedPrevious(p)) if p == previous));
 }
+
+#[cfg(test)]
+#[test]
+fn a_stamp_of_the_identifier_before_the_function_identifiers_is_accepted() {
+    use crate::llama3::{kv_check_semantics, KvCacheSemantics};
+    let previous: [u8; 32] = [
+        0xcd, 0x0f, 0x62, 0x4f, 0xc7, 0x21, 0x08, 0x62, 0x70, 0x35, 0x02, 0xa5, 0xea, 0xd1, 0xb6,
+        0xba, 0xaf, 0xe6, 0x5a, 0xf5, 0xf9, 0x24, 0x0a, 0xb6, 0x3a, 0xb2, 0xe9, 0x54, 0xbb, 0x78,
+        0x75, 0xdc,
+    ];
+    let got = kv_check_semantics(previous, &crate::semantics::LLM_SEMANTICS_ID);
+    assert!(matches!(got, Ok(KvCacheSemantics::VerifiedPrevious(p)) if p == previous));
+}
