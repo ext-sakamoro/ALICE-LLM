@@ -284,7 +284,7 @@ fn a_token_with_no_probability_is_never_sampled() {
         let n = 1 + (rng.next() % 16) as usize;
         let mut logits: Vec<f32> = (0..n).map(|_| (rng.unit() - 0.5) * 20.0).collect();
         for l in &mut logits {
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 *l = MASK;
                 masked_seen += 1;
             }
@@ -294,7 +294,7 @@ fn a_token_with_no_probability_is_never_sampled() {
         }
         let probs = softmax(&logits).unwrap();
         // the top of the range is where rounding leaves the sum short
-        let r = if rng.next() % 2 == 0 {
+        let r = if rng.next().is_multiple_of(2) {
             1.0 - f32::EPSILON / 2.0
         } else {
             rng.unit()
