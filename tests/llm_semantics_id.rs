@@ -354,7 +354,7 @@ fn the_identifiers_are_the_folds_of_their_tables() {
 fn the_identifiers_are_the_recorded_values() {
     assert_eq!(
         hex(&LLM_SEMANTICS_ID),
-        "c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf"
+        "cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc"
     );
 }
 

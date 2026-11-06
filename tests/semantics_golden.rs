@@ -19,7 +19,9 @@ use alice_llm::linalg::{gelu, layer_norm, rms_norm, silu};
 use alice_llm::llama3::{kimi_delta_lower_bounded_decay, kimi_delta_output_gate};
 use alice_llm::quantization::{QuantizedInt4, QuantizedInt8};
 use alice_llm::rope::apply_rope;
-use alice_llm::sampling::{apply_temperature, softmax, top_p_filter};
+use alice_llm::sampling::{
+    apply_temperature, sample_argmax, sample_with_random, softmax, top_k_filter, top_p_filter,
+};
 use sha2::{Digest, Sha256};
 
 fn hex(bytes: &[u8]) -> String {
@@ -122,6 +124,49 @@ fn softmax_and_sampling_filters_are_the_recorded_bits() {
         "softmax and sampling",
         &out,
         "766bc8cd3d681be4e4ef057528c811fdd46ee7de504de3b33d0b9bdc839bd2a2",
+    );
+}
+
+/// The filters and samplers that choose a token: `top_k_filter`, `sample_argmax` with its tie rule, and
+/// `sample_with_random` with its fallback to the last token that has any probability.
+#[test]
+fn sampling_choices_are_the_recorded_bits() {
+    let g = grid();
+    let mut out = Vec::new();
+    for chunk in g.chunks(97) {
+        // ties and masks: rounded to the tenth, and every fifth token masked
+        let logits: Vec<f32> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                if i.is_multiple_of(5) {
+                    f32::NEG_INFINITY
+                } else {
+                    (x * 0.1).round()
+                }
+            })
+            .collect();
+        for k in [0, 1, 7, 96, 1000] {
+            let mut t = logits.clone();
+            top_k_filter(&mut t, k).unwrap();
+            bits(&mut out, t.iter().copied());
+            out.extend_from_slice(&(sample_argmax(&t).unwrap() as u64).to_le_bytes());
+        }
+        let probs = softmax(&logits).unwrap();
+        for r in [0.0, 0.25, 0.5, 0.75, 0.999_999_9, 1.0, 2.0] {
+            let i = sample_with_random(&probs, r).unwrap();
+            out.extend_from_slice(&(i as u64).to_le_bytes());
+        }
+    }
+    // past the sum, with the last tokens at no probability
+    for r in [0.95, 1.0, 2.0] {
+        let i = sample_with_random(&[0.3, 0.3, 0.3, 0.0], r).unwrap();
+        out.extend_from_slice(&(i as u64).to_le_bytes());
+    }
+    assert_golden(
+        "sampling choices",
+        &out,
+        "aa3282680998a20f1999057d57f21ecf162eb455ec3f3493e8ce16b25e6df1f5",
     );
 }
 

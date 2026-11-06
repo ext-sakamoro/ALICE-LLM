@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `LLM_SEMANTICS_ID` を `cd0f624f` に動かした 新しい scenario `sampling choices` (`top_k_filter` / `sample_argmax` の同点の規則 / `sample_with_random` の和を超えた時) を fold に足した 以前の値 `c1eee96c` は `LLM_PREVIOUS_SEMANTICS_IDS` に置き、その KV cache は読める (cache に token の選択は入らない)
 - **破壊的:** `Llama3Model` の `generate` / `generate_speculative` / `generate_speculative_dual` / `generate_ternary` / `generate_sparse_ternary_speculative` / `generate_batch` と `speculative_decode` / `speculative_decode_v2` は `Result<_, SamplingError>` を返す 内部の sampling の写しをやめ `sampling` を呼ぶ `softmax` は `sampling` の丸めになり確率が最大 1 ulp 変わる、完全に同じ logit の組の選び方は `sample_argmax` と同じ最後の token になる (以前は sort の位置、`speculative_decode` は最初の token) `speculative_decode_v2` の分布も `apply_temperature` と `top_p_filter` と `softmax` で作る top-p は和が p を超えるまで残す (`cum > p`、以前は `cum >= p`) `p` が 0 以下の時は最も確率の高い token だけ残す (以前は全部残す) 境界の token が変わる
 - `sampling::descending_nan_last`: `NaN` を最後に置く全順序 数値の順は `partial_cmp` と同じで `-0` と `+0` を等しく扱う MoE の router と `PersistenceHeuristic::predict` が使い、`NaN` の score で sort が panic しない `NaN` は logits に届き、`sampling` が拒否する
 - **破壊的:** 版を 3.0.0 から 4.0.0 に `sampling` の `top_k_filter` / `top_p_filter` / `softmax` / `softmax_inplace` / `sample_argmax` / `sample_with_random` と `generate` は `Result<_, SamplingError>` を返す `NaN` か `+inf` の logit は `NonFinite`、全部が `-inf` は `AllMasked` で、入力を変更しない `-inf` は mask として使える 有限の logit の結果の bit は変わらない (`LLM_SEMANTICS_ID` と golden は動かない)

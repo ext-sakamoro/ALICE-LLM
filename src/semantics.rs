@@ -4,7 +4,7 @@
 //!
 //! The recorded-bit tests in `tests/semantics_golden.rs` pin the kernels the
 //! inference computes with: the `lawmath` transcendentals, the activations
-//! and norms, softmax and the sampling filters, rotary embeddings, the Kimi
+//! and norms, softmax and the sampling filters, the choice of a token, rotary embeddings, the Kimi
 //! delta gates, quantization and a forward pass of the reference transformer
 //! (`TransformerModel::new_test`). [`LLM_SEMANTICS_ID`] folds those digests and
 //! the semantics identifier of `alice-det-math`. Two builds with the same
@@ -13,7 +13,7 @@
 //! # Hex form (with `alice-det-math` at the git rev 2d01c63, its `SEMANTICS_ID` `a2a11b9b`)
 //!
 //! ```text
-//! LLM_SEMANTICS_ID           c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf
+//! LLM_SEMANTICS_ID           cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc
 //! LLM_PLATFORM_SEMANTICS_ID  269ade8fc103bb500c378ba0b10b61f2da534968ffd4c987a818e577aa033fac
 //! ```
 //!
@@ -78,6 +78,10 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
         hex32("766bc8cd3d681be4e4ef057528c811fdd46ee7de504de3b33d0b9bdc839bd2a2"),
     ),
     (
+        "sampling choices",
+        hex32("aa3282680998a20f1999057d57f21ecf162eb455ec3f3493e8ce16b25e6df1f5"),
+    ),
+    (
         "rope",
         hex32("5abde8f7b2926a6a0932c048cd37ca439470f5da6ddbd72862617afcbcdfd9d5"),
     ),
@@ -116,7 +120,7 @@ pub const LLM_SEMANTICS_BY_DET_MATH: &[([u8; 32], [u8; 32])] = &[
     // angle is the position times a frequency of at most 1, so 4095 stays below)
     (
         hex32("a2a11b9b826227fa7a9ed8ab2c1ce63dbb07ad4c39aa2c46a363ddea6b47dbe9"),
-        hex32("c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf"),
+        hex32("cd0f624fc7210862703502a5ead1b6baafe65af5f9240ab63ab2e954bb7875dc"),
     ),
 ];
 
@@ -139,9 +143,12 @@ pub const RUNNING_SEMANTICS_ID: [u8; 32] = if cfg!(feature = "platform-math") {
     LLM_SEMANTICS_ID
 };
 
-/// Earlier values of [`LLM_SEMANTICS_ID`] whose builds compute every pinned
-/// scenario to the same bits as this one (none yet)
-pub const LLM_PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[];
+/// Earlier values of [`LLM_SEMANTICS_ID`] whose KV cache files this build reads: their builds compute
+/// what a cache holds to the same bits. `c1eee96c...` differs only in the fold, which then gained
+/// the "sampling choices" scenario; the choice of a token is not in a cache.
+pub const LLM_PREVIOUS_SEMANTICS_IDS: &[[u8; 32]] = &[hex32(
+    "c1eee96c2de49cfd114ac48ab8fef3d8e7bd72522b8d1160ef426fdcb904eadf",
+)];
 
 /// The [`LLM_SEMANTICS_ID`] of a build that resolved the `alice-det-math`
 /// with identifier `det_math`.
