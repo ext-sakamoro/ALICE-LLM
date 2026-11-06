@@ -5174,7 +5174,7 @@ impl KvCache {
 }
 
 /// The semantics identifier of a version 2 file against this build's
-fn kv_check_semantics(
+pub(crate) fn kv_check_semantics(
     stored: [u8; 32],
     running: &[u8; 32],
 ) -> Result<KvCacheSemantics, KvCacheLoadError> {

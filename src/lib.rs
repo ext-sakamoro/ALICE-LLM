@@ -94,3 +94,20 @@ pub use crate::quantization::*;
 pub use crate::rope::*;
 pub use crate::sampling::*;
 pub use crate::tokenizer::*;
+
+/// A KV cache stamped with the identifier before the fold gained "sampling choices" loads, since
+/// what a cache holds is computed to the same bits. `scripts/id_move_check.py` runs this test, and
+/// runs it again with the value taken out of the previous list, where it has to fail. The tool
+/// selects a library test by its exact name, so this one stays at the crate root.
+#[cfg(test)]
+#[test]
+fn a_stamp_of_the_previous_identifier_is_accepted() {
+    use crate::llama3::{kv_check_semantics, KvCacheSemantics};
+    let previous: [u8; 32] = [
+        0xc1, 0xee, 0xe9, 0x6c, 0x2d, 0xe4, 0x9c, 0xfd, 0x11, 0x4a, 0xc4, 0x8a, 0xb8, 0xfe, 0xf3,
+        0xd8, 0xe7, 0xbd, 0x72, 0x52, 0x2b, 0x8d, 0x11, 0x60, 0xef, 0x42, 0x6f, 0xdc, 0xb9, 0x04,
+        0xea, 0xdf,
+    ];
+    let got = kv_check_semantics(previous, &crate::semantics::LLM_SEMANTICS_ID);
+    assert!(matches!(got, Ok(KvCacheSemantics::VerifiedPrevious(p)) if p == previous));
+}

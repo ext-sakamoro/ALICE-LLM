@@ -11,6 +11,7 @@ RUNNING_SEMANTICS_ID = "a cfg alias: LLM_SEMANTICS_ID, or LLM_PLATFORM_SEMANTICS
 [[id]]
 path = "alice_llm::semantics::LLM_SEMANTICS_ID"
 previous = "alice_llm::semantics::LLM_PREVIOUS_SEMANTICS_IDS"
+previous-tests = ["src/lib.rs::a_stamp_of_the_previous_identifier_is_accepted"]
 
 [[id]]
 # persisted: a platform-math build stamps it into the KV cache files (as RUNNING_SEMANTICS_ID,
