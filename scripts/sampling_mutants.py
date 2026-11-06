@@ -60,6 +60,10 @@ MUTANTS = [
 LLAMA3_MUTANTS = [
     ("the replay ignores top-p", "        top_p_filter(&mut scaled, p)?;\n", "        let _ = p;\n"),
     ("the replay does not check its temperature", "    if !(temperature > 0.0 && temperature.is_finite()) {\n        return Err(SamplingError::InvalidParameter);\n    }\n    let mut scaled", "    let mut scaled"),
+    ("the token ignores the temperature", "    apply_temperature(&mut logits, temperature);\n    top_k_filter(&mut logits, top_k)?;\n    softmax_inplace", "    top_k_filter(&mut logits, top_k)?;\n    softmax_inplace"),
+    ("the token ignores top-k", "    apply_temperature(&mut logits, temperature);\n    top_k_filter(&mut logits, top_k)?;\n    softmax_inplace", "    apply_temperature(&mut logits, temperature);\n    softmax_inplace"),
+    ("the token is greedy", "    Ok(sample_with_random(&logits, rng.next_f32())? as u32)\n}", "    let _ = rng.next_f32();\n    Ok(sample_argmax(&logits)? as u32)\n}"),
+    ("the seed changes each time", "    Ok(sample_with_random(&logits, rng.next_f32())? as u32)\n}", "    let mut r = Rng64::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos().into());\n    let _ = rng.next_f32();\n    Ok(sample_with_random(&logits, r.next_f32())? as u32)\n}"),
     ("a router sorts with the old comparator", "descending_nan_last(a.1, b.1));\n    indexed.truncate(top_k);\n\n    // Weights use the raw scores", "b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));\n    indexed.truncate(top_k);\n\n    // Weights use the raw scores"),
     ("the other router sorts with the old comparator", "idx_biased.sort_by(|a, b| descending_nan_last(a.1, b.1));", "idx_biased.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));"),
 ]

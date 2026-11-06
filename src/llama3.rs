@@ -16249,6 +16249,10 @@ impl<'a> Llama3Model<'a> {
     }
 
     /// Generate tokens autoregressively.
+    /// Below a temperature of `1e-6` it takes the largest token. Above, it samples from
+    /// `softmax(logits / temperature)` over the `top_k` largest (`top_k` 0 keeps all) with a fixed
+    /// seed: same inputs give the same tokens.
+    ///
     /// # Errors
     ///
     /// [`SamplingError`] when the model produces logits there is nothing to sample from.
@@ -16295,6 +16299,7 @@ impl<'a> Llama3Model<'a> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
 
+        let mut rng = Rng64::new(GENERATE_SEED);
         for _ in 0..max_new_tokens {
             // Repetition penalty on recently generated tokens (if enabled).
             if (rep_penalty - 1.0).abs() > f32::EPSILON {
@@ -16311,7 +16316,7 @@ impl<'a> Llama3Model<'a> {
                 }
             }
 
-            let next_token = sample_token(&logits, temperature, top_k)?;
+            let next_token = sample_token(&logits, temperature, top_k, &mut rng)?;
 
             if next_token == tokenizer.eos_id {
                 break;
@@ -17283,8 +17288,9 @@ impl<'a> Llama3Model<'a> {
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
 
+        let mut rng = Rng64::new(GENERATE_SEED);
         for _ in 0..max_new_tokens {
-            let next_token = sample_token(&logits, temperature, top_k)?;
+            let next_token = sample_token(&logits, temperature, top_k, &mut rng)?;
             if next_token == tokenizer.eos_id {
                 break;
             }
@@ -17978,6 +17984,7 @@ impl<'a> Llama3Model<'a> {
         scheduler: &mut BatchScheduler,
         top_k: usize,
     ) -> Result<(), SamplingError> {
+        let mut rng = Rng64::new(GENERATE_SEED);
         // Phase 1: Prefill — run all prompt tokens, store the last logits per request
         let mut pending_logits: Vec<Option<Vec<f32>>> = Vec::new();
         for req in scheduler.requests_mut().iter_mut() {
@@ -17999,7 +18006,7 @@ impl<'a> Llama3Model<'a> {
                 continue;
             }
             if let Some(ref logits) = pending_logits[i] {
-                let next_token = sample_token(logits, req.temperature, top_k)?;
+                let next_token = sample_token(logits, req.temperature, top_k, &mut rng)?;
                 if next_token == tokenizer.eos_id {
                     req.done = true;
                 } else {
@@ -18023,7 +18030,7 @@ impl<'a> Llama3Model<'a> {
 
                 let last_tok = *req.generated.last().unwrap();
                 let logits = self.forward_paged(last_tok, &mut req.kv_cache);
-                let next_token = sample_token(&logits, req.temperature, top_k)?;
+                let next_token = sample_token(&logits, req.temperature, top_k, &mut rng)?;
 
                 if next_token == tokenizer.eos_id {
                     req.done = true;
@@ -18240,10 +18247,11 @@ impl<'a> Llama3Model<'a> {
         })
     }
 
-    /// One token from what a grammar left unmasked, by the sampling law.
+    /// One token from what a grammar left unmasked: greedy, as `generate_grammar` documents, so the
+    /// temperature has no part in it.
     #[cfg(feature = "grammar")]
-    fn pick_token(logits: &[f32], temperature: f32, top_k: usize) -> Result<u32, SamplingError> {
-        sample_token(logits, temperature, top_k)
+    fn pick_token(logits: &[f32], _temperature: f32, top_k: usize) -> Result<u32, SamplingError> {
+        sample_token(logits, 0.0, top_k, &mut Rng64::new(GREEDY_SEED))
     }
 
     /// Shared grammar-constrained decode loop: FSM at grammar root, token
@@ -18379,15 +18387,29 @@ impl crate::speculative_dspark::DraftBackend for KimiK3Model<'_> {
 
 // ─── Sampling helpers ────────────────────────────────────────────────────────
 
-fn sample_token(logits: &[f32], temperature: f32, top_k: usize) -> Result<u32, SamplingError> {
+fn sample_token(
+    logits: &[f32],
+    temperature: f32,
+    top_k: usize,
+    rng: &mut Rng64,
+) -> Result<u32, SamplingError> {
     let mut logits = logits.to_vec();
-    if temperature != 1.0 {
-        apply_temperature(&mut logits, temperature);
+    if temperature < 1e-6 {
+        // greedy: the largest token is inside any top-k, so `top_k` only adds its check
+        top_k_filter(&mut logits, top_k)?;
+        return Ok(sample_argmax(&logits)? as u32);
     }
-    // the largest token is inside any top-k, so `top_k` changes nothing here: this path is greedy
+    apply_temperature(&mut logits, temperature);
     top_k_filter(&mut logits, top_k)?;
-    Ok(sample_argmax(&logits)? as u32)
+    softmax_inplace(&mut logits)?;
+    Ok(sample_with_random(&logits, rng.next_f32())? as u32)
 }
+
+/// The seed of `generate`, `generate_ternary` and `generate_batch`: same inputs give the same tokens.
+const GENERATE_SEED: u64 = 42;
+/// The seed where the choice is greedy and takes nothing from it.
+#[cfg(feature = "grammar")]
+const GREEDY_SEED: u64 = 42;
 
 /// Simple xorshift64 PRNG for speculative sampling.
 struct Rng64 {
@@ -24004,6 +24026,8 @@ mod a_model_that_produces_nan {
             ("llama.feed_forward_length".to_string(), HIDDEN as u32),
             ("llama.vocab_size".to_string(), VOCAB as u32),
             ("llama.attention.head_count".to_string(), 1),
+            // no token ends the generation in these tests
+            ("tokenizer.ggml.eos_token_id".to_string(), 999),
         ];
         let embedding: Vec<f32> = (0..VOCAB * HIDDEN)
             .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
@@ -24131,6 +24155,57 @@ mod a_model_that_produces_nan {
         assert!(out.tokens_generated <= 2);
     }
 
+    /// `generate` with a fixed model: the tokens it returns
+    fn tokens(temperature: f32, top_k: usize) -> Vec<u32> {
+        let bytes = llama_bytes(SMALL);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        let out = model
+            .generate(&tokenizer, "t1", 64, temperature, top_k)
+            .unwrap();
+        assert_eq!(out.tokens_generated, 64);
+        out.text
+            .split('t')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn generate_honours_temperature_and_is_the_same_each_time() {
+        let hot = tokens(50.0, 0);
+        assert_eq!(hot.len(), 64);
+        assert_eq!(hot, tokens(50.0, 0), "same inputs give the same tokens");
+        let mut seen = hot.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(seen.len() > 1, "temperature 50 chose only {seen:?}");
+        assert_ne!(
+            hot,
+            tokens(0.0, 0),
+            "temperature 50 chose what greedy chooses"
+        );
+    }
+
+    #[test]
+    fn generate_at_temperature_zero_is_greedy_whatever_top_k_says() {
+        let greedy = tokens(0.0, 0);
+        let first = greedy[0];
+        for k in [0, 1, 2, VOCAB] {
+            assert_eq!(tokens(0.0, k), greedy, "top_k {k}");
+        }
+        assert!(greedy.len() == 64 && first < VOCAB as u32);
+    }
+
+    #[test]
+    fn generate_with_top_k_one_is_greedy_at_any_temperature() {
+        let greedy = tokens(0.0, 0);
+        for t in [0.5, 1.0, 50.0] {
+            assert_eq!(tokens(t, 1), greedy, "temperature {t}");
+        }
+    }
+
     #[test]
     fn nan_logits_are_refused_on_every_generate_path() {
         let bytes = llama_bytes(NAN_F16);
@@ -24226,26 +24301,87 @@ mod refuses_what_it_cannot_sample {
     fn the_copies_of_the_law_are_gone_and_the_token_comes_from_it() {
         let logits = every_third_nan(64);
         assert_eq!(
-            sample_token(&logits, 1.0, 5),
+            sample_token(&logits, 1.0, 5, &mut Rng64::new(42)),
             Err(SamplingError::NonFinite { index: 0 })
         );
         assert_eq!(
-            sample_token(&[f32::NEG_INFINITY; 3], 1.0, 2),
+            sample_token(&[f32::NEG_INFINITY; 3], 1.0, 2, &mut Rng64::new(42)),
             Err(SamplingError::AllMasked)
         );
         // a temperature that breaks the logits meets the same check
         assert_eq!(
-            sample_token(&[1.0, 2.0], f32::NAN, 1),
+            sample_token(&[1.0, 2.0], f32::NAN, 1, &mut Rng64::new(42)),
             Err(SamplingError::NonFinite { index: 0 })
         );
-        // no tie: the largest, whatever k and the temperature
+        // no tie, temperature 0: the largest, whatever k
         for k in [0, 1, 2, 5] {
-            for t in [0.0, 0.5, 1.0, 2.0] {
-                assert_eq!(sample_token(&[1.0, 5.0, 2.0, 3.0], t, k), Ok(1), "{k} {t}");
-            }
+            assert_eq!(
+                sample_token(&[1.0, 5.0, 2.0, 3.0], 0.0, k, &mut Rng64::new(42)),
+                Ok(1),
+                "{k}"
+            );
         }
         // a tie goes to the last, as in `sample_argmax`
-        assert_eq!(sample_token(&[5.0, 1.0, 5.0], 1.0, 0), Ok(2));
+        assert_eq!(
+            sample_token(&[5.0, 1.0, 5.0], 0.0, 0, &mut Rng64::new(42)),
+            Ok(2)
+        );
+    }
+
+    /// oracle: `softmax(logits / temperature)`, worked by hand for logits `ln 1, ln 2, ln 3, ln 4`: at
+    /// temperature 1 the probabilities are 0.1, 0.2, 0.3, 0.4. Over 200,000 draws one standard deviation
+    /// of a frequency is at most 0.0011; the stated error is 0.005.
+    #[test]
+    fn sampling_at_temperature_one_matches_the_softmax() {
+        let logits: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .map(|x| crate::lawmath::ln(*x))
+            .collect();
+        let mut rng = Rng64::new(42);
+        let mut count = [0u32; 4];
+        const DRAWS: u32 = 200_000;
+        for _ in 0..DRAWS {
+            count[sample_token(&logits, 1.0, 0, &mut rng).unwrap() as usize] += 1;
+        }
+        for (i, expected) in [0.1f64, 0.2, 0.3, 0.4].iter().enumerate() {
+            let got = f64::from(count[i]) / f64::from(DRAWS);
+            assert!(
+                (got - expected).abs() < 0.005,
+                "token {i}: {got} {expected}"
+            );
+        }
+    }
+
+    /// oracle: at temperature 2 the same logits give `sqrt` of the weights: `1, 1.414, 1.732, 2` over
+    /// `6.146`, and `top_k` 2 leaves the last two: `1.732, 2` over `3.732`.
+    #[test]
+    fn temperature_and_top_k_shape_the_distribution() {
+        let logits: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .map(|x| crate::lawmath::ln(*x))
+            .collect();
+        const DRAWS: u32 = 200_000;
+        let frequencies = |t: f32, k: usize| {
+            let mut rng = Rng64::new(42);
+            let mut count = [0u32; 4];
+            for _ in 0..DRAWS {
+                count[sample_token(&logits, t, k, &mut rng).unwrap() as usize] += 1;
+            }
+            count.map(|c| f64::from(c) / f64::from(DRAWS))
+        };
+        let hot = frequencies(2.0, 0);
+        for (i, w) in [1.0f64, 2.0, 3.0, 4.0].iter().enumerate() {
+            let expected = w.sqrt() / (1.0 + 2f64.sqrt() + 3f64.sqrt() + 2.0);
+            assert!(
+                (hot[i] - expected).abs() < 0.005,
+                "token {i}: {} {expected}",
+                hot[i]
+            );
+        }
+        let top = frequencies(2.0, 2);
+        assert_eq!((top[0], top[1]), (0.0, 0.0), "top_k excludes the others");
+        let expected = 3f64.sqrt() / (3f64.sqrt() + 2.0);
+        assert!((top[2] - expected).abs() < 0.005, "{top:?}");
     }
 
     #[test]
