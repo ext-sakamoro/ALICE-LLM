@@ -25,7 +25,13 @@ pub fn ternary_threshold(weights: &[f32], ratio: f32) -> f32 {
         return 0.0;
     }
     let mean_abs = weights.iter().map(|w| w.abs()).sum::<f32>() / weights.len() as f32;
-    ratio * mean_abs
+    let threshold = ratio * mean_abs;
+    if threshold.is_finite() {
+        return threshold;
+    }
+    // finite weights past what f32 can add up. A threshold still past f32::MAX is above every weight
+    let sum: f64 = weights.iter().map(|w| f64::from(w.abs())).sum();
+    (f64::from(ratio) * (sum / weights.len() as f64)) as f32
 }
 
 /// Ternarize an entire weight matrix in-place, returning the scale factor.

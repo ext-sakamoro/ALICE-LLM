@@ -59,6 +59,58 @@ fn a_finite_row_keeps_its_form() {
 }
 
 #[test]
+fn finite_weights_too_large_to_add_up_in_f32_keep_their_form() {
+    // oracle: the mean of |w| by hand. The sum passes f32::MAX, so a sum in f32 is infinite, the
+    // threshold with it, and the row came out all zero
+    let big = 3e38_f32;
+    let row = TernaryRow::from_f32(&[big, -big], 0.5).unwrap();
+    assert_eq!(row.pos_mask, [0b01]);
+    assert_eq!(row.neg_mask, [0b10]);
+    assert_eq!(row.scale.to_bits(), big.to_bits());
+
+    // mean (MAX + MAX + 1 + 1) / 4 is about MAX / 2, threshold about MAX / 4: only the two pass
+    let row = TernaryRow::from_f32(&[f32::MAX, f32::MAX, 1.0, -1.0], 0.5).unwrap();
+    assert_eq!(row.pos_mask, [0b0011]);
+    assert_eq!(row.neg_mask, [0]);
+    assert_eq!(row.scale.to_bits(), f32::MAX.to_bits());
+
+    // the mean of 8 is under the largest, and 2 weights are above it
+    let w = [big, big, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let row = TernaryRow::from_f32(&w, 1.0).unwrap();
+    assert_eq!(row.pos_mask, [0b0000_0011]);
+
+    let sparse = SparseTernaryRow::from_f32(&[big, -big], 0.5, 8).unwrap();
+    assert_eq!(sparse.nnz(), 2);
+    assert_eq!(sparse.scale.to_bits(), big.to_bits());
+}
+
+#[test]
+fn the_threshold_of_training_is_the_same_mean() {
+    // oracle: (3e38 + 3e38) / 2 is 3e38, half of it 1.5e38
+    let big = 3e38_f32;
+    let got = alice_llm::training::ternary_threshold(&[big, big], 0.5);
+    assert_eq!(got.to_bits(), (big / 2.0).to_bits());
+    // a ratio of 0 is a threshold of 0, also when the sum passes f32
+    assert_eq!(
+        alice_llm::training::ternary_threshold(&[big, big], 0.0).to_bits(),
+        0
+    );
+    // nothing changes for a row f32 can add up: 1 + 2 + 3, mean 2
+    assert_eq!(
+        alice_llm::training::ternary_threshold(&[1.0, 2.0, 3.0], 0.5).to_bits(),
+        1.0_f32.to_bits()
+    );
+}
+
+#[test]
+fn a_threshold_that_passes_f32_is_above_every_weight() {
+    // by the definition: ratio * mean is past f32::MAX, so no weight is above it
+    let row = TernaryRow::from_f32(&[f32::MAX, f32::MAX], 2.0).unwrap();
+    assert_eq!(row.pos_mask, [0]);
+    assert_eq!(row.scale.to_bits(), 0.0_f32.to_bits());
+}
+
+#[test]
 fn a_block_keeps_its_largest_weights() {
     // one block of 16: 5..=16 are above the threshold, and the 2 largest are 15 and 16
     let w: Vec<f32> = (1..=16u8).map(f32::from).collect();

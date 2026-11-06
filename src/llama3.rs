@@ -13638,7 +13638,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .k_proj
                         .as_ref()
-                        .expect("k_proj required for ternarize"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -13647,7 +13647,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .v_proj
                         .as_ref()
-                        .expect("v_proj required for ternarize"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -13663,7 +13663,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .gate_proj
                         .as_ref()
-                        .expect("gate_proj required for ternarize"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -13672,7 +13672,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .up_proj
                         .as_ref()
-                        .expect("up_proj required for ternarize"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -13681,7 +13681,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .down_proj
                         .as_ref()
-                        .expect("down_proj required for ternarize"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.hidden_dim,
                     c.intermediate_dim,
                     threshold_ratio,
@@ -17360,14 +17360,20 @@ impl<'a> Llama3Model<'a> {
                     n_keep,
                 )?,
                 k_proj: sparsify_weight(
-                    layer.k_proj.as_ref().expect("k_proj required for sparsify"),
+                    layer
+                        .k_proj
+                        .as_ref()
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
                 )?,
                 v_proj: sparsify_weight(
-                    layer.v_proj.as_ref().expect("v_proj required for sparsify"),
+                    layer
+                        .v_proj
+                        .as_ref()
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -17385,7 +17391,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .gate_proj
                         .as_ref()
-                        .expect("gate_proj required for sparsify"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -17395,7 +17401,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .up_proj
                         .as_ref()
-                        .expect("up_proj required for sparsify"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
@@ -17405,7 +17411,7 @@ impl<'a> Llama3Model<'a> {
                     layer
                         .down_proj
                         .as_ref()
-                        .expect("down_proj required for sparsify"),
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,
                     c.hidden_dim,
                     c.intermediate_dim,
                     threshold_ratio,
@@ -24183,6 +24189,19 @@ mod a_model_that_produces_nan {
         assert_eq!(model.load_ternary(0.7), Err(bad));
         assert!(model.ternary_layers.is_none() && model.ternary_output_proj.is_none());
         assert_eq!(model.load_sparse_ternary(0.7, 8), Err(bad));
+        assert!(model.sparse_ternary_layers.is_none() && model.sparse_ternary_output.is_none());
+    }
+
+    /// A MoE layer has experts where a ternary form needs gate, up and down: it was a panic.
+    #[test]
+    fn a_moe_model_has_no_ternary_form_and_stays_as_it_was() {
+        let bytes = moe_bytes(21, false);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        let refused = TernaryError::NoTernaryForm { layer: 0 };
+        assert_eq!(model.load_ternary(0.7), Err(refused));
+        assert!(model.ternary_layers.is_none() && model.ternary_output_proj.is_none());
+        assert_eq!(model.load_sparse_ternary(0.7, 8), Err(refused));
         assert!(model.sparse_ternary_layers.is_none() && model.sparse_ternary_output.is_none());
     }
 

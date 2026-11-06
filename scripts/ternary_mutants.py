@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GGUF = ROOT / "src" / "gguf.rs"
 LLAMA3 = ROOT / "src" / "llama3.rs"
+TRAINING = ROOT / "src" / "training.rs"
 COMMANDS = [
     ["cargo", "test", "--test", "ternary_refuses"],
     ["cargo", "test", "--lib", "a_model_that_produces_nan"],
@@ -69,6 +70,24 @@ MUTANTS = [
     ("the shape product wraps", GGUF, """        let expected = num_rows.saturating_mul(num_cols);
         if weights.len()""", """        let expected = num_rows.wrapping_mul(num_cols);
         if weights.len()"""),
+    ("a threshold past f32 is left infinite", TRAINING, """    if threshold.is_finite() {
+        return threshold;
+    }
+""", "    if true {\n        return threshold;\n    }\n"),
+    ("the wide threshold has no ratio", TRAINING, "(f64::from(ratio) * (sum / weights.len() as f64)) as f32", "(sum / weights.len() as f64) as f32"),
+    ("a scale past f32 is left infinite", GGUF, "            if abs_sum.is_finite() {\n", "            if true {\n"),
+    ("a MoE layer is a panic in the ternary form", LLAMA3, """gate_proj: ternarize_weight(
+                    layer
+                        .gate_proj
+                        .as_ref()
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,""", """gate_proj: ternarize_weight(
+                    layer.gate_proj.as_ref().expect("gate_proj"),"""),
+    ("a MoE layer is a panic in the sparse form", LLAMA3, """gate_proj: sparsify_weight(
+                    layer
+                        .gate_proj
+                        .as_ref()
+                        .ok_or(TernaryError::NoTernaryForm { layer: i })?,""", """gate_proj: sparsify_weight(
+                    layer.gate_proj.as_ref().expect("gate_proj"),"""),
     ("the draft path has no MoE", LLAMA3, """            // the same dispatch as `forward`: a MoE layer has no gate_proj
             if layer.ffn_gate_inp().is_some() {""", """            if false {"""),
 ]

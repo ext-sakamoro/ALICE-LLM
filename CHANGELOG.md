@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **破壊的:** `TernaryRow::from_f32` / `TernaryMatrix::from_quantized` / `SparseTernaryRow::from_f32` / `from_ternary_row` / `SparseTernaryMatrix::from_ternary` / `from_f32_weights` / `Llama3Model::load_ternary` / `load_sparse_ternary` は `Result<_, TernaryError>` を返す 有限でない重み、有限で 0 以上でない threshold、dequantize できない型、形の合わない入力を断る 以前は重みに `NaN` か無限大が 1 つあると、その行全体がエラーなしで 0 になった 型が未対応の tensor も 0 として読んでいた `from_ternary_row` は panic していた
+- **破壊的:** `TernaryRow::from_f32` / `TernaryMatrix::from_quantized` / `SparseTernaryRow::from_f32` / `from_ternary_row` / `SparseTernaryMatrix::from_ternary` / `from_f32_weights` / `Llama3Model::load_ternary` / `load_sparse_ternary` は `Result<_, TernaryError>` を返す 有限でない重み、有限で 0 以上でない threshold、dequantize できない型、形の合わない入力、ternary の形を持たない層 (MoE、KV 共有) を断る 以前は重みに `NaN` か無限大が 1 つあると、その行全体がエラーなしで 0 になった 型が未対応の tensor も 0 として読んでいた `from_ternary_row` は panic していた
 - `LLM_SEMANTICS_ID` を `cd0f624f` に動かした 新しい scenario `sampling choices` (`top_k_filter` / `sample_argmax` の同点の規則 / `sample_with_random` の和を超えた時) を fold に足した 以前の値 `c1eee96c` は `LLM_PREVIOUS_SEMANTICS_IDS` に置き、その KV cache は読める (cache に token の選択は入らない)
 - **破壊的:** `Llama3Model` の `generate` / `generate_speculative` / `generate_speculative_dual` / `generate_ternary` / `generate_sparse_ternary_speculative` / `generate_batch` と `speculative_decode` / `speculative_decode_v2` は `Result<_, SamplingError>` を返す 内部の sampling の写しをやめ `sampling` を呼ぶ `softmax` は `sampling` の丸めになり確率が最大 1 ulp 変わる、完全に同じ logit の組の選び方は `sample_argmax` と同じ最後の token になる (以前は sort の位置、`speculative_decode` は最初の token) `speculative_decode_v2` の分布も `apply_temperature` と `top_p_filter` と `softmax` で作る top-p は和が p を超えるまで残す (`cum > p`、以前は `cum >= p`) `p` が 0 以下の時は最も確率の高い token だけ残す (以前は全部残す) 境界の token が変わる
 - `sampling::descending_nan_last`: `NaN` を最後に置く全順序 数値の順は `partial_cmp` と同じで `-0` と `+0` を等しく扱う MoE の router と `PersistenceHeuristic::predict` が使い、`NaN` の score で sort が panic しない `NaN` は logits に届き、`sampling` が拒否する
@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: `semver-checks.yml` runs only when started by hand (`workflow_dispatch`); it has no `changes` job or gate, and `.github/paths/semver-checks.txt` is removed. The full preflight run still runs the same command.
 
 ### Fixed
+- `TernaryRow::from_f32` / `training::ternary_threshold`: 有限の重みの和が f32 を超えると threshold が無限大になり、行全体が 0 になった その時だけ f64 で計算する 超えない行の結果は変わらない
 - `generate_speculative` が MoE の model で panic していた draft の経路で MoE の層を `forward` と同じように扱う
 - `Llama3Model::generate` / `generate_ternary` / `generate_batch` が `temperature` と `top_k` を無視して常に最大の token を返していた temperature が `1e-6` 以上なら `softmax(logits / temperature)` の上位 `top_k` から固定の seed で sample する 同じ入力は同じ token を返す temperature 0 の結果は変わらない
 - `sample_with_random`: 乱数が確率の和を超えた時 (丸めで和が 1 に届かない時を含む)、最後の token でなく確率を持つ最後の token を返す 確率 0 の token、たとえば grammar で mask した token を返していた (`[0.3, 0.3, 0.3, 0.0]` と 0.95 で 3) 結果が変わるのはこの場合だけ

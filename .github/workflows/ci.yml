@@ -239,7 +239,7 @@ jobs:
         run: scripts/run_tests.sh gguf_untrusted_counts=4 -- cargo test --test gguf_untrusted_counts
       - name: Ternary weights refused
         if: matrix.features == 'default'
-        run: scripts/run_tests.sh ternary_refuses=8 -- cargo test --test ternary_refuses
+        run: scripts/run_tests.sh ternary_refuses=11 -- cargo test --test ternary_refuses
       # the non-Law build (platform libm in lawmath) must keep compiling
       - name: Non-Law build compiles (platform-math)
         if: matrix.features == 'default'

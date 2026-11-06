@@ -5441,6 +5441,8 @@ pub enum TernaryError {
     InvalidThreshold,
     /// The tensor type has no dequantizer here
     UnsupportedType(GgmlType),
+    /// This layer has no projection the ternary form needs, as in a MoE or shared-KV layer
+    NoTernaryForm { layer: usize },
     /// The weights given do not match the shape of the row or matrix
     LengthMismatch { expected: usize, got: usize },
 }
@@ -5449,7 +5451,10 @@ impl std::fmt::Display for TernaryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NonFiniteWeight { index } => write!(f, "weight {index} is not finite"),
-            Self::InvalidThreshold => f.write_str("threshold ratio is not finite and positive"),
+            Self::InvalidThreshold => {
+                f.write_str("threshold ratio is not finite and at least zero")
+            }
+            Self::NoTernaryForm { layer } => write!(f, "layer {layer} has no ternary form"),
             Self::UnsupportedType(t) => write!(f, "no ternary form for tensor type {t:?}"),
             Self::LengthMismatch { expected, got } => {
                 write!(f, "expected {expected} weights, got {got}")
@@ -5483,12 +5488,12 @@ impl TernaryRow {
         let num_cols = weights.len();
         let num_bytes = num_cols.div_ceil(8);
 
-        let mean_abs: f32 = weights.iter().map(|w| w.abs()).sum::<f32>() / num_cols as f32;
-        let threshold = threshold_ratio * mean_abs;
+        let threshold = crate::training::ternary_threshold(weights, threshold_ratio);
 
         let mut pos_mask = vec![0u8; num_bytes];
         let mut neg_mask = vec![0u8; num_bytes];
         let mut abs_sum = 0.0f32;
+        let mut abs_sum_wide = 0.0f64;
         let mut nonzero_count = 0usize;
 
         for (i, &w) in weights.iter().enumerate() {
@@ -5501,12 +5506,18 @@ impl TernaryRow {
                     neg_mask[byte_idx] |= bit;
                 }
                 abs_sum += w.abs();
+                abs_sum_wide += f64::from(w.abs());
                 nonzero_count += 1;
             }
         }
 
         let scale = if nonzero_count > 0 {
-            abs_sum / nonzero_count as f32
+            if abs_sum.is_finite() {
+                abs_sum / nonzero_count as f32
+            } else {
+                // finite weights past what f32 can add up
+                (abs_sum_wide / nonzero_count as f64) as f32
+            }
         } else {
             0.0
         };
