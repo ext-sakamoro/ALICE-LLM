@@ -64,7 +64,8 @@ fn main() {
     let mut draft = Llama3Model::from_gguf(&gguf).expect("draft");
     let mut main1 = Llama3Model::from_gguf(&gguf).expect("main");
     let t0 = Instant::now();
-    let r1 = speculative_decode_v2(&mut draft, &mut main1, &tokens, &cfg);
+    let r1 = speculative_decode_v2(&mut draft, &mut main1, &tokens, &cfg)
+        .expect("the model produced logits it cannot sample from");
     let t1 = t0.elapsed().as_millis();
     let text1 = tokenizer.decode(&r1.tokens);
     eprintln!(
@@ -81,7 +82,8 @@ fn main() {
     eprintln!("\n[run 2] same seed — verify determinism");
     let mut draft2 = Llama3Model::from_gguf(&gguf).expect("draft2");
     let mut main2 = Llama3Model::from_gguf(&gguf).expect("main2");
-    let r2 = speculative_decode_v2(&mut draft2, &mut main2, &tokens, &cfg);
+    let r2 = speculative_decode_v2(&mut draft2, &mut main2, &tokens, &cfg)
+        .expect("the model produced logits it cannot sample from");
     let text2 = tokenizer.decode(&r2.tokens);
     eprintln!(
         "Run 2: {} tokens, acceptance {:.1}%",
@@ -105,7 +107,8 @@ fn main() {
     eprintln!("\n[run 3] different seed — expect divergence (informational)");
     let mut draft3 = Llama3Model::from_gguf(&gguf).expect("draft3");
     let mut main3 = Llama3Model::from_gguf(&gguf).expect("main3");
-    let r3 = speculative_decode_v2(&mut draft3, &mut main3, &tokens, &cfg2);
+    let r3 = speculative_decode_v2(&mut draft3, &mut main3, &tokens, &cfg2)
+        .expect("the model produced logits it cannot sample from");
     let text3 = tokenizer.decode(&r3.tokens);
     eprintln!(
         "Run 3: {} tokens, acceptance {:.1}%",

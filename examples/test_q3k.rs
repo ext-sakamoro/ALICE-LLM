@@ -30,7 +30,9 @@ fn main() {
 
     println!("\nGenerating with Q3_K_M model...");
     let prompt = "<|start_header_id|>user<|end_header_id|>\n\nWhat is 1+1?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-    let result = model.generate(&tok, prompt, 30, 0.0, 40);
+    let result = model
+        .generate(&tok, prompt, 30, 0.0, 40)
+        .expect("the model produced logits it cannot sample from");
     println!("Greedy: \"{}\"", result.text);
     println!(
         "{} tokens, {:.1} tok/s",
@@ -39,7 +41,9 @@ fn main() {
 
     // Try with temperature
     model.clear_cache();
-    let result2 = model.generate(&tok, prompt, 50, 0.7, 40);
+    let result2 = model
+        .generate(&tok, prompt, 50, 0.7, 40)
+        .expect("the model produced logits it cannot sample from");
     println!("\nTemp=0.7: \"{}\"", result2.text);
 
     // BOS token top-10

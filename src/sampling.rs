@@ -48,7 +48,7 @@ impl core::fmt::Display for SamplingError {
 impl std::error::Error for SamplingError {}
 
 /// Logits are finite or `-inf` (a masked token), and at least one is not masked.
-fn check_logits(logits: &[f32]) -> Result<(), SamplingError> {
+pub(crate) fn check_logits(logits: &[f32]) -> Result<(), SamplingError> {
     if let Some(index) = logits
         .iter()
         .position(|l| l.is_nan() || *l == f32::INFINITY)
@@ -90,7 +90,19 @@ pub fn top_k_filter(logits: &mut [f32], k: usize) -> Result<(), SamplingError> {
 
 /// Descending order of values already checked to have no `NaN`.
 fn f32_descending(a: &f32, b: &f32) -> std::cmp::Ordering {
-    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    descending_nan_last(*a, *b)
+}
+
+/// A total order for sorting scores: descending, `NaN` last. Finite values and `±inf` order exactly as
+/// `partial_cmp` does, `-0` and `+0` as equal (`f32::total_cmp` would part them and reorder ties).
+#[must_use]
+pub fn descending_nan_last(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+    }
 }
 
 /// Top-p (nucleus) filtering: keep smallest set of tokens whose

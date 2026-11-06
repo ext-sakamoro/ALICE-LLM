@@ -294,11 +294,51 @@ fn a_token_with_no_probability_is_never_sampled() {
         }
         let probs = softmax(&logits).unwrap();
         // the top of the range is where rounding leaves the sum short
-        let r = if rng.next() % 2 == 0 { 1.0 - f32::EPSILON / 2.0 } else { rng.unit() };
+        let r = if rng.next() % 2 == 0 {
+            1.0 - f32::EPSILON / 2.0
+        } else {
+            rng.unit()
+        };
         let i = sample_with_random(&probs, r).unwrap();
         assert!(probs[i] > 0.0, "token {i} of {probs:?} at {r}");
     }
     assert!(masked_seen > 100_000, "masked {masked_seen}");
+}
+
+/// `descending_nan_last` orders numbers exactly as `partial_cmp` did, `-0` and `+0` as equal, and has
+/// a total order with `NaN` in it: the sort it serves panics on one that is not.
+#[test]
+fn the_order_for_scores() {
+    use alice_llm::sampling::descending_nan_last;
+    use std::cmp::Ordering::Equal;
+    let mut rng = Rng(0x4f52_4445);
+    let mut compared = 0usize;
+    for _ in 0..20_000 {
+        let v: Vec<(usize, f32)> = rng.logits().into_iter().enumerate().collect();
+        let mut a = v.clone();
+        let mut b = v;
+        a.sort_by(|x, y| descending_nan_last(x.1, y.1));
+        b.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(Equal));
+        assert_eq!(a, b);
+        compared += a.len();
+    }
+    assert!(compared > 100_000, "{compared}");
+    assert_eq!(descending_nan_last(0.0, -0.0), Equal);
+    for n in [8usize, 21, 32, 64, 192, 256, 4096] {
+        let mut v: Vec<f32> = (0..n)
+            .map(|i| match i % 5 {
+                0 => NAN,
+                1 => -NAN,
+                2 => INF,
+                3 => MASK,
+                _ => i as f32,
+            })
+            .collect();
+        v.sort_by(|x, y| descending_nan_last(*x, *y));
+        let first_nan = v.iter().position(|x| x.is_nan()).unwrap();
+        assert!(v[first_nan..].iter().all(|x| x.is_nan()), "{n}");
+        assert!(v[..first_nan].windows(2).all(|w| w[0] >= w[1]), "{n}");
+    }
 }
 
 #[test]

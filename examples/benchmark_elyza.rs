@@ -84,7 +84,9 @@ fn main() {
             "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
 
-        let result = model.generate(&tokenizer, &formatted, max_tokens, 0.0, 1);
+        let result = model
+            .generate(&tokenizer, &formatted, max_tokens, 0.0, 1)
+            .expect("the model produced logits it cannot sample from");
 
         println!("\n[{}/{}] {prompt}", i + 1, PROMPTS.len());
         println!("  → {}", result.text.chars().take(200).collect::<String>());

@@ -138,14 +138,16 @@ fn main() {
 
     // --- Baseline: vanilla generate_speculative_dual ---
     println!("--- Baseline (vanilla speculative_dual, K={spec_k}) ---");
-    let baseline = main_model.generate_speculative_dual(
-        &mut draft_model,
-        &tokenizer,
-        &formatted,
-        max_tokens,
-        temperature,
-        spec_k,
-    );
+    let baseline = main_model
+        .generate_speculative_dual(
+            &mut draft_model,
+            &tokenizer,
+            &formatted,
+            max_tokens,
+            temperature,
+            spec_k,
+        )
+        .expect("the model produced logits it cannot sample from");
     println!("{}", baseline.text);
     println!(
         "  {} tokens, {:.2} tok/s ({}ms prefill + {}ms decode)",

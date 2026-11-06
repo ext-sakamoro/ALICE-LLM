@@ -20,7 +20,9 @@ fn main() {
 
     // Test: generate 3 tokens
     println!("\nGenerating 3 tokens...");
-    let result = model.generate(&tokenizer, "Hello", 3, 0.0, 1);
+    let result = model
+        .generate(&tokenizer, "Hello", 3, 0.0, 1)
+        .expect("the model produced logits it cannot sample from");
     println!("Output: {:?}", result.text);
     println!(
         "Tokens: {}, Speed: {:.2} tok/s",

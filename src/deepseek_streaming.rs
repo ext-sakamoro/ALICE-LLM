@@ -662,7 +662,7 @@ impl NextLayerPredictor for PersistenceHeuristic {
             .enumerate()
             .map(|(i, &v)| (i, v))
             .collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_by(|a, b| crate::sampling::descending_nan_last(a.1, b.1));
         indexed.into_iter().take(top_k).map(|(i, _)| i).collect()
     }
 }

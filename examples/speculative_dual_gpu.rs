@@ -268,8 +268,10 @@ fn main() {
 
             for i in 0..k {
                 let p = softmax(&verify_logits_flat[i * verify_vocab..(i + 1) * verify_vocab])
+                    .expect("the model produced logits it cannot sample from")
                     .expect("the model produced logits it cannot sample from");
                 let q = softmax(&draft_logits[i][..draft_vocab])
+                    .expect("the model produced logits it cannot sample from")
                     .expect("the model produced logits it cannot sample from");
                 let x = draft_tokens[i] as usize;
 

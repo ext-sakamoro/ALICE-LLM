@@ -261,19 +261,25 @@ fn main() {
     }
 
     let result = if ternary {
-        model.generate_ternary(&tokenizer, &formatted, max_tokens, temperature, 40)
+        model
+            .generate_ternary(&tokenizer, &formatted, max_tokens, temperature, 40)
+            .expect("the model produced logits it cannot sample from")
     } else if spec_k > 0 {
-        model.generate_speculative(
-            &tokenizer,
-            &formatted,
-            max_tokens,
-            temperature,
-            40,
-            spec_k,
-            draft_layers,
-        )
+        model
+            .generate_speculative(
+                &tokenizer,
+                &formatted,
+                max_tokens,
+                temperature,
+                40,
+                spec_k,
+                draft_layers,
+            )
+            .expect("the model produced logits it cannot sample from")
     } else {
-        model.generate(&tokenizer, &formatted, max_tokens, temperature, 40)
+        model
+            .generate(&tokenizer, &formatted, max_tokens, temperature, 40)
+            .expect("the model produced logits it cannot sample from")
     };
 
     println!("{}", result.text);

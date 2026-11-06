@@ -82,7 +82,8 @@ fn main() {
         n_draft,
         max_new,
         Some(eos_id),
-    );
+    )
+    .expect("the model produced logits it cannot sample from");
     let spec_ms = t0.elapsed().as_millis();
     let spec_text = tokenizer.decode(&spec.tokens);
     eprintln!(

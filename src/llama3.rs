@@ -9,6 +9,10 @@ use crate::gguf::{
     ternary_matvec, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, SparseTernaryMatrix,
     TernaryMatrix,
 };
+use crate::sampling::{
+    apply_temperature, descending_nan_last, sample_argmax, sample_with_random, softmax,
+    top_k_filter, SamplingError,
+};
 use std::fmt::Write;
 use std::time::Instant;
 
@@ -8524,7 +8528,7 @@ fn kimi_k3_moe_router(
         .enumerate()
         .map(|(i, &v)| (i, v))
         .collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| descending_nan_last(a.1, b.1));
     indexed.truncate(top_k);
 
     // Weights use the raw scores (bias omitted, per §2.3.3 Eq 13
@@ -16245,6 +16249,9 @@ impl<'a> Llama3Model<'a> {
     }
 
     /// Generate tokens autoregressively.
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate(
         &mut self,
         tokenizer: &GgufTokenizer,
@@ -16252,7 +16259,7 @@ impl<'a> Llama3Model<'a> {
         max_new_tokens: usize,
         temperature: f32,
         top_k: usize,
-    ) -> GenerateResult {
+    ) -> Result<GenerateResult, SamplingError> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Prepend BOS if not already present
@@ -16304,41 +16311,7 @@ impl<'a> Llama3Model<'a> {
                 }
             }
 
-            // Temperature
-            if temperature > 0.0 && temperature != 1.0 {
-                let inv_t = 1.0 / temperature;
-                for l in &mut logits {
-                    *l *= inv_t;
-                }
-            }
-
-            // Top-k + argmax sampling
-            let next_token = if top_k > 0 && top_k < logits.len() {
-                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                indexed.truncate(top_k);
-
-                let max_val = indexed[0].1;
-                let mut sum = 0.0f32;
-                for (_, l) in &mut indexed {
-                    *l = crate::lawmath::exp(*l - max_val);
-                    sum += *l;
-                }
-                for (_, l) in &mut indexed {
-                    *l /= sum;
-                }
-
-                indexed
-                    .iter()
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                    .map_or(0, |(idx, _)| *idx as u32)
-            } else {
-                logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map_or(0, |(idx, _)| idx as u32)
-            };
+            let next_token = sample_token(&logits, temperature, top_k)?;
 
             if next_token == tokenizer.eos_id {
                 break;
@@ -16368,7 +16341,7 @@ impl<'a> Llama3Model<'a> {
 
         let output_text = tokenizer.decode(&generated);
 
-        GenerateResult {
+        Ok(GenerateResult {
             text: output_text,
             tokens_generated: gen_count,
             prompt_tokens: prompt_token_count,
@@ -16377,7 +16350,7 @@ impl<'a> Llama3Model<'a> {
             total_ms,
             tokens_per_sec: tok_per_sec,
             spec_stats: None,
-        }
+        })
     }
 
     /// Generate with speculative decoding (layer-skip draft + verify).
@@ -16385,6 +16358,10 @@ impl<'a> Llama3Model<'a> {
     /// Uses the first `draft_layers` layers as a cheap draft model to predict
     /// `spec_k` tokens ahead, then verifies with the full model. Accepted draft
     /// tokens skip redundant full-forward passes.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate_speculative(
         &mut self,
         tokenizer: &GgufTokenizer,
@@ -16394,7 +16371,7 @@ impl<'a> Llama3Model<'a> {
         _top_k: usize,
         spec_k: usize,
         draft_layers: usize,
-    ) -> GenerateResult {
+    ) -> Result<GenerateResult, SamplingError> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
@@ -16423,9 +16400,9 @@ impl<'a> Llama3Model<'a> {
         while generated.len() < max_new_tokens {
             // Sample from current logits
             let next_token = if temperature > 0.0 {
-                sample_from_probs(&softmax(&logits), rng.next_f32())
+                sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32
             } else {
-                argmax(&logits)
+                sample_argmax(&logits)? as u32
             };
             if next_token == tokenizer.eos_id {
                 break;
@@ -16448,7 +16425,7 @@ impl<'a> Llama3Model<'a> {
             let mut draft_input = next_token;
             for _ in 0..k {
                 let dl = self.forward_draft(draft_input, draft_layers);
-                draft_input = argmax(&dl);
+                draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
             }
@@ -16462,8 +16439,8 @@ impl<'a> Llama3Model<'a> {
 
             let mut all_accepted = true;
             for i in 0..draft_tokens.len() {
-                let p = softmax(&logits);
-                let q = softmax(&draft_logits_all[i]);
+                let p = softmax(&logits)?;
+                let q = softmax(&draft_logits_all[i])?;
                 let x = draft_tokens[i] as usize;
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
@@ -16490,9 +16467,9 @@ impl<'a> Llama3Model<'a> {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_from_probs(&adjusted, rng.next_f32())
+                        sample_with_random(&adjusted, rng.next_f32())? as u32
                     } else {
-                        sample_from_probs(&p, rng.next_f32())
+                        sample_with_random(&p, rng.next_f32())? as u32
                     };
                     if resampled == tokenizer.eos_id {
                         all_accepted = false;
@@ -16508,7 +16485,7 @@ impl<'a> Llama3Model<'a> {
 
             // If all K drafts accepted, sample one more from the final verify logits
             if all_accepted && generated.len() < max_new_tokens {
-                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                let bonus = sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32;
                 if bonus != tokenizer.eos_id {
                     generated.push(bonus);
                     tokens.push(bonus);
@@ -16528,7 +16505,7 @@ impl<'a> Llama3Model<'a> {
 
         let output_text = tokenizer.decode(&generated);
 
-        GenerateResult {
+        Ok(GenerateResult {
             text: output_text,
             tokens_generated: gen_count,
             prompt_tokens: prompt_token_count,
@@ -16542,12 +16519,16 @@ impl<'a> Llama3Model<'a> {
                 draft_layers,
                 spec_k,
             }),
-        }
+        })
     }
 
     /// True speculative decoding with a separate draft model.
     /// The draft model generates K candidate tokens, the main model verifies them
     /// using probabilistic speculative sampling (Leviathan et al.).
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate_speculative_dual(
         &mut self,
         draft_model: &mut Llama3Model,
@@ -16556,7 +16537,7 @@ impl<'a> Llama3Model<'a> {
         max_new_tokens: usize,
         temperature: f32,
         spec_k: usize,
-    ) -> GenerateResult {
+    ) -> Result<GenerateResult, SamplingError> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
@@ -16587,9 +16568,9 @@ impl<'a> Llama3Model<'a> {
         while generated.len() < max_new_tokens {
             // Sample from current main model logits
             let next_token = if temperature > 0.0 {
-                sample_from_probs(&softmax(&logits), rng.next_f32())
+                sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32
             } else {
-                argmax(&logits)
+                sample_argmax(&logits)? as u32
             };
             if next_token == tokenizer.eos_id {
                 break;
@@ -16615,13 +16596,13 @@ impl<'a> Llama3Model<'a> {
 
             // Feed the accepted token to draft model first
             let dl = draft_model.forward(draft_input);
-            draft_input = argmax(&dl);
+            draft_input = sample_argmax(&dl)? as u32;
             draft_tokens.push(draft_input);
             draft_logits_all.push(dl);
 
             for _ in 1..k {
                 let dl = draft_model.forward(draft_input);
-                draft_input = argmax(&dl);
+                draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
             }
@@ -16634,8 +16615,8 @@ impl<'a> Llama3Model<'a> {
             let mut num_accepted = 0;
             let mut rejected = false;
             for i in 0..draft_tokens.len() {
-                let p = softmax(&logits);
-                let q = softmax(&draft_logits_all[i]);
+                let p = softmax(&logits)?;
+                let q = softmax(&draft_logits_all[i])?;
                 let x = draft_tokens[i] as usize;
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
@@ -16663,9 +16644,9 @@ impl<'a> Llama3Model<'a> {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_from_probs(&adjusted, rng.next_f32())
+                        sample_with_random(&adjusted, rng.next_f32())? as u32
                     } else {
-                        sample_from_probs(&p, rng.next_f32())
+                        sample_with_random(&p, rng.next_f32())? as u32
                     };
                     if resampled != tokenizer.eos_id {
                         generated.push(resampled);
@@ -16679,7 +16660,7 @@ impl<'a> Llama3Model<'a> {
 
             // If all K drafts accepted, bonus token from final verify logits
             if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
-                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                let bonus = sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32;
                 if bonus != tokenizer.eos_id {
                     generated.push(bonus);
                     tokens.push(bonus);
@@ -16707,7 +16688,7 @@ impl<'a> Llama3Model<'a> {
             0.0
         };
 
-        GenerateResult {
+        Ok(GenerateResult {
             text: tokenizer.decode(&generated),
             tokens_generated: gen_count,
             prompt_tokens: prompt_token_count,
@@ -16721,7 +16702,7 @@ impl<'a> Llama3Model<'a> {
                 draft_layers: draft_model.config.num_layers,
                 spec_k,
             }),
-        }
+        })
     }
 
     /// DSpark 版 speculative dual decoding (Phase 5) [`generate_speculative_dual`] と同じ
@@ -16815,9 +16796,9 @@ impl<'a> Llama3Model<'a> {
 
         while generated.len() < max_new_tokens {
             let next_token = if temperature > 0.0 {
-                sample_from_probs(&softmax(&logits), rng.next_f32())
+                sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32
             } else {
-                argmax(&logits)
+                sample_argmax(&logits)? as u32
             };
             if next_token == tokenizer.eos_id {
                 break;
@@ -16866,7 +16847,7 @@ impl<'a> Llama3Model<'a> {
                         break;
                     }
                 }
-                draft_input = argmax(&dl);
+                draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
                 prev_for_bigram = draft_input;
@@ -16879,8 +16860,8 @@ impl<'a> Llama3Model<'a> {
             let mut num_accepted = 0;
             let mut rejected = false;
             for i in 0..draft_tokens.len() {
-                let p = softmax(&logits);
-                let q = softmax(&draft_logits_all[i]);
+                let p = softmax(&logits)?;
+                let q = softmax(&draft_logits_all[i])?;
                 let x = draft_tokens[i] as usize;
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
@@ -16906,9 +16887,9 @@ impl<'a> Llama3Model<'a> {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_from_probs(&adjusted, rng.next_f32())
+                        sample_with_random(&adjusted, rng.next_f32())? as u32
                     } else {
-                        sample_from_probs(&p, rng.next_f32())
+                        sample_with_random(&p, rng.next_f32())? as u32
                     };
                     if resampled != tokenizer.eos_id {
                         generated.push(resampled);
@@ -16921,7 +16902,7 @@ impl<'a> Llama3Model<'a> {
             }
 
             if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
-                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                let bonus = sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32;
                 if bonus != tokenizer.eos_id {
                     generated.push(bonus);
                     tokens.push(bonus);
@@ -17020,9 +17001,9 @@ impl<'a> Llama3Model<'a> {
 
         while generated.len() < max_new_tokens {
             let next_token = if temperature > 0.0 {
-                sample_from_probs(&softmax(&logits), rng.next_f32())
+                sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32
             } else {
-                argmax(&logits)
+                sample_argmax(&logits)? as u32
             };
             if next_token == tokenizer.eos_id {
                 break;
@@ -17049,7 +17030,7 @@ impl<'a> Llama3Model<'a> {
             for _ in 0..k {
                 let (dl, hidden) =
                     draft_model.forward_capture_hidden(draft_input, hidden_capture_layer);
-                draft_input = argmax(&dl);
+                draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
                 draft_hiddens.push(hidden);
@@ -17062,8 +17043,8 @@ impl<'a> Llama3Model<'a> {
             let mut num_accepted = 0;
             let mut rejected = false;
             for i in 0..draft_tokens.len() {
-                let p = softmax(&logits);
-                let q = softmax(&draft_logits_all[i]);
+                let p = softmax(&logits)?;
+                let q = softmax(&draft_logits_all[i])?;
                 let x = draft_tokens[i] as usize;
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
                 let q_x = if x < q.len() { q[x] } else { 1e-10 };
@@ -17095,9 +17076,9 @@ impl<'a> Llama3Model<'a> {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_from_probs(&adjusted, rng.next_f32())
+                        sample_with_random(&adjusted, rng.next_f32())? as u32
                     } else {
-                        sample_from_probs(&p, rng.next_f32())
+                        sample_with_random(&p, rng.next_f32())? as u32
                     };
                     if resampled != tokenizer.eos_id {
                         generated.push(resampled);
@@ -17110,7 +17091,7 @@ impl<'a> Llama3Model<'a> {
             }
 
             if !rejected && num_accepted == draft_tokens.len() && generated.len() < max_new_tokens {
-                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                let bonus = sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32;
                 if bonus != tokenizer.eos_id {
                     generated.push(bonus);
                     tokens.push(bonus);
@@ -17270,6 +17251,10 @@ impl<'a> Llama3Model<'a> {
     }
 
     /// Generate with ternary-quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate_ternary(
         &mut self,
         tokenizer: &GgufTokenizer,
@@ -17277,7 +17262,7 @@ impl<'a> Llama3Model<'a> {
         max_new_tokens: usize,
         temperature: f32,
         top_k: usize,
-    ) -> GenerateResult {
+    ) -> Result<GenerateResult, SamplingError> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
@@ -17299,7 +17284,7 @@ impl<'a> Llama3Model<'a> {
         let mut generated = Vec::with_capacity(max_new_tokens);
 
         for _ in 0..max_new_tokens {
-            let next_token = sample_token(&logits, temperature, top_k);
+            let next_token = sample_token(&logits, temperature, top_k)?;
             if next_token == tokenizer.eos_id {
                 break;
             }
@@ -17317,7 +17302,7 @@ impl<'a> Llama3Model<'a> {
             0.0
         };
 
-        GenerateResult {
+        Ok(GenerateResult {
             text: tokenizer.decode(&generated),
             tokens_generated: gen_count,
             prompt_tokens: prompt_token_count,
@@ -17326,7 +17311,7 @@ impl<'a> Llama3Model<'a> {
             total_ms,
             tokens_per_sec: tok_per_sec,
             spec_stats: None,
-        }
+        })
     }
 
     // ─── Sparse Ternary (N:M structured sparsity) ─────────────────────────
@@ -17652,6 +17637,10 @@ impl<'a> Llama3Model<'a> {
     /// Generate with sparse ternary speculative decoding.
     /// Draft model = first `draft_layers` layers (layer-skip).
     /// Verify model = all layers.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate_sparse_ternary_speculative(
         &mut self,
         tokenizer: &GgufTokenizer,
@@ -17661,7 +17650,7 @@ impl<'a> Llama3Model<'a> {
         _top_k: usize,
         spec_k: usize,
         draft_layers: usize,
-    ) -> GenerateResult {
+    ) -> Result<GenerateResult, SamplingError> {
         let start = Instant::now();
         let mut tokens = tokenizer.encode(prompt);
         // Only prepend BOS if the tokenizer's add_bos_token is True (Qwen 3: False).
@@ -17689,9 +17678,9 @@ impl<'a> Llama3Model<'a> {
 
         while generated.len() < max_new_tokens {
             let next_token = if temperature > 0.0 {
-                sample_from_probs(&softmax(&logits), rng.next_f32())
+                sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32
             } else {
-                argmax(&logits)
+                sample_argmax(&logits)? as u32
             };
             if next_token == tokenizer.eos_id {
                 break;
@@ -17714,7 +17703,7 @@ impl<'a> Llama3Model<'a> {
             let mut draft_input = next_token;
             for _ in 0..k {
                 let dl = self.forward_sparse_ternary_draft(draft_input, draft_layers);
-                draft_input = argmax(&dl);
+                draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
             }
@@ -17728,8 +17717,8 @@ impl<'a> Llama3Model<'a> {
 
             let mut all_accepted = true;
             for i in 0..draft_tokens.len() {
-                let p = softmax(&logits);
-                let q = softmax(&draft_logits_all[i]);
+                let p = softmax(&logits)?;
+                let q = softmax(&draft_logits_all[i])?;
                 let x = draft_tokens[i] as usize;
 
                 let p_x = if x < p.len() { p[x] } else { 0.0 };
@@ -17755,9 +17744,9 @@ impl<'a> Llama3Model<'a> {
                         for a in &mut adjusted {
                             *a *= inv;
                         }
-                        sample_from_probs(&adjusted, rng.next_f32())
+                        sample_with_random(&adjusted, rng.next_f32())? as u32
                     } else {
-                        sample_from_probs(&p, rng.next_f32())
+                        sample_with_random(&p, rng.next_f32())? as u32
                     };
                     if resampled == tokenizer.eos_id {
                         all_accepted = false;
@@ -17773,7 +17762,7 @@ impl<'a> Llama3Model<'a> {
 
             // If all K drafts accepted, sample one more from final verify logits
             if all_accepted && generated.len() < max_new_tokens {
-                let bonus = sample_from_probs(&softmax(&logits), rng.next_f32());
+                let bonus = sample_with_random(&softmax(&logits)?, rng.next_f32())? as u32;
                 if bonus != tokenizer.eos_id {
                     generated.push(bonus);
                     tokens.push(bonus);
@@ -17791,7 +17780,7 @@ impl<'a> Llama3Model<'a> {
             0.0
         };
 
-        GenerateResult {
+        Ok(GenerateResult {
             text: tokenizer.decode(&generated),
             tokens_generated: gen_count,
             prompt_tokens: prompt_token_count,
@@ -17805,7 +17794,7 @@ impl<'a> Llama3Model<'a> {
                 draft_layers,
                 spec_k,
             }),
-        }
+        })
     }
 
     // ─── Paged KV Cache forward ─────────────────────────────────────────────
@@ -17979,12 +17968,16 @@ impl<'a> Llama3Model<'a> {
 
     /// Process all active requests in the batch scheduler.
     /// Prefills each request, then decodes round-robin until all are done.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplingError`] when the model produces logits there is nothing to sample from.
     pub fn generate_batch(
         &self,
         tokenizer: &GgufTokenizer,
         scheduler: &mut BatchScheduler,
         top_k: usize,
-    ) {
+    ) -> Result<(), SamplingError> {
         // Phase 1: Prefill — run all prompt tokens, store the last logits per request
         let mut pending_logits: Vec<Option<Vec<f32>>> = Vec::new();
         for req in scheduler.requests_mut().iter_mut() {
@@ -18006,7 +17999,7 @@ impl<'a> Llama3Model<'a> {
                 continue;
             }
             if let Some(ref logits) = pending_logits[i] {
-                let next_token = sample_token(logits, req.temperature, top_k);
+                let next_token = sample_token(logits, req.temperature, top_k)?;
                 if next_token == tokenizer.eos_id {
                     req.done = true;
                 } else {
@@ -18030,7 +18023,7 @@ impl<'a> Llama3Model<'a> {
 
                 let last_tok = *req.generated.last().unwrap();
                 let logits = self.forward_paged(last_tok, &mut req.kv_cache);
-                let next_token = sample_token(&logits, req.temperature, top_k);
+                let next_token = sample_token(&logits, req.temperature, top_k)?;
 
                 if next_token == tokenizer.eos_id {
                     req.done = true;
@@ -18039,6 +18032,7 @@ impl<'a> Llama3Model<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     // ─── Grammar-constrained generation (Phase X.8 B-4) ─────────────────────
@@ -18183,7 +18177,7 @@ impl<'a> Llama3Model<'a> {
         let mut prefix_tokens: Vec<u32> = Vec::new();
         let mut marker_hit = false;
         for _ in 0..prefix.max_prefix_tokens {
-            let next = Self::pick_token(&logits, temperature, top_k);
+            let next = Self::pick_token(&logits, temperature, top_k)?;
             if next == tokenizer.eos_id {
                 break;
             }
@@ -18246,36 +18240,10 @@ impl<'a> Llama3Model<'a> {
         })
     }
 
-    /// Greedy pick within `top_k` after temperature, over the finite
-    /// subset of `logits` (masked entries are `-inf`). Returns 0 if
-    /// nothing is finite — callers that need to distinguish check
-    /// finiteness first.
+    /// One token from what a grammar left unmasked, by the sampling law.
     #[cfg(feature = "grammar")]
-    fn pick_token(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
-        let scale = if temperature > 0.0 && temperature != 1.0 {
-            1.0 / temperature
-        } else {
-            1.0
-        };
-        if top_k > 0 && top_k < logits.len() {
-            let mut indexed: Vec<(usize, f32)> = logits
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(_, l)| l.is_finite())
-                .map(|(i, l)| (i, l * scale))
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            indexed.truncate(top_k);
-            indexed.first().map_or(0u32, |(idx, _)| *idx as u32)
-        } else {
-            logits
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.is_finite())
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map_or(0u32, |(idx, _)| idx as u32)
-        }
+    fn pick_token(logits: &[f32], temperature: f32, top_k: usize) -> Result<u32, SamplingError> {
+        sample_token(logits, temperature, top_k)
     }
 
     /// Shared grammar-constrained decode loop: FSM at grammar root, token
@@ -18309,7 +18277,7 @@ impl<'a> Llama3Model<'a> {
                 return Err(GrammarGenError::NoValidToken { step });
             }
 
-            let next_token = Self::pick_token(&logits, temperature, top_k);
+            let next_token = Self::pick_token(&logits, temperature, top_k)?;
 
             if next_token == tokenizer.eos_id {
                 break;
@@ -18411,67 +18379,13 @@ impl crate::speculative_dspark::DraftBackend for KimiK3Model<'_> {
 
 // ─── Sampling helpers ────────────────────────────────────────────────────────
 
-fn sample_token(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
+fn sample_token(logits: &[f32], temperature: f32, top_k: usize) -> Result<u32, SamplingError> {
     let mut logits = logits.to_vec();
-    if temperature > 0.0 && temperature != 1.0 {
-        let inv_t = 1.0 / temperature;
-        for l in &mut logits {
-            *l *= inv_t;
-        }
+    if temperature != 1.0 {
+        apply_temperature(&mut logits, temperature);
     }
-
-    if top_k > 0 && top_k < logits.len() {
-        let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        indexed.truncate(top_k);
-        indexed
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map_or(0, |(idx, _)| *idx as u32)
-    } else {
-        argmax(&logits)
-    }
-}
-
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map_or(0, |(idx, _)| idx as u32)
-}
-
-/// Convert logits to probability distribution via softmax.
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, crate::lawmath::max);
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&l| crate::lawmath::exp(l - max_val))
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    if sum > 0.0 {
-        let inv = 1.0 / sum;
-        for p in &mut probs {
-            *p *= inv;
-        }
-    }
-    probs
-}
-
-/// Sample a token index from a probability distribution using the provided RNG value.
-/// `rand_val` should be uniform in [0, 1).
-fn sample_from_probs(probs: &[f32], rand_val: f32) -> u32 {
-    let mut cumsum = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cumsum += p;
-        if rand_val < cumsum {
-            return i as u32;
-        }
-    }
-    (probs.len() - 1) as u32
+    top_k_filter(&mut logits, top_k)?;
+    Ok(sample_argmax(&logits)? as u32)
 }
 
 /// Simple xorshift64 PRNG for speculative sampling.
@@ -18539,6 +18453,15 @@ pub enum GrammarGenError {
     /// (e.g. prompt already emitted invalid text) or the grammar is
     /// under-specified for the model's vocabulary.
     NoValidToken { step: usize },
+    /// The model produced logits there is nothing to sample from.
+    Sampling(SamplingError),
+}
+
+#[cfg(feature = "grammar")]
+impl From<SamplingError> for GrammarGenError {
+    fn from(e: SamplingError) -> Self {
+        Self::Sampling(e)
+    }
 }
 
 /// Free-prefix settings for [`Llama3Model::generate_grammar_prefixed`].
@@ -18591,6 +18514,7 @@ impl std::fmt::Display for GrammarGenError {
             Self::NoValidToken { step } => {
                 write!(f, "no valid token accepted by grammar at step {step}")
             }
+            Self::Sampling(e) => write!(f, "sampling refused: {e}"),
         }
     }
 }
@@ -18765,7 +18689,7 @@ fn deepseek_moe_route(
     } else {
         scores.iter().enumerate().map(|(i, &s)| (i, s)).collect()
     };
-    idx_biased.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx_biased.sort_by(|a, b| descending_nan_last(a.1, b.1));
     idx_biased.truncate(top_k);
 
     let mut selected: Vec<(usize, f32)> =
@@ -19020,7 +18944,7 @@ fn forward_moe_layer(
 
     // Sort indices by probability descending; keep top-k.
     let mut idx_prob: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    idx_prob.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx_prob.sort_by(|a, b| descending_nan_last(a.1, b.1));
     idx_prob.truncate(n_active);
 
     // Step 4: renormalise top-k probabilities.
@@ -19164,7 +19088,7 @@ pub fn speculative_decode(
     n_draft: usize,
     max_new_tokens: usize,
     eos_id: Option<u32>,
-) -> SpeculativeResult {
+) -> Result<SpeculativeResult, SamplingError> {
     assert!(n_draft >= 1, "n_draft must be at least 1");
     assert!(!prompt.is_empty(), "prompt must be non-empty");
 
@@ -19188,7 +19112,7 @@ pub fn speculative_decode(
         let mut curr = last_tok;
         for _ in 0..n_draft {
             let logits = draft.forward(curr);
-            let argmax = greedy_argmax(&logits);
+            let argmax = sample_argmax(&logits)? as u32;
             draft_tokens.push(argmax);
             curr = argmax;
         }
@@ -19200,7 +19124,7 @@ pub fn speculative_decode(
         curr = last_tok;
         for &draft_tok in &draft_tokens {
             let logits = main.forward(curr);
-            let main_argmax = greedy_argmax(&logits);
+            let main_argmax = sample_argmax(&logits)? as u32;
             if main_argmax == draft_tok {
                 result.tokens.push(draft_tok);
                 accepted += 1;
@@ -19240,7 +19164,7 @@ pub fn speculative_decode(
             // with main after main's bonus forward.
             let _ = draft.forward(curr);
             let logits = main.forward(curr);
-            let bonus = greedy_argmax(&logits);
+            let bonus = sample_argmax(&logits)? as u32;
             result.tokens.push(bonus);
             result.bonus_tokens += 1;
             last_tok = bonus;
@@ -19261,19 +19185,7 @@ pub fn speculative_decode(
 
     // Truncate to the requested budget.
     result.tokens.truncate(max_new_tokens);
-    result
-}
-
-fn greedy_argmax(logits: &[f32]) -> u32 {
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    best_idx as u32
+    Ok(result)
 }
 
 // ─── Phase JJJ v0.2: Sampling distribution replay ─────────────────────────
@@ -19540,11 +19452,15 @@ impl SplitMix64 {
 /// * `top_p = None` or `Some(t) where t >= 1.0` disables top-p filtering.
 /// * `top_p = Some(t) where 0 < t < 1` keeps the smallest set of tokens
 ///   whose cumulative probability >= t (nucleus sampling).
-fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f32>) -> Vec<f32> {
-    assert!(
-        temperature > 0.0 && temperature.is_finite(),
-        "temperature must be positive and finite"
-    );
+fn apply_temperature_and_top_p(
+    logits: &[f32],
+    temperature: f32,
+    top_p: Option<f32>,
+) -> Result<Vec<f32>, SamplingError> {
+    if !(temperature > 0.0 && temperature.is_finite()) {
+        return Err(SamplingError::InvalidParameter);
+    }
+    crate::sampling::check_logits(logits)?;
     let inv_t = 1.0 / temperature;
     let max_logit = logits
         .iter()
@@ -19555,10 +19471,9 @@ fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f
         .map(|&l| crate::lawmath::exp((l - max_logit) * inv_t))
         .collect();
     let sum: f32 = probs.iter().sum();
-    assert!(
-        sum > 0.0 && sum.is_finite(),
-        "softmax normaliser is degenerate"
-    );
+    if !(sum > 0.0 && sum.is_finite()) {
+        return Err(SamplingError::AllMasked);
+    }
     for p in &mut probs {
         *p /= sum;
     }
@@ -19566,7 +19481,7 @@ fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f
     if let Some(p_thresh) = top_p {
         if p_thresh > 0.0 && p_thresh < 1.0 - 1e-6 {
             let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.sort_by(|a, b| descending_nan_last(a.1, b.1));
             let mut cum = 0.0f32;
             let mut keep_mask = vec![false; probs.len()];
             for &(orig_idx, prob) in &indexed {
@@ -19589,7 +19504,7 @@ fn apply_temperature_and_top_p(logits: &[f32], temperature: f32, top_p: Option<f
             }
         }
     }
-    probs
+    Ok(probs)
 }
 
 /// Sample one index from a probability distribution using inverse CDF.
@@ -19662,7 +19577,7 @@ pub fn speculative_decode_v2(
     main: &mut Llama3Model<'_>,
     prompt: &[u32],
     cfg: &SpeculativeConfig,
-) -> SpeculativeResult {
+) -> Result<SpeculativeResult, SamplingError> {
     assert!(cfg.n_draft >= 1, "n_draft must be at least 1");
     assert!(!prompt.is_empty(), "prompt must be non-empty");
 
@@ -19705,7 +19620,7 @@ pub fn speculative_decode_v2(
         let mut curr = last_tok;
         for _ in 0..cfg.n_draft {
             let logits = draft.forward(curr);
-            let dist = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let dist = apply_temperature_and_top_p(&logits, temperature, top_p)?;
             let sample = sample_multinomial(&dist, &mut rng);
             let p_at = dist[sample as usize];
             draft_probs_at_pick.push(p_at);
@@ -19721,7 +19636,7 @@ pub fn speculative_decode_v2(
         curr = last_tok;
         for (idx, &draft_tok) in draft_tokens.iter().enumerate() {
             let logits = main.forward(curr);
-            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p)?;
             let p_draft = &draft_dists[idx];
             let p_m = p_main[draft_tok as usize];
             let p_d = draft_probs_at_pick[idx];
@@ -19765,7 +19680,7 @@ pub fn speculative_decode_v2(
             // main advances by one more step (forward on curr = last draft).
             let _ = draft.forward(curr);
             let logits = main.forward(curr);
-            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p);
+            let p_main = apply_temperature_and_top_p(&logits, temperature, top_p)?;
             let bonus = sample_multinomial(&p_main, &mut rng);
             result.tokens.push(bonus);
             result.bonus_tokens += 1;
@@ -19782,7 +19697,7 @@ pub fn speculative_decode_v2(
     }
 
     result.tokens.truncate(cfg.max_new_tokens);
-    result
+    Ok(result)
 }
 
 /// Load the FFN input norm for layer `prefix`, trying `ffn_norm.weight` first
@@ -21668,32 +21583,6 @@ mod tests {
     // ─── Phase JJJ: Speculative decoding helper tests ─────────────────────
 
     #[test]
-    fn test_greedy_argmax_basic() {
-        let logits = [0.1_f32, 0.5, 0.3, 0.7, 0.2];
-        assert_eq!(greedy_argmax(&logits), 3);
-    }
-
-    #[test]
-    fn test_greedy_argmax_first_wins_on_tie() {
-        // First occurrence wins because subsequent equal values do not
-        // satisfy strict `>` comparison.
-        let logits = [0.7_f32, 0.5, 0.7, 0.3];
-        assert_eq!(greedy_argmax(&logits), 0);
-    }
-
-    #[test]
-    fn test_greedy_argmax_single_element() {
-        let logits = [42.0_f32];
-        assert_eq!(greedy_argmax(&logits), 0);
-    }
-
-    #[test]
-    fn test_greedy_argmax_negative_values() {
-        let logits = [-3.0_f32, -1.5, -2.0, -0.5];
-        assert_eq!(greedy_argmax(&logits), 3);
-    }
-
-    #[test]
     fn test_speculative_result_acceptance_rate_empty() {
         let r = SpeculativeResult {
             tokens: vec![],
@@ -21752,7 +21641,7 @@ mod tests {
     fn test_apply_temperature_and_top_p_uniform_at_high_temp() {
         // Very high temperature → distribution approaches uniform.
         let logits = [1.0f32, 2.0, 3.0, 4.0];
-        let dist = apply_temperature_and_top_p(&logits, 1000.0, None);
+        let dist = apply_temperature_and_top_p(&logits, 1000.0, None).unwrap();
         let sum: f32 = dist.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4);
         for &p in &dist {
@@ -21765,7 +21654,7 @@ mod tests {
     fn test_apply_temperature_and_top_p_argmax_at_low_temp() {
         // Very low temperature → distribution collapses to argmax.
         let logits = [1.0f32, 5.0, 2.0, 3.0];
-        let dist = apply_temperature_and_top_p(&logits, 0.001, None);
+        let dist = apply_temperature_and_top_p(&logits, 0.001, None).unwrap();
         // Argmax is index 1.
         assert!(dist[1] > 0.999, "argmax prob {} not near 1", dist[1]);
         for (i, &p) in dist.iter().enumerate() {
@@ -21778,7 +21667,7 @@ mod tests {
     #[test]
     fn test_apply_temperature_and_top_p_sums_to_one() {
         let logits = [0.5f32, -1.0, 2.5, 0.1, -0.3];
-        let dist = apply_temperature_and_top_p(&logits, 1.0, None);
+        let dist = apply_temperature_and_top_p(&logits, 1.0, None).unwrap();
         let sum: f32 = dist.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }
@@ -21790,7 +21679,7 @@ mod tests {
         // Build logits so softmax approximates the above distribution.
         // ln(0.5)=-0.693, ln(0.3)=-1.204, ln(0.15)=-1.897, ln(0.05)=-2.996
         let logits = [-0.693f32, -1.204, -1.897, -2.996];
-        let dist = apply_temperature_and_top_p(&logits, 1.0, Some(0.7));
+        let dist = apply_temperature_and_top_p(&logits, 1.0, Some(0.7)).unwrap();
         assert!(dist[0] > 0.0);
         assert!(dist[1] > 0.0);
         assert!(dist[2].abs() < 1e-6, "tail should be zero, got {}", dist[2]);
@@ -24025,5 +23914,94 @@ mod tests {
             );
             assert_eq!(restored.seq_len, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod refuses_what_it_cannot_sample {
+    use super::*;
+
+    /// The patterns that panicked the sort as it was written: every third value `NaN`.
+    fn every_third_nan(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| if i % 3 == 0 { f32::NAN } else { i as f32 })
+            .collect()
+    }
+
+    #[test]
+    fn the_routers_do_not_panic_on_nan_at_any_size() {
+        for n in [8, 16, 20, 21, 32, 64, 192, 256] {
+            let logits = every_third_nan(n);
+            let selected = deepseek_moe_route(&logits, None, 8.min(n), 1.0);
+            assert_eq!(selected.len(), 8.min(n), "deepseek {n}");
+
+            // one input dimension: each expert's row is its logit
+            let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8.min(n), false);
+            assert_eq!(selected.len(), 8.min(n), "kimi {n}");
+        }
+    }
+
+    #[test]
+    fn a_router_prefers_a_finite_score_to_nan() {
+        let mut logits = every_third_nan(64);
+        logits[1] = 100.0;
+        // the highest logit is not NaN, so it is chosen first and no NaN comes before a number
+        let selected = deepseek_moe_route(&logits, None, 8, 1.0);
+        assert_eq!(selected[0].0, 1);
+        let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8, false);
+        assert_eq!(selected[0].0, 1);
+        assert!(selected.iter().all(|(i, _)| i % 3 != 0), "{selected:?}");
+    }
+
+    #[test]
+    fn the_copies_of_the_law_are_gone_and_the_token_comes_from_it() {
+        let logits = every_third_nan(64);
+        assert_eq!(
+            sample_token(&logits, 1.0, 5),
+            Err(SamplingError::NonFinite { index: 0 })
+        );
+        assert_eq!(
+            sample_token(&[f32::NEG_INFINITY; 3], 1.0, 2),
+            Err(SamplingError::AllMasked)
+        );
+        // a temperature that breaks the logits meets the same check
+        assert_eq!(
+            sample_token(&[1.0, 2.0], f32::NAN, 1),
+            Err(SamplingError::NonFinite { index: 0 })
+        );
+        // no tie: the largest, whatever k and the temperature
+        for k in [0, 1, 2, 5] {
+            for t in [0.0, 0.5, 1.0, 2.0] {
+                assert_eq!(sample_token(&[1.0, 5.0, 2.0, 3.0], t, k), Ok(1), "{k} {t}");
+            }
+        }
+        // a tie goes to the last, as in `sample_argmax`
+        assert_eq!(sample_token(&[5.0, 1.0, 5.0], 1.0, 0), Ok(2));
+    }
+
+    #[test]
+    fn the_distribution_of_the_replay_refuses() {
+        let nan = every_third_nan(64);
+        assert_eq!(
+            apply_temperature_and_top_p(&nan, 1.0, Some(0.5)),
+            Err(SamplingError::NonFinite { index: 0 })
+        );
+        assert_eq!(
+            apply_temperature_and_top_p(&[1.0, f32::INFINITY], 1.0, None),
+            Err(SamplingError::NonFinite { index: 1 })
+        );
+        assert_eq!(
+            apply_temperature_and_top_p(&[f32::NEG_INFINITY; 2], 1.0, None),
+            Err(SamplingError::AllMasked)
+        );
+        for t in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                apply_temperature_and_top_p(&[1.0, 2.0], t, None),
+                Err(SamplingError::InvalidParameter),
+                "{t}"
+            );
+        }
+        let d = apply_temperature_and_top_p(&[0.0, 0.0], 1.0, None).unwrap();
+        assert_eq!(d, vec![0.5, 0.5]);
     }
 }

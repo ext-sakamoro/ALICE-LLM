@@ -87,7 +87,9 @@ fn main() {
 
     // --- Baseline: main model only ---
     println!("--- Baseline (main model only) ---");
-    let baseline = main_model.generate(&tokenizer, &formatted, max_tokens, temperature, 40);
+    let baseline = main_model
+        .generate(&tokenizer, &formatted, max_tokens, temperature, 40)
+        .expect("the model produced logits it cannot sample from");
     println!("{}", baseline.text);
     println!(
         "  {} tokens, {:.1} tok/s ({}ms prefill + {}ms decode)",
@@ -98,14 +100,16 @@ fn main() {
     // --- Speculative: dual model ---
     for k in [3, 4, 5] {
         println!("--- Speculative K={k} (1B draft → 8B verify) ---");
-        let result = main_model.generate_speculative_dual(
-            &mut draft_model,
-            &tokenizer,
-            &formatted,
-            max_tokens,
-            temperature,
-            k,
-        );
+        let result = main_model
+            .generate_speculative_dual(
+                &mut draft_model,
+                &tokenizer,
+                &formatted,
+                max_tokens,
+                temperature,
+                k,
+            )
+            .expect("the model produced logits it cannot sample from");
         println!("{}", result.text);
         println!(
             "  {} tokens, {:.1} tok/s ({}ms prefill + {}ms decode)",

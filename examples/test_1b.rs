@@ -279,13 +279,17 @@ fn main() {
     );
 
     // Test with prompt that already includes <|begin_of_text|> (will get double BOS)
-    let result = model.generate(&tok, prompt_with_bos, 30, 0.0, 40);
+    let result = model
+        .generate(&tok, prompt_with_bos, 30, 0.0, 40)
+        .expect("the model produced logits it cannot sample from");
     println!("\nWith <|begin_of_text|> (double BOS): \"{}\"", result.text);
 
     // Test WITHOUT <|begin_of_text|> in prompt (generate() adds BOS)
     model.clear_cache();
     let prompt_no_bos = "<|start_header_id|>user<|end_header_id|>\n\nWhat is 1+1?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-    let result2 = model.generate(&tok, prompt_no_bos, 30, 0.0, 40);
+    let result2 = model
+        .generate(&tok, prompt_no_bos, 30, 0.0, 40)
+        .expect("the model produced logits it cannot sample from");
     println!(
         "Without <|begin_of_text|> (single BOS): \"{}\"",
         result2.text

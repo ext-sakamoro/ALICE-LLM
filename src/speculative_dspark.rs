@@ -45,6 +45,8 @@ pub type TokenId = u32;
 #[cfg_attr(feature = "dspark-serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DsparkError {
+    /// モデルの logits から sample できない
+    Sampling(crate::sampling::SamplingError),
     /// Token id が宣言 vocab_size を超過
     TokenOutOfVocab {
         /// 越境した token id
@@ -134,6 +136,7 @@ pub enum DsparkError {
 impl core::fmt::Display for DsparkError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Sampling(e) => write!(f, "sampling refused: {e}"),
             Self::TokenOutOfVocab { token, vocab_size } => {
                 write!(f, "token id {token} exceeds vocab size {vocab_size}")
             }
@@ -201,6 +204,12 @@ impl core::fmt::Display for DsparkError {
 }
 
 impl std::error::Error for DsparkError {}
+
+impl From<crate::sampling::SamplingError> for DsparkError {
+    fn from(e: crate::sampling::SamplingError) -> Self {
+        Self::Sampling(e)
+    }
+}
 
 /// bigram bias 実装が実装すべき最小 API
 ///

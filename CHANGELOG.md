@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **破壊的:** `Llama3Model` の `generate` / `generate_speculative` / `generate_speculative_dual` / `generate_ternary` / `generate_sparse_ternary_speculative` / `generate_batch` と `speculative_decode` / `speculative_decode_v2` は `Result<_, SamplingError>` を返す 内部の sampling の写しをやめ `sampling` を呼ぶ `softmax` は `sampling` の丸めになり確率が最大 1 ulp 変わる、完全に同じ logit の組の選び方は `sample_argmax` と同じ最後の token になる (以前は sort の位置、`speculative_decode` は最初の token)
+- `sampling::descending_nan_last`: `NaN` を最後に置く全順序 数値の順は `partial_cmp` と同じで `-0` と `+0` を等しく扱う MoE の router と `PersistenceHeuristic::predict` が使い、`NaN` の score で sort が panic しない `NaN` は logits に届き、`sampling` が拒否する
 - **破壊的:** 版を 3.0.0 から 4.0.0 に `sampling` の `top_k_filter` / `top_p_filter` / `softmax` / `softmax_inplace` / `sample_argmax` / `sample_with_random` と `generate` は `Result<_, SamplingError>` を返す `NaN` か `+inf` の logit は `NonFinite`、全部が `-inf` は `AllMasked` で、入力を変更しない `-inf` は mask として使える 有限の logit の結果の bit は変わらない (`LLM_SEMANTICS_ID` と golden は動かない)
 - server: logit を読めない時、通常の応答は 500、stream は最後の chunk の `finish_reason` が `error`
 - CI: `fuzz.yml` の `Run fuzz target` の `continue-on-error` を外し、crash で job を red にする artifact は残す
