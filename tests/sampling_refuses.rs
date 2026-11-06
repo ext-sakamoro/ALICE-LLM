@@ -324,6 +324,8 @@ fn the_order_for_scores() {
     }
     assert!(compared > 100_000, "{compared}");
     assert_eq!(descending_nan_last(0.0, -0.0), Equal);
+    assert_eq!(descending_nan_last(NAN, NAN), Equal);
+    assert_eq!(descending_nan_last(NAN, -NAN), Equal);
     for n in [8usize, 21, 32, 64, 192, 256, 4096] {
         let mut v: Vec<f32> = (0..n)
             .map(|i| match i % 5 {

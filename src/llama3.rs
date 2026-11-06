@@ -18384,6 +18384,7 @@ fn sample_token(logits: &[f32], temperature: f32, top_k: usize) -> Result<u32, S
     if temperature != 1.0 {
         apply_temperature(&mut logits, temperature);
     }
+    // the largest token is inside any top-k, so `top_k` changes nothing here: this path is greedy
     top_k_filter(&mut logits, top_k)?;
     Ok(sample_argmax(&logits)? as u32)
 }
@@ -24025,7 +24026,7 @@ mod a_model_that_produces_nan {
         let line = [HIDDEN as u64];
         let router: Vec<f32> = (0..n * HIDDEN)
             .map(|i| {
-                if nan_router && (i / HIDDEN) % 3 == 0 {
+                if nan_router && (i / HIDDEN).is_multiple_of(3) {
                     f32::NAN
                 } else {
                     (i % 11) as f32 * 0.01
@@ -24155,7 +24156,13 @@ mod refuses_what_it_cannot_sample {
     /// The patterns that panicked the sort as it was written: every third value `NaN`.
     fn every_third_nan(n: usize) -> Vec<f32> {
         (0..n)
-            .map(|i| if i % 3 == 0 { f32::NAN } else { i as f32 })
+            .map(|i| {
+                if i.is_multiple_of(3) {
+                    f32::NAN
+                } else {
+                    i as f32
+                }
+            })
             .collect()
     }
 

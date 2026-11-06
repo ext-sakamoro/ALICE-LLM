@@ -22,6 +22,7 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
 
 /// Why a sampling function refused its input. Nothing was changed when it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "dspark-serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum SamplingError {
     /// This logit is `NaN` or `+inf`: the model failed numerically, and no order or softmax exists.
