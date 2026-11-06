@@ -876,6 +876,12 @@ step "ci.yml / test: GGUF untrusted counts [features=default]"
 ( export CARGO_TERM_COLOR="always"; scripts/run_tests.sh gguf_untrusted_counts=4 -- cargo test --test gguf_untrusted_counts )
 )
 
+step "ci.yml / test: Ternary weights refused [features=default]"
+(
+  gh_step ci.yml.test
+( export CARGO_TERM_COLOR="always"; scripts/run_tests.sh ternary_refuses=8 -- cargo test --test ternary_refuses )
+)
+
 step "ci.yml / test: Running identifier under platform-math [features=default]"
 (
   gh_step ci.yml.test

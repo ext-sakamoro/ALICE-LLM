@@ -146,7 +146,7 @@ fn main() {
     if ternary {
         println!("  Ternarizing weights (threshold={ternary_threshold})...");
         let t_start = Instant::now();
-        model.load_ternary(ternary_threshold);
+        model.load_ternary(ternary_threshold).expect("ternarize");
         println!("  Ternarized in {}ms", t_start.elapsed().as_millis());
     }
     println!();

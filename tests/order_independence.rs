@@ -70,7 +70,7 @@ fn ternary_matvec_is_the_same_on_one_and_four_threads() {
                     f32::from(k) / 50.0 - 1.0
                 })
                 .collect();
-            TernaryRow::from_f32(&w, 0.7)
+            TernaryRow::from_f32(&w, 0.7).unwrap()
         })
         .collect();
     let m = TernaryMatrix {

@@ -6,7 +6,7 @@
 
 use crate::gguf::{
     quantize_row_q8_k, quantized_matvec, quantized_matvec_preq, sparse_ternary_matvec,
-    ternary_matvec, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, SparseTernaryMatrix,
+    ternary_matvec, BlockQ8K, GgmlType, GgufFile, GgufTokenizer, SparseTernaryMatrix, TernaryError,
     TernaryMatrix,
 };
 use crate::sampling::{
@@ -13614,7 +13614,12 @@ impl<'a> Llama3Model<'a> {
 
     /// Ternarize all weights for ternary inference mode.
     /// threshold_ratio controls sparsity (0.7 = ~50% zero weights).
-    pub fn load_ternary(&mut self, threshold_ratio: f32) {
+    ///
+    /// # Errors
+    ///
+    /// [`TernaryError`] for a weight that is not finite, a threshold ratio that is not finite and
+    /// at least zero, or a tensor type with no ternary form. The model is left as it was.
+    pub fn load_ternary(&mut self, threshold_ratio: f32) -> Result<(), TernaryError> {
         let c = &self.config;
         let kv_dim = c.num_kv_heads * c.head_dim;
         let mut ternary_layers = Vec::with_capacity(c.num_layers);
@@ -13628,7 +13633,7 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 k_proj: ternarize_weight(
                     layer
                         .k_proj
@@ -13637,7 +13642,7 @@ impl<'a> Llama3Model<'a> {
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 v_proj: ternarize_weight(
                     layer
                         .v_proj
@@ -13646,13 +13651,13 @@ impl<'a> Llama3Model<'a> {
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 o_proj: ternarize_weight(
                     &layer.o_proj,
                     c.hidden_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 ffn_norm: layer.ffn_norm.clone(),
                 gate_proj: ternarize_weight(
                     layer
@@ -13662,7 +13667,7 @@ impl<'a> Llama3Model<'a> {
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 up_proj: ternarize_weight(
                     layer
                         .up_proj
@@ -13671,7 +13676,7 @@ impl<'a> Llama3Model<'a> {
                     c.intermediate_dim,
                     c.hidden_dim,
                     threshold_ratio,
-                ),
+                )?,
                 down_proj: ternarize_weight(
                     layer
                         .down_proj
@@ -13680,7 +13685,7 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     c.intermediate_dim,
                     threshold_ratio,
-                ),
+                )?,
             });
         }
         eprintln!("  Ternarized {}/{} layers", c.num_layers, c.num_layers);
@@ -13690,8 +13695,9 @@ impl<'a> Llama3Model<'a> {
             c.vocab_size,
             c.hidden_dim,
             threshold_ratio,
-        ));
+        )?);
         self.ternary_layers = Some(ternary_layers);
+        Ok(())
     }
 
     /// Clear KV cache (start new conversation).
@@ -16215,26 +16221,31 @@ impl<'a> Llama3Model<'a> {
             }
 
             rms_norm(&hidden, &layer.ffn_norm, c.norm_eps, &mut norm_buf);
-            let q8_ffn = quantize_row_q8_k(&norm_buf);
-            layer
-                .gate_proj
-                .as_ref()
-                .expect("gate_proj required for non-MoE layer")
-                .matvec_preq(&q8_ffn, &mut gate_buf);
-            layer
-                .up_proj
-                .as_ref()
-                .expect("up_proj required for non-MoE layer")
-                .matvec_preq(&q8_ffn, &mut up_buf);
-            c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
-            for i in 0..c.intermediate_dim {
-                gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
+            // the same dispatch as `forward`: a MoE layer has no gate_proj
+            if layer.ffn_gate_inp().is_some() {
+                forward_moe_layer(c, layer, &norm_buf, &mut down_buf);
+            } else {
+                let q8_ffn = quantize_row_q8_k(&norm_buf);
+                layer
+                    .gate_proj
+                    .as_ref()
+                    .expect("gate_proj required for non-MoE layer")
+                    .matvec_preq(&q8_ffn, &mut gate_buf);
+                layer
+                    .up_proj
+                    .as_ref()
+                    .expect("up_proj required for non-MoE layer")
+                    .matvec_preq(&q8_ffn, &mut up_buf);
+                c.apply_ffn_sparsity(layer_idx, &mut gate_buf);
+                for i in 0..c.intermediate_dim {
+                    gate_buf[i] = c.apply_ffn_act(layer_idx, gate_buf[i]) * up_buf[i];
+                }
+                layer
+                    .down_proj
+                    .as_ref()
+                    .expect("down_proj required for non-MoE layer")
+                    .matvec(&gate_buf, &mut down_buf);
             }
-            layer
-                .down_proj
-                .as_ref()
-                .expect("down_proj required for non-MoE layer")
-                .matvec(&gate_buf, &mut down_buf);
             for i in 0..c.hidden_dim {
                 hidden[i] += down_buf[i];
             }
@@ -17324,7 +17335,15 @@ impl<'a> Llama3Model<'a> {
 
     /// Convert all weights to sparse ternary format with N:M structured sparsity.
     /// n_keep = number of non-zero weights per 16-element block (e.g. 8 = 8:16 = 50% density).
-    pub fn load_sparse_ternary(&mut self, threshold_ratio: f32, n_keep: usize) {
+    ///
+    /// # Errors
+    ///
+    /// As [`Llama3Model::load_ternary`].
+    pub fn load_sparse_ternary(
+        &mut self,
+        threshold_ratio: f32,
+        n_keep: usize,
+    ) -> Result<(), TernaryError> {
         let c = &self.config;
         let kv_dim = c.num_kv_heads * c.head_dim;
         let mut layers = Vec::with_capacity(c.num_layers);
@@ -17339,28 +17358,28 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 k_proj: sparsify_weight(
                     layer.k_proj.as_ref().expect("k_proj required for sparsify"),
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 v_proj: sparsify_weight(
                     layer.v_proj.as_ref().expect("v_proj required for sparsify"),
                     kv_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 o_proj: sparsify_weight(
                     &layer.o_proj,
                     c.hidden_dim,
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 ffn_norm: layer.ffn_norm.clone(),
                 gate_proj: sparsify_weight(
                     layer
@@ -17371,7 +17390,7 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 up_proj: sparsify_weight(
                     layer
                         .up_proj
@@ -17381,7 +17400,7 @@ impl<'a> Llama3Model<'a> {
                     c.hidden_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
                 down_proj: sparsify_weight(
                     layer
                         .down_proj
@@ -17391,7 +17410,7 @@ impl<'a> Llama3Model<'a> {
                     c.intermediate_dim,
                     threshold_ratio,
                     n_keep,
-                ),
+                )?,
             });
         }
         eprintln!(
@@ -17405,8 +17424,9 @@ impl<'a> Llama3Model<'a> {
             c.hidden_dim,
             threshold_ratio,
             n_keep,
-        ));
+        )?);
         self.sparse_ternary_layers = Some(layers);
+        Ok(())
     }
 
     /// Forward pass using sparse ternary weights (block-packed, SDOT+LUT optimized).
@@ -18559,7 +18579,7 @@ fn ternarize_weight(
     rows: usize,
     cols: usize,
     threshold_ratio: f32,
-) -> TernaryMatrix {
+) -> Result<TernaryMatrix, TernaryError> {
     TernaryMatrix::from_quantized(w.data, w.qtype, rows, cols, threshold_ratio)
 }
 
@@ -18569,7 +18589,7 @@ fn sparsify_weight(
     cols: usize,
     threshold_ratio: f32,
     n_keep: usize,
-) -> SparseTernaryMatrix {
+) -> Result<SparseTernaryMatrix, TernaryError> {
     // Dequantize to f32 then convert to sparse ternary with N:M sparsity
     let weights_f32 = w.dequantize_all(rows, cols);
     SparseTernaryMatrix::from_f32_weights(&weights_f32, rows, cols, threshold_ratio, n_keep)
@@ -24020,6 +24040,10 @@ mod a_model_that_produces_nan {
 
     /// A one-layer llama whose output projection has this scale.
     fn llama_bytes(output_scale: u16) -> Vec<u8> {
+        llama_bytes_with_output(q8_tensor("output.weight", VOCAB, output_scale))
+    }
+
+    fn llama_bytes_with_output(output: Tensor) -> Vec<u8> {
         let kv = [
             ("llama.block_count".to_string(), 1),
             ("llama.embedding_length".to_string(), HIDDEN as u32),
@@ -24041,7 +24065,7 @@ mod a_model_that_produces_nan {
                 &embedding,
             ),
             f32_tensor("output_norm.weight", &line, &one),
-            q8_tensor("output.weight", VOCAB, output_scale),
+            output,
             f32_tensor("blk.0.attn_norm.weight", &line, &one),
             f32_tensor("blk.0.ffn_norm.weight", &line, &one),
         ];
@@ -24143,6 +24167,63 @@ mod a_model_that_produces_nan {
         let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
         let mut model = Llama3Model::from_gguf(&gguf).expect("model");
         assert!(model.generate(&tokenizer, "t1", 2, 1.0, 2).is_ok());
+    }
+
+    /// A row with one `NaN` was all zero with no error. The output tensor is loaded last, so a
+    /// refusal there would show a model left half loaded.
+    #[test]
+    fn a_weight_that_is_not_finite_stops_loading_a_ternary_form() {
+        let mut values = vec![0.5; HIDDEN * VOCAB];
+        values[HIDDEN + 3] = f32::NAN;
+        let bad = TernaryError::NonFiniteWeight { index: 3 };
+        let output = f32_tensor("output.weight", &[HIDDEN as u64, VOCAB as u64], &values);
+        let bytes = llama_bytes_with_output(output);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        assert_eq!(model.load_ternary(0.7), Err(bad));
+        assert!(model.ternary_layers.is_none() && model.ternary_output_proj.is_none());
+        assert_eq!(model.load_sparse_ternary(0.7, 8), Err(bad));
+        assert!(model.sparse_ternary_layers.is_none() && model.sparse_ternary_output.is_none());
+    }
+
+    #[test]
+    fn a_healthy_model_loads_a_ternary_form() {
+        let bytes = llama_bytes(SMALL);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        assert_eq!(model.load_ternary(0.7), Ok(()));
+        assert_eq!(model.load_sparse_ternary(0.7, 8), Ok(()));
+    }
+
+    /// oracle: a draft of every layer is the model. The draft path is the forward path with fewer
+    /// layers, so with none left out they give the same bits.
+    #[test]
+    fn a_draft_of_every_layer_of_a_moe_model_is_the_model() {
+        let bytes = moe_bytes(21, false);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        let layers = model.config.num_layers;
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for token in [0u32, 1, 2] {
+            model.clear_cache();
+            let draft = model.forward_draft(token, layers);
+            model.clear_cache();
+            let full = model.forward(token);
+            assert_eq!(bits(&draft), bits(&full), "token {token}");
+        }
+    }
+
+    /// The public way into the draft path: a temperature above 0, as greedy ends at once on this stub
+    #[test]
+    fn speculative_generation_runs_on_a_moe_model() {
+        let bytes = moe_bytes(21, false);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("model");
+        let out = model
+            .generate_speculative(&tokenizer, "t1", 8, 1.0, 0, 3, 1)
+            .unwrap();
+        assert!(out.tokens_generated > 0, "{out:?}");
     }
 
     #[test]

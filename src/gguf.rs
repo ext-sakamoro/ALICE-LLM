@@ -5430,10 +5430,56 @@ pub struct TernaryMatrix {
     pub num_cols: usize,
 }
 
+/// Why weights have no ternary form
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TernaryError {
+    /// A weight is `NaN` or infinite. The threshold comes from the mean of the row, so one such
+    /// weight would make every weight of the row fall under it, and the row zero.
+    NonFiniteWeight { index: usize },
+    /// The threshold ratio is `NaN`, infinite or negative
+    InvalidThreshold,
+    /// The tensor type has no dequantizer here
+    UnsupportedType(GgmlType),
+    /// The weights given do not match the shape of the row or matrix
+    LengthMismatch { expected: usize, got: usize },
+}
+
+impl std::fmt::Display for TernaryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteWeight { index } => write!(f, "weight {index} is not finite"),
+            Self::InvalidThreshold => f.write_str("threshold ratio is not finite and positive"),
+            Self::UnsupportedType(t) => write!(f, "no ternary form for tensor type {t:?}"),
+            Self::LengthMismatch { expected, got } => {
+                write!(f, "expected {expected} weights, got {got}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TernaryError {}
+
+fn check_finite(weights: &[f32]) -> Result<(), TernaryError> {
+    match weights.iter().position(|w| !w.is_finite()) {
+        Some(index) => Err(TernaryError::NonFiniteWeight { index }),
+        None => Ok(()),
+    }
+}
+
 impl TernaryRow {
     /// Ternarize a f32 weight row. threshold_ratio controls sparsity
     /// (0.7 = weights below 0.7 × mean(|w|) become zero).
-    pub fn from_f32(weights: &[f32], threshold_ratio: f32) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TernaryError`] for a weight that is not finite or a threshold ratio that is not finite and
+    /// at least zero.
+    pub fn from_f32(weights: &[f32], threshold_ratio: f32) -> Result<Self, TernaryError> {
+        check_finite(weights)?;
+        if !threshold_ratio.is_finite() || threshold_ratio < 0.0 {
+            return Err(TernaryError::InvalidThreshold);
+        }
         let num_cols = weights.len();
         let num_bytes = num_cols.div_ceil(8);
 
@@ -5465,12 +5511,12 @@ impl TernaryRow {
             0.0
         };
 
-        Self {
+        Ok(Self {
             pos_mask,
             neg_mask,
             scale,
             num_cols,
-        }
+        })
     }
 }
 
@@ -5482,11 +5528,18 @@ impl TernaryMatrix {
         num_rows: usize,
         num_cols: usize,
         threshold_ratio: f32,
-    ) -> Self {
+    ) -> Result<Self, TernaryError> {
         let elems_per_block = qtype.elements_per_block();
         let bytes_per_block = qtype.block_bytes();
         let blocks_per_row = num_cols / elems_per_block;
         let row_bytes = blocks_per_row * bytes_per_block;
+        let expected = num_rows.saturating_mul(row_bytes);
+        if data.len() < expected {
+            return Err(TernaryError::LengthMismatch {
+                expected,
+                got: data.len(),
+            });
+        }
 
         let mut rows = Vec::with_capacity(num_rows);
         let mut row_f32 = vec![0.0f32; num_cols];
@@ -5512,18 +5565,16 @@ impl TernaryMatrix {
                         ]);
                     }
                 }
-                _ => {
-                    row_f32.fill(0.0);
-                }
+                other => return Err(TernaryError::UnsupportedType(other)),
             }
-            rows.push(TernaryRow::from_f32(&row_f32, threshold_ratio));
+            rows.push(TernaryRow::from_f32(&row_f32, threshold_ratio)?);
         }
 
-        Self {
+        Ok(Self {
             rows,
             num_rows,
             num_cols,
-        }
+        })
     }
 }
 
@@ -5677,8 +5728,23 @@ impl SparseTernaryRow {
     /// Create from a dense TernaryRow, enforcing N:M structured sparsity.
     /// Within each block of SPARSE_BLOCK, keeps only the top-N by magnitude
     /// (from the original f32 weights) and zeros the rest.
-    pub fn from_ternary_row(row: &TernaryRow, original_weights: &[f32], n_keep: usize) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TernaryError`] when `original_weights` is not one finite weight per column.
+    pub fn from_ternary_row(
+        row: &TernaryRow,
+        original_weights: &[f32],
+        n_keep: usize,
+    ) -> Result<Self, TernaryError> {
         let num_cols = row.num_cols;
+        if original_weights.len() != num_cols {
+            return Err(TernaryError::LengthMismatch {
+                expected: num_cols,
+                got: original_weights.len(),
+            });
+        }
+        check_finite(original_weights)?;
         let num_blocks = num_cols.div_ceil(SPARSE_BLOCK);
         let mut active_masks = vec![0u16; num_blocks];
         let mut sign_masks = vec![0u16; num_blocks];
@@ -5702,7 +5768,7 @@ impl SparseTernaryRow {
                 }
             }
 
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
             candidates.truncate(n_keep.min(block_len));
 
             for &(i, mag) in &candidates {
@@ -5726,18 +5792,26 @@ impl SparseTernaryRow {
             row.scale
         };
 
-        Self {
+        Ok(Self {
             active_masks,
             sign_masks,
             scale,
             num_cols,
             num_blocks,
-        }
+        })
     }
 
     /// Create directly from f32 weights with N:M structured sparsity.
-    pub fn from_f32(weights: &[f32], threshold_ratio: f32, n_keep: usize) -> Self {
-        let row = TernaryRow::from_f32(weights, threshold_ratio);
+    ///
+    /// # Errors
+    ///
+    /// As [`TernaryRow::from_f32`].
+    pub fn from_f32(
+        weights: &[f32],
+        threshold_ratio: f32,
+        n_keep: usize,
+    ) -> Result<Self, TernaryError> {
+        let row = TernaryRow::from_f32(weights, threshold_ratio)?;
         Self::from_ternary_row(&row, weights, n_keep)
     }
 
@@ -5852,15 +5926,26 @@ impl SparseTernaryMatrix {
         dense: &TernaryMatrix,
         original_weights_per_row: &[Vec<f32>],
         n_keep: usize,
-    ) -> Self {
+    ) -> Result<Self, TernaryError> {
+        if original_weights_per_row.len() != dense.rows.len() {
+            return Err(TernaryError::LengthMismatch {
+                expected: dense.rows.len(),
+                got: original_weights_per_row.len(),
+            });
+        }
         let target_sparsity = 1.0 - (n_keep as f32 / SPARSE_BLOCK as f32);
-        let rows: Vec<SparseTernaryRow> = dense
+        let rows = dense
             .rows
             .iter()
             .zip(original_weights_per_row.iter())
             .map(|(row, orig)| SparseTernaryRow::from_ternary_row(row, orig, n_keep))
-            .collect();
-        Self::from_rows(rows, dense.num_rows, dense.num_cols, target_sparsity)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_rows(
+            rows,
+            dense.num_rows,
+            dense.num_cols,
+            target_sparsity,
+        ))
     }
 
     /// Create directly from f32 weight data (row-major).
@@ -5870,7 +5955,14 @@ impl SparseTernaryMatrix {
         num_cols: usize,
         threshold_ratio: f32,
         n_keep: usize,
-    ) -> Self {
+    ) -> Result<Self, TernaryError> {
+        let expected = num_rows.saturating_mul(num_cols);
+        if weights.len() != expected {
+            return Err(TernaryError::LengthMismatch {
+                expected,
+                got: weights.len(),
+            });
+        }
         let target_sparsity = 1.0 - (n_keep as f32 / SPARSE_BLOCK as f32);
         let mut rows = Vec::with_capacity(num_rows);
         for r in 0..num_rows {
@@ -5879,9 +5971,9 @@ impl SparseTernaryMatrix {
                 row_data,
                 threshold_ratio,
                 n_keep,
-            ));
+            )?);
         }
-        Self::from_rows(rows, num_rows, num_cols, target_sparsity)
+        Ok(Self::from_rows(rows, num_rows, num_cols, target_sparsity))
     }
 
     /// Get active_masks slice for a row.
@@ -7761,7 +7853,7 @@ mod tests {
     fn test_sparse_ternary_row_from_f32() {
         // 32 weights, keep 8 per block of 16 (50% sparsity)
         let weights: Vec<f32> = (0..32).map(|i| (i as f32 - 15.5) * 0.1).collect();
-        let row = SparseTernaryRow::from_f32(&weights, 0.3, 8);
+        let row = SparseTernaryRow::from_f32(&weights, 0.3, 8).unwrap();
 
         assert_eq!(row.num_cols, 32);
         assert_eq!(row.num_blocks, 2);
@@ -7778,7 +7870,7 @@ mod tests {
             1.0, -2.0, 0.5, -0.1, 3.0, -0.3, 0.8, -0.05, 0.02, -1.5, 0.7, -0.9, 0.01, -0.4, 2.5,
             -0.6,
         ];
-        let row = SparseTernaryRow::from_f32(&weights, 0.1, 4);
+        let row = SparseTernaryRow::from_f32(&weights, 0.1, 4).unwrap();
         assert_eq!(row.active_masks[0].count_ones(), 4);
         assert_eq!(row.nnz(), 4);
     }
@@ -7798,14 +7890,17 @@ mod tests {
         // Dense ternary (keep all)
         let dense = TernaryMatrix {
             rows: (0..num_rows)
-                .map(|r| TernaryRow::from_f32(&weights[r * num_cols..(r + 1) * num_cols], 0.05))
+                .map(|r| {
+                    TernaryRow::from_f32(&weights[r * num_cols..(r + 1) * num_cols], 0.05).unwrap()
+                })
                 .collect(),
             num_rows,
             num_cols,
         };
 
         // Sparse ternary (keep 16 = all, so should match dense)
-        let sparse = SparseTernaryMatrix::from_f32_weights(&weights, num_rows, num_cols, 0.05, 16);
+        let sparse =
+            SparseTernaryMatrix::from_f32_weights(&weights, num_rows, num_cols, 0.05, 16).unwrap();
 
         let input = vec![
             1.0, 0.5, -1.0, 2.0, 0.3, -0.7, 1.5, -0.2, 0.8, -1.2, 0.4, 0.6, -0.9, 1.1, -0.3, 0.7,
@@ -7839,7 +7934,7 @@ mod tests {
         // sparse ternary = 64 blocks × (2+2) bytes = 256 bytes + scale
         // But with 50% sparsity, fewer ops in matvec (not less storage for masks)
         let weights: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7).sin()) * 2.0).collect();
-        let sparse = SparseTernaryMatrix::from_f32_weights(&weights, 1, 1024, 0.5, 8);
+        let sparse = SparseTernaryMatrix::from_f32_weights(&weights, 1, 1024, 0.5, 8).unwrap();
 
         // Verify nnz is roughly 50% of 1024
         let nnz = sparse.total_nnz();
@@ -7857,7 +7952,7 @@ mod tests {
         let weights = vec![
             0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ];
-        let row = SparseTernaryRow::from_f32(&weights, 0.01, 2);
+        let row = SparseTernaryRow::from_f32(&weights, 0.01, 2).unwrap();
 
         // Only positions 3 (+5.0→+1) and 10 (-3.0→-1) should be active
         assert_eq!(row.nnz(), 2);
