@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "alice-det-math"
 version = "0.6.1"
-source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#57e65fce8c1ae6213896957fff4cad7835874078"
+source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#8cb532f332be03db8ccc6a98612ae206ca23275d"
 
 [[package]]
 name = "alice-llm"
