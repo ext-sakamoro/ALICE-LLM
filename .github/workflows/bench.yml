@@ -39,6 +39,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Runner CPU info
         id: cpuinfo
+        shell: bash
         run: |
           # Emit to both stdout (so `gh run view --log` picks it up) and
           # $GITHUB_STEP_SUMMARY (nice rendering in the web summary).
@@ -64,6 +65,7 @@ jobs:
         run: cargo build --release --example bench_simd_matvec --features gguf
       - name: Run bench_simd_matvec
         id: bench
+        shell: bash
         run: |
           {
             echo "## bench_simd_matvec (${{ matrix.os }})"

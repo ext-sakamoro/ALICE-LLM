@@ -450,6 +450,8 @@ has_toolchain() { grep -q "^$1" <<<"$(rustup toolchain list)"; }
 #   - fuzz.yml:fuzz:Run fuzz target (time-boxed) [target=fuzz_sampling] (runner-only (open-ended or unprovable-bounded fuzz run))
 #   - fuzz.yml:gate:gate (reads NEEDS, a value only the runner has)
 
+python3 scripts/test_workflow_pipefail.py
+python3 scripts/workflow_pipefail.py
 need actionlint "brew install actionlint"
 need cargo-audit "cargo install cargo-audit --locked"
 need cargo-deny "cargo install cargo-deny --locked"

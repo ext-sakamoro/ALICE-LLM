@@ -42,6 +42,10 @@ jobs:
           reporter: github-check
       # every job has a job-level timeout-minutes (a hung step otherwise holds a shared
       # runner for GitHub's 6-hour limit); the checker's own tests run first
+      - name: workflow_pipefail (test, then check)
+        run: |
+          python3 scripts/test_workflow_pipefail.py
+          python3 scripts/workflow_pipefail.py
       - name: workflow-timeouts
         run: |
           python3 scripts/test_workflow_timeouts.py

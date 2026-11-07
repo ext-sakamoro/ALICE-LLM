@@ -205,6 +205,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run coverage
+        shell: bash
         run: |
           cargo llvm-cov --lib --summary-only 2>&1 | tee coverage-summary.txt
 
