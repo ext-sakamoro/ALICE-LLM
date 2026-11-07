@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- CI: toolchain の action を上流の master から届く commit に固定した 固定していた sha は上流の branch の書き換えで届かなくなっていた
 - CI: 共有の `scripts/semver_gate.py`、`scripts/test_semver_gate.py`、`scripts/release_baseline.py`、`scripts/test_release_baseline.py` の subprocess に `encoding="utf-8"` を明示した (text mode は既定で locale の符号化で読むため) ALICE-Law の pin を今の版へ移した
 - **破壊的:** `TernaryRow::from_f32` / `TernaryMatrix::from_quantized` / `SparseTernaryRow::from_f32` / `from_ternary_row` / `SparseTernaryMatrix::from_ternary` / `from_f32_weights` / `Llama3Model::load_ternary` / `load_sparse_ternary` は `Result<_, TernaryError>` を返す 有限でない重み、有限で 0 以上でない threshold、dequantize できない型、形の合わない入力、ternary の形を持たない層 (MoE、KV 共有) を断る 以前は重みに `NaN` か無限大が 1 つあると、その行全体がエラーなしで 0 になった 型が未対応の tensor も 0 として読んでいた `from_ternary_row` は panic していた
 - `LLM_SEMANTICS_ID` を `cd0f624f` に動かした 新しい scenario `sampling choices` (`top_k_filter` / `sample_argmax` の同点の規則 / `sample_with_random` の和を超えた時) を fold に足した 以前の値 `c1eee96c` は `LLM_PREVIOUS_SEMANTICS_IDS` に置き、その KV cache は読める (cache に token の選択は入らない)
