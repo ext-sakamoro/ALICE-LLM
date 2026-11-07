@@ -2201,7 +2201,7 @@ pub fn kimi_delta_l2_norm_in_place(x: &mut [f32], eps: f32) {
 /// on the large hidden-dim reductions typical of transformer
 /// projections (matches the convention in this module's private
 /// [`rms_norm`] helper).
-fn kimi_delta_matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+fn matvec_f64_acc(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_dim * in_dim, "w shape mismatch");
     debug_assert_eq!(x.len(), in_dim, "x length mismatch");
     let mut y = vec![0.0_f32; out_dim];
@@ -2217,7 +2217,7 @@ fn kimi_delta_matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
 }
 
 /// Scalar dot product with `f64` accumulation.
-fn kimi_delta_dot(a: &[f32], b: &[f32]) -> f32 {
+fn dot_f64_acc(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot length mismatch");
     let mut acc = 0.0_f64;
     for i in 0..a.len() {
@@ -2279,9 +2279,9 @@ pub fn kimi_delta_forward_head(
     let ks = cache.kernel_size;
 
     // Step 1: linear projections.
-    let q_pre = kimi_delta_matvec(params.w_q, x, d_k, d);
-    let k_pre = kimi_delta_matvec(params.w_k, x, d_k, d);
-    let v_pre = kimi_delta_matvec(params.w_v, x, d_v, d);
+    let q_pre = matvec_f64_acc(params.w_q, x, d_k, d);
+    let k_pre = matvec_f64_acc(params.w_k, x, d_k, d);
+    let v_pre = matvec_f64_acc(params.w_v, x, d_v, d);
 
     // Step 2: ShortConv (kernel_size taps, depthwise per channel).
     let mut q_conv = vec![0.0_f32; d_k];
@@ -2339,11 +2339,11 @@ pub fn kimi_delta_forward_head(
         d,
         "w_beta length must equal hidden dim"
     );
-    let beta = sigmoid(kimi_delta_dot(params.w_beta, x));
+    let beta = sigmoid(dot_f64_acc(params.w_beta, x));
 
     // Step 6: z = W_α_↑ (W_α_↓ x) + b_α, then α = lower_bounded_decay.
-    let z_mid = kimi_delta_matvec(params.w_alpha_down, x, params.alpha_rank, d);
-    let mut z = kimi_delta_matvec(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
+    let z_mid = matvec_f64_acc(params.w_alpha_down, x, params.alpha_rank, d);
+    let mut z = matvec_f64_acc(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
     debug_assert_eq!(params.b_alpha.len(), d_k, "b_alpha length must equal d_k");
     for i in 0..d_k {
         z[i] += params.b_alpha[i];
@@ -2357,7 +2357,7 @@ pub fn kimi_delta_forward_head(
     let o_bar = kimi_delta_read(&cache.state, &q_conv);
 
     // Step 9: output gate (Eq 6 / Eq 7 depending on rms_gamma).
-    let gate_pre = kimi_delta_matvec(params.w_gate, x, d_v, d);
+    let gate_pre = matvec_f64_acc(params.w_gate, x, d_v, d);
     kimi_delta_output_gate(
         &o_bar,
         &gate_pre,
@@ -2397,9 +2397,9 @@ pub fn kimi_delta_forward_head_with_capture(
     let ks = cache.kernel_size;
 
     // Step 1: linear projections. (q_pre, k_pre, v_pre をキャプチャ対象)
-    let q_pre = kimi_delta_matvec(params.w_q, x, d_k, d);
-    let k_pre = kimi_delta_matvec(params.w_k, x, d_k, d);
-    let v_pre = kimi_delta_matvec(params.w_v, x, d_v, d);
+    let q_pre = matvec_f64_acc(params.w_q, x, d_k, d);
+    let k_pre = matvec_f64_acc(params.w_k, x, d_k, d);
+    let v_pre = matvec_f64_acc(params.w_v, x, d_v, d);
     // Capture: pre-conv 値 (conv_state ring push 用)
     let q_pre_captured = q_pre.clone();
     let k_pre_captured = k_pre.clone();
@@ -2461,11 +2461,11 @@ pub fn kimi_delta_forward_head_with_capture(
         d,
         "w_beta length must equal hidden dim"
     );
-    let beta = sigmoid(kimi_delta_dot(params.w_beta, x));
+    let beta = sigmoid(dot_f64_acc(params.w_beta, x));
 
     // Step 6: α.
-    let z_mid = kimi_delta_matvec(params.w_alpha_down, x, params.alpha_rank, d);
-    let mut z = kimi_delta_matvec(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
+    let z_mid = matvec_f64_acc(params.w_alpha_down, x, params.alpha_rank, d);
+    let mut z = matvec_f64_acc(params.w_alpha_up, &z_mid, d_k, params.alpha_rank);
     debug_assert_eq!(params.b_alpha.len(), d_k, "b_alpha length must equal d_k");
     for i in 0..d_k {
         z[i] += params.b_alpha[i];
@@ -2490,7 +2490,7 @@ pub fn kimi_delta_forward_head_with_capture(
     let o_bar = kimi_delta_read(&cache.state, &q_conv);
 
     // Step 9: output gate.
-    let gate_pre = kimi_delta_matvec(params.w_gate, x, d_v, d);
+    let gate_pre = matvec_f64_acc(params.w_gate, x, d_v, d);
     let out = kimi_delta_output_gate(
         &o_bar,
         &gate_pre,
@@ -7307,7 +7307,7 @@ pub struct KimiK3MlaConfig {
 /// a fresh `[rows]` result. Thin allocating wrapper over
 /// `WeightRef::matvec` used by the K3 MLA forward for readability.
 #[inline]
-fn kimi_k3_matvec_ref(w: &WeightRef<'_>, x: &[f32]) -> Vec<f32> {
+fn weight_ref_matvec(w: &WeightRef<'_>, x: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; w.rows];
     w.matvec(x, &mut out);
     out
@@ -7317,7 +7317,7 @@ fn kimi_k3_matvec_ref(w: &WeightRef<'_>, x: &[f32]) -> Vec<f32> {
 /// module-private `rms_norm` helper but returns a fresh `Vec<f32>` so
 /// the MLA step can chain operations without threading scratch
 /// buffers. `x / sqrt(mean(x²) + eps) · γ`.
-fn kimi_k3_rms_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+fn rms_norm_owned(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
     debug_assert_eq!(x.len(), gamma.len());
     let mut out = vec![0.0_f32; x.len()];
     rms_norm(x, gamma, eps, &mut out);
@@ -7392,20 +7392,20 @@ fn kimi_k3_gated_mla_step(
     );
 
     // Step 1: pre-attention RMSNorm.
-    let x_norm = kimi_k3_rms_norm(x, attn_norm, config.rms_eps);
+    let x_norm = rms_norm_owned(x, attn_norm, config.rms_eps);
 
     // Step 2: Q LoRA chain.
-    let q_latent = kimi_k3_matvec_ref(&mla.q_a, &x_norm);
-    let q_latent_norm = kimi_k3_rms_norm(&q_latent, &mla.q_a_norm, config.rms_eps);
-    let q_full = kimi_k3_matvec_ref(&mla.q_b, &q_latent_norm);
+    let q_latent = weight_ref_matvec(&mla.q_a, &x_norm);
+    let q_latent_norm = rms_norm_owned(&q_latent, &mla.q_a_norm, config.rms_eps);
+    let q_full = weight_ref_matvec(&mla.q_b, &q_latent_norm);
     debug_assert_eq!(q_full.len(), h * qk_head, "q_full length");
 
     // Step 3: KV LoRA down + split.
-    let kv_a_out = kimi_k3_matvec_ref(&mla.kv_a_mqa, &x_norm);
+    let kv_a_out = weight_ref_matvec(&mla.kv_a_mqa, &x_norm);
     debug_assert_eq!(kv_a_out.len(), kv_lr + qk_rope);
     let c_k_slice = &kv_a_out[..kv_lr];
     let k_rope_slice = &kv_a_out[kv_lr..];
-    let c_k_norm = kimi_k3_rms_norm(c_k_slice, &mla.kv_a_norm, config.rms_eps);
+    let c_k_norm = rms_norm_owned(c_k_slice, &mla.kv_a_norm, config.rms_eps);
 
     // Step 4: cache append (K3 stores latent, not reconstructed k/v).
     cache.append(&c_k_norm, k_rope_slice);
@@ -7424,8 +7424,8 @@ fn kimi_k3_gated_mla_step(
     for pos in 0..n_pos {
         let c_k_i = cache.c_k_at(pos);
         let k_rope_i = cache.k_rope_at(pos);
-        let k_nope_reconstructed = kimi_k3_matvec_ref(&mla.k_b, c_k_i);
-        let v_reconstructed = kimi_k3_matvec_ref(&mla.v_b, c_k_i);
+        let k_nope_reconstructed = weight_ref_matvec(&mla.k_b, c_k_i);
+        let v_reconstructed = weight_ref_matvec(&mla.v_b, c_k_i);
         debug_assert_eq!(k_nope_reconstructed.len(), h * qk_nope);
         debug_assert_eq!(v_reconstructed.len(), h * v_head);
         // Layout k as [num_heads, qk_head] with nope first, rope last.
@@ -7490,11 +7490,11 @@ fn kimi_k3_gated_mla_step(
     }
 
     // Step 6: output projection.
-    let attn_out = kimi_k3_matvec_ref(attn_output, &concat_out);
+    let attn_out = weight_ref_matvec(attn_output, &concat_out);
     debug_assert_eq!(attn_out.len(), d);
 
     // Step 7: output gate (Eq 7). `y = Sigmoid(W_g x_norm) ⊙ attn_out`.
-    let gate_pre = kimi_k3_matvec_ref(attn_gate, &x_norm);
+    let gate_pre = weight_ref_matvec(attn_gate, &x_norm);
     debug_assert_eq!(gate_pre.len(), d);
     let mut y = vec![0.0_f32; d];
     for i in 0..d {
@@ -7583,7 +7583,7 @@ fn kimi_k3_dense_ffn_forward(
     );
 
     // Pre-FFN RMSNorm.
-    let x_norm = kimi_k3_rms_norm(x, ffn_norm, rms_eps);
+    let x_norm = rms_norm_owned(x, ffn_norm, rms_eps);
 
     // SwiGLU: gated = Swish(W_gate x_norm) ⊙ W_up x_norm.
     let mut gate_out = vec![0.0_f32; intermediate];
@@ -7946,7 +7946,7 @@ mod kimi_k3_attnres_tests {
 ///   (per-row byte offsets would land mid-block), or
 /// - `w.qtype` is `GgmlType::Other(_)` (unknown quant type).
 #[allow(dead_code)]
-fn kimi_k3_slice_weight_ref_rows<'a>(
+fn slice_weight_ref_rows<'a>(
     w: &WeightRef<'a>,
     row_start: usize,
     row_end: usize,
@@ -8050,7 +8050,7 @@ fn kimi_k3_kda_layer_forward(
     );
 
     // Pre-attention RMSNorm.
-    let x_norm = kimi_k3_rms_norm(x, attn_norm, rms_eps);
+    let x_norm = rms_norm_owned(x, attn_norm, rms_eps);
 
     // Per-head SIL SIL SIL. We aggregate concatenated outputs
     // `[num_heads * head_dim]` then apply the shared output
@@ -8242,61 +8242,60 @@ fn kimi_k3_kda_head_forward(
             t.qtype.block_bytes()
         )
     };
-    let w_q = kimi_k3_slice_weight_ref_rows(&kda.q, row_start, row_end).unwrap_or_else(|| {
+    let w_q = slice_weight_ref_rows(&kda.q, row_start, row_end).unwrap_or_else(|| {
         panic!(
             "kda_layer_forward: q slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
              tensor {})",
             describe(&kda.q)
         )
     });
-    let w_k = kimi_k3_slice_weight_ref_rows(&kda.k, row_start, row_end).unwrap_or_else(|| {
+    let w_k = slice_weight_ref_rows(&kda.k, row_start, row_end).unwrap_or_else(|| {
         panic!(
             "kda_layer_forward: k slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
              tensor {})",
             describe(&kda.k)
         )
     });
-    let w_v = kimi_k3_slice_weight_ref_rows(&kda.v, row_start, row_end).unwrap_or_else(|| {
+    let w_v = slice_weight_ref_rows(&kda.v, row_start, row_end).unwrap_or_else(|| {
         panic!(
             "kda_layer_forward: v slice failed (head {head_idx}, rows [{row_start}..{row_end}], \
              tensor {})",
             describe(&kda.v)
         )
     });
-    let w_conv_q = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end)
-        .unwrap_or_else(|| {
+    let w_conv_q =
+        slice_weight_ref_rows(&kda.ssm_conv1d_q, row_start, row_end).unwrap_or_else(|| {
             panic!(
                 "kda_layer_forward: conv1d_q slice failed (head {head_idx}, rows \
                  [{row_start}..{row_end}], tensor {})",
                 describe(&kda.ssm_conv1d_q)
             )
         });
-    let w_conv_k = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end)
-        .unwrap_or_else(|| {
+    let w_conv_k =
+        slice_weight_ref_rows(&kda.ssm_conv1d_k, row_start, row_end).unwrap_or_else(|| {
             panic!(
                 "kda_layer_forward: conv1d_k slice failed (head {head_idx}, rows \
                  [{row_start}..{row_end}], tensor {})",
                 describe(&kda.ssm_conv1d_k)
             )
         });
-    let w_conv_v = kimi_k3_slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end)
-        .unwrap_or_else(|| {
+    let w_conv_v =
+        slice_weight_ref_rows(&kda.ssm_conv1d_v, row_start, row_end).unwrap_or_else(|| {
             panic!(
                 "kda_layer_forward: conv1d_v slice failed (head {head_idx}, rows \
                  [{row_start}..{row_end}], tensor {})",
                 describe(&kda.ssm_conv1d_v)
             )
         });
-    let w_alpha_up = kimi_k3_slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end)
-        .unwrap_or_else(|| {
-            panic!(
-                "kda_layer_forward: ssm_f_b slice failed (head {head_idx}, rows \
+    let w_alpha_up = slice_weight_ref_rows(&kda.ssm_f_b, row_start, row_end).unwrap_or_else(|| {
+        panic!(
+            "kda_layer_forward: ssm_f_b slice failed (head {head_idx}, rows \
                  [{row_start}..{row_end}], tensor {})",
-                describe(&kda.ssm_f_b)
-            )
-        });
+            describe(&kda.ssm_f_b)
+        )
+    });
 
-    let w_beta_ref = kimi_k3_slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
+    let w_beta_ref = slice_weight_ref_rows(&kda.ssm_beta, head_idx, head_idx + 1)
         .unwrap_or_else(|| panic!("kda_layer_forward: ssm_beta slice failed (head {head_idx})"));
     let w_beta = weight_ref_row_dequant(&w_beta_ref);
 
@@ -8321,7 +8320,7 @@ fn kimi_k3_kda_head_forward(
     let ssm_g_slice = kda
         .ssm_g
         .as_ref()
-        .and_then(|g| kimi_k3_slice_weight_ref_rows(g, row_start, row_end));
+        .and_then(|g| slice_weight_ref_rows(g, row_start, row_end));
     let w_gate_owned = ssm_g_slice.as_ref().map(weight_ref_row_dequant);
     let w_gate_ref: &[f32] = w_gate_owned.as_deref().unwrap_or(identity_gate);
 
@@ -8475,7 +8474,7 @@ fn identity_matrix_f32(d: usize) -> Vec<f32> {
 /// `(expert_index, normalized_weight)`, sorted by expert index
 /// ascending for deterministic downstream reduce.
 #[allow(dead_code)]
-fn kimi_k3_moe_router(
+fn sigmoid_top_k_router_dense(
     x: &[f32],
     ffn_gate_inp: &[f32],
     exp_probs_b: Option<&[f32]>,
@@ -8638,7 +8637,7 @@ fn kimi_k3_situ_scalar(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
 /// `per_expert_bytes = cube.data.len() / num_experts`, from which the
 /// row count can be derived block-safely for any quant type.
 #[allow(dead_code)]
-fn kimi_k3_cube_per_expert_rows(cube: &WeightRef<'_>, num_experts: usize) -> usize {
+fn cube_per_expert_rows(cube: &WeightRef<'_>, num_experts: usize) -> usize {
     if num_experts == 0 {
         return cube.rows;
     }
@@ -8663,7 +8662,7 @@ fn kimi_k3_cube_per_expert_rows(cube: &WeightRef<'_>, num_experts: usize) -> usi
 }
 
 #[allow(dead_code)]
-fn kimi_k3_expert_plane_weight_ref<'a>(
+fn expert_plane_weight_ref<'a>(
     cube: &WeightRef<'a>,
     expert_idx: usize,
     num_experts: usize,
@@ -8722,7 +8721,7 @@ fn kimi_k3_expert_plane_weight_ref<'a>(
 /// 1. **Pre-FFN RMSNorm** applied to `x` using `ffn_norm` (this
 ///    convention differs from llama.cpp which does the norm in the
 ///    caller; we match the sibling `kimi_k3_dense_ffn_forward`).
-/// 2. **Router** (`kimi_k3_moe_router`) — runs on FULL-WIDTH `x_norm`
+/// 2. **Router** (`sigmoid_top_k_router_dense`) — runs on FULL-WIDTH `x_norm`
 ///    (n_embd), NOT the latent projection. Sigmoid + optional
 ///    noaux_tc bias + top-k + renormalize.
 /// 3. **Shared experts** (`kimi_k3_shared_experts_forward`) — also
@@ -8772,11 +8771,11 @@ fn kimi_k3_latent_moe_forward(
     // `kimi_k3_dense_ffn_forward` pattern; llama.cpp applies the
     // norm in the caller instead, but the aggregate math is
     // identical).
-    let x_norm = kimi_k3_rms_norm(x, ffn_norm, rms_eps);
+    let x_norm = rms_norm_owned(x, ffn_norm, rms_eps);
     let hidden = x.len();
 
     // Step 1: router (runs on full-width x_norm, not latent).
-    let selected = kimi_k3_moe_router(
+    let selected = sigmoid_top_k_router_dense(
         &x_norm,
         &moe.ffn_gate_inp,
         moe.exp_probs_b.as_deref(),
@@ -8838,10 +8837,10 @@ fn kimi_k3_latent_moe_forward(
     );
     // Per-expert n_ff_exp derivation: authoritative via data-length /
     // num_experts (works for both 2-D fixtures and real 3-D-flattened
-    // K3 GrEarl cubes). Helper matches kimi_k3_expert_plane_weight_ref
+    // K3 GrEarl cubes). Helper matches expert_plane_weight_ref
     // internal logic.
-    let n_ff_exp = kimi_k3_cube_per_expert_rows(&moe.ffn_gate_exps, num_experts);
-    let per_expert_up_rows = kimi_k3_cube_per_expert_rows(&moe.ffn_up_exps, num_experts);
+    let n_ff_exp = cube_per_expert_rows(&moe.ffn_gate_exps, num_experts);
+    let per_expert_up_rows = cube_per_expert_rows(&moe.ffn_up_exps, num_experts);
     assert_eq!(
         per_expert_up_rows, n_ff_exp,
         "ffn_up_exps per-expert rows must equal ffn_gate_exps per-expert rows"
@@ -8850,7 +8849,7 @@ fn kimi_k3_latent_moe_forward(
         moe.ffn_down_exps.cols, n_ff_exp,
         "ffn_down_exps.cols must equal n_ff_exp"
     );
-    let per_expert_down_rows = kimi_k3_cube_per_expert_rows(&moe.ffn_down_exps, num_experts);
+    let per_expert_down_rows = cube_per_expert_rows(&moe.ffn_down_exps, num_experts);
     assert_eq!(
         per_expert_down_rows, n_embd_latent,
         "ffn_down_exps per-expert rows must equal n_embd_latent"
@@ -8869,8 +8868,7 @@ fn kimi_k3_latent_moe_forward(
     if madv_on {
         for (expert_idx, _weight) in &selected {
             for cube in [&moe.ffn_gate_exps, &moe.ffn_up_exps, &moe.ffn_down_exps] {
-                if let Some(plane) = kimi_k3_expert_plane_weight_ref(cube, *expert_idx, num_experts)
-                {
+                if let Some(plane) = expert_plane_weight_ref(cube, *expert_idx, num_experts) {
                     let _ = crate::deepseek_streaming::advise_willneed(plane.data);
                 }
             }
@@ -8884,32 +8882,30 @@ fn kimi_k3_latent_moe_forward(
     // Step 5: per-expert dispatch, weighted sum in latent space.
     let mut routed_sum = vec![0.0_f32; n_embd_latent];
     for (expert_idx, weight) in &selected {
-        let gate_ref =
-            kimi_k3_expert_plane_weight_ref(&moe.ffn_gate_exps, *expert_idx, num_experts)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "K3 LatentMoE routed dispatch: ffn_gate_exps for expert \
+        let gate_ref = expert_plane_weight_ref(&moe.ffn_gate_exps, *expert_idx, num_experts)
+            .unwrap_or_else(|| {
+                panic!(
+                    "K3 LatentMoE routed dispatch: ffn_gate_exps for expert \
                          {expert_idx} not sliceable (qtype {:?}, num_experts \
                          {num_experts}, plane bytes {plane_bytes} × num_experts vs \
                          cube data {}). Quantized cubes require \
                          `plane_elements % elements_per_block == 0` — check that \
                          `n_embd_latent * n_ff_exp` is a multiple of the quant \
                          block size ({} for this qtype).",
-                        moe.ffn_gate_exps.qtype,
-                        moe.ffn_gate_exps.data.len(),
-                        moe.ffn_gate_exps.qtype.elements_per_block(),
-                        plane_bytes = {
-                            let epb = moe.ffn_gate_exps.qtype.elements_per_block().max(1);
-                            let bb = moe.ffn_gate_exps.qtype.block_bytes();
-                            (moe.ffn_gate_exps.rows * moe.ffn_gate_exps.cols / epb) * bb
-                        }
-                    )
-                });
-        let up_ref = kimi_k3_expert_plane_weight_ref(&moe.ffn_up_exps, *expert_idx, num_experts)
+                    moe.ffn_gate_exps.qtype,
+                    moe.ffn_gate_exps.data.len(),
+                    moe.ffn_gate_exps.qtype.elements_per_block(),
+                    plane_bytes = {
+                        let epb = moe.ffn_gate_exps.qtype.elements_per_block().max(1);
+                        let bb = moe.ffn_gate_exps.qtype.block_bytes();
+                        (moe.ffn_gate_exps.rows * moe.ffn_gate_exps.cols / epb) * bb
+                    }
+                )
+            });
+        let up_ref = expert_plane_weight_ref(&moe.ffn_up_exps, *expert_idx, num_experts)
             .expect("ffn_up_exps expert slice must succeed if gate slice did");
-        let down_ref =
-            kimi_k3_expert_plane_weight_ref(&moe.ffn_down_exps, *expert_idx, num_experts)
-                .expect("ffn_down_exps expert slice must succeed if gate slice did");
+        let down_ref = expert_plane_weight_ref(&moe.ffn_down_exps, *expert_idx, num_experts)
+            .expect("ffn_down_exps expert slice must succeed if gate slice did");
 
         let mut gate_out = vec![0.0_f32; n_ff_exp];
         gate_ref.matvec(&routed_in, &mut gate_out);
@@ -8934,7 +8930,7 @@ fn kimi_k3_latent_moe_forward(
     // Step 6a: K3-only RMSNorm on aggregated routed sum (paper §2.3.1
     // "Stable LatentMoE" — this norm prevents scale drift when the
     // per-expert outputs sum in an unbounded way).
-    let routed_normed = kimi_k3_rms_norm(&routed_sum, &moe.routed_exp_norm, rms_eps);
+    let routed_normed = rms_norm_owned(&routed_sum, &moe.routed_exp_norm, rms_eps);
 
     // Step 6b: up-project from latent back to hidden.
     let mut up_projected = vec![0.0_f32; hidden];
@@ -8951,8 +8947,8 @@ fn kimi_k3_latent_moe_forward(
 #[cfg(test)]
 mod kimi_k3_latent_moe_tests {
     use super::{
-        kimi_k3_expert_plane_weight_ref, kimi_k3_latent_moe_forward, kimi_k3_moe_router,
-        kimi_k3_shared_experts_forward, kimi_k3_situ_scalar, GgmlType, KimiK3LatentMoe, WeightRef,
+        expert_plane_weight_ref, kimi_k3_latent_moe_forward, kimi_k3_shared_experts_forward,
+        kimi_k3_situ_scalar, sigmoid_top_k_router_dense, GgmlType, KimiK3LatentMoe, WeightRef,
     };
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -8976,7 +8972,7 @@ mod kimi_k3_latent_moe_tests {
             0.1, 0.1, // expert 2
             5.0, 5.0, // expert 3
         ];
-        let selected = kimi_k3_moe_router(&x, &router, None, 2, true);
+        let selected = sigmoid_top_k_router_dense(&x, &router, None, 2, true);
         let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![0, 3], "top-2 should pick experts 0 and 3");
         // Renormalized weights sum to 1.
@@ -9006,7 +9002,7 @@ mod kimi_k3_latent_moe_tests {
         ];
         // Bias pushes expert 1's selection score above expert 3.
         let bias = vec![0.0_f32, 10.0, 0.0, 0.0];
-        let selected = kimi_k3_moe_router(&x, &router, Some(&bias), 2, false);
+        let selected = sigmoid_top_k_router_dense(&x, &router, Some(&bias), 2, false);
         let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
         // Selection order (by index ascending after sort): 0, 1.
         assert_eq!(indices, vec![0, 1], "bias must promote expert 1 over 3");
@@ -9031,7 +9027,7 @@ mod kimi_k3_latent_moe_tests {
             3.0, 3.0, // expert 2: mid
             5.0, 5.0, // expert 3: high
         ];
-        let selected = kimi_k3_moe_router(&x, &router, None, 3, true);
+        let selected = sigmoid_top_k_router_dense(&x, &router, None, 3, true);
         let indices: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![1, 2, 3], "indices must be sorted ascending");
     }
@@ -9110,8 +9106,7 @@ mod kimi_k3_latent_moe_tests {
             cols: 2, // n_embd_latent per expert
         };
 
-        let plane0 =
-            kimi_k3_expert_plane_weight_ref(&cube, 0, 2).expect("expert 0 plane must extract");
+        let plane0 = expert_plane_weight_ref(&cube, 0, 2).expect("expert 0 plane must extract");
         assert_eq!(plane0.rows, 3);
         assert_eq!(plane0.cols, 2);
         assert_eq!(plane0.data.len(), 6 * 4, "24 bytes = 6 F32");
@@ -9119,8 +9114,7 @@ mod kimi_k3_latent_moe_tests {
         let first_bytes: [u8; 4] = plane0.data[..4].try_into().unwrap();
         assert_eq!(f32::from_le_bytes(first_bytes), 1.0);
 
-        let plane1 =
-            kimi_k3_expert_plane_weight_ref(&cube, 1, 2).expect("expert 1 plane must extract");
+        let plane1 = expert_plane_weight_ref(&cube, 1, 2).expect("expert 1 plane must extract");
         let first_bytes: [u8; 4] = plane1.data[..4].try_into().unwrap();
         assert_eq!(f32::from_le_bytes(first_bytes), 10.0);
     }
@@ -9135,7 +9129,7 @@ mod kimi_k3_latent_moe_tests {
             cols: 2,
         };
         // num_experts = 2, expert_idx 2 is out of range.
-        assert!(kimi_k3_expert_plane_weight_ref(&cube, 2, 2).is_none());
+        assert!(expert_plane_weight_ref(&cube, 2, 2).is_none());
     }
 
     #[test]
@@ -9155,12 +9149,12 @@ mod kimi_k3_latent_moe_tests {
             rows: per_expert_rows * num_experts,
             cols: 64,
         };
-        let plane0 = kimi_k3_expert_plane_weight_ref(&cube, 0, num_experts)
+        let plane0 = expert_plane_weight_ref(&cube, 0, num_experts)
             .expect("Q4_K plane slicing must succeed when per-expert plane % 256 == 0");
         assert_eq!(plane0.rows, per_expert_rows);
         assert_eq!(plane0.cols, 64);
         assert_eq!(plane0.data.len(), 144, "1 Q4_K block per plane");
-        let plane1 = kimi_k3_expert_plane_weight_ref(&cube, 1, num_experts)
+        let plane1 = expert_plane_weight_ref(&cube, 1, num_experts)
             .expect("expert 1 slice must succeed for aligned Q4_K cube");
         assert_eq!(plane1.data.len(), 144);
     }
@@ -9181,7 +9175,7 @@ mod kimi_k3_latent_moe_tests {
             cols: 64,
         };
         assert!(
-            kimi_k3_expert_plane_weight_ref(&cube, 0, 2).is_none(),
+            expert_plane_weight_ref(&cube, 0, 2).is_none(),
             "misaligned Q4_K (100 bytes/expert vs 144-byte block) must fail slicing"
         );
     }
@@ -9199,7 +9193,7 @@ mod kimi_k3_latent_moe_tests {
             rows: 4,
             cols: 32,
         };
-        let plane2 = kimi_k3_expert_plane_weight_ref(&cube, 2, num_experts)
+        let plane2 = expert_plane_weight_ref(&cube, 2, num_experts)
             .expect("MXFP4 plane slicing must succeed at aligned boundary");
         assert_eq!(plane2.data.len(), 68);
     }
@@ -9341,8 +9335,8 @@ mod kimi_k3_latent_moe_tests {
 #[cfg(test)]
 mod kimi_k3_kda_layer_tests {
     use super::{
-        identity_matrix_f32, kimi_k3_slice_weight_ref_rows, weight_ref_as_f32,
-        weight_ref_slice_as_f32, GgmlType, WeightRef,
+        identity_matrix_f32, slice_weight_ref_rows, weight_ref_as_f32, weight_ref_slice_as_f32,
+        GgmlType, WeightRef,
     };
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -9366,7 +9360,7 @@ mod kimi_k3_kda_layer_tests {
         };
 
         // Rows 1..3 → [3,4, 5,6].
-        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 3).expect("slicing must succeed for F32");
+        let sliced = slice_weight_ref_rows(&w, 1, 3).expect("slicing must succeed for F32");
         assert_eq!(sliced.rows, 2);
         assert_eq!(sliced.cols, 2);
         let sliced_f32 = weight_ref_as_f32(&sliced);
@@ -9386,7 +9380,7 @@ mod kimi_k3_kda_layer_tests {
             rows: 4,
             cols: 64,
         };
-        assert!(kimi_k3_slice_weight_ref_rows(&w, 0, 2).is_none());
+        assert!(slice_weight_ref_rows(&w, 0, 2).is_none());
     }
 
     #[test]
@@ -9402,7 +9396,7 @@ mod kimi_k3_kda_layer_tests {
             rows: 4,
             cols: 256,
         };
-        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 3)
+        let sliced = slice_weight_ref_rows(&w, 1, 3)
             .expect("Q4_K per-row slicing must succeed when cols % 256 == 0");
         assert_eq!(sliced.rows, 2);
         assert_eq!(sliced.cols, 256);
@@ -9422,7 +9416,7 @@ mod kimi_k3_kda_layer_tests {
             rows: 4,
             cols: 32,
         };
-        let sliced = kimi_k3_slice_weight_ref_rows(&w, 0, 2)
+        let sliced = slice_weight_ref_rows(&w, 0, 2)
             .expect("MXFP4 per-row slicing must succeed at 32-element aligned cols");
         assert_eq!(sliced.rows, 2);
         assert_eq!(sliced.cols, 32);
@@ -9440,7 +9434,7 @@ mod kimi_k3_kda_layer_tests {
             rows: 3,
             cols: 64,
         };
-        let sliced = kimi_k3_slice_weight_ref_rows(&w, 1, 2)
+        let sliced = slice_weight_ref_rows(&w, 1, 2)
             .expect("Q8_0 per-row slicing must succeed at 32-element aligned cols");
         assert_eq!(sliced.rows, 1);
         assert_eq!(sliced.data.len(), 34 * 2);
@@ -9456,9 +9450,9 @@ mod kimi_k3_kda_layer_tests {
             cols: 4,
         };
         // row_end = 3 exceeds rows = 2.
-        assert!(kimi_k3_slice_weight_ref_rows(&w, 0, 3).is_none());
+        assert!(slice_weight_ref_rows(&w, 0, 3).is_none());
         // row_start > row_end.
-        assert!(kimi_k3_slice_weight_ref_rows(&w, 2, 1).is_none());
+        assert!(slice_weight_ref_rows(&w, 2, 1).is_none());
     }
 
     #[test]
@@ -10986,13 +10980,10 @@ impl<'a> KimiK3Model<'a> {
             "token_id {token_id} out of vocab range 0..{vocab_size}"
         );
         let row_start = token_id as usize;
-        let embed_row =
-            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id}"
-                    )
-                });
+        let embed_row = slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+            .unwrap_or_else(|| {
+                panic!("K3 embed lookup: token_embd per-row slicing failed for token {token_id}")
+            });
         let x_full = weight_ref_row_dequant(&embed_row);
         let mut x = vec![0.0_f32; hidden_dim];
         let take = hidden_dim.min(x_full.len());
@@ -11232,26 +11223,25 @@ impl<'a> KimiK3Model<'a> {
             "token_id {token_id} out of vocab range 0..{vocab_size}"
         );
         // Phase X.4.b.6 continued (2026-07-28): block-aware embed lookup
-        // via `kimi_k3_slice_weight_ref_rows` (which handles all K3 quant
+        // via `slice_weight_ref_rows` (which handles all K3 quant
         // types when `cols % elements_per_block == 0` — K3 hidden = 7168
         // = 28 × 256 = 224 × 32, block-aligned for all K3 quant types).
         // The sliced 1-row `WeightRef` is then dequantized to a `Vec<f32>`
         // via `weight_ref_row_dequant` (routes through the same
         // per-qtype dequantizers as `GgufFile::tensor_to_f32`).
         let row_start = token_id as usize;
-        let embed_row =
-            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
+        let embed_row = slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
                  (qtype {:?}, cols {}, rows {}). Ensure `cols % elements_per_block == 0` \
                  (K3 hidden = 7168 = 28 × 256 = 224 × 32, block-aligned for all K3 quant \
                  types). Phase X.4.c.3.3.b.2 upgrade.",
-                        self.weights.token_embd.qtype,
-                        self.weights.token_embd.cols,
-                        self.weights.token_embd.rows,
-                    )
-                });
+                    self.weights.token_embd.qtype,
+                    self.weights.token_embd.cols,
+                    self.weights.token_embd.rows,
+                )
+            });
         let x_full = weight_ref_row_dequant(&embed_row);
         let mut x = vec![0.0_f32; hidden_dim];
         let take = hidden_dim.min(x_full.len());
@@ -11487,19 +11477,18 @@ impl<'a> KimiK3Model<'a> {
             "token_id {token_id} out of vocab range 0..{vocab_size}"
         );
         let row_start = token_id as usize;
-        let embed_row =
-            kimi_k3_slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
+        let embed_row = slice_weight_ref_rows(&self.weights.token_embd, row_start, row_start + 1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "K3 embed lookup: token_embd per-row slicing failed for token {token_id} \
                  (qtype {:?}, cols {}, rows {}). Ensure `cols % elements_per_block == 0` \
                  (K3 hidden = 7168 = 28 × 256 = 224 × 32, block-aligned for all K3 quant \
                  types). Phase X.4.c.3.3.b.2 upgrade.",
-                        self.weights.token_embd.qtype,
-                        self.weights.token_embd.cols,
-                        self.weights.token_embd.rows,
-                    )
-                });
+                    self.weights.token_embd.qtype,
+                    self.weights.token_embd.cols,
+                    self.weights.token_embd.rows,
+                )
+            });
         let x_full = weight_ref_row_dequant(&embed_row);
         let mut x = vec![0.0_f32; hidden_dim];
         let take = hidden_dim.min(x_full.len());
@@ -24376,7 +24365,7 @@ mod refuses_what_it_cannot_sample {
             assert_eq!(selected.len(), 8.min(n), "sigmoid router {n}");
 
             // one input dimension: each expert's row is its logit
-            let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8.min(n), false);
+            let selected = sigmoid_top_k_router_dense(&[1.0], &logits, None, 8.min(n), false);
             assert_eq!(selected.len(), 8.min(n), "kimi {n}");
         }
     }
@@ -24388,7 +24377,7 @@ mod refuses_what_it_cannot_sample {
         // the highest logit is not NaN, so it is chosen first and no NaN comes before a number
         let selected = sigmoid_top_k_moe_route(&logits, None, 8, 1.0);
         assert_eq!(selected[0].0, 1);
-        let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8, false);
+        let selected = sigmoid_top_k_router_dense(&[1.0], &logits, None, 8, false);
         assert_eq!(selected[0].0, 1);
         assert!(selected.iter().all(|(i, _)| i % 3 != 0), "{selected:?}");
     }
