@@ -38,7 +38,7 @@
 //! # Scope of Phase 4a (this module)
 //!
 //! Ships the *infrastructure* — types, LRU semantics, and the enum that lets
-//! `DeepSeekMoeWeights` hold either in-memory `WeightRef`s or a shared pool:
+//! `SharedExpertMoeWeights` hold either in-memory `WeightRef`s or a shared pool:
 //!
 //! - [`StreamingExpertPool`] — owns a byte source and an LRU cache of decoded
 //!   expert slabs. Cache eviction is byte-budget-driven.
@@ -49,7 +49,7 @@
 //!   canonical implementations are an owned `Vec<u8>` (unit tests / small
 //!   test models) and a `memmap2::Mmap` (production, real GGUF).
 //! - [`ExpertKind`] / [`ExpertSlabRef`] — dispatch surface consumed by
-//!   `forward_deepseek_moe_layer` in `llama3.rs`.
+//!   `forward_shared_expert_moe_layer` in `llama3.rs`.
 //!
 //! # Deferred to Phase 4b
 //!
@@ -476,7 +476,7 @@ impl StreamingExpertPool {
 
     /// Warm the cache with a batch of expert keys. Every key that already
     /// hits stays in place (only its LRU position bumps); every miss reads
-    /// from the source and inserts. Intended usage: `forward_deepseek_moe_layer`
+    /// from the source and inserts. Intended usage: `forward_shared_expert_moe_layer`
     /// calls this on the top-k × 3-kind key list *immediately after* the
     /// router picks its winners and *before* the per-expert matvec loop.
     /// The subsequent `get_or_load` calls inside the loop then become

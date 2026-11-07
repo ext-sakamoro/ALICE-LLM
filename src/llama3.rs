@@ -6660,11 +6660,11 @@ impl<'a> LayerWeights<'a> {
 /// * `o_proj`: `[hidden_dim, num_heads * v_head]`
 ///
 /// FFN weights are `Option` because MoE layers omit them entirely.
-struct DeepSeekV3LayerWeights<'a> {
+struct MlaMoeLayerWeights<'a> {
     attn_norm: Vec<f32>,
     /// Q projection: dense (V2 / V2-Lite) or LoRA (V2.5 / V3 / R1).
-    /// See [`DeepSeekQProjection`] for the family-specific layout.
-    q: DeepSeekQProjection<'a>,
+    /// See [`MlaQProjection`] for the family-specific layout.
+    q: MlaQProjection<'a>,
     /// Fused KV LoRA down + MQA k_pe projection:
     /// `hidden → (kv_lora_rank + qk_rope_head_dim)`.
     kv_a_proj_with_mqa: WeightRef<'a>,
@@ -6686,7 +6686,7 @@ struct DeepSeekV3LayerWeights<'a> {
     down_proj: Option<WeightRef<'a>>,
     // ── MoE (present only for layers ≥ `first_k_dense_replace`) ─────────
     /// DeepSeek-V3 MoE weights (Phase 3). `None` for dense layers.
-    moe: Option<DeepSeekMoeWeights<'a>>,
+    moe: Option<SharedExpertMoeWeights<'a>>,
 }
 
 /// Family-specific Q projection layout for DeepSeek variants (Issue #58).
@@ -6700,7 +6700,7 @@ struct DeepSeekV3LayerWeights<'a> {
 /// KV projection stays LoRA across the entire family so it lives outside
 /// this enum. V2-Lite's `deepseek2.attention.q_lora_rank` metadata key is
 /// absent, which the loader keys on to pick the `Dense` variant.
-enum DeepSeekQProjection<'a> {
+enum MlaQProjection<'a> {
     /// V2 / V2-Lite dense Q: `[num_heads * (qk_nope + qk_rope), hidden_dim]`.
     Dense { q_proj: WeightRef<'a> },
     /// V2.5 / V3 / R1 LoRA Q: `[q_lora_rank, hidden]` → norm → `[num_heads * (qk_nope + qk_rope), q_lora_rank]`.
@@ -6718,7 +6718,7 @@ enum DeepSeekQProjection<'a> {
 /// to the routed sum. All three components are loaded together so the
 /// forward path can dispatch without checking Option-ness inside the
 /// hot loop.
-struct DeepSeekMoeWeights<'a> {
+struct SharedExpertMoeWeights<'a> {
     /// FFN RMSNorm applied to `hidden` before the router / shared expert.
     ffn_norm: Vec<f32>,
     /// Router logits projection: `hidden → n_routed_experts` (dense f32).
@@ -12712,13 +12712,13 @@ mod kimi_k3_model_tests {
 ///
 /// Ships the *loader* and *storage* only — the forward path is stubbed
 /// via [`Llama3Model::mtp_draft`] which currently returns `todo!()`. Full
-/// MTP forward needs to reuse `forward_deepseek_v3`'s per-layer MLA + MoE
+/// MTP forward needs to reuse `forward_mla_moe`'s per-layer MLA + MoE
 /// primitives; factoring those out is a follow-up (Phase 5a.2) because it
 /// touches the outer forward loop.
 ///
 /// [`Llama3Model::mtp_draft`]: Llama3Model::mtp_draft
 #[allow(dead_code)]
-struct DeepSeekV3MtpWeights<'a> {
+struct MlaMoeMtpWeights<'a> {
     /// Embedding entry RMSNorm — applied to the next token's embedding.
     enorm: Vec<f32>,
     /// Hidden entry RMSNorm — applied to the incoming hidden state.
@@ -12730,7 +12730,7 @@ struct DeepSeekV3MtpWeights<'a> {
     /// The inner transformer block. Structurally identical to a regular
     /// V3 layer (attention: MLA with LoRA Q/KV + partial NEOX RoPE, FFN:
     /// MoE with sigmoid gating + shared expert + noaux_tc bias).
-    block: DeepSeekV3LayerWeights<'a>,
+    block: MlaMoeLayerWeights<'a>,
     /// Final RMSNorm before the output head. The head itself is shared
     /// with the main model's `output_proj` — no separate MTP `output.weight`.
     final_norm: Vec<f32>,
@@ -12753,7 +12753,7 @@ struct DeepSeekV3MtpWeights<'a> {
 /// The loader currently only builds `InMemory` — real-GGUF streaming
 /// wiring is deliberately deferred to a follow-up (see [`Phase 4a scope`
 /// in `deepseek_streaming.rs`](crate::deepseek_streaming)). The enum shape
-/// is in place so `forward_deepseek_moe_layer` supports either backend
+/// is in place so `forward_shared_expert_moe_layer` supports either backend
 /// today and the loader can be swapped without further code changes.
 enum RoutedExpertStorage<'a> {
     InMemory {
@@ -13037,17 +13037,17 @@ pub struct Llama3Model<'a> {
     /// `None` for non-DeepSeek architectures. Indexed by global layer index
     /// (unlike DeltaNet, DeepSeek-V3 does not interleave with attention layers
     /// — every layer is MLA).
-    deepseek_v3_layers: Option<Vec<DeepSeekV3LayerWeights<'a>>>,
+    mla_moe_layers: Option<Vec<MlaMoeLayerWeights<'a>>>,
     /// DeepSeek-V3 Multi-Token Prediction head weights (Phase 5a, Issue #35).
     /// `None` when the checkpoint does not ship an MTP head (all V2 quants
     /// and some V3 variants) or the arch is not DeepSeek-V3. Populated at
-    /// load time by [`load_deepseek_v3_mtp_weights`] when the `mtp.*`
+    /// load time by [`load_mla_moe_mtp_weights`] when the `mtp.*`
     /// tensor family is present. Used at inference time by [`mtp_draft`]
     /// to produce a single draft token for speculative decoding.
     ///
-    /// [`load_deepseek_v3_mtp_weights`]: crate::llama3::load_deepseek_v3_mtp_weights
+    /// [`load_mla_moe_mtp_weights`]: crate::llama3::load_mla_moe_mtp_weights
     /// [`mtp_draft`]: Llama3Model::mtp_draft
-    deepseek_v3_mtp: Option<DeepSeekV3MtpWeights<'a>>,
+    mla_moe_mtp: Option<MlaMoeMtpWeights<'a>>,
 }
 
 /// Compact routing tag used by `Llama3Model::layer_kind_map` for hybrid
@@ -13088,29 +13088,29 @@ impl<'a> Llama3Model<'a> {
 
         // Layers. Three routing regimes coexist:
         //  * DeepSeek-V3 / R1 — every layer is MLA, weights live in
-        //    `deepseek_v3_layers`; `layers` stays empty and `layer_kind_map`
+        //    `mla_moe_layers`; `layers` stays empty and `layer_kind_map`
         //    is unused (the forward path indexes directly by global index).
         //  * Qwen 3.5 / 3.6 hybrid — DeltaNet layers land in
         //    `deltanet_layers`, attention layers in `layers`,
         //    `layer_kind_map` disambiguates.
         //  * Everything else — every layer is a standard attention entry in
         //    `layers`, `layer_kind_map` is empty.
-        let is_deepseek_model = matches!(config.arch, ModelArch::DeepSeekV3);
+        let is_mla_moe_model = matches!(config.arch, ModelArch::DeepSeekV3);
         let is_hybrid_model = config.is_hybrid();
-        let mut layers = Vec::with_capacity(if is_deepseek_model {
+        let mut layers = Vec::with_capacity(if is_mla_moe_model {
             0
         } else {
             config.num_layers
         });
         let mut deltanet_layers_vec: Vec<DeltaNetLayerWeights<'a>> = Vec::new();
-        let mut deepseek_v3_layers_vec: Vec<DeepSeekV3LayerWeights<'a>> = Vec::new();
+        let mut mla_moe_layers_vec: Vec<MlaMoeLayerWeights<'a>> = Vec::new();
         // Phase 4b.1: build one shared streaming pool for the whole model
         // when `ALICE_LLM_MOE_STREAMING=1` + `ALICE_LLM_MOE_STREAMING_FILE=<path>`
         // are both set. Failure (env unset, file open error, missing tensor)
         // silently falls back to InMemory so callers who don't opt in are
         // unaffected.
-        let deepseek_streaming_pool = if is_deepseek_model {
-            build_deepseek_streaming_pool(gguf, &config)
+        let mla_moe_streaming_pool = if is_mla_moe_model {
+            build_mla_moe_streaming_pool(gguf, &config)
         } else {
             None
         };
@@ -13120,14 +13120,10 @@ impl<'a> Llama3Model<'a> {
             Vec::new()
         };
         for i in 0..config.num_layers {
-            if is_deepseek_model {
-                let dsv = load_deepseek_v3_layer_weights(
-                    gguf,
-                    i,
-                    &config,
-                    deepseek_streaming_pool.as_ref(),
-                )?;
-                deepseek_v3_layers_vec.push(dsv);
+            if is_mla_moe_model {
+                let dsv =
+                    load_mla_moe_layer_weights(gguf, i, &config, mla_moe_streaming_pool.as_ref())?;
+                mla_moe_layers_vec.push(dsv);
             } else if is_hybrid_model && config.is_deltanet_layer(i) {
                 let dn = load_deltanet_layer_weights(gguf, i, &config)?;
                 layer_kind_map.push(LayerKind::DeltaNet(deltanet_layers_vec.len()));
@@ -13145,8 +13141,8 @@ impl<'a> Llama3Model<'a> {
         } else {
             None
         };
-        let deepseek_v3_layers = if is_deepseek_model {
-            Some(deepseek_v3_layers_vec)
+        let mla_moe_layers = if is_mla_moe_model {
+            Some(mla_moe_layers_vec)
         } else {
             None
         };
@@ -13154,8 +13150,8 @@ impl<'a> Llama3Model<'a> {
         // this; V2 quants and pre-MTP V3 variants leave it None. The
         // loader tolerates missing tensors and never errors — a missing
         // MTP head only prevents speculative decoding, not regular decode.
-        let deepseek_v3_mtp = if is_deepseek_model {
-            load_deepseek_v3_mtp_weights(gguf, &config, deepseek_streaming_pool.as_ref())
+        let mla_moe_mtp = if is_mla_moe_model {
+            load_mla_moe_mtp_weights(gguf, &config, mla_moe_streaming_pool.as_ref())
         } else {
             None
         };
@@ -13189,7 +13185,7 @@ impl<'a> Llama3Model<'a> {
         //    source of the ~57× KV-cache compression relative to standard
         //    GQA and is what makes long-context DeepSeek runs fit in RAM.
         //  * Everything else stores full `num_kv_heads * head_dim` bytes.
-        let kv_dim = if is_deepseek_model {
+        let kv_dim = if is_mla_moe_model {
             config.deepseek_kv_lora_rank().unwrap_or(0)
                 + config.deepseek_qk_rope_head_dim().unwrap_or(0)
         } else {
@@ -13287,8 +13283,8 @@ impl<'a> Llama3Model<'a> {
             deltanet_state,
             deltanet_conv_state,
             deltanet_conv_ring_pos,
-            deepseek_v3_layers,
-            deepseek_v3_mtp,
+            mla_moe_layers,
+            mla_moe_mtp,
         })
     }
 
@@ -13299,7 +13295,7 @@ impl<'a> Llama3Model<'a> {
     /// [`mtp_draft`]: Self::mtp_draft
     #[must_use]
     pub fn has_deepseek_mtp(&self) -> bool {
-        self.deepseek_v3_mtp.is_some()
+        self.mla_moe_mtp.is_some()
     }
 
     /// DeepSeek-V3 Multi-Token Prediction draft (Phase 5a.3, Issue #35).
@@ -13329,7 +13325,7 @@ impl<'a> Llama3Model<'a> {
     /// - `prev_hidden.len() == config.hidden_dim`.
     /// - The loaded MTP block uses the MoE FFN branch (all V3 MTP variants
     ///   at authorship time do; a dense fallback would need to be added
-    ///   alongside `forward_deepseek_moe_layer`).
+    ///   alongside `forward_shared_expert_moe_layer`).
     ///
     /// # Panics
     ///
@@ -13346,7 +13342,7 @@ impl<'a> Llama3Model<'a> {
     /// [`has_deepseek_mtp`]: Self::has_deepseek_mtp
     pub fn mtp_draft(&mut self, prev_hidden: &[f32], next_token: u32) -> Vec<f32> {
         let mtp = self
-            .deepseek_v3_mtp
+            .mla_moe_mtp
             .as_ref()
             .expect("mtp_draft called without a loaded MTP head — check has_deepseek_mtp() first");
         let c = self.config.clone();
@@ -13381,7 +13377,7 @@ impl<'a> Llama3Model<'a> {
         mtp.eh_proj.matvec(&concat, &mut hidden);
 
         // ── Step 5: Inner V3 transformer block at pos=0 (seq_len=1).
-        // Layout mirrors forward_deepseek_v3's per-layer body — extracted
+        // Layout mirrors forward_mla_moe's per-layer body — extracted
         // here so MTP does not require the full multi-position attention
         // loop or a shared KV cache. Every softmax reduces to [1.0]
         // because there is exactly one attention slot.
@@ -13395,7 +13391,7 @@ impl<'a> Llama3Model<'a> {
         let mut q_a_normed = vec![0.0f32; q_lora_rank];
         let mut q_full = vec![0.0f32; num_heads * q_head_total];
         match &block.q {
-            DeepSeekQProjection::LoRA {
+            MlaQProjection::LoRA {
                 q_a_proj,
                 q_a_norm,
                 q_b_proj,
@@ -13404,7 +13400,7 @@ impl<'a> Llama3Model<'a> {
                 rms_norm(&q_a_buf, q_a_norm, c.norm_eps, &mut q_a_normed);
                 q_b_proj.matvec(&q_a_normed, &mut q_full);
             }
-            DeepSeekQProjection::Dense { .. } => {
+            MlaQProjection::Dense { .. } => {
                 unreachable!("MTP head is V3-only; V2 / V2-Lite never load a dense-Q MTP block")
             }
         }
@@ -13462,14 +13458,14 @@ impl<'a> Llama3Model<'a> {
             hidden[i] += o_buf[i];
         }
 
-        // FFN branch. MTP always uses MoE (see load_deepseek_v3_mtp_weights
+        // FFN branch. MTP always uses MoE (see load_mla_moe_mtp_weights
         // caveat) — no dense fallback here.
         let moe = block
             .moe
             .as_ref()
             .expect("MTP block requires MoE FFN weights (Phase 5a.2 loader guarantee)");
         let mut down_buf = vec![0.0f32; hidden_dim];
-        forward_deepseek_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
+        forward_shared_expert_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
         for i in 0..hidden_dim {
             hidden[i] += down_buf[i];
         }
@@ -13868,7 +13864,7 @@ impl<'a> Llama3Model<'a> {
         // get silent garbage from a fallback that treats the model as
         // standard attention.
         if self.config.arch == ModelArch::DeepSeekV3 {
-            return self.forward_deepseek_v3(token_id);
+            return self.forward_mla_moe(token_id);
         }
         // Kimi K3 / Kimi Delta Attention (Moonshot AI). Weights released
         // 2026-07-27 and the full spec is now captured by KimiDeltaConfig
@@ -15528,7 +15524,7 @@ impl<'a> Llama3Model<'a> {
     /// instead of returning a silent `Ok`.
     // `&mut self` is intentional: the real Phase X.4.c implementation will
     // mutate `self.kv_cache` on every forward, mirroring
-    // `forward_deepseek_v3` and `forward_gemma3n`. Keeping the signature
+    // `forward_mla_moe` and `forward_gemma3n`. Keeping the signature
     // stable now so the dispatch in `forward_with_layer_hook` doesn't need
     // to change when the stub gets replaced.
     #[allow(clippy::needless_pass_by_ref_mut)]
@@ -15575,7 +15571,7 @@ impl<'a> Llama3Model<'a> {
         );
     }
 
-    fn forward_deepseek_v3(&mut self, token_id: u32) -> Vec<f32> {
+    fn forward_mla_moe(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
         let num_heads = c.num_heads;
@@ -15593,8 +15589,8 @@ impl<'a> Llama3Model<'a> {
         let kv_up_head_total = qk_nope + v_head_dim;
         let compressed_kv_dim = kv_lora_rank + qk_rope;
 
-        let deepseek_layers = self
-            .deepseek_v3_layers
+        let mla_moe_layer_slots = self
+            .mla_moe_layers
             .as_ref()
             .expect("DeepSeek-V3 layers not loaded");
 
@@ -15644,7 +15640,7 @@ impl<'a> Llama3Model<'a> {
         }
 
         for layer_idx in 0..c.num_layers {
-            let layer = &deepseek_layers[layer_idx];
+            let layer = &mla_moe_layer_slots[layer_idx];
 
             // ── Attention block ───────────────────────────────────────
             rms_norm(&hidden, &layer.attn_norm, c.norm_eps, &mut norm_buf);
@@ -15652,10 +15648,10 @@ impl<'a> Llama3Model<'a> {
 
             // Q projection: dense (V2 / V2-Lite) or LoRA (V2.5 / V3 / R1).
             match &layer.q {
-                DeepSeekQProjection::Dense { q_proj } => {
+                MlaQProjection::Dense { q_proj } => {
                     q_proj.matvec(&norm_buf, &mut q_full);
                 }
-                DeepSeekQProjection::LoRA {
+                MlaQProjection::LoRA {
                     q_a_proj,
                     q_a_norm,
                     q_b_proj,
@@ -15829,7 +15825,7 @@ impl<'a> Llama3Model<'a> {
                     .moe
                     .as_ref()
                     .expect("DeepSeek-V3 MoE weights required past first_k_dense_replace");
-                forward_deepseek_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
+                forward_shared_expert_moe_layer(&c, moe, &hidden, &mut norm_buf, &mut down_buf);
                 for i in 0..hidden_dim {
                     hidden[i] += down_buf[i];
                 }
@@ -18694,7 +18690,7 @@ fn load_weight_ref_any_rows<'a>(
 ///
 /// DeepSeek-V3 MoE routing (pure math, Phase 3).
 ///
-/// Splits out steps 3-7 of `forward_deepseek_moe_layer` so the routing
+/// Splits out steps 3-7 of `forward_shared_expert_moe_layer` so the routing
 /// arithmetic can be unit-tested in isolation without loading real weights:
 ///
 /// 1. `scores = sigmoid(router_logits)` (un-biased routing weights).
@@ -18708,7 +18704,7 @@ fn load_weight_ref_any_rows<'a>(
 ///
 /// Numerically-stable sigmoid: uses the branch `1/(1+exp(-x))` for x ≥ 0
 /// and `exp(x)/(1+exp(x))` for x < 0 to keep the exp argument non-positive.
-fn deepseek_moe_route(
+fn sigmoid_top_k_moe_route(
     router_logits: &[f32],
     exp_probs_b: Option<&[f32]>,
     top_k: usize,
@@ -18783,9 +18779,9 @@ fn deepseek_moe_route(
 ///
 /// Output is the FFN branch's contribution — the caller adds it to the
 /// residual `hidden` outside this function.
-fn forward_deepseek_moe_layer(
+fn forward_shared_expert_moe_layer(
     c: &Llama3Config,
-    moe: &DeepSeekMoeWeights<'_>,
+    moe: &SharedExpertMoeWeights<'_>,
     hidden: &[f32],
     norm_buf: &mut [f32],
     output: &mut [f32],
@@ -18829,7 +18825,7 @@ fn forward_deepseek_moe_layer(
     }
 
     // ── Steps 3-7: pure routing math (testable in isolation). ──────────
-    let selected = deepseek_moe_route(
+    let selected = sigmoid_top_k_moe_route(
         &router_logits,
         moe.exp_probs_b.as_deref(),
         top_k,
@@ -20016,7 +20012,7 @@ fn load_layer_weights<'a>(
 ///
 /// [`StreamingExpertPool`]: crate::deepseek_streaming::StreamingExpertPool
 #[cfg(not(feature = "gguf"))]
-fn build_deepseek_streaming_pool(
+fn build_mla_moe_streaming_pool(
     _gguf: &GgufFile<'_>,
     _config: &Llama3Config,
 ) -> Option<std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>> {
@@ -20027,7 +20023,7 @@ fn build_deepseek_streaming_pool(
 /// `not(feature = "gguf")` stub above for full env-var documentation.
 #[cfg(feature = "gguf")]
 #[allow(clippy::too_many_lines)]
-fn build_deepseek_streaming_pool(
+fn build_mla_moe_streaming_pool(
     gguf: &GgufFile<'_>,
     config: &Llama3Config,
 ) -> Option<std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>> {
@@ -20073,7 +20069,7 @@ fn build_deepseek_streaming_pool(
     // ExpertLayerInfo entry so `Vec::len() == num_layers` and callers can
     // index by layer_idx uniformly. The forward path never touches these
     // placeholders because it only takes the Streaming branch when the
-    // layer's `DeepSeekMoeWeights.routed` is Streaming (which only happens
+    // layer's `SharedExpertMoeWeights.routed` is Streaming (which only happens
     // for MoE layers, past first_k_dense).
     let placeholder = ExpertLayerInfo {
         base_offset: 0,
@@ -20142,12 +20138,12 @@ fn build_deepseek_streaming_pool(
     )))
 }
 
-fn load_deepseek_v3_layer_weights<'a>(
+fn load_mla_moe_layer_weights<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
     config: &Llama3Config,
     streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
-) -> Option<DeepSeekV3LayerWeights<'a>> {
+) -> Option<MlaMoeLayerWeights<'a>> {
     let prefix = format!("blk.{layer}");
 
     let attn_norm = gguf.tensor_to_f32(&format!("{prefix}.attn_norm.weight"))?;
@@ -20177,7 +20173,7 @@ fn load_deepseek_v3_layer_weights<'a>(
             config.num_heads * q_head_total,
             q_lora_rank,
         )?;
-        DeepSeekQProjection::LoRA {
+        MlaQProjection::LoRA {
             q_a_proj,
             q_a_norm,
             q_b_proj,
@@ -20189,7 +20185,7 @@ fn load_deepseek_v3_layer_weights<'a>(
             config.num_heads * q_head_total,
             config.hidden_dim,
         )?;
-        DeepSeekQProjection::Dense { q_proj }
+        MlaQProjection::Dense { q_proj }
     };
     let kv_a_proj_with_mqa = load_weight_ref(
         gguf,
@@ -20305,7 +20301,7 @@ fn load_deepseek_v3_layer_weights<'a>(
                 down: ffn_down_exps,
             }
         };
-        let moe = DeepSeekMoeWeights {
+        let moe = SharedExpertMoeWeights {
             ffn_norm,
             ffn_gate_inp,
             exp_probs_b,
@@ -20317,7 +20313,7 @@ fn load_deepseek_v3_layer_weights<'a>(
         (None, None, None, None, Some(moe))
     };
 
-    Some(DeepSeekV3LayerWeights {
+    Some(MlaMoeLayerWeights {
         attn_norm,
         q,
         kv_a_proj_with_mqa,
@@ -20348,16 +20344,16 @@ fn load_deepseek_v3_layer_weights<'a>(
 /// its names to the alternates list in-line.
 ///
 /// The inner transformer block is loaded by delegating to
-/// [`load_deepseek_v3_layer_weights`] with `prefix = "mtp.blk.0"` — MTP
+/// [`load_mla_moe_layer_weights`] with `prefix = "mtp.blk.0"` — MTP
 /// reuses the exact MLA + MoE layer structure of a main-model block, so
 /// there is no MTP-specific attention / FFN loader to write.
 ///
 /// [`Llama3Model::has_deepseek_mtp`]: crate::llama3::Llama3Model::has_deepseek_mtp
-fn load_deepseek_v3_mtp_weights<'a>(
+fn load_mla_moe_mtp_weights<'a>(
     gguf: &'a GgufFile<'a>,
     config: &Llama3Config,
     streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
-) -> Option<DeepSeekV3MtpWeights<'a>> {
+) -> Option<MlaMoeMtpWeights<'a>> {
     // Only look for MTP tensors when the config declares an MTP layer.
     // V2 quants and pre-MTP V3 variants leave this field None.
     config.deepseek_mtp_layer()?;
@@ -20389,16 +20385,16 @@ fn load_deepseek_v3_mtp_weights<'a>(
         // and using a wrapper. Actually simpler: modify the loader to
         // accept a prefix. That refactor is invasive for one caller;
         // instead call load_weight_ref explicitly for the block below,
-        // mirroring load_deepseek_v3_layer_weights. Since this is Phase
+        // mirroring load_mla_moe_layer_weights. Since this is Phase
         // 5a scaffolding and the forward is stubbed, keep it minimal —
         // load only the attention path and the MoE / dense-FFN decision,
         // leaving the same-shaped stub in `block`.
-        load_deepseek_v3_layer_weights_with_prefix(gguf, "mtp.blk.0", config, None)?
+        load_mla_moe_layer_weights_with_prefix(gguf, "mtp.blk.0", config, None)?
     };
 
     let final_norm = gguf.tensor_to_f32("mtp.norm.weight")?;
 
-    Some(DeepSeekV3MtpWeights {
+    Some(MlaMoeMtpWeights {
         enorm,
         hnorm,
         eh_proj,
@@ -20407,17 +20403,17 @@ fn load_deepseek_v3_mtp_weights<'a>(
     })
 }
 
-/// Prefix-parameterised variant of [`load_deepseek_v3_layer_weights`] used
+/// Prefix-parameterised variant of [`load_mla_moe_layer_weights`] used
 /// by the MTP loader. The main-layer loader hard-codes `blk.{layer}` as
 /// the tensor namespace; MTP needs `mtp.blk.0` so we accept an explicit
 /// prefix instead. Returns None if any required tensor is missing.
-fn load_deepseek_v3_layer_weights_with_prefix<'a>(
+fn load_mla_moe_layer_weights_with_prefix<'a>(
     gguf: &'a GgufFile<'a>,
     prefix: &str,
     config: &Llama3Config,
     streaming_pool: Option<&std::sync::Arc<crate::deepseek_streaming::StreamingExpertPool>>,
-) -> Option<DeepSeekV3LayerWeights<'a>> {
-    // Duplication with load_deepseek_v3_layer_weights is intentional — the
+) -> Option<MlaMoeLayerWeights<'a>> {
+    // Duplication with load_mla_moe_layer_weights is intentional — the
     // main-layer function hard-codes `format!("blk.{layer}")` deep in a
     // 200-line body, refactoring it to take a prefix would touch every
     // call site. This helper is used by exactly one caller (MTP), so a
@@ -20444,7 +20440,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
             config.num_heads * q_head_total,
             q_lora_rank,
         )?;
-        DeepSeekQProjection::LoRA {
+        MlaQProjection::LoRA {
             q_a_proj,
             q_a_norm,
             q_b_proj,
@@ -20456,7 +20452,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
             config.num_heads * q_head_total,
             config.hidden_dim,
         )?;
-        DeepSeekQProjection::Dense { q_proj }
+        MlaQProjection::Dense { q_proj }
     };
     let kv_a_proj_with_mqa = load_weight_ref(
         gguf,
@@ -20535,7 +20531,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
             down: ffn_down_exps,
         }
     };
-    let moe = DeepSeekMoeWeights {
+    let moe = SharedExpertMoeWeights {
         ffn_norm: ffn_norm_v,
         ffn_gate_inp,
         exp_probs_b,
@@ -20545,7 +20541,7 @@ fn load_deepseek_v3_layer_weights_with_prefix<'a>(
         ffn_down_shexp,
     };
 
-    Some(DeepSeekV3LayerWeights {
+    Some(MlaMoeLayerWeights {
         attn_norm,
         q,
         kv_a_proj_with_mqa,
@@ -23042,7 +23038,7 @@ mod tests {
     // ── DeepSeek-V3 / R1 foundation (Phase 1) ────────────────────────
 
     #[test]
-    fn deepseek_v3_config_accessors_return_none_when_absent() {
+    fn mla_moe_config_accessors_return_none_when_absent() {
         let c = Llama3Config::llama3_8b();
         assert!(c.deepseek_v3.is_none());
         assert!(c.deepseek_q_lora_rank().is_none());
@@ -23061,7 +23057,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v3_config_reads_typical_v3_values() {
+    fn mla_moe_config_reads_typical_v3_values() {
         let mut c = Llama3Config::llama3_8b();
         c.arch = ModelArch::DeepSeekV3;
         c.deepseek_v3 = Some(DeepSeekV3Config {
@@ -23095,14 +23091,14 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v3_arch_uses_neox_rope() {
+    fn mla_moe_arch_uses_neox_rope() {
         // DeepSeek-V3 uses NEOX RoPE half-rotation on the `qk_rope_head_dim`
         // slice, consistent with Qwen and Gemma families.
         assert!(ModelArch::DeepSeekV3.use_neox_rope());
     }
 
     #[test]
-    fn deepseek_v3_arch_meta_prefix_is_deepseek2() {
+    fn mla_moe_arch_meta_prefix_is_the_gguf_one() {
         // llama.cpp names V2 / V3 / R1 all under the same `deepseek2` key
         // prefix. Any drift here would silently mis-route GGUF metadata
         // lookups in `Llama3Config::from_gguf`.
@@ -23115,7 +23111,7 @@ mod tests {
     /// forward paths can be exercised without a real 671B GGUF. Numbers
     /// are downsized proportionally (num_heads=2, hidden_dim=16,
     /// q_lora_rank=8, kv_lora_rank=4, qk_nope=4, qk_rope=2, v_head=4).
-    fn tiny_deepseek_v3_config() -> Llama3Config {
+    fn tiny_mla_moe_config() -> Llama3Config {
         Llama3Config {
             arch: ModelArch::DeepSeekV3,
             vocab_size: 32,
@@ -23155,10 +23151,10 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v3_compressed_kv_dim_matches_paper() {
+    fn mla_moe_compressed_kv_dim_matches_paper() {
         // The MLA cache stores `kv_lora_rank + qk_rope_head_dim` floats per
         // token — 576 for V3 (512 + 64). The tiny fixture uses 4 + 2 = 6.
-        let c = tiny_deepseek_v3_config();
+        let c = tiny_mla_moe_config();
         let kv_dim = c.deepseek_kv_lora_rank().unwrap() + c.deepseek_qk_rope_head_dim().unwrap();
         assert_eq!(kv_dim, 6);
         // Sanity-check the paper's V3 numbers as documented in the config
@@ -23167,11 +23163,11 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v3_shape_totals_align_with_head_layout() {
+    fn mla_moe_shape_totals_align_with_head_layout() {
         // `q_b_proj` output size and `kv_b_proj` output size are both
         // per-head split into (nope, rope|v). A mistuned config would
-        // silently mis-index the split inside `forward_deepseek_v3`.
-        let c = tiny_deepseek_v3_config();
+        // silently mis-index the split inside `forward_mla_moe`.
+        let c = tiny_mla_moe_config();
         let num_heads = c.num_heads;
         let q_head_total =
             c.deepseek_qk_nope_head_dim().unwrap() + c.deepseek_qk_rope_head_dim().unwrap();
@@ -23185,7 +23181,7 @@ mod tests {
 
     /// Constructs both `RoutedExpertStorage::InMemory` and
     /// `RoutedExpertStorage::Streaming` variants over the same underlying
-    /// byte buffer, calls `forward_deepseek_moe_layer` on each, and
+    /// byte buffer, calls `forward_shared_expert_moe_layer` on each, and
     /// asserts the output is bit-identical.
     ///
     /// This is the end-to-end proof that swapping storage backends never
@@ -23196,7 +23192,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "G1 reference: test oracle or example code, not Law output; each call is listed in scripts/g1_reference_sites.tsv"
     )]
-    fn deepseek_moe_forward_streaming_matches_in_memory() {
+    fn mla_moe_forward_streaming_matches_in_memory() {
         use crate::deepseek_streaming::{ExpertLayerInfo, StreamingExpertPool};
         use crate::gguf::GgmlType;
         use std::sync::Arc;
@@ -23296,12 +23292,12 @@ mod tests {
             kimi_delta: None,
         };
 
-        // Build the two `DeepSeekMoeWeights` variants sharing everything
+        // Build the two `SharedExpertMoeWeights` variants sharing everything
         // except the routed-expert storage backend. Written as explicit
         // struct literals rather than a closure so both variants borrow
         // from the same set of `Vec<u8>` bindings — a closure would
         // trigger `lifetime may not live long enough`.
-        let in_memory = DeepSeekMoeWeights {
+        let in_memory = SharedExpertMoeWeights {
             ffn_norm: ffn_norm.clone(),
             ffn_gate_inp: ffn_gate_inp.clone(),
             exp_probs_b: Some(exp_probs_b.clone()),
@@ -23373,7 +23369,7 @@ mod tests {
             layer_info,
             1024 * 1024, // 1 MiB budget, plenty for 3 * 128 = 384 bytes/expert
         ));
-        let streaming = DeepSeekMoeWeights {
+        let streaming = SharedExpertMoeWeights {
             ffn_norm,
             ffn_gate_inp,
             exp_probs_b: Some(exp_probs_b),
@@ -23408,14 +23404,14 @@ mod tests {
         let mut out_in_memory = vec![0.0f32; HIDDEN];
         let mut out_streaming = vec![0.0f32; HIDDEN];
 
-        forward_deepseek_moe_layer(
+        forward_shared_expert_moe_layer(
             &config,
             &in_memory,
             &hidden_state,
             &mut norm_buf_a,
             &mut out_in_memory,
         );
-        forward_deepseek_moe_layer(
+        forward_shared_expert_moe_layer(
             &config,
             &streaming,
             &hidden_state,
@@ -23455,11 +23451,11 @@ mod tests {
     // ── DeepSeek-V3 Phase 3: MoE routing math ────────────────────────
 
     #[test]
-    fn deepseek_moe_route_sigmoid_topk_no_bias() {
+    fn sigmoid_top_k_moe_route_no_bias() {
         // Logits chosen so sigmoid(x) is roughly [0.27, 0.5, 0.73, 0.88, 0.95]
         // for [-1, 0, 1, 2, 3]. Top-2 by score = experts 4 and 3.
         let logits = vec![-1.0, 0.0, 1.0, 2.0, 3.0];
-        let selected = deepseek_moe_route(&logits, None, 2, 1.0);
+        let selected = sigmoid_top_k_moe_route(&logits, None, 2, 1.0);
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0, 4);
         assert_eq!(selected[1].0, 3);
@@ -23469,7 +23465,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_moe_route_noaux_tc_bias_affects_selection_not_weights() {
+    fn sigmoid_top_k_moe_route_noaux_tc_bias_affects_selection_not_weights() {
         // Logits: expert 0 has highest un-biased score (sigmoid(3) ≈ 0.95).
         // Bias vector boosts expert 3 by +10 so it becomes top-1 despite a
         // much lower un-biased score. But the returned weight for expert 3
@@ -23477,7 +23473,7 @@ mod tests {
         // one — that's the whole point of noaux_tc.
         let logits = vec![3.0, -5.0, -5.0, -1.0, -5.0];
         let bias = vec![0.0, 0.0, 0.0, 10.0, 0.0];
-        let selected = deepseek_moe_route(&logits, Some(&bias), 2, 1.0);
+        let selected = sigmoid_top_k_moe_route(&logits, Some(&bias), 2, 1.0);
         // Selection: biased top-2 = expert 3 (score+10) and expert 0.
         let picked: Vec<usize> = selected.iter().map(|(i, _)| *i).collect();
         assert!(picked.contains(&3), "expert 3 must be top-k via bias");
@@ -23498,12 +23494,12 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_moe_route_routed_scaling_factor() {
+    fn sigmoid_top_k_moe_route_routed_scaling_factor() {
         // With routed_scale = 2.5, the returned weights must sum to
         // routed_scale (not 1.0) — DeepSeek-V3 uses this to amplify the
         // routed sum relative to the always-active shared expert.
         let logits = vec![0.0, 1.0, 2.0, 3.0];
-        let selected = deepseek_moe_route(&logits, None, 2, 2.5);
+        let selected = sigmoid_top_k_moe_route(&logits, None, 2, 2.5);
         let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
         assert!(
             (sum - 2.5).abs() < 1e-5,
@@ -23512,10 +23508,10 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_moe_route_top_k_larger_than_experts() {
+    fn sigmoid_top_k_moe_route_top_k_larger_than_experts() {
         // Edge case: top-k > n_experts. Must not panic; selects all.
         let logits = vec![1.0, 2.0];
-        let selected = deepseek_moe_route(&logits, None, 8, 1.0);
+        let selected = sigmoid_top_k_moe_route(&logits, None, 8, 1.0);
         assert_eq!(selected.len(), 2, "must select all experts when top-k > n");
         let sum: f32 = selected.iter().map(|(_, w)| *w).sum();
         assert!((sum - 1.0).abs() < 1e-5);
@@ -23629,7 +23625,7 @@ mod tests {
     #[test]
     fn mtp_loader_returns_none_when_config_has_no_mtp_layer() {
         // Config with mtp_layer explicitly unset.
-        let mut c = tiny_deepseek_v3_config();
+        let mut c = tiny_mla_moe_config();
         if let Some(d) = c.deepseek_v3.as_mut() {
             d.mtp_layer = None;
         }
@@ -23641,11 +23637,11 @@ mod tests {
     /// vacuously false. Regression guard against future refactors that
     /// might inadvertently return true for Llama-3.
     #[test]
-    fn has_deepseek_mtp_false_when_arch_is_not_deepseek() {
+    fn has_mtp_is_false_for_other_architectures() {
         // We construct a Llama3Model isn't possible without a full GGUF,
         // but we can at least assert the invariant at the config layer:
         // non-DeepSeek configs never populate `deepseek_v3`, so the
-        // `deepseek_v3_mtp` field will always be None regardless of
+        // `mla_moe_mtp` field will always be None regardless of
         // whether the MTP layer count env is set.
         let llama_config = Llama3Config {
             arch: ModelArch::Llama,
@@ -23671,7 +23667,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v3_first_k_dense_boundary_gates_moe_branch() {
+    fn mla_moe_first_k_dense_boundary_gates_moe_branch() {
         // Layers below `first_k_dense_replace` take the dense SwiGLU FFN
         // path; layers at or above take the DeepSeek-V3 MoE branch
         // (Phase 3 landed — no more panic). The tiny fixture keeps
@@ -23680,18 +23676,18 @@ mod tests {
         // when a real GGUF (or a fixture that actually loads MoE weights)
         // is loaded, since the MoE weights are not synthesised here.
         // This guard makes sure the boundary predicate itself stays
-        // aligned with what `forward_deepseek_v3` inspects.
-        let c = tiny_deepseek_v3_config();
+        // aligned with what `forward_mla_moe` inspects.
+        let c = tiny_mla_moe_config();
         let first_k = c.deepseek_first_k_dense_replace().unwrap();
         assert!(first_k >= c.num_layers, "tiny fixture must stay dense-only");
     }
 
     #[test]
-    fn deepseek_v3_config_fixture_declares_all_mla_fields() {
+    fn mla_moe_config_fixture_declares_all_mla_fields() {
         // A tripwire: if a future PR adds an MLA field, this test forces
         // the tiny fixture (and by extension every deep-seek test) to be
         // updated so the shape assertions keep making sense.
-        let c = tiny_deepseek_v3_config();
+        let c = tiny_mla_moe_config();
         let d = c.deepseek_v3.as_ref().unwrap();
         assert!(d.q_lora_rank.is_some());
         assert!(d.kv_lora_rank.is_some());
@@ -24376,8 +24372,8 @@ mod refuses_what_it_cannot_sample {
     fn the_routers_do_not_panic_on_nan_at_any_size() {
         for n in [8, 16, 20, 21, 32, 64, 192, 256] {
             let logits = every_third_nan(n);
-            let selected = deepseek_moe_route(&logits, None, 8.min(n), 1.0);
-            assert_eq!(selected.len(), 8.min(n), "deepseek {n}");
+            let selected = sigmoid_top_k_moe_route(&logits, None, 8.min(n), 1.0);
+            assert_eq!(selected.len(), 8.min(n), "sigmoid router {n}");
 
             // one input dimension: each expert's row is its logit
             let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8.min(n), false);
@@ -24390,7 +24386,7 @@ mod refuses_what_it_cannot_sample {
         let mut logits = every_third_nan(64);
         logits[1] = 100.0;
         // the highest logit is not NaN, so it is chosen first and no NaN comes before a number
-        let selected = deepseek_moe_route(&logits, None, 8, 1.0);
+        let selected = sigmoid_top_k_moe_route(&logits, None, 8, 1.0);
         assert_eq!(selected[0].0, 1);
         let selected = kimi_k3_moe_router(&[1.0], &logits, None, 8, false);
         assert_eq!(selected[0].0, 1);

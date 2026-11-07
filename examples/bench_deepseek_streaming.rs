@@ -167,9 +167,9 @@ fn main() {
     );
     // Cache stats live on the pool, but the pool is private to the model
     // internals — we surface them via the [pool] eprintln! banner emitted
-    // by build_deepseek_streaming_pool at load time. See the streaming
+    // by build_mla_moe_streaming_pool at load time. See the streaming
     // module doc-comment for how a follow-up can expose CacheStats
-    // through a public accessor once the model's `deepseek_v3_layers`
+    // through a public accessor once the model's `mla_moe_layers`
     // field is refactored to expose one.
     println!();
 
