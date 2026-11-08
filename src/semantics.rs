@@ -111,8 +111,9 @@ pub const DET_MATH_FUNCTIONS: &[&str] = &[
     "tanh",
 ];
 
-/// The identifier of each function of [`DET_MATH_FUNCTIONS`], in that order,
-/// as recorded when [`LLM_SEMANTICS_ID`] was computed. A function whose
+/// The identifier of each function of [`DET_MATH_FUNCTIONS`], in that order.
+///
+/// As recorded when [`LLM_SEMANTICS_ID`] was computed. A function whose
 /// identifier moves in the resolved `alice-det-math` stops the compile, rather
 /// than reporting an identifier computed from other bits.
 pub const DET_MATH_PINS: &[(&str, [u8; 32])] = &[
