@@ -86,7 +86,7 @@ fn main() {
     let main_gguf = GgufFile::parse(&main_data).expect("Failed to parse main model");
     let tokenizer = GgufTokenizer::from_gguf(&main_gguf).expect("Failed to load tokenizer");
     let mut main_model = Llama3Model::from_gguf(&main_gguf).expect("Failed to load main model");
-    let main_ms = load_start.elapsed().as_millis();
+    let main_ms = alice_llm::diag_clock::elapsed(load_start).as_millis();
     println!(
         "  Main: {} layers, hidden={}, vocab={} ({main_ms}ms)",
         main_model.config.num_layers, main_model.config.hidden_dim, main_model.config.vocab_size
@@ -97,7 +97,7 @@ fn main() {
     let draft_data = fs::read(draft_path).expect("Failed to read draft model");
     let draft_gguf = GgufFile::parse(&draft_data).expect("Failed to parse draft model");
     let mut draft_model = Llama3Model::from_gguf(&draft_gguf).expect("Failed to load draft model");
-    let draft_ms = draft_start.elapsed().as_millis();
+    let draft_ms = alice_llm::diag_clock::elapsed(draft_start).as_millis();
     println!(
         "  Draft: {} layers, hidden={}, vocab={} ({draft_ms}ms)",
         draft_model.config.num_layers, draft_model.config.hidden_dim, draft_model.config.vocab_size

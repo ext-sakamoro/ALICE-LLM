@@ -93,7 +93,7 @@ fn main() {
     });
     println!(
         "  loaded in {}ms — vocab={}, arch={:?}",
-        t0.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t0).as_millis(),
         tokenizer.vocab_size(),
         gguf.meta_str("general.architecture").unwrap_or("unknown")
     );

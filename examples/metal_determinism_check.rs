@@ -103,7 +103,7 @@ forward_with_early_exit_and_read(num_layers)."
     let config = Llama3Config::from_gguf(&gguf).expect("Llama3Config");
     eprintln!(
         "  GGUF parsed: {}ms (layers={} vocab={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         config.num_layers,
         config.vocab_size,
         config.hidden_dim,
@@ -135,7 +135,10 @@ forward_with_early_exit_and_read(num_layers)."
     eprintln!("  Loading GPU model (Metal shader compile is one-time ~10-30 s)...");
     let t_gpu_load = Instant::now();
     let mut gpu_model = GpuModel::load(engine, &gguf, gpu_cfg);
-    eprintln!("  GPU model loaded: {}ms", t_gpu_load.elapsed().as_millis());
+    eprintln!(
+        "  GPU model loaded: {}ms",
+        alice_llm::diag_clock::elapsed(t_gpu_load).as_millis()
+    );
     eprintln!();
 
     let mut max_pair_diff: f32 = 0.0;

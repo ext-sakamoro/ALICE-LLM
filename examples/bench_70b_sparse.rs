@@ -86,7 +86,7 @@ fn bench_matvec(name: &str, matrix: &SparseTernaryMatrix, input: &[f32], iters: 
     for _ in 0..iters {
         sparse_ternary_matvec(matrix, input, &mut output);
     }
-    let elapsed = start.elapsed();
+    let elapsed = alice_llm::diag_clock::elapsed(start);
     let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / iters as f64;
 
     let nnz = matrix.total_nnz();
@@ -133,7 +133,7 @@ fn main() {
     let up_proj = make_sparse_matrix(INTERMEDIATE_DIM, HIDDEN_DIM, N_KEEP); // 28672×8192
     let down_proj = make_sparse_matrix(HIDDEN_DIM, INTERMEDIATE_DIM, N_KEEP); // 8192×28672
 
-    let gen_ms = gen_start.elapsed().as_millis();
+    let gen_ms = alice_llm::diag_clock::elapsed(gen_start).as_millis();
     println!("  Generated in {gen_ms}ms");
 
     // Memory per layer

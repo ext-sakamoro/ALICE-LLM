@@ -11127,8 +11127,8 @@ impl<'a> KimiK3Model<'a> {
                 } else {
                     "MoE"
                 };
-                let ms = il_t0.elapsed().as_millis();
-                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                let ms = crate::diag_clock::elapsed(il_t0).as_millis();
+                let cumulative_s = crate::diag_clock::elapsed(layer_t0).as_secs_f64();
                 eprintln!(
                     "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
                     self.config.num_layers
@@ -11421,8 +11421,8 @@ impl<'a> KimiK3Model<'a> {
                 } else {
                     "MoE"
                 };
-                let ms = il_t0.elapsed().as_millis();
-                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                let ms = crate::diag_clock::elapsed(il_t0).as_millis();
+                let cumulative_s = crate::diag_clock::elapsed(layer_t0).as_secs_f64();
                 eprintln!(
                     "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
                     self.config.num_layers
@@ -11624,8 +11624,8 @@ impl<'a> KimiK3Model<'a> {
                 } else {
                     "MoE"
                 };
-                let ms = il_t0.elapsed().as_millis();
-                let cumulative_s = layer_t0.elapsed().as_secs_f64();
+                let ms = crate::diag_clock::elapsed(il_t0).as_millis();
+                let cumulative_s = crate::diag_clock::elapsed(layer_t0).as_secs_f64();
                 eprintln!(
                     "[K3 trace] layer {il:>2}/{} {kind}+{ffn_kind} {ms:>6} ms (cum {cumulative_s:>7.2}s)",
                     self.config.num_layers
@@ -16277,7 +16277,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode — sample from prefill logits, then forward only NEW tokens
         let decode_start = Instant::now();
@@ -16331,8 +16331,8 @@ impl<'a> Llama3Model<'a> {
             logits = self.forward(next_token);
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -16389,7 +16389,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode with probabilistic speculative sampling
         let decode_start = Instant::now();
@@ -16495,8 +16495,8 @@ impl<'a> Llama3Model<'a> {
             }
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -16557,7 +16557,7 @@ impl<'a> Llama3Model<'a> {
             logits = self.forward(tok);
             draft_model.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode with dual-model speculation
         let decode_start = Instant::now();
@@ -16680,8 +16680,8 @@ impl<'a> Llama3Model<'a> {
             }
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -16786,7 +16786,7 @@ impl<'a> Llama3Model<'a> {
             logits = self.forward(tok);
             draft_model.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode with dual-model speculation + DSpark bigram bias
         let decode_start = Instant::now();
@@ -16918,8 +16918,8 @@ impl<'a> Llama3Model<'a> {
             }
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -16991,7 +16991,7 @@ impl<'a> Llama3Model<'a> {
             logits = self.forward(tok);
             draft_model.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -17107,8 +17107,8 @@ impl<'a> Llama3Model<'a> {
             }
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -17279,7 +17279,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward_ternary(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -17295,8 +17295,8 @@ impl<'a> Llama3Model<'a> {
             logits = self.forward_ternary(next_token);
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -17684,7 +17684,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward_sparse_ternary(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode with probabilistic speculative sampling
         let decode_start = Instant::now();
@@ -17788,8 +17788,8 @@ impl<'a> Llama3Model<'a> {
             }
         }
 
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -18100,7 +18100,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Decode
         let decode_start = Instant::now();
@@ -18112,8 +18112,8 @@ impl<'a> Llama3Model<'a> {
             temperature,
             top_k,
         )?;
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)
@@ -18187,7 +18187,7 @@ impl<'a> Llama3Model<'a> {
         for &tok in &tokens {
             logits = self.forward(tok);
         }
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+        let prefill_ms = crate::diag_clock::elapsed(prefill_start).as_millis() as u64;
 
         // Phase 1: free prefix until marker / EOS / budget.
         let prefix_start = Instant::now();
@@ -18222,7 +18222,7 @@ impl<'a> Llama3Model<'a> {
             }
             prefix_tokens.extend_from_slice(&marker_ids);
         }
-        let prefix_ms = prefix_start.elapsed().as_millis() as u64;
+        let prefix_ms = crate::diag_clock::elapsed(prefix_start).as_millis() as u64;
 
         // Phase 2: grammar-constrained, continuing from the current cache.
         let decode_start = Instant::now();
@@ -18234,8 +18234,8 @@ impl<'a> Llama3Model<'a> {
             temperature,
             top_k,
         )?;
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = crate::diag_clock::elapsed(decode_start).as_millis() as u64;
+        let total_ms = crate::diag_clock::elapsed(start).as_millis() as u64;
         let gen_count = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             gen_count as f64 / (decode_ms as f64 / 1000.0)

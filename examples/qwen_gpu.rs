@@ -134,7 +134,7 @@ fn run_hybrid_cpu_delegate(
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
     println!(
         "  GGUF parsed: {}ms (vocab={})",
-        t0.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t0).as_millis(),
         tokenizer.vocab_size()
     );
 
@@ -156,7 +156,10 @@ fn run_hybrid_cpu_delegate(
 
     let t_load = Instant::now();
     let mut model = Llama3Model::from_gguf(&gguf).expect("Failed to load Llama3Model");
-    println!("  Model loaded (CPU): {}ms", t_load.elapsed().as_millis());
+    println!(
+        "  Model loaded (CPU): {}ms",
+        alice_llm::diag_clock::elapsed(t_load).as_millis()
+    );
     println!("  [hybrid] GPU allocation skipped; weights on CPU only (mmap'd)");
 
     let formatted = format!("<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n");
@@ -171,7 +174,7 @@ fn run_hybrid_cpu_delegate(
     }
     let last_prompt = *prompt_tokens.last().unwrap();
     let mut logits = model.forward(last_prompt);
-    let prefill_ms = t_prefill.elapsed().as_millis();
+    let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
     let t_decode = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::new();
@@ -211,7 +214,7 @@ fn run_hybrid_cpu_delegate(
     println!();
     println!("---");
 
-    let decode_ms = t_decode.elapsed().as_millis();
+    let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
     let n_tokens = generated_tokens.len();
     println!(
         "{n_tokens} tokens generated, {:.1} tok/s ({prefill_ms}ms prefill + {decode_ms}ms decode = {}ms)",
@@ -252,7 +255,7 @@ fn run_hybrid_per_layer(
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
     println!(
         "  GGUF parsed: {}ms (vocab={})",
-        t0.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t0).as_millis(),
         tokenizer.vocab_size()
     );
 
@@ -267,7 +270,10 @@ fn run_hybrid_per_layer(
 
     let t_load = Instant::now();
     let mut cpu_model = Llama3Model::from_gguf(&gguf).expect("Failed to load Llama3Model");
-    println!("  CPU model loaded: {}ms", t_load.elapsed().as_millis());
+    println!(
+        "  CPU model loaded: {}ms",
+        alice_llm::diag_clock::elapsed(t_load).as_millis()
+    );
 
     let engine = GpuEngine::new();
     let mut gpu_cfg = gpu_cfg;
@@ -281,7 +287,10 @@ fn run_hybrid_per_layer(
     gpu_cfg.attention_only_load = true;
     let t_gpu = Instant::now();
     let mut gpu_model = GpuModel::load(engine, &gguf, gpu_cfg);
-    println!("  GPU model loaded: {}ms", t_gpu.elapsed().as_millis());
+    println!(
+        "  GPU model loaded: {}ms",
+        alice_llm::diag_clock::elapsed(t_gpu).as_millis()
+    );
 
     // Build the attention-layer bitmap once so the CPU hook can decide
     // per-layer whether to defer to GPU without probing the model on
@@ -326,7 +335,7 @@ fn run_hybrid_per_layer(
     }
     let last_prompt = *prompt_tokens.last().unwrap();
     let mut logits = step_forward(&mut cpu_model, &mut gpu_model, last_prompt);
-    let prefill_ms = t_prefill.elapsed().as_millis();
+    let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
     let t_decode = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::new();
@@ -366,7 +375,7 @@ fn run_hybrid_per_layer(
     println!();
     println!("---");
 
-    let decode_ms = t_decode.elapsed().as_millis();
+    let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
     let n_tokens = generated_tokens.len();
     println!(
         "{n_tokens} tokens generated, {:.1} tok/s ({prefill_ms}ms prefill + {decode_ms}ms decode = {}ms) [per-layer hybrid]",
@@ -448,7 +457,7 @@ fn main() {
         let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
         println!(
             "  GGUF parsed: {}ms (vocab={})",
-            t0.elapsed().as_millis(),
+            alice_llm::diag_clock::elapsed(t0).as_millis(),
             tokenizer.vocab_size()
         );
 
@@ -485,7 +494,10 @@ fn main() {
         let t_gpu = Instant::now();
         let engine = GpuEngine::new();
         let mut model = GpuModel::load(engine, &gguf, config);
-        println!("  GPU model ready: {}ms", t_gpu.elapsed().as_millis());
+        println!(
+            "  GPU model ready: {}ms",
+            alice_llm::diag_clock::elapsed(t_gpu).as_millis()
+        );
 
         // --- Qwen 3 / 3.5 ChatML template with thinking-mode disabled ---
         // Same template as CPU (`examples/elyza_gguf.rs:163-165`) — pre-fills
@@ -641,7 +653,7 @@ fn main() {
         } else {
             model.forward_and_read(last_prompt)
         };
-        let prefill_ms = t_prefill.elapsed().as_millis();
+        let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
         // Issue #40 diagnostic: dump prompt-end position logits (labelled pos=-1)
         // before any decoded token is sampled. This is the layer input that
@@ -702,7 +714,7 @@ fn main() {
             }
         }
 
-        let decode_ms = t_decode.elapsed().as_millis();
+        let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
         let total_ms = prefill_ms + decode_ms;
         let n_gen = generated_tokens.len();
         let tok_per_sec = if decode_ms > 0 {

@@ -220,7 +220,7 @@ fn run(
             prev_was_gated = was_gated;
 
             if n_scored > 0 && n_scored - last_report_at >= progress_every {
-                let elapsed = t_run.elapsed().as_secs_f32();
+                let elapsed = alice_llm::diag_clock::elapsed(t_run).as_secs_f32();
                 let tok_per_sec = n_scored as f32 / elapsed.max(1e-6);
                 let ppl_running = (sum_nll / n_scored as f64).exp();
                 let gate_rate = n_gated as f32 / n_scored.max(1) as f32;
@@ -240,7 +240,7 @@ fn run(
         }
     }
 
-    let wall_sec = t_run.elapsed().as_secs_f64();
+    let wall_sec = alice_llm::diag_clock::elapsed(t_run).as_secs_f64();
     RunSummary {
         mode: mode_label,
         n_scored,
@@ -356,7 +356,7 @@ Emits one JSON line per mode on stdout for scripted comparison."
     let config = Llama3Config::from_gguf(&gguf).expect("failed to load Llama3Config from GGUF");
     eprintln!(
         "  GGUF parsed: {}ms (vocab={} layers={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         tokenizer.vocab_size(),
         config.num_layers,
         config.hidden_dim

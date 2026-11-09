@@ -64,7 +64,7 @@ fn main() {
     let mut baseline_model = Llama3Model::from_gguf(&gguf).expect("load baseline model");
     let t0 = Instant::now();
     let baseline = greedy_generate(&mut baseline_model, &tokens, max_new, Some(eos_id));
-    let baseline_ms = t0.elapsed().as_millis();
+    let baseline_ms = alice_llm::diag_clock::elapsed(t0).as_millis();
     let baseline_text = tokenizer.decode(&baseline);
     eprintln!("Baseline: {baseline_ms} ms, {} tokens", baseline.len());
     eprintln!("Baseline text: {baseline_text:?}");
@@ -84,7 +84,7 @@ fn main() {
         Some(eos_id),
     )
     .expect("the model produced logits it cannot sample from");
-    let spec_ms = t0.elapsed().as_millis();
+    let spec_ms = alice_llm::diag_clock::elapsed(t0).as_millis();
     let spec_text = tokenizer.decode(&spec.tokens);
     eprintln!(
         "Speculative: {spec_ms} ms, {} tokens, acceptance {:.1}%",

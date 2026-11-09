@@ -70,7 +70,10 @@ fn main() {
         let engine = GpuEngine::new();
         let engine_period = engine.timestamp_period;
         let mut model = GpuModel::load(engine, &gguf, config);
-        println!("GpuModel ready: {:.0}ms", t_load.elapsed().as_millis());
+        println!(
+            "GpuModel ready: {:.0}ms",
+            alice_llm::diag_clock::elapsed(t_load).as_millis()
+        );
 
         let test_token: u32 = 1; // BOS token
 
@@ -93,7 +96,7 @@ fn main() {
                 model.forward(test_token);
             }
             model.sync();
-            let k1_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+            let k1_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
             model.reset();
 
             // K=4: batch4 unrolled scalar path
@@ -109,7 +112,7 @@ fn main() {
                 model.forward_batch(&batch_tokens);
             }
             model.sync();
-            let k4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+            let k4_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
             let k4_per_token = k4_us / 4.0;
             model.reset();
 
@@ -249,7 +252,7 @@ fn main() {
                 model.forward(test_token);
             }
             model.sync();
-            let total_us = t0.elapsed().as_micros() as f64;
+            let total_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64;
             let avg_us = total_us / n_iter as f64;
             let final_pos = model.position();
             println!(

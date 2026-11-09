@@ -477,7 +477,7 @@ fn generate(
         logits = model.forward_and_read(next);
     }
 
-    let decode_ms = t_decode.elapsed().as_millis() as u64;
+    let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis() as u64;
     let text = state.tokenizer.decode(&generated);
 
     Ok((
@@ -958,7 +958,7 @@ fn main() {
     };
     println!(
         "Model ready: {}ms (vocab={vocab_size})",
-        t0.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t0).as_millis()
     );
 
     let model_name = std::path::Path::new(&model_path)

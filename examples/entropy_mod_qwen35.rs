@@ -157,7 +157,7 @@ References:
     let config = Llama3Config::from_gguf(&gguf).expect("failed to load Llama3Config from GGUF");
     eprintln!(
         "  GGUF parsed: {}ms (vocab={} layers={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         tokenizer.vocab_size(),
         config.num_layers,
         config.hidden_dim
@@ -167,7 +167,7 @@ References:
     let mut model = Llama3Model::from_gguf(&gguf).expect("failed to load Llama3Model");
     eprintln!(
         "  Model loaded: {}ms (CPU forward path)",
-        t_model.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_model).as_millis()
     );
 
     let t_tok = Instant::now();
@@ -196,7 +196,7 @@ References:
     eprintln!(
         "  Tokenized: {} tokens ({}ms)",
         tokens.len(),
-        t_tok.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_tok).as_millis()
     );
 
     let num_layers = config.num_layers;
@@ -274,7 +274,7 @@ References:
         }
 
         if (token_idx + 1) % progress_every == 0 {
-            let elapsed = t_forward.elapsed().as_secs_f32();
+            let elapsed = alice_llm::diag_clock::elapsed(t_forward).as_secs_f32();
             let tok_per_sec = (token_idx + 1) as f32 / alice_llm::lawmath::max(elapsed, 1e-6);
             eprintln!(
                 "  {}/{} tokens ({:.2} tok/s, {:.1}s elapsed)",
@@ -290,7 +290,7 @@ References:
         w.flush().expect("failed to flush output");
     }
 
-    let total_elapsed = t_forward.elapsed();
+    let total_elapsed = alice_llm::diag_clock::elapsed(t_forward);
     eprintln!(
         "Forward complete: {} tokens in {:.1}s ({:.2} tok/s)",
         tokens.len(),

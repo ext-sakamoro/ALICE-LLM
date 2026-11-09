@@ -16,7 +16,10 @@ fn main() {
     let gguf = GgufFile::parse(&data).expect("Failed to parse");
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("tokenizer");
     let mut model = Llama3Model::from_gguf(&gguf).expect("model");
-    println!("Loaded in {}ms", load_start.elapsed().as_millis());
+    println!(
+        "Loaded in {}ms",
+        alice_llm::diag_clock::elapsed(load_start).as_millis()
+    );
 
     // Test: generate 3 tokens
     println!("\nGenerating 3 tokens...");

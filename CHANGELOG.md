@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- 経過時間の読みを `diag_clock::elapsed` の 1 か所にまとめた (src の 38 か所、example と試験の 130 か所) 計時は表示と統計だけに使い、生成する token や logit には入らない `clippy.toml` で `std::time::Instant::elapsed` / `std::time::SystemTime::elapsed` を禁止し、許可はこの関数の中だけ
+- CI: 共有の `scripts/entropy_guard.py` と試験を ALICE-Analytics の今の bytes にし、この crate が許す呼び出し (server の計時と応答の時刻など 5 件) を `scripts/entropy_guard.toml` に移した
 - **破壊的:** `TernaryRow::from_f32` / `TernaryMatrix::from_quantized` / `SparseTernaryRow::from_f32` / `from_ternary_row` / `SparseTernaryMatrix::from_ternary` / `from_f32_weights` / `Llama3Model::load_ternary` / `load_sparse_ternary` は `Result<_, TernaryError>` を返す 有限でない重み、有限で 0 以上でない threshold、dequantize できない型、形の合わない入力、ternary の形を持たない層 (MoE、KV 共有) を断る 以前は重みに `NaN` か無限大が 1 つあると、その行全体がエラーなしで 0 になった 型が未対応の tensor も 0 として読んでいた `from_ternary_row` は panic していた
 - **破壊的:** `LLM_SEMANTICS_ID` は `alice-det-math` 全体の識別子でなく、この crate が呼ぶ 13 関数の識別子 (`semantics::DET_MATH_FUNCTIONS` / `DET_MATH_PINS`) を fold する (`cd0f624f` から `5e093a04`、記録 bit は全部不変、`cd0f624f` は `LLM_PREVIOUS_SEMANTICS_IDS` に、公開版の値 `c1eee96c` も同じ list に残る) 呼ばない関数が動いても識別子は動かず、呼ぶ関数が動けば compile が止まる `LLM_SEMANTICS_BY_DET_MATH` と `semantics_id_for` は削除 `alice-det-math` は rev から `branch = "main"` + version 0.6 に
 - `LLM_SEMANTICS_ID` を `cd0f624f` に動かした 新しい scenario `sampling choices` (`top_k_filter` / `sample_argmax` の同点の規則 / `sample_with_random` の和を超えた時) を fold に足した 以前の値 `c1eee96c` は `LLM_PREVIOUS_SEMANTICS_IDS` に置き、その KV cache は読める (cache に token の選択は入らない)

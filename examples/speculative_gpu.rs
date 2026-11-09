@@ -128,7 +128,7 @@ fn main() {
             baseline_tokens.push(next);
             logits = model.forward_and_read(next);
         }
-        let baseline_ms = t_baseline.elapsed().as_millis();
+        let baseline_ms = alice_llm::diag_clock::elapsed(t_baseline).as_millis();
         let baseline_text = tokenizer.decode(&baseline_tokens);
         println!("{baseline_text}");
         println!("---");
@@ -291,7 +291,7 @@ fn main() {
             total_rounds += 1;
         }
 
-        let spec_ms = t_spec.elapsed().as_millis();
+        let spec_ms = alice_llm::diag_clock::elapsed(t_spec).as_millis();
         let spec_text = tokenizer.decode(&spec_tokens);
         println!("{spec_text}");
         println!("---");

@@ -80,13 +80,19 @@ fn main() {
         let draft_data = std::fs::read(&draft_path).expect("Failed to read draft GGUF");
         let draft_gguf = GgufFile::parse(&draft_data).expect("Failed to parse draft GGUF");
         let tokenizer = GgufTokenizer::from_gguf(&draft_gguf).expect("Failed to load tokenizer");
-        println!("  parsed: {}ms", t0.elapsed().as_millis());
+        println!(
+            "  parsed: {}ms",
+            alice_llm::diag_clock::elapsed(t0).as_millis()
+        );
 
         println!("Loading verify GGUF: {verify_path}");
         let t1 = Instant::now();
         let verify_data = std::fs::read(&verify_path).expect("Failed to read verify GGUF");
         let verify_gguf = GgufFile::parse(&verify_data).expect("Failed to parse verify GGUF");
-        println!("  parsed: {}ms", t1.elapsed().as_millis());
+        println!(
+            "  parsed: {}ms",
+            alice_llm::diag_clock::elapsed(t1).as_millis()
+        );
 
         // --- Shared GPU engine ---
         let t_gpu = Instant::now();
@@ -139,7 +145,7 @@ fn main() {
         let mut verifier = GpuModel::load_shared(Arc::clone(&engine), &verify_gguf, verify_config);
         println!(
             "GPU models ready: {}ms (draft=1B + verifier=8B, shared engine)",
-            t_gpu.elapsed().as_millis(),
+            alice_llm::diag_clock::elapsed(t_gpu).as_millis(),
         );
 
         let draft_vocab = draft.vocab_size();
@@ -176,7 +182,7 @@ fn main() {
             baseline_tokens.push(next);
             logits = verifier.forward_and_read(next);
         }
-        let base_ms = t_base.elapsed().as_millis();
+        let base_ms = alice_llm::diag_clock::elapsed(t_base).as_millis();
         let baseline_text = tokenizer.decode(&baseline_tokens);
         println!("{baseline_text}");
         println!("---");
@@ -348,7 +354,7 @@ fn main() {
             total_rounds += 1;
         }
 
-        let spec_ms = t_spec.elapsed().as_millis();
+        let spec_ms = alice_llm::diag_clock::elapsed(t_spec).as_millis();
         let spec_text = tokenizer.decode(&spec_tokens);
         println!("{spec_text}");
         println!("---");

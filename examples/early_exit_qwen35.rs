@@ -268,7 +268,7 @@ fn run_pass(
             prev_was_fast = engaged;
 
             if n_scored > 0 && n_scored - last_report_at >= progress_every {
-                let elapsed = t_run.elapsed().as_secs_f32();
+                let elapsed = alice_llm::diag_clock::elapsed(t_run).as_secs_f32();
                 let tok_per_sec = n_scored as f32 / elapsed.max(1e-6);
                 let ppl_running = (sum_nll / n_scored as f64).exp();
                 let hit_rate = n_fast_path as f32 / n_scored as f32;
@@ -288,7 +288,7 @@ fn run_pass(
         }
     }
 
-    let wall_sec = t_run.elapsed().as_secs_f64();
+    let wall_sec = alice_llm::diag_clock::elapsed(t_run).as_secs_f64();
     RunSummary {
         mode: mode_label,
         n_scored,
@@ -372,7 +372,7 @@ References:
     let config = Llama3Config::from_gguf(&gguf).expect("failed to load Llama3Config from GGUF");
     eprintln!(
         "  GGUF parsed: {}ms (vocab={} layers={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         tokenizer.vocab_size(),
         config.num_layers,
         config.hidden_dim
@@ -389,7 +389,7 @@ References:
     let mut model = Llama3Model::from_gguf(&gguf).expect("failed to load Llama3Model");
     eprintln!(
         "  Model loaded: {}ms (CPU forward path)",
-        t_model.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_model).as_millis()
     );
 
     let t_tok = Instant::now();
@@ -419,7 +419,7 @@ References:
     eprintln!(
         "  Tokenized: {} tokens ({}ms)",
         tokens.len(),
-        t_tok.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_tok).as_millis()
     );
 
     let mut writer: Option<BufWriter<File>> =

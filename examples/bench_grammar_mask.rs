@@ -62,7 +62,7 @@ fn main() {
     let mut model = Llama3Model::from_gguf(&gguf).expect("model");
     println!(
         "loaded in {}ms vocab={} arch={}",
-        t0.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t0).as_millis(),
         tokenizer.vocab_size(),
         gguf.meta_str("general.architecture").unwrap_or("unknown")
     );
@@ -82,7 +82,7 @@ fn main() {
     println!(
         "prefill {} tokens: {}ms",
         tokens.len(),
-        t_prefill.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_prefill).as_millis()
     );
 
     let mut fsm = Fsm::start(&grammar)
@@ -94,7 +94,7 @@ fn main() {
         "trie: {} nodes, {} empty tokens, built in {}ms (mask mode: {})",
         trie.node_count(),
         trie.empty_token_count(),
-        t_trie.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_trie).as_millis(),
         if naive { "naive" } else { "trie" }
     );
     let mut scratch = Vec::new();
@@ -110,7 +110,7 @@ fn main() {
         } else {
             mask_logits_by_grammar_trie(&fsm, &trie, &tokenizer, &mut logits, &mut scratch)
         };
-        let mask_ms = t.elapsed().as_millis();
+        let mask_ms = alice_llm::diag_clock::elapsed(t).as_millis();
 
         let t = Instant::now();
         let next = logits
@@ -119,7 +119,7 @@ fn main() {
             .filter(|(_, l)| l.is_finite())
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32);
-        let argmax_ms = t.elapsed().as_millis();
+        let argmax_ms = alice_llm::diag_clock::elapsed(t).as_millis();
         let Some(next) = next else {
             println!("step {step}: no valid token");
             break;
@@ -133,7 +133,7 @@ fn main() {
 
         let t = Instant::now();
         logits = model.forward(next);
-        let fwd_ms = t.elapsed().as_millis();
+        let fwd_ms = alice_llm::diag_clock::elapsed(t).as_millis();
 
         sum_mask += mask_ms;
         sum_argmax += argmax_ms;

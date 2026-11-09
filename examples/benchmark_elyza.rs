@@ -54,7 +54,7 @@ fn main() {
     let gguf = GgufFile::parse(&data).expect("Failed to parse GGUF");
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
     let mut model = Llama3Model::from_gguf(&gguf).expect("Failed to load model");
-    let load_ms = load_start.elapsed().as_millis();
+    let load_ms = alice_llm::diag_clock::elapsed(load_start).as_millis();
     println!("  Loaded in {load_ms}ms");
     println!(
         "  Config: hidden={}, heads={}, kv_heads={}, layers={}",

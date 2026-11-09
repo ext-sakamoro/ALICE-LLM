@@ -139,7 +139,7 @@ fn main() {
     println!("  Vocab size: {}", tokenizer.vocab_size());
 
     let mut model = Llama3Model::from_gguf(&gguf).expect("Failed to load model");
-    let load_ms = load_start.elapsed().as_millis();
+    let load_ms = alice_llm::diag_clock::elapsed(load_start).as_millis();
     println!("  Model loaded in {load_ms}ms");
     println!("  Config: {:?}", model.config);
 
@@ -147,7 +147,10 @@ fn main() {
         println!("  Ternarizing weights (threshold={ternary_threshold})...");
         let t_start = Instant::now();
         model.load_ternary(ternary_threshold).expect("ternarize");
-        println!("  Ternarized in {}ms", t_start.elapsed().as_millis());
+        println!(
+            "  Ternarized in {}ms",
+            alice_llm::diag_clock::elapsed(t_start).as_millis()
+        );
     }
     println!();
 
@@ -220,7 +223,7 @@ fn main() {
         // Last prompt token: capture logits for pos=-1 (prompt end).
         let last_prompt = *prompt_tokens.last().unwrap();
         let mut logits = model.forward(last_prompt);
-        let prefill_ms = t_prefill.elapsed().as_millis();
+        let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
         dump_logits_jsonl("cpu", -1, &logits, &tokenizer);
 
         let t_decode = Instant::now();
@@ -243,7 +246,7 @@ fn main() {
                 dump_logits_jsonl("cpu", step as i64, &logits, &tokenizer);
             }
         }
-        let decode_ms = t_decode.elapsed().as_millis();
+        let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
         let n_gen = generated.len();
         let tok_per_sec = if decode_ms > 0 {
             n_gen as f64 / (decode_ms as f64 / 1000.0)

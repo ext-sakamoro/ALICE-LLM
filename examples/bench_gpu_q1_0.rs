@@ -101,7 +101,7 @@ fn main() {
             &mut cpu_output,
         );
     }
-    let cpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+    let cpu_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
     println!("CPU matvec: {cpu_us:>10.1} µs/iter ({n_iter} iters)");
 
     // ---- GPU ----
@@ -129,7 +129,7 @@ fn main() {
             pass.execute();
         }
         engine.sync();
-        let gpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
 
         let gpu_output = engine.read_f32(&output_buf);
         println!("GPU matvec: {gpu_us:>10.1} µs/iter ({n_iter} iters)");
@@ -187,7 +187,7 @@ fn main() {
             pass.execute();
         }
         engine.sync();
-        let gpu_b4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_b4_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
         let gpu_b4_per_matvec = gpu_b4_us / 4.0;
 
         println!(
@@ -258,7 +258,7 @@ fn main() {
             pass.execute();
             engine.sync();
         }
-        let total_us = t0.elapsed().as_micros() as f64;
+        let total_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64;
         let batched_per_dispatch = total_us / n_iter as f64;
         let batched_per_matvec = batched_per_dispatch / 4.0;
 
@@ -311,7 +311,8 @@ fn main() {
             pass.execute();
             engine.sync();
         }
-        let gpu_r4b4_per_dispatch = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_r4b4_per_dispatch =
+            alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
         // Each dispatch produces 4 rows × 4 batches = 16 outputs, but the
         // per-matvec unit for comparison with prior steps is one full
         // (rows × batch=1) matvec → 16 outputs / dispatch is equivalent to
@@ -384,7 +385,8 @@ fn main() {
             pass.execute();
             engine.sync();
         }
-        let gpu_r8b4_per_dispatch = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_r8b4_per_dispatch =
+            alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
         // Each dispatch produces 8 rows × 4 batches = 32 outputs; comparing
         // "per matvec" (rows × batch=1 = rows outputs), one dispatch is
         // worth 4 matvecs (same as row4×batch4, since we still amortize
@@ -457,7 +459,7 @@ fn main() {
             pass.execute();
             engine.sync();
         }
-        let gpu_r4_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_r4_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
 
         println!(
             "GPU row4 (single-batch):  {:.1} µs/iter (single matvec = 1 batch × rows outputs)",

@@ -57,6 +57,7 @@
 pub mod attention;
 pub mod batch_inference;
 pub mod deepseek_streaming;
+pub mod diag_clock;
 pub mod gguf;
 #[cfg(feature = "gpu")]
 pub mod gpu;
