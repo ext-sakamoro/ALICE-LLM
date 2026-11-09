@@ -83,13 +83,13 @@ fn main() {
     for &tok in &tokens[..tokens.len() - 1] {
         let _ = model.forward(tok);
     }
-    let prefill_ms = start.elapsed().as_millis();
+    let prefill_ms = alice_llm::diag_clock::elapsed(start).as_millis();
     eprintln!("Prefill: {} tokens in {} ms", tokens.len() - 1, prefill_ms);
 
     eprintln!("\nDecoding 1 token (feeding last prompt token)...");
     let start = Instant::now();
     let logits = model.forward(*tokens.last().unwrap());
-    let decode_ms = start.elapsed().as_millis();
+    let decode_ms = alice_llm::diag_clock::elapsed(start).as_millis();
     eprintln!("First decode: {decode_ms} ms");
 
     let finite_count = logits.iter().filter(|v| v.is_finite()).count();

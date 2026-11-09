@@ -2495,7 +2495,7 @@ fn timed_dispatch(
     let t0 = std::time::Instant::now();
     engine.queue.submit(Some(encoder.finish()));
     engine.device.poll(wgpu::Maintain::Wait);
-    t0.elapsed().as_nanos() as f64 / 1000.0
+    crate::diag_clock::elapsed(t0).as_nanos() as f64 / 1000.0
 }
 
 /// Timed matvec dispatch (auto-selects pipeline by quant type).
@@ -3487,7 +3487,7 @@ impl GpuModel {
 
         eprintln!(
             "[GpuModel] weights uploaded: {:.0}ms (vocab={vocab_size}, output={:?})",
-            t0.elapsed().as_millis(),
+            crate::diag_clock::elapsed(t0).as_millis(),
             output_proj_weight.quant,
         );
 

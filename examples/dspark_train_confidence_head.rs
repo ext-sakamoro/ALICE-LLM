@@ -80,7 +80,7 @@ fn main() {
         main_model.config.num_layers,
         main_model.config.hidden_dim,
         main_model.config.vocab_size,
-        load_start.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(load_start).as_millis()
     );
 
     let draft_start = Instant::now();
@@ -92,7 +92,7 @@ fn main() {
         draft_model.config.num_layers,
         draft_model.config.hidden_dim,
         draft_model.config.vocab_size,
-        draft_start.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(draft_start).as_millis()
     );
     println!();
 
@@ -114,7 +114,7 @@ fn main() {
             hidden_layer,
         )
         .expect("collect labels");
-    let collect_ms = collect_start.elapsed().as_millis();
+    let collect_ms = alice_llm::diag_clock::elapsed(collect_start).as_millis();
     println!("{}", gen_result.text);
     println!(
         "  {} tokens generated, {} labels collected in {}ms",
@@ -191,7 +191,7 @@ fn main() {
     }
     println!(
         "  Training completed in {}ms",
-        train_start.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(train_start).as_millis()
     );
     println!();
 

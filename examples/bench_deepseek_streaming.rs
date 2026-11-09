@@ -96,7 +96,7 @@ fn main() {
     let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("failed to load tokenizer");
     println!(
         "GGUF parsed in {:.2}s (vocab={})",
-        t_load.elapsed().as_secs_f64(),
+        alice_llm::diag_clock::elapsed(t_load).as_secs_f64(),
         tokenizer.vocab_size()
     );
 
@@ -109,7 +109,10 @@ fn main() {
     println!("--- InMemory (baseline) ---");
     let t_build = Instant::now();
     let mut model = Llama3Model::from_gguf(&gguf).expect("model load failed");
-    println!("Model loaded in {:.2}s", t_build.elapsed().as_secs_f64());
+    println!(
+        "Model loaded in {:.2}s",
+        alice_llm::diag_clock::elapsed(t_build).as_secs_f64()
+    );
 
     // Prefill.
     let t_prefill = Instant::now();
@@ -117,7 +120,7 @@ fn main() {
     for &tok in &prompt_tokens {
         last_logits = model.forward(tok);
     }
-    let prefill_ms = t_prefill.elapsed().as_millis();
+    let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
     // Decode `decode_tokens` tokens greedily.
     let t_decode = Instant::now();
@@ -125,7 +128,7 @@ fn main() {
         let next = argmax(&last_logits) as u32;
         last_logits = model.forward(next);
     }
-    let decode_ms = t_decode.elapsed().as_millis();
+    let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
     let tok_per_sec = decode_tokens as f64 / (decode_ms as f64 / 1000.0);
     println!(
         "InMemory: prefill {} ms, decode {} ms, {:.2} tok/s",
@@ -144,7 +147,7 @@ fn main() {
     let mut model = Llama3Model::from_gguf(&gguf).expect("model load failed");
     println!(
         "Model loaded in {:.2}s (routed-expert bytes NOT materialised)",
-        t_build.elapsed().as_secs_f64()
+        alice_llm::diag_clock::elapsed(t_build).as_secs_f64()
     );
 
     let t_prefill = Instant::now();
@@ -152,14 +155,14 @@ fn main() {
     for &tok in &prompt_tokens {
         last_logits = model.forward(tok);
     }
-    let prefill_ms = t_prefill.elapsed().as_millis();
+    let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
     let t_decode = Instant::now();
     for _ in 0..decode_tokens {
         let next = argmax(&last_logits) as u32;
         last_logits = model.forward(next);
     }
-    let decode_ms = t_decode.elapsed().as_millis();
+    let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
     let tok_per_sec = decode_tokens as f64 / (decode_ms as f64 / 1000.0);
     println!(
         "Streaming: prefill {} ms, decode {} ms, {:.2} tok/s",

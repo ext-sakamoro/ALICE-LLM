@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "mmap'd {total} shards ({:.2} GB total) in {:?}",
             total_gb,
-            t0.elapsed()
+            alice_llm::diag_clock::elapsed(t0)
         );
         let shard_bytes: Vec<&[u8]> = mmaps.iter().map(|m| m.as_ref()).collect();
         let multi =
@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "mmap'd single-file {:.2} GB in {:?}",
             file_len as f64 / 1e9,
-            t0.elapsed()
+            alice_llm::diag_clock::elapsed(t0)
         );
         let single = GgufFile::parse(mmaps[0].as_ref()).ok_or("GgufFile::parse failed")?;
         gguf = GgufKind::Single(single);
@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t1 = Instant::now();
     println!("=== Detecting architecture ===");
     let arch = ModelArch::from_gguf(&gguf);
-    println!("arch: {arch:?} in {:?}", t1.elapsed());
+    println!("arch: {arch:?} in {:?}", alice_llm::diag_clock::elapsed(t1));
     if arch != ModelArch::KimiK3 {
         return Err(format!("expected KimiK3 arch, got {arch:?}").into());
     }
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.num_layers,
         config.num_heads,
         config.vocab_size,
-        t2.elapsed()
+        alice_llm::diag_clock::elapsed(t2)
     );
     if let Some(kd) = &config.kimi_delta {
         println!(
@@ -191,13 +191,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t3 = Instant::now();
     let weights = load_kimi_k3_model_weights(&gguf, &config)
         .map_err(|e| format!("load_kimi_k3_model_weights failed: {e}"))?;
-    println!("weights loaded in {:?}", t3.elapsed());
+    println!("weights loaded in {:?}", alice_llm::diag_clock::elapsed(t3));
 
     println!("=== Constructing KimiK3Model ===");
     let t4 = Instant::now();
     let mut model =
         KimiK3Model::new(weights, config).map_err(|e| format!("KimiK3Model::new failed: {e}"))?;
-    println!("model constructed in {:?}", t4.elapsed());
+    println!(
+        "model constructed in {:?}",
+        alice_llm::diag_clock::elapsed(t4)
+    );
     println!("num_layers: {}", model.num_layers());
 
     // ── Load tokenizer (K3 vocab_size=163840, GPT-2 BPE from tiktoken) ──
@@ -218,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &tokenizer {
         Some(t) => println!(
             "tokenizer loaded in {:?} (some vocab entries, e.g. id 0 = {:?})",
-            t_tok.elapsed(),
+            alice_llm::diag_clock::elapsed(t_tok),
             t.decode(&[0])
         ),
         None => println!("tokenizer load returned None (still proceeding)"),
@@ -236,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n=== Forward pass #{pass} ({phase}, token_id = {token_id}, cache reset) ===");
         let t5 = Instant::now();
         let logits = model.forward(token_id);
-        let elapsed = t5.elapsed();
+        let elapsed = alice_llm::diag_clock::elapsed(t5);
         println!(
             "forward in {:?} ({:.2} min)",
             elapsed,

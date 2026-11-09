@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "mmap'd {total} shards ({:.2} GB total) in {:?}",
             total_gb,
-            t0.elapsed()
+            alice_llm::diag_clock::elapsed(t0)
         );
         let shard_bytes: Vec<&[u8]> = mmaps.iter().map(|m| m.as_ref()).collect();
         let multi = GgufMultiFile::parse_shards(shard_bytes).ok_or("parse_shards failed")?;
@@ -148,7 +148,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_load = Instant::now();
     let weights =
         load_kimi_k3_model_weights(&gguf, &config).map_err(|e| format!("load weights: {e}"))?;
-    println!("weights loaded in {:?}", t_load.elapsed());
+    println!(
+        "weights loaded in {:?}",
+        alice_llm::diag_clock::elapsed(t_load)
+    );
 
     let mut model =
         KimiK3Model::new(weights, config).map_err(|e| format!("KimiK3Model::new: {e}"))?;
@@ -189,12 +192,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[prefill] token {}/{} id={tok} in {:.2} min",
             i + 1,
             prompt_tokens.len(),
-            t_tok.elapsed().as_secs_f64() / 60.0
+            alice_llm::diag_clock::elapsed(t_tok).as_secs_f64() / 60.0
         );
     }
     println!(
         "prefill total: {:.2} min",
-        t_prefill.elapsed().as_secs_f64() / 60.0
+        alice_llm::diag_clock::elapsed(t_prefill).as_secs_f64() / 60.0
     );
 
     // ── Decode: greedy argmax up to max_new_tokens or EOS ──
@@ -214,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "\n[decode] EOS at step {} (id={next_id}, cumulative decode {:.2} min)",
                 step + 1,
-                t_decode.elapsed().as_secs_f64() / 60.0
+                alice_llm::diag_clock::elapsed(t_decode).as_secs_f64() / 60.0
             );
             break;
         }
@@ -224,16 +227,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n[decode] step {}/{max_new_tokens} id={next_id} decoded={decoded:?} \
              forward {:.2} min (cum {:.2} min)",
             step + 1,
-            t_step.elapsed().as_secs_f64() / 60.0,
-            t_decode.elapsed().as_secs_f64() / 60.0
+            alice_llm::diag_clock::elapsed(t_step).as_secs_f64() / 60.0,
+            alice_llm::diag_clock::elapsed(t_decode).as_secs_f64() / 60.0
         );
     }
     println!();
     println!(
         "\ndecode total: {:.2} min for {} tokens ({:.3} tok/min)",
-        t_decode.elapsed().as_secs_f64() / 60.0,
+        alice_llm::diag_clock::elapsed(t_decode).as_secs_f64() / 60.0,
         generated.len(),
-        generated.len() as f64 / (t_decode.elapsed().as_secs_f64() / 60.0)
+        generated.len() as f64 / (alice_llm::diag_clock::elapsed(t_decode).as_secs_f64() / 60.0)
     );
     println!("generated ids: {generated:?}");
     println!("generated text: {:?}", tokenizer.decode(&generated));

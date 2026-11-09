@@ -1,0 +1,31 @@
+# ALICE-LLM: the call sites scripts/entropy_guard.py allows in src/ (exact counts; an entry that matches nothing fails)
+
+[[allow]]
+path = "src/bin/server.rs"
+pattern = "Instant::now"
+count = 2
+reason = "request latency in the server's response statistics; the generated tokens do not read it"
+
+[[allow]]
+path = "src/bin/server.rs"
+pattern = "SystemTime::now"
+count = 2
+reason = "the OpenAI-compatible response's `created` timestamp and the request id; metadata, not the generated text"
+
+[[allow]]
+path = "src/bin/server.rs"
+pattern = "UNIX_EPOCH"
+count = 3
+reason = "the epoch the `created` timestamp and the request id count from (with the SystemTime entry above)"
+
+[[allow]]
+path = "src/gpu.rs"
+pattern = "Instant::now"
+count = 2
+reason = "a kernel timing helper that returns microseconds, and a log line of the weight upload; neither feeds a computed value"
+
+[[allow]]
+path = "src/llama3.rs"
+pattern = "Instant::now"
+count = 34
+reason = "timing of the generate loops and of the ALICE_K3_TRACE output: the values fill GenerateResult's prefill_ms / decode_ms / total_ms / tokens_per_sec and stderr lines; no comparison of an elapsed time decides a token"

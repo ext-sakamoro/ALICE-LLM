@@ -66,7 +66,7 @@ fn main() {
     let t0 = Instant::now();
     let r1 = speculative_decode_v2(&mut draft, &mut main1, &tokens, &cfg)
         .expect("the model produced logits it cannot sample from");
-    let t1 = t0.elapsed().as_millis();
+    let t1 = alice_llm::diag_clock::elapsed(t0).as_millis();
     let text1 = tokenizer.decode(&r1.tokens);
     eprintln!(
         "Run 1: {t1} ms, {} tokens, acceptance {:.1}% ({}/{}, bonus {})",

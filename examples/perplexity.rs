@@ -221,7 +221,7 @@ fn main() {
     let config = Llama3Config::from_gguf(&gguf).expect("failed to load Llama3Config from GGUF");
     eprintln!(
         "  GGUF parsed: {}ms (vocab={} layers={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         tokenizer.vocab_size(),
         config.num_layers,
         config.hidden_dim
@@ -231,7 +231,7 @@ fn main() {
     let mut model = Llama3Model::from_gguf(&gguf).expect("failed to load Llama3Model");
     eprintln!(
         "  Model loaded: {}ms (CPU forward path)",
-        t_model.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_model).as_millis()
     );
 
     let t_tok = Instant::now();
@@ -279,7 +279,7 @@ fn main() {
         raw_full.len(),
         raw.len(),
         n_dataset_tokens,
-        t_tok.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_tok).as_millis()
     );
 
     if n_dataset_tokens < 2 {
@@ -416,7 +416,7 @@ fn main() {
                     prev_logits = Some(model.forward(tok));
 
                     if count > 0 && count.saturating_sub(last_report_count) >= progress_every {
-                        let elapsed = t_ppl.elapsed().as_secs_f64();
+                        let elapsed = alice_llm::diag_clock::elapsed(t_ppl).as_secs_f64();
                         report(count, sum_nll, elapsed, false);
                         last_report_count = count;
                         last_report_time = Instant::now();
@@ -462,7 +462,7 @@ fn main() {
                     prev_logits = Some(model.forward(tok));
 
                     if count > 0 && count.saturating_sub(last_report_count) >= progress_every {
-                        let elapsed = t_ppl.elapsed().as_secs_f64();
+                        let elapsed = alice_llm::diag_clock::elapsed(t_ppl).as_secs_f64();
                         report(count, sum_nll, elapsed, false);
                         last_report_count = count;
                         let _ = std::io::stderr().flush();
@@ -478,7 +478,7 @@ fn main() {
         _ => unreachable!(),
     }
 
-    let wall_sec = t_ppl.elapsed().as_secs_f64();
+    let wall_sec = alice_llm::diag_clock::elapsed(t_ppl).as_secs_f64();
     if count == 0 {
         eprintln!("no tokens scored — check --n-samples / --ctx / dataset length");
         std::process::exit(4);

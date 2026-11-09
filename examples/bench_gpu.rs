@@ -67,7 +67,7 @@ fn main() {
             &mut cpu_output,
         );
     }
-    let cpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+    let cpu_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
     println!("\nCPU matvec: {cpu_us:.0} µs/iter ({n_iter} iters)");
 
     #[cfg(feature = "gpu")]
@@ -89,7 +89,7 @@ fn main() {
         for _ in 0..n_iter {
             gpu_output = gpu.matvec_fast(&ctx, &input);
         }
-        let gpu_readback_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_readback_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
 
         // --- GPU dispatch only (no readback) ---
         // Submit N dispatches in one command buffer, measure total time
@@ -99,7 +99,7 @@ fn main() {
         }
         // Single sync at end
         gpu.sync();
-        let gpu_dispatch_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_dispatch_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
 
         // --- GPU kernel only (batched dispatches, single command buffer) ---
         // Warmup
@@ -107,7 +107,7 @@ fn main() {
         let batch_n = 200u32;
         let t0 = Instant::now();
         gpu.bench_dispatch_batch(&ctx, &input, batch_n);
-        let gpu_kernel_us = t0.elapsed().as_micros() as f64 / batch_n as f64;
+        let gpu_kernel_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / batch_n as f64;
 
         let readback_overhead = gpu_readback_us - gpu_dispatch_us;
 

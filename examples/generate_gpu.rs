@@ -51,7 +51,7 @@ fn main() {
         let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("Failed to load tokenizer");
         println!(
             "  GGUF parsed: {}ms (vocab={})",
-            t0.elapsed().as_millis(),
+            alice_llm::diag_clock::elapsed(t0).as_millis(),
             tokenizer.vocab_size()
         );
 
@@ -81,7 +81,10 @@ fn main() {
         let t_gpu = Instant::now();
         let engine = GpuEngine::new();
         let mut model = GpuModel::load(engine, &gguf, config);
-        println!("  GPU model ready: {}ms", t_gpu.elapsed().as_millis());
+        println!(
+            "  GPU model ready: {}ms",
+            alice_llm::diag_clock::elapsed(t_gpu).as_millis()
+        );
 
         // --- Format as Llama-3 instruct ---
         let formatted = format!(
@@ -102,7 +105,7 @@ fn main() {
         // Last prompt token: read logits to get first generated token
         let last_prompt = *prompt_tokens.last().unwrap();
         let mut logits = model.forward_and_read(last_prompt);
-        let prefill_ms = t_prefill.elapsed().as_millis();
+        let prefill_ms = alice_llm::diag_clock::elapsed(t_prefill).as_millis();
 
         // --- Decode: autoregressive loop ---
         let t_decode = Instant::now();
@@ -150,7 +153,7 @@ fn main() {
             logits = model.forward_and_read(next_token);
         }
 
-        let decode_ms = t_decode.elapsed().as_millis();
+        let decode_ms = alice_llm::diag_clock::elapsed(t_decode).as_millis();
         let total_ms = prefill_ms + decode_ms;
         let n_gen = generated_tokens.len();
         let tok_per_sec = if decode_ms > 0 {

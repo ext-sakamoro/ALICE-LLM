@@ -187,7 +187,7 @@ fn main() {
             cpu_hidden[i] += down_buf[i];
         }
     }
-    let cpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+    let cpu_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
     println!("\nCPU FFN chain: {cpu_us:.0} µs/iter ({n_iter} iters)");
 
     // --- GPU FFN chain ---
@@ -235,7 +235,7 @@ fn main() {
             pass.residual_add(&g_hidden, &g_down_buf);
             pass.execute();
         }
-        let gpu_us = t0.elapsed().as_micros() as f64 / n_iter as f64;
+        let gpu_us = alice_llm::diag_clock::elapsed(t0).as_micros() as f64 / n_iter as f64;
 
         // Read final result
         gpu.write_f32(&g_hidden, &hidden);

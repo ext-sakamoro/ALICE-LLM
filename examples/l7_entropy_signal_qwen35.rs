@@ -234,7 +234,7 @@ References:
     let config = Llama3Config::from_gguf(&gguf).expect("failed to load Llama3Config from GGUF");
     eprintln!(
         "  GGUF parsed: {}ms (vocab={} layers={} hidden={})",
-        t_load.elapsed().as_millis(),
+        alice_llm::diag_clock::elapsed(t_load).as_millis(),
         tokenizer.vocab_size(),
         config.num_layers,
         config.hidden_dim
@@ -251,7 +251,7 @@ References:
     let mut model = Llama3Model::from_gguf(&gguf).expect("failed to load Llama3Model");
     eprintln!(
         "  Model loaded: {}ms (CPU forward path)",
-        t_model.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_model).as_millis()
     );
 
     let t_tok = Instant::now();
@@ -282,7 +282,7 @@ References:
     eprintln!(
         "  Tokenized: {} tokens ({}ms)",
         tokens.len(),
-        t_tok.elapsed().as_millis()
+        alice_llm::diag_clock::elapsed(t_tok).as_millis()
     );
 
     let mut writer: Option<BufWriter<File>> =
@@ -369,7 +369,7 @@ References:
         prev_entropy = Some(entropy);
 
         if scored > 0 && scored.is_multiple_of(progress_every) {
-            let elapsed = t_run.elapsed().as_secs_f32();
+            let elapsed = alice_llm::diag_clock::elapsed(t_run).as_secs_f32();
             let tok_per_sec = scored as f32 / elapsed.max(1e-6);
             let ppl_running = (sum_nll / scored as f64).exp();
             eprintln!(
@@ -388,7 +388,7 @@ References:
     } else {
         f64::NAN
     };
-    let wall = t_run.elapsed().as_secs_f64();
+    let wall = alice_llm::diag_clock::elapsed(t_run).as_secs_f64();
     eprintln!();
     eprintln!("=== summary ===");
     eprintln!(

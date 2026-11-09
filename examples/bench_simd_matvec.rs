@@ -180,7 +180,7 @@ fn measure_ns(iters: usize, mut run: impl FnMut()) -> u128 {
     for _ in 0..iters {
         let t0 = Instant::now();
         run();
-        samples.push(t0.elapsed().as_nanos());
+        samples.push(alice_llm::diag_clock::elapsed(t0).as_nanos());
     }
     samples.sort_unstable();
     samples[iters / 2]

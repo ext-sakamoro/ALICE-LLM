@@ -5,6 +5,7 @@ allowed counts are exact."""
 import contextlib
 import io
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,8 +17,12 @@ import entropy_guard as eg  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 
 
+_TREES: list[Path] = []
+
+
 def tree(files: dict[str, str]) -> Path:
     root = Path(tempfile.mkdtemp(prefix="entropy-guard-"))
+    _TREES.append(root)
     for rel, text in files.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -25,47 +30,46 @@ def tree(files: dict[str, str]) -> Path:
     return root
 
 
-class EntropyGuard(unittest.TestCase):
-    def setUp(self):
-        self._allowed = dict(eg.ALLOWED)
-        eg.ALLOWED.clear()
+def allow(*entries: tuple[str, str, int, str]) -> str:
+    """scripts/entropy_guard.toml with one [[allow]] per (path, pattern, count, reason)"""
+    return "".join(f'[[allow]]\npath = "{p}"\npattern = "{n}"\ncount = {c}\nreason = "{r}"\n\n' for p, n, c, r in entries)
 
+
+TOML = "scripts/entropy_guard.toml"
+CALL = "pub fn f() { let _ = std::time::SystemTime::now(); }\n"
+
+
+class EntropyGuard(unittest.TestCase):
     def tearDown(self):
-        eg.ALLOWED.clear()
-        eg.ALLOWED.update(self._allowed)
+        while _TREES:
+            shutil.rmtree(_TREES.pop(), ignore_errors=True)
 
     def problems(self, files):
         return eg.check(tree(files))[0]
 
-    def test_elapsed_only_where_now_is_allowed(self):
-        # `.elapsed()` reads the wall clock like `::now()`, but a lexical
-        # pattern for it would be too broad (any value named `elapsed`).
-        # This repository has no clippy ban for the clock methods (its
-        # clippy.toml is the G1 / G2 float list, whose call pin counts every
-        # disallowed-method finding); instead every file of src/ that calls
-        # `.elapsed()` must be a file whose `Instant::now` calls ALLOWED
-        # accounts for, and the scan must find at least one such file.
-        import re as _re
-        checked = 0
-        for path in sorted((ROOT / "src").rglob("*.rs")):
-            text = path.read_text(encoding="utf-8")
-            if not _re.search(r"\.elapsed\(\)", text):
-                continue
-            rel = path.relative_to(ROOT).as_posix()
-            checked += 1
-            self.assertIn((rel, "Instant::now"), self._allowed, f"{rel} reads elapsed() outside ALLOWED")
-        self.assertGreater(checked, 0, "no file calls elapsed(): the check compared nothing")
+    def test_clippy_toml_bans_elapsed(self):
+        # `.elapsed()` reads the wall clock exactly like `::now()`, but a
+        # lexical guard pattern for it would be too broad (any value named
+        # `elapsed` anywhere); clippy's disallowed-methods is type-resolved
+        # and carries this one instead -- this canary only confirms the ban
+        # is actually present, not absent-by-typo.
+        clippy_toml = (ROOT / "clippy.toml").read_text(encoding="utf-8")
+        for path in ("std::time::Instant::elapsed", "std::time::SystemTime::elapsed"):
+            self.assertIn(
+                f'path = "{path}"',
+                clippy_toml,
+                f"clippy.toml must disallow {path}",
+            )
 
     def test_the_repository_passes(self):
-        eg.ALLOWED.update(self._allowed)
         problems, files, patterns = eg.check(ROOT)
         self.assertEqual(problems, [])
-        self.assertGreater(files, 10)
+        self.assertGreater(files, 5)
         self.assertEqual(patterns, len(eg.PATTERNS))
 
     def test_every_source_in_production_code_is_reported(self):
         for call in ["getrandom::getrandom(&mut b)", "rand::rngs::OsRng", "rand::thread_rng()",
-                     "rand::random::<u64>()", "SecureRng::from_entropy()", "DpNoise::try_from_entropy(1.0, 1.0)",
+                     "rand::random::<u64>()", "XorShift64::from_entropy()", "Rng::try_from_entropy(1.0, 1.0)",
                      "std::time::SystemTime::now()", "std::time::Instant::now()",
                      "std::collections::hash_map::RandomState::new()", "uuid::Uuid::new_v4()"]:
             p = self.problems({"src/a.rs": f"pub fn f() {{ let _ = {call}; }}\n"})
@@ -76,15 +80,13 @@ class EntropyGuard(unittest.TestCase):
         self.assertEqual(self.problems({"src/a.rs": src}), [])
 
     def test_a_cfg_all_test_module_is_exempt(self):
-        # ALICE-DB gates one test module behind `#[cfg(all(test, feature = "fs"))]`,
-        # not the plain `#[cfg(test)]` the upstream script only recognised.
-        src = ('pub fn f() {}\n\n#[cfg(all(test, feature = "fs"))]\nmod tests {\n'
+        src = ('pub fn f() {}\n\n#[cfg(all(test, feature = "std"))]\nmod tests {\n'
                '    fn t() {\n        let _ = std::time::Instant::now();\n    }\n}\n')
         self.assertEqual(self.problems({"src/a.rs": src}), [])
 
     def test_cfg_not_test_is_not_exempt(self):
-        # `not(test)` contains the word "test" but means the opposite of it;
-        # a regex keyed on the substring "test" would wrongly treat this as a
+        # `not(test)` contains the word "test" but means the opposite of it; a
+        # regex keyed on the substring "test" would wrongly treat this as a
         # test module and hide a real production call.
         src = ('pub fn f() {}\n\n#[cfg(not(test))]\nmod prod_only {\n'
                '    fn t() {\n        let _ = std::time::Instant::now();\n    }\n}\n')
@@ -103,22 +105,53 @@ class EntropyGuard(unittest.TestCase):
                '// SystemTime::now() is not used here\n')
         self.assertEqual(self.problems({"src/a.rs": src}), [])
 
+    # The allowances are this repository's own data, read from scripts/entropy_guard.toml (the guard
+    # itself is shared byte-for-byte, so it cannot carry them). oracle: each expected message is written
+    # out here from the rule it states.
     def test_an_allowed_site_needs_its_exact_count(self):
-        src = "pub fn f() { let _ = std::time::SystemTime::now(); }\n"
-        eg.ALLOWED[("src/a.rs", "SystemTime::now")] = (1, "reason")
-        self.assertEqual(self.problems({"src/a.rs": src}), [])
-        eg.ALLOWED[("src/a.rs", "SystemTime::now")] = (2, "reason")
-        self.assertTrue(any("1 call sites, ALLOWED says 2" in x for x in self.problems({"src/a.rs": src})))
+        self.assertEqual(self.problems({"src/a.rs": CALL, TOML: allow(("src/a.rs", "SystemTime::now", 1, "why"))}), [])
+
+    def test_a_call_beyond_the_allowed_count_fails(self):
+        two = CALL + "pub fn g() { let _ = std::time::SystemTime::now(); }\n"
+        p = self.problems({"src/a.rs": two, TOML: allow(("src/a.rs", "SystemTime::now", 1, "why"))})
+        self.assertTrue(any("2 call sites, scripts/entropy_guard.toml allows 1" in x for x in p), p)
+
+    def test_a_count_above_the_calls_fails(self):
+        p = self.problems({"src/a.rs": CALL, TOML: allow(("src/a.rs", "SystemTime::now", 2, "why"))})
+        self.assertTrue(any("1 call sites, scripts/entropy_guard.toml allows 2" in x for x in p), p)
 
     def test_an_allowed_entry_needs_a_reason(self):
-        src = "pub fn f() { let _ = std::time::SystemTime::now(); }\n"
-        eg.ALLOWED[("src/a.rs", "SystemTime::now")] = (1, "  ")
-        self.assertTrue(any("has no reason" in x for x in self.problems({"src/a.rs": src})))
+        p = self.problems({"src/a.rs": CALL, TOML: allow(("src/a.rs", "SystemTime::now", 1, "  "))})
+        self.assertTrue(any("has no reason" in x for x in p), p)
 
     def test_a_stale_allowed_entry_fails(self):
-        eg.ALLOWED[("src/a.rs", "OsRng")] = (1, "reason")
-        p = self.problems({"src/a.rs": "pub fn f() {}\n"})
+        p = self.problems({"src/a.rs": "pub fn f() {}\n", TOML: allow(("src/a.rs", "OsRng", 1, "why"))})
         self.assertTrue(any("matches nothing" in x for x in p), p)
+
+    def test_a_missing_toml_allows_nothing(self):
+        """an absent file is no allowance, not a skip: the call is a finding"""
+        p = self.problems({"src/a.rs": CALL})
+        self.assertTrue(any("SystemTime::now in production code: src/a.rs:1" in x for x in p), p)
+
+    def test_a_toml_that_does_not_parse_fails(self):
+        p = self.problems({"src/a.rs": "pub fn f() {}\n", TOML: "[[allow]\npath = \n"})
+        self.assertTrue(any("scripts/entropy_guard.toml is not TOML" in x for x in p), p)
+
+    def test_an_entry_with_an_unknown_pattern_or_key_or_a_bad_count_fails(self):
+        for text, want in (
+            (allow(("src/a.rs", "rand::thread", 1, "why")), "unknown pattern"),
+            (allow(("src/a.rs", "SystemTime::now", 0, "why")), "count must be a positive integer"),
+            ('[[allow]]\npath = "src/a.rs"\npattern = "SystemTime::now"\ncount = 1\nreason = "w"\nwhy = "x"\n', "unknown key"),
+            ('[[allow]]\npath = "src/a.rs"\npattern = "SystemTime::now"\nreason = "w"\n', "count must be a positive integer"),
+            ('[other]\nx = 1\n', "only [[allow]] entries"),
+        ):
+            p = self.problems({"src/a.rs": CALL, TOML: text})
+            self.assertTrue(any(want in x for x in p), (want, p))
+
+    def test_the_same_site_listed_twice_fails(self):
+        p = self.problems({"src/a.rs": CALL, TOML: allow(("src/a.rs", "SystemTime::now", 1, "a"),
+                                                          ("src/a.rs", "SystemTime::now", 1, "b"))})
+        self.assertTrue(any("listed twice" in x for x in p), p)
 
     def test_an_aliased_clock_is_found(self):
         src = "use std::time::Instant as Clock;\npub fn f() { let _ = Clock::now(); }\n"

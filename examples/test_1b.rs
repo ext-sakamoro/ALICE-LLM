@@ -176,7 +176,7 @@ fn main() {
         let l2: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
         eprintln!(
             "Layer {layer}: l2={l2:.4} ({:.1}s)",
-            t.elapsed().as_secs_f64()
+            alice_llm::diag_clock::elapsed(t).as_secs_f64()
         );
     }
 
