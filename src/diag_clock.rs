@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[must_use]
 #[inline]
 pub fn elapsed(start: Instant) -> Duration {
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the crate's single wall-clock read for diagnostic timings, never part of a computed value"
     )]

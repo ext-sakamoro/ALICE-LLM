@@ -5,8 +5,9 @@
 # default). The crate has no libm dependency, so no libm free function can be
 # named. CI runs clippy with -D warnings, which makes each call an error.
 #
-# The library calls none of them: the inference code goes through
-# src/lawmath.rs (alice-det-math), so scripts/g1_debt_sites.tsv is empty;
+# The library calls none of the libm methods: the inference code goes through
+# src/lawmath.rs (alice-det-math); scripts/g1_debt_sites.tsv lists only the one
+# wall-clock read (Instant::elapsed in src/diag_clock.rs, diagnostic timings);
 # scripts/g1_debt_pin.py fails when a call appears in library or binary code
 # (tests and examples are listed in scripts/g1_reference_sites.tsv).
 # The max / min / clamp entries at the end are G2: use crate::lawmath.
