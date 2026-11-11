@@ -367,7 +367,7 @@ jobs:
         run: cargo doc --no-deps --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
 
   gpu_pipeline_smoke:
-    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest moved to 26.04, where Mesa 26's lavapipe crashes (SIGSEGV)
+    # GPU lanes run on a fixed image (ubuntu-24.04) so the software Vulkan stack doesn't change under the job; move deliberately when the image is retired
     # Phase 2 Step 6: catches shader / pipeline compilation regressions that
     # only surface at Metal / Vulkan runtime (e.g., PR #73 row8×batch4
     # exceeded Metal per-shader threadgroup slot limit — CI test passed on
