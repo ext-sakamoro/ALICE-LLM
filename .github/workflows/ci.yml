@@ -156,7 +156,7 @@ jobs:
       - name: Identifier moves (the release compared with)
         id: id-base
         run: echo "crate=$(python3 scripts/id_move_check.py --print-base)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.cargo/registry/cache/*/${{ steps.id-base.outputs.crate }}.crate
           key: id-move-${{ steps.id-base.outputs.crate }}
