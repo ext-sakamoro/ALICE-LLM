@@ -367,6 +367,7 @@ jobs:
         run: cargo doc --no-deps --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix"
 
   gpu_pipeline_smoke:
+    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest moved to 26.04, where Mesa 26's lavapipe crashes (SIGSEGV)
     # Phase 2 Step 6: catches shader / pipeline compilation regressions that
     # only surface at Metal / Vulkan runtime (e.g., PR #73 row8×batch4
     # exceeded Metal per-shader threadgroup slot limit — CI test passed on
@@ -415,10 +416,10 @@ jobs:
         # windows-latest has no hardware GPU either; `wgpu`'s DX12 backend
         # enumerates the WARP software adapter, which lacks SUBGROUP (see
         # above) — most of this leg's tests print the named skip marker.
-        # ubuntu-latest does not have GPU hardware and no software compute
+        # ubuntu-24.04 does not have GPU hardware and no software compute
         # fallback either, so the test skips gracefully (compile-check +
         # adapter-absence path) — kept for the pure compile-check signal.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -437,13 +438,13 @@ jobs:
             exit 1
           fi
           echo "pipefail self-test ok: a failing producer piped through tee correctly failed this step"
-      # lavapipe (Mesa's software Vulkan rasterizer) so ubuntu-latest's
+      # lavapipe (Mesa's software Vulkan rasterizer) so ubuntu-24.04's
       # `wgpu` adapter request finds a real, working adapter instead of
       # falling through the "no GPU adapter found" skip path — without
       # this, the ubuntu leg below only compile-checks and never actually
       # dispatches a kernel.
-      - name: Install lavapipe (software Vulkan, ubuntu-latest only)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install lavapipe (software Vulkan, ubuntu-24.04 only)
+        if: matrix.os == 'ubuntu-24.04'
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
       # windows-latest (WARP) runs the same NEW-kernel-only tests as the
       # other two OSes, but never `old_vs_new_oracle::`: that module builds
@@ -452,7 +453,7 @@ jobs:
       # which is exactly the shape measured to crash WARP — running it there
       # would make this leg red by construction, not because of a real
       # regression. The old-vs-new comparison only runs where the OLD kernel
-      # can safely execute (ubuntu-latest's lavapipe / macos-latest's
+      # can safely execute (ubuntu-24.04's lavapipe / macos-latest's
       # Metal); windows-latest instead gets new-vs-CPU-reference coverage
       # (q5k/q8_0 today; more to follow), which exercises the NEW kernel
       # only — but even that cannot construct `GpuEngine` on WARP for the
