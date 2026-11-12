@@ -9,7 +9,7 @@ source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#8cb532f3
 
 [[package]]
 name = "alice-llm"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "alice-det-math",
  "async-stream",

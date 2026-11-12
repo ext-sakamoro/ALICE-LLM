@@ -115,9 +115,9 @@ pub enum ModelArch {
     /// target; foundation only until the CPU forward path lands
     /// (X.4.c) and community GGUF conversion arrives (X.4.b).
     ///
-    /// `forward()` immediately `todo!()` on `KimiK3` — silent garbage
-    /// on a 2.8T model is worse than an explicit panic pointing to
-    /// `docs/KIMI_K3_INTEGRATION.md`. The full HF-confirmed spec is
+    /// [`Llama3Model::from_gguf`] refuses it with
+    /// [`LoadError::UnsupportedArch`]: it loads through [`KimiK3Model`]
+    /// (see `docs/KIMI_K3_INTEGRATION.md`). The full HF-confirmed spec is
     /// captured by [`KimiDeltaConfig`] and parseable from `config.json`
     /// via [`KimiDeltaConfig::from_hf_config`] (`hf-config` feature).
     KimiK3,
@@ -136,9 +136,8 @@ pub enum ModelArch {
     /// GQA and MoE scaffolding is already reused across Kimi K3 /
     /// DeepSeek V3).
     ///
-    /// `forward()` immediately `todo!()` on `Hy3` — silent garbage on
-    /// a 295B model is worse than an explicit panic pointing to the
-    /// integration doc.
+    /// [`Llama3Model::from_gguf`] refuses it with
+    /// [`LoadError::UnsupportedArch`] until a forward pass exists.
     ///
     /// References:
     /// - GitHub: `Tencent-Hunyuan/Hy3` (weights + inference + RL)
@@ -12967,10 +12966,93 @@ struct SparseTernaryLayerWeights {
     down_proj: SparseTernaryMatrix,
 }
 
+/// Why [`Llama3Model::from_gguf`] refused a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadError {
+    /// The architecture is one whose forward pass this model does not carry: Kimi K3 loads
+    /// through [`KimiK3Model`], Hy3 has no forward pass yet. Refused before any tensor is read.
+    UnsupportedArch(ModelArch),
+    /// The metadata or a tensor the architecture needs is missing or has the wrong shape.
+    Malformed,
+}
+
+impl core::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnsupportedArch(arch) => {
+                write!(
+                    f,
+                    "architecture {arch:?} has no forward pass in Llama3Model"
+                )
+            }
+            Self::Malformed => {
+                f.write_str("GGUF metadata or a required tensor is missing or malformed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Why [`Llama3Model::forward_capture_hidden`] refused a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaptureError {
+    /// This architecture's forward pass (Gemma 3n, Gemma 4, DeepSeek-V3) does not run the
+    /// per-layer hook, so there is no hidden state to capture. Refused before the forward pass.
+    NoLayerHook(ModelArch),
+}
+
+impl core::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoLayerHook(arch) => {
+                write!(
+                    f,
+                    "architecture {arch:?} uses a forward pass without the layer hook"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+/// The forward pass a [`Llama3Model`] runs, fixed at load. Kimi K3 and Hy3 have no variant, so a
+/// model that exists can always run its forward pass; dispatch reads this, not
+/// `config.arch` (a public field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardPath {
+    Gemma3n,
+    Gemma4,
+    MlaMoe,
+    /// Standard attention, with the per-layer DeltaNet branch for Qwen 3.5 / 3.6.
+    Standard,
+}
+
+impl ForwardPath {
+    const fn for_arch(arch: ModelArch) -> Result<Self, LoadError> {
+        match arch {
+            ModelArch::Gemma3n => Ok(Self::Gemma3n),
+            ModelArch::Gemma4 => Ok(Self::Gemma4),
+            ModelArch::DeepSeekV3 => Ok(Self::MlaMoe),
+            ModelArch::Llama
+            | ModelArch::Mistral
+            | ModelArch::Gemma2
+            | ModelArch::Qwen2
+            | ModelArch::Qwen3
+            | ModelArch::Qwen3_5 => Ok(Self::Standard),
+            ModelArch::KimiK3 | ModelArch::Hy3 => Err(LoadError::UnsupportedArch(arch)),
+        }
+    }
+}
+
 /// Llama-3 model loaded from GGUF. Weights stay in quantized form
 /// in the mmap'd file; only dequantized during matvec.
 pub struct Llama3Model<'a> {
     pub config: Llama3Config,
+    forward_path: ForwardPath,
     embedding: Vec<f32>,
     layers: Vec<LayerWeights<'a>>,
     output_norm: Vec<f32>,
@@ -13053,7 +13135,18 @@ enum LayerKind {
 
 impl<'a> Llama3Model<'a> {
     /// Load model from a parsed GGUF file.
-    pub fn from_gguf(gguf: &'a GgufFile<'a>) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// [`LoadError::UnsupportedArch`] for Kimi K3 (use [`KimiK3Model`]) and Hy3, decided from
+    /// `general.architecture` before anything else is read; [`LoadError::Malformed`] when the
+    /// metadata or a tensor the architecture needs is missing or has the wrong shape.
+    pub fn from_gguf(gguf: &'a GgufFile<'a>) -> Result<Self, LoadError> {
+        let forward_path = ForwardPath::for_arch(ModelArch::from_gguf(gguf))?;
+        Self::load(gguf, forward_path).ok_or(LoadError::Malformed)
+    }
+
+    fn load(gguf: &'a GgufFile<'a>, forward_path: ForwardPath) -> Option<Self> {
         let config = Llama3Config::from_gguf(gguf)?;
 
         // Embedding (dequantized to f32 once)
@@ -13251,6 +13344,7 @@ impl<'a> Llama3Model<'a> {
             .map(|info| info.qtype);
         Some(Self {
             config,
+            forward_path,
             embedding,
             layers,
             output_norm,
@@ -13703,29 +13797,18 @@ impl<'a> Llama3Model<'a> {
     /// `layer_idx = None` は最終層 (num_layers - 1)、`Some(n)` は layer n
     /// 範囲外の場合は最終層 fallback (silent ではなく documented behavior)
     ///
-    /// # Panics
-    /// 非標準 arch (Gemma3n / Gemma4 / DeepSeekV3 / KimiK3 / Hy3) では
-    /// `forward_with_layer_hook` が specialized path に short-circuit するため
-    /// hook が呼ばれない `unimplemented!` で fail fast する 標準 arch
-    /// (Llama / Mistral / Gemma2 / Qwen2 / Qwen3 / Qwen3_5) のみ動作する
+    /// # Errors
+    /// [`CaptureError::NoLayerHook`] for Gemma 3n / Gemma 4 / DeepSeek-V3, whose forward pass
+    /// does not run the layer hook, returned before the forward pass (the cache is untouched)
+    /// The standard arches (Llama / Mistral / Gemma2 / Qwen2 / Qwen3 / Qwen3_5) capture
     #[cfg(feature = "dspark")]
     pub fn forward_capture_hidden(
         &mut self,
         token_id: u32,
         layer_idx: Option<usize>,
-    ) -> (Vec<f32>, Vec<f32>) {
-        match self.config.arch {
-            ModelArch::Gemma3n
-            | ModelArch::Gemma4
-            | ModelArch::DeepSeekV3
-            | ModelArch::KimiK3
-            | ModelArch::Hy3 => {
-                unimplemented!(
-                    "dspark forward_capture_hidden: arch {:?} uses specialized forward path that does not invoke layer hook",
-                    self.config.arch
-                );
-            }
-            _ => {}
+    ) -> Result<(Vec<f32>, Vec<f32>), CaptureError> {
+        if self.forward_path != ForwardPath::Standard {
+            return Err(CaptureError::NoLayerHook(self.config.arch));
         }
         let num_layers = self.config.num_layers;
         let target = layer_idx
@@ -13739,7 +13822,7 @@ impl<'a> Llama3Model<'a> {
             }
             false
         });
-        (logits, captured)
+        Ok((logits, captured))
     }
 
     /// External-signal-driven per-layer routing convenience API.
@@ -13834,46 +13917,16 @@ impl<'a> Llama3Model<'a> {
     where
         F: FnMut(usize, &mut Vec<f32>) -> bool,
     {
-        // Gemma 3n: use dedicated forward path (AltUp + Laurel + per-layer
-        // input embedding + shared KV are fundamentally different from the
-        // standard single-stream flow).
-        if self.config.arch == ModelArch::Gemma3n {
-            return self.forward_gemma3n(token_id);
-        }
-        // Gemma 4: dedicated forward path (per-layer FFN size, per-layer
-        // head_dim / RoPE base, shared KV, optional per-layer output scale).
-        if self.config.arch == ModelArch::Gemma4 {
-            return self.forward_gemma4(token_id);
-        }
-        // DeepSeek-V3 / R1: dedicated forward path (MLA + DeepSeek MoE with
-        // shared expert + partial RoPE + optional MTP head). Foundation
-        // (arch detection + config + weight loading) landed 2026-07-11;
-        // MLA CPU forward / MoE routing / expert streaming / MTP are
-        // Phase 2-5 follow-up work. Fail fast so users don't accidentally
-        // get silent garbage from a fallback that treats the model as
-        // standard attention.
-        if self.config.arch == ModelArch::DeepSeekV3 {
-            return self.forward_mla_moe(token_id);
-        }
-        // Kimi K3 / Kimi Delta Attention (Moonshot AI). Weights released
-        // 2026-07-27 and the full spec is now captured by KimiDeltaConfig
-        // via config.json (see KimiDeltaConfig::from_hf_config); the CPU
-        // forward path itself is still Phase X.4.c work (community GGUF
-        // conversion X.4.b is the outstanding blocker). Silent garbage on
-        // a 2.8T model is worse than an explicit panic pointing to the
-        // integration doc, so we `todo!()` here rather than fall through
-        // to the standard path (which would misinterpret Kimi Delta +
-        // Gated MLA + AttnRes as vanilla attention).
-        if self.config.arch == ModelArch::KimiK3 {
-            return self.forward_kimi_k3(token_id);
-        }
-        // Tencent Hy3 (Hunyuan 3). Skeleton only — the actual GGUF
-        // conversion & the 295B/21B MoE forward path are Phase X.11
-        // follow-up work. Fail fast rather than misinterpret Hy3 as
-        // vanilla attention (its 192-expert top-8 routing + MTP head
-        // are unique).
-        if self.config.arch == ModelArch::Hy3 {
-            return self.forward_hy3(token_id);
+        // Gemma 3n: AltUp + Laurel + per-layer input embedding + shared KV.
+        // Gemma 4: per-layer FFN size, per-layer head_dim / RoPE base, shared KV,
+        // optional per-layer output scale. DeepSeek-V3 / R1: MLA + DeepSeek MoE
+        // with shared expert + partial RoPE + optional MTP head. Kimi K3 and Hy3
+        // never reach here: `from_gguf` refuses them (`LoadError::UnsupportedArch`).
+        match self.forward_path {
+            ForwardPath::Gemma3n => return self.forward_gemma3n(token_id),
+            ForwardPath::Gemma4 => return self.forward_gemma4(token_id),
+            ForwardPath::MlaMoe => return self.forward_mla_moe(token_id),
+            ForwardPath::Standard => {}
         }
         // Qwen 3.5 / Qwen 3.6 hybrid uses the standard forward path with a
         // per-layer branch (DeltaNet linear-attention vs. full attention).
@@ -15493,73 +15546,6 @@ impl<'a> Llama3Model<'a> {
     ///
     /// Phase 4 (expert streaming) and Phase 5 (MTP native speculative
     /// decoding) still track separately (Issues #34 / #35).
-    /// Kimi K3 / Kimi Delta Attention forward path (Phase X.4).
-    ///
-    /// **Skeleton only.** The 2026-07-27 open weight release + paper drop
-    /// are prerequisites for the actual forward path. `todo!()` here so a
-    /// user who somehow feeds a Kimi K3 GGUF into ALICE-LLM gets an
-    /// explicit panic pointing to `docs/KIMI_K3_INTEGRATION.md` rather
-    /// than silent garbage from the standard `Llama3Model::forward` path.
-    ///
-    /// Once the paper drops and Kimi K3 GGUF conversion lands upstream,
-    /// this method should reuse `gated_deltanet_step*` for the DeltaNet
-    /// layers, standard attention for the full-attention layers, and
-    /// whatever KV compression scheme K3 ships. See the doc for the phased
-    /// integration plan (X.4.a-X.4.g).
-    ///
-    /// # Panics
-    ///
-    /// Always — this is a fail-fast stub: unimplemented paths panic
-    /// instead of returning a silent `Ok`.
-    // `&mut self` is intentional: the real Phase X.4.c implementation will
-    // mutate `self.kv_cache` on every forward, mirroring
-    // `forward_mla_moe` and `forward_gemma3n`. Keeping the signature
-    // stable now so the dispatch in `forward_with_layer_hook` doesn't need
-    // to change when the stub gets replaced.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    fn forward_kimi_k3(&mut self, _token_id: u32) -> Vec<f32> {
-        todo!(
-            "KIMI-K3 forward: open weights released 2026-07-27, spec is \
-             now captured in KimiDeltaConfig (parseable from HF config.json \
-             via KimiDeltaConfig::from_hf_config under `hf-config` feature). \
-             CPU forward path (Phase X.4.c) is still pending community GGUF \
-             conversion (X.4.b, mradermacher / bartowski watch). See \
-             docs/KIMI_K3_INTEGRATION.md for the phased integration plan \
-             (Phase X.4.a-X.4.j) and the reusable ALICE-LLM components \
-             (`gated_deltanet_step*`, `SsmDeltaNetConfig`, MoE routing, \
-             MLA scaffolding shared with DeepSeek V3)."
-        );
-    }
-
-    /// Fail-fast stub for Tencent Hy3 (Hunyuan 3) forward. Same rationale
-    /// as `forward_kimi_k3`: the target ships as a 295B / 21B-active MoE
-    /// with 192 experts (top-8 routing), 1 MTP layer (3.8B), GQA (8 KV
-    /// heads), 256K context, and native FP8 (E4M3) weights. Enough of that
-    /// scaffolding is unique that pretending it is a standard attention
-    /// model would corrupt the output rather than degrade it gracefully.
-    ///
-    /// Once GGUF conversion for Hy3 lands upstream, this method is
-    /// expected to inherit ~90% from the Bonsai / Qwen 3.6 gated-DeltaNet
-    /// forward path (GQA + MoE scaffolding is already shared across Kimi
-    /// K3 / DeepSeek V3); the net-new pieces are the 192-expert top-8
-    /// sparse routing and the MTP head. See references on `ModelArch::Hy3`.
-    ///
-    /// # Panics
-    ///
-    /// Always — fail-fast stub (unimplemented paths panic, never return silently).
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    fn forward_hy3(&mut self, _token_id: u32) -> Vec<f32> {
-        todo!(
-            "HY3 forward: waiting for community GGUF conversion of \
-             Tencent Hy3 (Hunyuan 3, 295B / 21B active MoE, 192 experts \
-             top-8, MTP head 3.8B, GQA 8 KV, 256K context, FP8 native) \
-             before implementation. Expected to inherit ~90% from the \
-             Bonsai `gated_deltanet_step*` path; net-new pieces are the \
-             192-expert top-8 sparse routing and MTP head. See the \
-             Tencent-Hunyuan/Hy3 GitHub repository for the model spec."
-        );
-    }
-
     fn forward_mla_moe(&mut self, token_id: u32) -> Vec<f32> {
         let c = self.config.clone();
         let hidden_dim = c.hidden_dim;
@@ -16827,8 +16813,8 @@ impl<'a> Llama3Model<'a> {
             // advanced = None は Phase 5 と bit-exact (forward + argmax + push)
             for i in 0..k {
                 let (mut dl, hidden_opt) = if let Some(cfg) = advanced {
-                    let (l, h) =
-                        draft_model.forward_capture_hidden(draft_input, cfg.hidden_capture_layer);
+                    let (l, h) = draft_model
+                        .forward_capture_hidden(draft_input, cfg.hidden_capture_layer)?;
                     (l, Some(h))
                 } else {
                     (draft_model.forward(draft_input), None)
@@ -17030,7 +17016,7 @@ impl<'a> Llama3Model<'a> {
             // Draft phase: capture hidden state per position (vanilla argmax、bigram なし)
             for _ in 0..k {
                 let (dl, hidden) =
-                    draft_model.forward_capture_hidden(draft_input, hidden_capture_layer);
+                    draft_model.forward_capture_hidden(draft_input, hidden_capture_layer)?;
                 draft_input = sample_argmax(&dl)? as u32;
                 draft_tokens.push(draft_input);
                 draft_logits_all.push(dl);
@@ -18325,8 +18311,8 @@ impl crate::speculative_dspark::DraftBackend for Llama3Model<'_> {
         &mut self,
         token_id: crate::speculative_dspark::TokenId,
         layer_idx: Option<usize>,
-    ) -> (Vec<f32>, Vec<f32>) {
-        Self::forward_capture_hidden(self, token_id, layer_idx)
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::speculative_dspark::DsparkError> {
+        Ok(Self::forward_capture_hidden(self, token_id, layer_idx)?)
     }
 
     fn seq_len(&self) -> usize {
@@ -18367,8 +18353,10 @@ impl crate::speculative_dspark::DraftBackend for KimiK3Model<'_> {
         &mut self,
         token_id: crate::speculative_dspark::TokenId,
         layer_idx: Option<usize>,
-    ) -> (Vec<f32>, Vec<f32>) {
-        Self::forward_capture_hidden_with_snapshot(self, token_id, layer_idx)
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::speculative_dspark::DsparkError> {
+        Ok(Self::forward_capture_hidden_with_snapshot(
+            self, token_id, layer_idx,
+        ))
     }
 
     fn seq_len(&self) -> usize {
@@ -23937,19 +23925,19 @@ mod a_model_that_produces_nan {
     use super::*;
     use crate::gguf::GgufFile;
 
-    fn string(buf: &mut Vec<u8>, s: &str) {
+    pub(super) fn string(buf: &mut Vec<u8>, s: &str) {
         buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
     }
 
     /// A tensor as GGUF stores it: `(name, dims, ggml type, bytes)`.
-    type Tensor = (String, Vec<u64>, u32, Vec<u8>);
+    pub(super) type Tensor = (String, Vec<u64>, u32, Vec<u8>);
 
-    const F32: u32 = 0;
-    const Q8_0: u32 = 8;
+    pub(super) const F32: u32 = 0;
+    pub(super) const Q8_0: u32 = 8;
 
     /// `kv_u32`, then the vocabulary, then each tensor.
-    fn gguf_bytes(arch: &str, kv_u32: &[(String, u32)], tensors: &[Tensor]) -> Vec<u8> {
+    pub(super) fn gguf_bytes(arch: &str, kv_u32: &[(String, u32)], tensors: &[Tensor]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
@@ -24001,17 +23989,17 @@ mod a_model_that_produces_nan {
         buf
     }
 
-    const VOCAB: usize = 4;
+    pub(super) const VOCAB: usize = 4;
     /// A `Q8_0` block holds 32 values, and the matrix kernels read whole blocks.
-    const HIDDEN: usize = 32;
+    pub(super) const HIDDEN: usize = 32;
 
-    fn f32_tensor(name: &str, dims: &[u64], values: &[f32]) -> Tensor {
+    pub(super) fn f32_tensor(name: &str, dims: &[u64], values: &[f32]) -> Tensor {
         let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         (name.to_string(), dims.to_vec(), F32, bytes)
     }
 
     /// `rows` rows of 32 columns: each block has the scale in half precision, then 32 `i8`.
-    fn q8_tensor(name: &str, rows: usize, scale_f16: u16) -> Tensor {
+    pub(super) fn q8_tensor(name: &str, rows: usize, scale_f16: u16) -> Tensor {
         let mut bytes = Vec::new();
         for r in 0..rows {
             bytes.extend_from_slice(&scale_f16.to_le_bytes());
@@ -24026,7 +24014,7 @@ mod a_model_that_produces_nan {
     }
 
     /// Half precision 0.01, near enough for a matrix of small weights.
-    const SMALL: u16 = 0x23d7;
+    pub(super) const SMALL: u16 = 0x23d7;
     const NAN_F16: u16 = 0x7e00;
 
     /// A one-layer llama whose output projection has this scale.
@@ -24337,6 +24325,200 @@ mod a_model_that_produces_nan {
             speculative_decode(&mut draft, &mut main, &[1], 2, 2, None).map(|r| r.tokens.len()),
             "speculative_decode",
         );
+    }
+}
+
+/// `from_gguf` refuses the architectures whose forward pass `Llama3Model` does not carry, before
+/// reading a tensor, and every architecture it accepts reaches a forward pass that returns logits.
+#[cfg(test)]
+mod refuses_what_it_cannot_run {
+    use super::a_model_that_produces_nan::{
+        f32_tensor, gguf_bytes, q8_tensor, Tensor, HIDDEN, SMALL, VOCAB,
+    };
+    use super::*;
+    use crate::gguf::GgufFile;
+
+    /// Every `ModelArch`, written as a match so a new variant does not compile until it is listed
+    /// here with the forward path it should get (`None` = refused).
+    fn expected_path(arch: ModelArch) -> Option<ForwardPath> {
+        match arch {
+            ModelArch::Gemma3n => Some(ForwardPath::Gemma3n),
+            ModelArch::Gemma4 => Some(ForwardPath::Gemma4),
+            ModelArch::DeepSeekV3 => Some(ForwardPath::MlaMoe),
+            ModelArch::Llama
+            | ModelArch::Mistral
+            | ModelArch::Gemma2
+            | ModelArch::Qwen2
+            | ModelArch::Qwen3
+            | ModelArch::Qwen3_5 => Some(ForwardPath::Standard),
+            ModelArch::KimiK3 | ModelArch::Hy3 => None,
+        }
+    }
+
+    const ALL: [ModelArch; 11] = [
+        ModelArch::Llama,
+        ModelArch::Mistral,
+        ModelArch::Gemma2,
+        ModelArch::Gemma3n,
+        ModelArch::Gemma4,
+        ModelArch::Qwen2,
+        ModelArch::Qwen3,
+        ModelArch::Qwen3_5,
+        ModelArch::DeepSeekV3,
+        ModelArch::KimiK3,
+        ModelArch::Hy3,
+    ];
+
+    #[test]
+    fn the_forward_path_of_every_architecture_is_the_listed_one() {
+        let mut compared = 0;
+        for arch in ALL {
+            match (ForwardPath::for_arch(arch), expected_path(arch)) {
+                (Ok(got), Some(want)) => assert_eq!(got, want, "{arch:?}"),
+                (Err(e), None) => assert_eq!(e, LoadError::UnsupportedArch(arch)),
+                (got, want) => panic!("{arch:?}: got {got:?}, expected {want:?}"),
+            }
+            compared += 1;
+        }
+        assert_eq!(compared, ALL.len());
+        assert!(compared > 0, "compared nothing");
+    }
+
+    /// A header with no tensor at all: the refusal comes from `general.architecture` alone, so a
+    /// Kimi K3 or Hy3 file is `UnsupportedArch`, not `Malformed`.
+    #[test]
+    fn kimi_k3_and_hy3_headers_are_refused_before_any_tensor_is_read() {
+        let cases = [
+            ("kimi-k3", ModelArch::KimiK3),
+            ("kimi", ModelArch::KimiK3),
+            ("hunyuan", ModelArch::Hy3),
+            ("hy3", ModelArch::Hy3),
+            ("hunyuan_moe", ModelArch::Hy3),
+        ];
+        for (name, arch) in cases {
+            let bytes = gguf_bytes(name, &[], &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse");
+            assert_eq!(
+                Llama3Model::from_gguf(&gguf).err(),
+                Some(LoadError::UnsupportedArch(arch)),
+                "{name}"
+            );
+        }
+        // the same empty header on an accepted architecture is malformed, not unsupported
+        let bytes = gguf_bytes("llama", &[], &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        assert_eq!(
+            Llama3Model::from_gguf(&gguf).err(),
+            Some(LoadError::Malformed)
+        );
+    }
+
+    /// A one-layer standard-attention model whose metadata keys carry `prefix`.
+    fn standard_bytes(arch: &str, prefix: &str) -> Vec<u8> {
+        let kv = [
+            (format!("{prefix}.block_count"), 1),
+            (format!("{prefix}.embedding_length"), HIDDEN as u32),
+            (format!("{prefix}.feed_forward_length"), HIDDEN as u32),
+            (format!("{prefix}.vocab_size"), VOCAB as u32),
+            (format!("{prefix}.attention.head_count"), 1),
+            ("tokenizer.ggml.eos_token_id".to_string(), 999),
+        ];
+        let embedding: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let one = vec![1.0; HIDDEN];
+        let line = [HIDDEN as u64];
+        let mut tensors: Vec<Tensor> = vec![
+            f32_tensor(
+                "token_embd.weight",
+                &[HIDDEN as u64, VOCAB as u64],
+                &embedding,
+            ),
+            f32_tensor("output_norm.weight", &line, &one),
+            q8_tensor("output.weight", VOCAB, SMALL),
+            f32_tensor("blk.0.attn_norm.weight", &line, &one),
+            f32_tensor("blk.0.ffn_norm.weight", &line, &one),
+        ];
+        for name in [
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ] {
+            tensors.push(q8_tensor(&format!("blk.0.{name}.weight"), HIDDEN, SMALL));
+        }
+        gguf_bytes(arch, &kv, &tensors)
+    }
+
+    /// The architectures this file format can build in a few tensors (the standard path); the
+    /// specialised paths (Gemma 3n / Gemma 4 / DeepSeek-V3 / Qwen 3.5) need their own tensors.
+    const STANDARD: [(&str, &str, ModelArch); 5] = [
+        ("llama", "llama", ModelArch::Llama),
+        ("mistral", "mistral", ModelArch::Mistral),
+        ("gemma2", "gemma2", ModelArch::Gemma2),
+        ("qwen2", "qwen2", ModelArch::Qwen2),
+        ("qwen3", "qwen3", ModelArch::Qwen3),
+    ];
+
+    #[test]
+    fn every_accepted_standard_architecture_loads_and_runs_a_forward_pass() {
+        let mut compared = 0;
+        for (name, prefix, arch) in STANDARD {
+            let bytes = standard_bytes(name, prefix);
+            let gguf = GgufFile::parse(&bytes).expect("parse");
+            let mut model = Llama3Model::from_gguf(&gguf).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(model.config.arch, arch, "{name}");
+            assert_eq!(model.forward_path, ForwardPath::Standard, "{name}");
+            let logits = model.forward(1);
+            assert_eq!(logits.len(), VOCAB, "{name}");
+            assert!(logits.iter().all(|x| x.is_finite()), "{name}: {logits:?}");
+            compared += 1;
+        }
+        assert_eq!(compared, STANDARD.len(), "compared nothing");
+    }
+
+    /// Dispatch reads the path fixed at load: writing an unsupported arch into the public
+    /// `config` afterwards does not route the forward pass anywhere else.
+    #[test]
+    fn rewriting_config_arch_after_load_does_not_change_the_forward_pass() {
+        let bytes = standard_bytes("llama", "llama");
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut a = Llama3Model::from_gguf(&gguf).expect("load");
+        let mut b = Llama3Model::from_gguf(&gguf).expect("load");
+        b.config.arch = ModelArch::KimiK3;
+        let (la, lb) = (a.forward(2), b.forward(2));
+        assert_eq!(
+            la.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            lb.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A forward pass without the layer hook is refused before it runs: the cache stays empty.
+    #[cfg(feature = "dspark")]
+    #[test]
+    fn capture_on_a_path_without_the_layer_hook_is_refused_and_touches_nothing() {
+        let bytes = standard_bytes("llama", "llama");
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let mut model = Llama3Model::from_gguf(&gguf).expect("load");
+        let (logits, hidden) = model.forward_capture_hidden(1, None).expect("standard");
+        assert_eq!((logits.len(), hidden.len()), (VOCAB, HIDDEN));
+        let before = model.kv_seq_len();
+        for (path, arch) in [
+            (ForwardPath::Gemma3n, ModelArch::Gemma3n),
+            (ForwardPath::Gemma4, ModelArch::Gemma4),
+            (ForwardPath::MlaMoe, ModelArch::DeepSeekV3),
+        ] {
+            model.forward_path = path;
+            model.config.arch = arch;
+            assert_eq!(
+                model.forward_capture_hidden(1, None).err(),
+                Some(CaptureError::NoLayerHook(arch))
+            );
+            assert_eq!(model.kv_seq_len(), before);
+        }
     }
 }
 

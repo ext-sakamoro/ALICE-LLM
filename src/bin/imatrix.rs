@@ -16,6 +16,8 @@
 //! Dynamic v3.0 GGUFs) directly to the tensor layout of any input GGUF. Later phases add activation
 //! capture (`collect`), imatrix-tuned assignment (`decide`), and repack.
 
+#![deny(clippy::todo, clippy::unimplemented)]
+
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;

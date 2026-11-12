@@ -101,7 +101,7 @@ pub const LLM_SEMANTICS_PINS: &[(&str, [u8; 32])] = &[
 ];
 
 /// The crate version and toolchain the pins were last checked against
-pub const LLM_SEMANTICS_CHECKED_AT: (&str, &str) = ("4.0.0", "1.98.1");
+pub const LLM_SEMANTICS_CHECKED_AT: (&str, &str) = ("5.0.0", "1.98.1");
 
 /// The functions of `alice-det-math` this crate calls (ALICE-Law's
 /// `scripts/fold_set_check.py` compares this with the calls in the source and
