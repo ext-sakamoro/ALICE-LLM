@@ -47,7 +47,7 @@ pub type TokenId = u32;
 pub enum DsparkError {
     /// モデルの logits から sample できない
     Sampling(crate::sampling::SamplingError),
-    /// draft model の forward pass が layer hook を通らない (Gemma 3n / Gemma 4 / DeepSeek-V3)
+    /// draft model の forward pass が layer hook を通らない (`ModelArch::Gemma3n` / `Gemma4` / `DeepSeekV3`)
     /// ので hidden state を capture できない forward 前に返す
     NoLayerHook,
     /// Token id が宣言 vocab_size を超過
