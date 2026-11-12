@@ -53,6 +53,13 @@ jobs:
         run: |
           python3 scripts/test_changed_paths.py
           python3 scripts/changed_paths.py sync
+      # every tracked Cargo.lock takes each alice-* crate by git and with the same source as the other
+      # locks (scripts/lock_sources_check.py, shared with the other ALICE crates; exemptions in
+      # scripts/lock_sources.toml); no lock read fails
+      - name: Lock sources and agreement across workspaces (test, then check)
+        run: |
+          python3 scripts/test_lock_sources_check.py
+          python3 scripts/lock_sources_check.py
 
   docs_lint:
     # Public documents and every tracked file: no development-process vocabulary,

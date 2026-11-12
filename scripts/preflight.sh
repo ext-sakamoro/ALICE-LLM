@@ -488,6 +488,16 @@ step "ci.yml / actionlint: Changed paths tests + trigger lint"
 )
 )
 
+step "ci.yml / actionlint: Lock sources and agreement across workspaces (test, then check)"
+(
+  gh_step ci.yml.actionlint
+(
+  export CARGO_TERM_COLOR="always"
+  python3 scripts/test_lock_sources_check.py
+  python3 scripts/lock_sources_check.py
+)
+)
+
 step "ci.yml / docs_lint: Docs lint (tests)"
 (
   gh_step ci.yml.docs_lint
