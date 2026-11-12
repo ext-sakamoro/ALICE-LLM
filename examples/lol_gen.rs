@@ -87,8 +87,8 @@ fn main() {
         eprintln!("failed to load tokenizer from GGUF");
         process::exit(1);
     });
-    let mut model = Llama3Model::from_gguf(&gguf).unwrap_or_else(|| {
-        eprintln!("failed to load model from GGUF");
+    let mut model = Llama3Model::from_gguf(&gguf).unwrap_or_else(|e| {
+        eprintln!("failed to load model from GGUF: {e}");
         process::exit(1);
     });
     println!(

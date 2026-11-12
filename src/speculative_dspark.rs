@@ -47,6 +47,9 @@ pub type TokenId = u32;
 pub enum DsparkError {
     /// モデルの logits から sample できない
     Sampling(crate::sampling::SamplingError),
+    /// draft model の forward pass が layer hook を通らない (Gemma 3n / Gemma 4 / DeepSeek-V3)
+    /// ので hidden state を capture できない forward 前に返す
+    NoLayerHook,
     /// Token id が宣言 vocab_size を超過
     TokenOutOfVocab {
         /// 越境した token id
@@ -137,6 +140,9 @@ impl core::fmt::Display for DsparkError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Sampling(e) => write!(f, "sampling refused: {e}"),
+            Self::NoLayerHook => {
+                f.write_str("the draft model's forward pass does not run the layer hook")
+            }
             Self::TokenOutOfVocab { token, vocab_size } => {
                 write!(f, "token id {token} exceeds vocab size {vocab_size}")
             }
@@ -204,6 +210,14 @@ impl core::fmt::Display for DsparkError {
 }
 
 impl std::error::Error for DsparkError {}
+
+impl From<crate::llama3::CaptureError> for DsparkError {
+    fn from(e: crate::llama3::CaptureError) -> Self {
+        match e {
+            crate::llama3::CaptureError::NoLayerHook(_) => Self::NoLayerHook,
+        }
+    }
+}
 
 impl From<crate::sampling::SamplingError> for DsparkError {
     fn from(e: crate::sampling::SamplingError) -> Self {
@@ -838,7 +852,7 @@ pub trait DraftBackend {
         &mut self,
         token_id: TokenId,
         layer_idx: Option<usize>,
-    ) -> (Vec<f32>, Vec<f32>);
+    ) -> Result<(Vec<f32>, Vec<f32>), DsparkError>;
 
     /// 現在の KV cache 内 token 数 (最後の `clear_cache` / `rollback_to` 以降に append された数)
     fn seq_len(&self) -> usize;

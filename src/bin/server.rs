@@ -22,6 +22,8 @@
 //!   GET  /v1/models           — List loaded models
 //!   GET  /health              — Health check
 
+#![deny(clippy::todo, clippy::unimplemented)]
+
 use alice_llm::gguf::{GgufFile, GgufTokenizer};
 use alice_llm::gpu::{GpuEngine, GpuModel, GpuModelConfig};
 use alice_llm::llama3::{Llama3Config, Llama3Model};

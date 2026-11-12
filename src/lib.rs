@@ -1,6 +1,7 @@
 //! ALICE-LLM: Pure Rust LLM inference engine.
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![deny(clippy::todo, clippy::unimplemented)]
 #![allow(
     clippy::module_name_repetitions,
     clippy::cast_possible_truncation,
