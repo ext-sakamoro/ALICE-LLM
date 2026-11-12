@@ -1384,10 +1384,8 @@ mod kimi_k3_hf_config_tests {
 //
 // Scaffolding for the Kimi K3 KDA forward path. Implements the math
 // primitives of Section 2.1.1 of the K3 tech report (Eq 1, 5, 6) as
-// standalone, unit-testable functions. The `forward_kimi_k3` dispatch
-// still `todo!()`s until Phase X.4.c.2 wires these primitives into a
-// full per-head + per-layer forward with weight loading (Phase X.4.b)
-// and ShortConv history buffers.
+// standalone, unit-testable functions. `KimiK3Model` runs them; a
+// `Llama3Model` refuses a Kimi K3 file at load (`LoadError::UnsupportedArch`).
 //
 // The composite `kimi_delta_forward_head` function (Eq 2 projections +
 // ShortConv + L2Norm + Swish + step + read + output gate) is
@@ -1915,9 +1913,8 @@ mod kimi_delta_tests {
 //
 // Layer-level orchestration (Block AttnRes at §2.2 Eq 8-10, KV cache
 // interaction for the 24 Gated MLA layers, GGUF weight lookup) is
-// out of scope for X.4.c.2 and lives in `forward_kimi_k3` (still
-// `todo!()`) at Phase X.4.c.3+ — those are blocked on Phase X.4.b
-// (community `convert_hf_to_gguf.py`) and Phase X.4.d (AttnRes).
+// out of scope for X.4.c.2 and lives in `KimiK3Model` (Phase X.4.c.3+;
+// GGUF conversion Phase X.4.b, AttnRes Phase X.4.d).
 
 /// Per-head runtime cache for one KDA layer.
 ///
@@ -4416,7 +4413,7 @@ impl Llama3Config {
 
         // DeepSeek-V3 / R1: read the `deepseek2.*` sub-config. All fields
         // optional — a missing key does not disqualify the model, we just
-        // leave the future forward path to raise a targeted `todo!()`.
+        // leave the forward path to work with what is present.
         let deepseek_v3 = if arch == ModelArch::DeepSeekV3 {
             let q_lora_rank = gguf
                 .meta_u32(&format!("{prefix}.attention.q_lora_rank"))
@@ -13919,7 +13916,7 @@ impl<'a> Llama3Model<'a> {
     {
         // Gemma 3n: AltUp + Laurel + per-layer input embedding + shared KV.
         // Gemma 4: per-layer FFN size, per-layer head_dim / RoPE base, shared KV,
-        // optional per-layer output scale. DeepSeek-V3 / R1: MLA + DeepSeek MoE
+        // optional per-layer output scale. `ModelArch::DeepSeekV3`: MLA + MoE
         // with shared expert + partial RoPE + optional MTP head. Kimi K3 and Hy3
         // never reach here: `from_gguf` refuses them (`LoadError::UnsupportedArch`).
         match self.forward_path {

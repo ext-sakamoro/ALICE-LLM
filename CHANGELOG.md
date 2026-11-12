@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **破壊的:** 版を 4.0.0 から 5.0.0 に `Llama3Model::from_gguf` は `Option<Self>` でなく `Result<Self, LoadError>` を返す forward pass を持たない arch (Kimi K3 は `KimiK3Model` で読む、Hy3 は forward pass が無い) は `general.architecture` を読んだ時点で `LoadError::UnsupportedArch` で断り、tensor を 1 つも読まない 欠けた metadata や形の合わない tensor は `LoadError::Malformed` 以前は読み込みが成功し、最初の `forward` が `todo!` で panic した forward の振り分けは読み込み時に決まる private な値で行い、公開 field の `config.arch` を後から書き換えても振り分けは変わらない
-- **破壊的:** `Llama3Model::forward_capture_hidden` (feature `dspark`) は `Result<_, CaptureError>` を返す layer hook を通らない forward pass (Gemma 3n / Gemma 4 / DeepSeek-V3) は forward の前に `CaptureError::NoLayerHook` で断り、KV cache を触らない 以前は `unimplemented!` で panic した `DraftBackend::forward_capture_hidden` は `Result<_, DsparkError>` を返し、`DsparkError::NoLayerHook` が増えた
+- **破壊的:** `Llama3Model::forward_capture_hidden` (feature `dspark`) は `Result<_, CaptureError>` を返す layer hook を通らない forward pass (`ModelArch::Gemma3n` / `Gemma4` / `DeepSeekV3`) は forward の前に `CaptureError::NoLayerHook` で断り、KV cache を触らない 以前は `unimplemented!` で panic した `DraftBackend::forward_capture_hidden` は `Result<_, DsparkError>` を返し、`DsparkError::NoLayerHook` が増えた
 - `LLM_SEMANTICS_CHECKED_AT` を 5.0.0 にした (pin と識別子は 5.0.0 で照合し直して不変)
 - crate に `todo!` / `unimplemented!` の呼び出しが無くなったので `#![deny(clippy::todo, clippy::unimplemented)]` を付けた
 - 経過時間の読みを `diag_clock::elapsed` の 1 か所にまとめた (src の 38 か所、example と試験の 130 か所) 計時は表示と統計だけに使い、生成する token や logit には入らない `clippy.toml` で `std::time::Instant::elapsed` / `std::time::SystemTime::elapsed` を禁止し、許可はこの関数の中だけ
