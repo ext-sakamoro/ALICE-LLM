@@ -562,6 +562,16 @@ relint
 ( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings )
 )
 
+step "ci.yml / clippy: Upstream previous identifiers (test, then whole-list uses only) [features=default]"
+(
+  gh_step ci.yml.clippy
+(
+  export CARGO_TERM_COLOR="always"
+  python3 scripts/test_upstream_previous_ids_check.py
+  python3 scripts/upstream_previous_ids_check.py
+)
+)
+
 step "ci.yml / clippy: Identifier moves (tests) [features=default]"
 (
   gh_step ci.yml.clippy

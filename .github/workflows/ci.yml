@@ -153,6 +153,12 @@ jobs:
       - name: cargo clippy (full feature set + internal-kernel-oracle, all targets)
         if: matrix.features == 'gpu-oracle'
         run: cargo clippy --all-targets --features "gguf,parallel,simd,grammar,quant,hf-config,dspark,dspark-serde,imatrix,gpu,server,internal-kernel-oracle" -- -D warnings
+      # another crate's PREVIOUS_*_SEMANTICS_IDS is used only as a whole list (an upstream empties it on
+      # a major version; scripts/upstream_previous_ids_check.py, shared with the other ALICE crates)
+      - name: Upstream previous identifiers (test, then whole-list uses only)
+        run: |
+          python3 scripts/test_upstream_previous_ids_check.py
+          python3 scripts/upstream_previous_ids_check.py
       # G9: an identifier (LLM_SEMANTICS_ID, LLM_PLATFORM_SEMANTICS_ID) moves only with a breaking version, with the
       # released value in its previous list (when it has one) and both values named in
       # CHANGELOG.md; the released value is read from the published crate at the newest

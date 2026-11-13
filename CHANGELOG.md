@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alice-llm-server --exit-on-stdin-eof`: stdin が閉じたら終了する 親 process が server を stdin を piped にして起動し書き込み側を持っておけば、親が正常終了・signal・異常終了のどれで止まっても OS が pipe を閉じるので server も止まる 監視は model の読込より前に始まる
 
 ### Added
+- CI: 他の crate の `PREVIOUS_*_SEMANTICS_IDS` は一覧全体としてだけ使える (`contains` / `len` / `is_empty`、全体を回す iterator や for、引数として丸ごと渡す) とし、添字・slice のパターン・`.first` / `next` / `take` などを拒む `scripts/upstream_previous_ids_check.py` と試験を足した (ALICE-Edge と同じ中身の共有 file) 上流は major で一覧を空にする 走査した .rs が 0 件なら失敗 (ci.yml と preflight)
 - CI と preflight: 共有の `scripts/lock_sources_check.py` と試験 (ALICE-Edge と同じ bytes) を持つ 追跡している全ての Cargo.lock が alice-* を git から取り、lock の間で同じ source を引くかを見る (fuzz / tools の lock だけが古い commit に残るのを止める、lock が 1 本も読めなければ失敗)
 - `conformance/g11.toml` (ALICE-Law の `g11_table_gen.py` で生成した G11 の表) と `.github/g11-table-pin` / `scripts/g11_table.sh` (CI の float-environment job と preflight で表を検査)
 - `alice_llm::server_cli` (std のみ、feature 不要): server の引数の解析 (`parse_args`、`--host` / `--port` の不正な値は既定に戻さず error)、`bind`、`watch_until_eof` server は model の読込より前に bind し、`Bound to http://<addr>` を出す (使用中の port は読込を待たずに失敗する) README / README_JP に server の option を書き、curl の例を 127.0.0.1 にした
