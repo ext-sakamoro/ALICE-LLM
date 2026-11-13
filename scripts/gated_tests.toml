@@ -1,0 +1,16 @@
+# Configuration of scripts/gated_tests.py (the script is shared between repositories; this file is not)
+mode = "run"
+ignored = "run"
+
+[[cover]]
+name = "ci"
+globs = [".github/workflows/ci.yml"]
+
+[[cover]]
+name = "preflight"
+globs = ["scripts/preflight.sh"]
+
+# gates this script cannot read (any()/not()), with where they run
+[unread]
+float_edge_golden = "cfg(not(feature = \"platform-math\")): runs with default features in ci.yml and preflight.sh (scripts/run_tests.sh float_edge_golden=6, debug and release)"
+semantics_golden = "cfg(not(feature = \"platform-math\")): runs with default features in ci.yml and preflight.sh (scripts/run_tests.sh semantics_golden=9, debug and release)"

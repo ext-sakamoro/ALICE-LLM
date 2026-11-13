@@ -53,6 +53,12 @@ jobs:
         run: |
           python3 scripts/test_changed_paths.py
           python3 scripts/changed_paths.py sync
+      # every feature-gated test file is run by a cargo test of ci.yml and of the preflight (scripts/gated_tests.py,
+      # shared with the other ALICE crates; gates it cannot read are listed in scripts/gated_tests.toml [unread])
+      - name: Gated test files are run
+        run: |
+          python3 scripts/test_gated_tests.py
+          python3 scripts/gated_tests.py
       # every tracked Cargo.lock takes each alice-* crate by git and with the same source as the other
       # locks (scripts/lock_sources_check.py, shared with the other ALICE crates; exemptions in
       # scripts/lock_sources.toml); no lock read fails
