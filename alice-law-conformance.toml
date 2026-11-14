@@ -175,6 +175,7 @@ evidence = [
     ".github/public-text-pin (rev 779fa443f95bc0caca5ca2d5bdb9156051fd6143, sha256 e439fdd7495e45486b67d57d227f828426b703c0224b8a00d2e8a1c2f1e66594)",
     "scripts/test_public_text.py",
     "scripts/preflight.sh (step public-text.yml / public-text)",
+    "the public text check runs in CI: `.github/workflows/public-text.yml#- name: Public text (tree at HEAD, then the pushed commits)` (scripts/public_text.sh, ALICE-Law's checker at .github/public-text-pin) after its tests `.github/workflows/public-text.yml#- name: Tests of scripts/public_text.sh (no network)`",
 ]
 mutant = "in a throwaway clone at this commit, commit a README.md line naming a development-process role and run PUBLIC_TEXT_BASE=<previous commit> scripts/public_text.sh: it reports `agent process` on the committed line, `public text: 1 findings in 208 files at HEAD` and exits 1; the unchanged tree reports `public text: 0 findings in 208 files at HEAD` and exits 0 (measured 2026-10-16)"
 since = ""
@@ -201,6 +202,7 @@ evidence = [
     "scripts/test_build_config_guard.py, scripts/test_build_flags_check.py, scripts/run_tests.sh and scripts/test_run_tests.py (the last two byte-identical to ALICE-DB's)",
     ".github/workflows/ci.yml float-environment job (ubuntu, macOS, Windows): tests/float_environment.rs in debug and release through scripts/run_tests.sh float_environment=2, the static guard and the three test files; on ubuntu and macOS the dynamic check for the default, docs.rs and no-default feature sets in the release profile",
     "tests/float_environment.rs round_to_nearest_even and subnormals_are_not_flushed (byte-identical to ALICE-DB's)",
+    "where it runs: the static guard `.github/workflows/ci.yml#scripts/build_config_guard.py` and the float environment with the dynamic check `.github/workflows/ci.yml#- name: Float environment (debug and release)`",
 ]
 mutant = "measured 2026-10-16, each reverted: `RUSTFLAGS: \"-C target-cpu=native\"` added to ci.yml's env makes scripts/build_config_guard.py exit 1 with `target-cpu-native: target-cpu=native` on the added line; RUSTFLAGS=$'-C target-cpu=nat\\x69ve' makes scripts/build_flags_check.py exit 1 with `alice_llm: target-cpu-native: target-cpu=native`; setting FPCR.RMode to round-toward-plus-infinity fails round_to_nearest_even and setting FPCR.FZ (flush-to-zero) fails subnormals_are_not_flushed (aarch64, macOS); `#[ignore]` on subnormals_are_not_flushed makes the run_tests.sh step exit 1 (1 passed, needs at least 2)"
 since = ""
