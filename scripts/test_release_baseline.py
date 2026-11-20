@@ -59,7 +59,7 @@ def load():
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
                            "-c", "init.defaultBranch=main", *args], cwd=repo, check=True,
-                          capture_output=True, text=True, env=ENV).stdout.strip()
+                          capture_output=True, text=True, encoding="utf-8", env=ENV).stdout.strip()
 
 
 def toml(name: str, version: str) -> str:
@@ -112,12 +112,45 @@ class Baseline(unittest.TestCase):
         b = self.base()
         self.assertEqual((b.sha, b.version), (c2, "0.1.0"))
 
-    def test_a_branch_off_main_looks_for_the_bump_on_main(self):
+    def test_a_branch_with_its_own_bump_gets_the_parent_of_its_own_bump(self):
+        """the pushed commits (merge-base..HEAD) are read as if main had them: a branch that bumps the
+        version is judged against the parent of its bump, the base main computes once the branch lands
+        by fast-forward (oracle: c4 written out here, the commit before the branch's bump c5)"""
         c1, c2, c3, c4 = self.linear()
         git(self.repo, "checkout", "-q", "-b", "work")
         self.commit({"Cargo.toml": toml("alice-x", "0.3.0")}, "c5 bump on the branch")
         b = self.base()
+        self.assertEqual((b.sha, b.version), (c4, "0.2.0"))
+
+    def test_the_branch_base_equals_the_base_main_computes_after_the_landing(self):
+        """the same answer on the ci branch and on main after a fast-forward landing of the same commits"""
+        c1, c2, c3, c4 = self.linear()
+        git(self.repo, "checkout", "-q", "-b", "work")
+        c5 = self.commit({"Cargo.toml": toml("alice-x", "0.3.0")}, "c5 bump on the branch")
+        self.commit({"src.rs": "c"}, "c6 after the bump")
+        on_branch = self.base()
+        git(self.repo, "branch", "-q", "-f", "main", "HEAD")
+        on_main = self.base()
+        self.assertEqual(on_branch, on_main)
+        self.assertEqual((on_branch.sha, on_branch.version), (c4, "0.2.0"))
+        self.assertNotEqual(on_branch.sha, c5)
+
+    def test_a_branch_without_a_bump_keeps_the_bump_on_main(self):
+        """no version change in merge-base..HEAD: the base is main's newest bump, as before (c2)"""
+        c1, c2, c3, c4 = self.linear()
+        git(self.repo, "checkout", "-q", "-b", "work")
+        self.commit({"src.rs": "branch work"}, "c5 no bump")
+        b = self.base()
         self.assertEqual((b.sha, b.version), (c2, "0.1.0"))
+
+    def test_the_newest_of_two_bumps_on_the_branch_sets_the_base(self):
+        """two bumps in the pushed commits: the parent of the newer one (c5, at 0.3.0)"""
+        c1, c2, c3, c4 = self.linear()
+        git(self.repo, "checkout", "-q", "-b", "work")
+        c5 = self.commit({"Cargo.toml": toml("alice-x", "0.3.0")}, "c5 bump")
+        self.commit({"Cargo.toml": toml("alice-x", "0.4.0")}, "c6 bump again")
+        b = self.base()
+        self.assertEqual((b.sha, b.version), (c5, "0.3.0"))
 
     def test_a_version_that_moved_only_on_a_merged_branch_is_not_a_bump(self):
         c1, c2, c3, c4 = self.linear()
@@ -262,16 +295,16 @@ class Baseline(unittest.TestCase):
         c1, c2, c3, c4 = self.linear()
         args = [sys.executable, str(SCRIPT), "--root", str(self.repo), "--manifest", "Cargo.toml", "--main", "main",
                 "--print", "--package"]
-        r = subprocess.run(args + ["alice-x"], capture_output=True, text=True, env=ENV)
+        r = subprocess.run(args + ["alice-x"], capture_output=True, text=True, encoding="utf-8", env=ENV)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), f"{c2} 0.1.0")
-        r = subprocess.run(args + ["alice-nope"], capture_output=True, text=True, env=ENV)
+        r = subprocess.run(args + ["alice-nope"], capture_output=True, text=True, encoding="utf-8", env=ENV)
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
         # a new crate at a new manifest (replacing the manifest of alice-x would be a rename, an error)
         self.commit({"crates/z/Cargo.toml": toml("alice-z", "0.1.0")}, "z")
         zargs = [a if a != "Cargo.toml" else "crates/z/Cargo.toml" for a in args]
-        r = subprocess.run(zargs + ["alice-z"], capture_output=True, text=True, env=ENV)
+        r = subprocess.run(zargs + ["alice-z"], capture_output=True, text=True, encoding="utf-8", env=ENV)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "introduced"), r.stderr)
 
 if __name__ == "__main__":
