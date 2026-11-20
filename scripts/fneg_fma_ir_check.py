@@ -80,9 +80,11 @@ problem, 2 on a usage or build error.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -286,10 +288,55 @@ def _cargo_metadata(package: str | None) -> tuple[str, str]:
     return pkg["name"], libs[0]["name"].replace("-", "_")
 
 
+# A build with no CARGO_TARGET_DIR goes to a target directory of this run's own ($TMPDIR/g3-ir-<pid>-*, a release
+# build): main() removes it on every return (atexit when build_ll is called directly), and a run that was killed
+# (a prepass time limit, -9) is swept by the next run, which removes the directories of pids that are gone. Before,
+# each run left its directory (148 left in one $TMPDIR, 2.9 GiB). A CARGO_TARGET_DIR that is given is never removed.
+OWN_TARGET_PREFIX = "g3-ir-"
+_own_targets: list[Path] = []
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_dead_targets(tmp: str | None = None) -> int:
+    """remove the own target directories of runs that are gone; returns how many were removed"""
+    removed = 0
+    for d in Path(tmp or tempfile.gettempdir()).glob(OWN_TARGET_PREFIX + "*-*"):
+        m = re.fullmatch(re.escape(OWN_TARGET_PREFIX) + r"(\d+)-.+", d.name)
+        if not m or not d.is_dir() or int(m.group(1)) == os.getpid() or _pid_alive(int(m.group(1))):
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += not d.exists()
+    return removed
+
+
+def own_target_dir() -> Path:
+    sweep_dead_targets()
+    d = Path(tempfile.mkdtemp(prefix=f"{OWN_TARGET_PREFIX}{os.getpid()}-"))
+    _own_targets.append(d)
+    return d
+
+
+def remove_own_targets() -> None:
+    while _own_targets:
+        shutil.rmtree(_own_targets.pop(), ignore_errors=True)
+
+
+atexit.register(remove_own_targets)
+
+
 def build_ll(args: argparse.Namespace) -> Path:
     package, crate = _cargo_metadata(args.package)
     shared = os.environ.get("CARGO_TARGET_DIR")
-    target_dir = Path(shared or tempfile.mkdtemp(prefix="g3-ir-"))
+    target_dir = Path(shared) if shared else own_target_dir()
     profile_dir = target_dir / (args.target or "") / "release" / "deps"
     sel = ["-p", package]
     tgt = ["--target", args.target] if args.target else []
@@ -425,6 +472,13 @@ def report(analysis: Analysis, label: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    finally:
+        remove_own_targets()
+
+
+def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--target")
     ap.add_argument("--package")

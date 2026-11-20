@@ -12,6 +12,7 @@ Usage: python3 scripts/test_fneg_fma_ir_check.py
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -312,6 +313,86 @@ class Cli(unittest.TestCase):
             empty = Path(d) / "empty.ll"
             empty.write_text("\n", encoding="utf-8")
             self.assertEqual(g.main(["--ll", str(empty)]), 1)
+
+
+# a child that builds with a stand-in for cargo (writes the .ll where cargo would), in a fresh TMPDIR
+STUB = '''
+import argparse, os, subprocess, sys
+sys.path.insert(0, {scripts!r})
+import fneg_fma_ir_check as g
+g._cargo_metadata = lambda package: ("pkg", "pkg")
+def fake_run(cmd, *a, **k):
+    if "--target-dir" in cmd and "rustc" in cmd:
+        deps = os.path.join(cmd[cmd.index("--target-dir") + 1], "release", "deps")
+        os.makedirs(deps, exist_ok=True)
+        open(os.path.join(deps, "pkg-0.ll"), "w").write("define void @f() {{ ret void }}\\n")
+    return subprocess.CompletedProcess(cmd, 0, "", "")
+g.subprocess.run = fake_run
+NS = argparse.Namespace(package=None, target=None, all_features=False, no_default_features=False, features=None)
+def left():
+    return len(os.listdir(os.environ["TMPDIR"]))
+'''
+
+
+class OwnTargetDirectory(unittest.TestCase):
+    """a build with no CARGO_TARGET_DIR leaves nothing in $TMPDIR: on success, on failure, after a killed run; a
+    given CARGO_TARGET_DIR is never removed (before: every run left a g3-ir-* release target)"""
+
+    def child(self, body: str, tmp: Path, **env) -> subprocess.CompletedProcess:
+        e = {**os.environ, "TMPDIR": str(tmp) + "/", **env}
+        if "CARGO_TARGET_DIR" not in env:
+            e.pop("CARGO_TARGET_DIR", None)
+        code = STUB.format(scripts=str(ROOT / "scripts")) + body
+        return subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True)
+
+    def fresh(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def test_main_removes_the_own_target_on_success(self):
+        tmp = self.fresh()
+        r = self.child("def run():\n    ll = g.build_ll(NS); print('MADE', ll.exists(), left()); return 0\n"
+                       "g._main = lambda argv=None: run()\nprint('RC', g.main([])); print('LEFT', left())\n", tmp)
+        self.assertIn("MADE True 1", r.stdout, r.stdout + r.stderr)   # (the build used an own target dir)
+        self.assertIn("LEFT 0", r.stdout)                              # removed when main returns, not only at exit
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_main_removes_the_own_target_on_failure(self):
+        tmp = self.fresh()
+        r = self.child("def run():\n    g.build_ll(NS); print('MADE', left()); raise SystemExit(2)\n"
+                       "g._main = lambda argv=None: run()\n"
+                       "try:\n    g.main([])\nexcept SystemExit as e:\n    print('EXIT', e.code)\nprint('LEFT', left())\n",
+                       tmp)
+        self.assertIn("MADE 1", r.stdout, r.stdout + r.stderr)
+        self.assertIn("EXIT 2", r.stdout)
+        self.assertIn("LEFT 0", r.stdout)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_a_killed_run_is_swept_by_the_next(self):
+        tmp = self.fresh()
+        r = self.child("g.build_ll(NS); import signal; os.kill(os.getpid(), signal.SIGKILL)\n", tmp)
+        self.assertEqual(r.returncode, -9, r.stderr)
+        self.assertEqual(len(list(tmp.iterdir())), 1)                 # (the kill left its target: something to sweep)
+        r = self.child("g.own_target_dir()\n", tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_a_live_runs_target_is_not_swept(self):
+        tmp = self.fresh()
+        live = tmp / f"{g.OWN_TARGET_PREFIX}{os.getppid()}-abcdefgh"    # (the parent shell: alive)
+        live.mkdir()
+        self.assertEqual(g.sweep_dead_targets(str(tmp)), 0)
+        self.assertTrue(live.exists())
+
+    def test_a_given_cargo_target_dir_is_kept(self):
+        tmp = self.fresh()
+        shared = self.fresh()
+        r = self.child("g._main = lambda argv=None: (g.build_ll(NS), 0)[1]\nprint('RC', g.main([]))\n", tmp,
+                       CARGO_TARGET_DIR=str(shared))
+        self.assertIn("RC 0", r.stdout, r.stdout + r.stderr)
+        self.assertTrue((shared / "release" / "deps" / "pkg-0.ll").exists())
+        self.assertEqual(list(tmp.iterdir()), [])
 
 
 if __name__ == "__main__":
