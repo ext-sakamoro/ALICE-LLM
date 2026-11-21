@@ -71,7 +71,7 @@ gate = "G10"
 checker = "scripts/entropy_guard.py"
 canary = "scripts/test_entropy_guard.py::EntropyGuard.test_every_source_in_production_code_is_reported"
 zero = "scripts/test_entropy_guard.py::EntropyGuard.test_main_exits_1_when_it_scans_no_file"
-shared = "n/a: this crate's guard over src/ with its own allowed sites; no other crate carries it"
+shared = ["scripts/entropy_guard.py", "scripts/test_entropy_guard.py"]
 
 [[row]]
 gate = "G12"

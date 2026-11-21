@@ -607,6 +607,22 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("(0.3.0)", report[0])
         self.assertTrue(any("moved 11111111 -> 22222222" in r for r in report), report)
 
+    def test_a_ci_branch_bump_that_moves_an_id_unnamed_fails_on_the_branch(self):
+        """a version bump that is only on a ci branch (main has not got it yet) is judged as main judges it
+        after a fast-forward landing: against the commit before the bump, so a move CHANGELOG.md does not
+        name fails on the branch, not only after landing (2026-11-09: it passed on ci/** and went red on main)"""
+        d = self.repo()
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "-B", "ci/x"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(d), "branch", "-f", "main", "HEAD"], check=True, capture_output=True)
+        self.write(d, "0.4.0", "0x22", "")
+        (d / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n\n- the version moves\n")
+        self.commit(d, "bump on the branch")
+        problems = imc.check(d, None, "bump", "main")[0]
+        self.assertTrue(any("does not name 11111111, 22222222" in p for p in problems), problems)
+        # the same commit on main (landed by fast-forward) gives the same verdict
+        subprocess.run(["git", "-C", str(d), "branch", "-f", "main", "HEAD"], check=True, capture_output=True)
+        self.assertEqual(imc.check(d, None, "bump", "main")[0], problems)
+
     def test_bump_base_named_only_in_an_older_section_fails(self):
         d = self.repo()
         self.write(d, "0.4.0", "0x22", "")
@@ -947,6 +963,271 @@ class SiblingPointsBack(unittest.TestCase):
         passed, problems = imc.PreviousVerifier(self.d, self.cfg, doc, self.target)(self.cfg.ids[0], "11" * 32)
         self.assertEqual(passed, [])
         self.assertTrue(any("names ../ALICE-Back, which is not checked out" in p for p in problems), problems)
+
+
+class VersionSatisfies(unittest.TestCase):
+    """cargo requirement semantics the lockless pin checks against"""
+
+    def test_caret_tilde_exact_and_ranges(self):
+        cases = [
+            ("2.0.0", "2.0.0", True), ("2.0.0", "2.9.1", True), ("2.0.0", "3.0.0", False), ("2.0.0", "1.9.9", False),
+            ("^0.7", "0.7.5", True), ("^0.7", "0.8.0", False), ("0.1.0", "0.1.9", True), ("0.1.0", "0.2.0", False),
+            ("^0.0.3", "0.0.3", True), ("^0.0.3", "0.0.4", False), ("~1.2", "1.2.9", True), ("~1.2", "1.3.0", False),
+            ("=1.2.3", "1.2.3", True), ("=1.2.3", "1.2.4", False), (">=0.7, <0.8", "0.7.9", True),
+            (">=0.7, <0.8", "0.8.0", False), ("*", "9.9.9", True), ("3.0", "3.0.0", True), ("3.0", "2.0.0", False),
+            ("^1", "1.9.9", True), ("^0", "0.9.0", True), ("^0", "1.0.0", False), ("^0.0", "0.0.9", True),
+            ("^0.0", "0.1.0", False), ("=1.2", "1.2.7", True), ("=1.2", "1.3.0", False), ("<1.2", "1.1.9", True),
+            ("<1.2", "1.2.0", False), ("1.*", "1.9.0", True), ("1.*", "2.0.0", False),
+        ]
+        for req, version, want in cases:
+            self.assertEqual(imc.version_satisfies(req, version), want, f"{req} vs {version}")
+        self.assertEqual(len(cases), 30)
+
+    def test_partial_wildcard_and_pre_release_rules_follow_cargo(self):
+        # a partial version names a range: `>1` is beyond every 1.x, `<=1.2` is up to every 1.2.x, `1.2.*` is
+        # tilde; a pre-release matches only a comparator that names a pre-release of the same version
+        cases = [
+            (">1", "1.0.1", False), (">1", "2.0.0", True), (">1.2", "1.2.9", False), (">1.2", "1.3.0", True),
+            ("<=1.2", "1.2.5", True), ("<=1.2", "1.3.0", False), ("1.2.*", "1.3.0", False), ("1.2.*", "1.2.9", True),
+            ("^3.0.0", "3.0.0-alpha", False), ("^3.0.0-alpha", "3.0.0-alpha", True), ("^3.0.0-alpha", "3.0.0", True),
+            (">=1.2.0", "1.3.0-beta", False),
+        ]
+        for req, version, want in cases:
+            self.assertEqual(imc.version_satisfies(req, version), want, f"{req} vs {version}")
+        self.assertEqual(len(cases), 12)
+
+    def test_an_unreadable_requirement_is_refused(self):
+        with self.assertRaises(imc.CheckError):
+            imc.version_satisfies("latest", "1.0.0")
+
+
+@unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
+class LocklessBaseAtGitMainAsOfItsDate(unittest.TestCase):
+    """The base tree takes an alice-* crate by git from branch main and has no Cargo.lock, and that
+    crate's main has since taken a major version the base's requirement cannot take: the base is
+    built with the crate pinned to its main as of the base commit (reported), the repository is not
+    changed, a base with its own lock uses that lock, and a requirement main did not meet at the
+    base's date is refused with the reason"""
+
+    ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.target = Path(tempfile.mkdtemp(prefix="id-move-gitpin-target-"))
+        os.environ["ID_MOVE_TARGET_DIR"] = str(cls.target)
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("ID_MOVE_TARGET_DIR", None)
+        shutil.rmtree(cls.target, ignore_errors=True)
+
+    def git(self, d: Path, *args: str, date: str | None = None) -> str:
+        env = dict(self.ENV)
+        if date is not None:
+            env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        return subprocess.run(["git", "-C", str(d), *args], check=True, env=env,
+                              capture_output=True, text=True).stdout.strip()
+
+    def up_version(self, version: str, date: str) -> str:
+        (self.up / "Cargo.toml").write_text(
+            f'[package]\nname = "alice-up"\nversion = "{version}"\nedition = "2021"\n\n[workspace]\n')
+        self.git(self.up, "add", "-A")
+        self.git(self.up, "commit", "-qm", version, date=date)
+        return self.git(self.up, "rev-parse", "HEAD")
+
+    def consumer(self, version: str, up_req: str):
+        (self.d / "Cargo.toml").write_text(
+            f'[package]\nname = "probe-crate"\nversion = "{version}"\nedition = "2021"\n\n[dependencies]\n'
+            f'alice-up = {{ git = "{self.up.as_uri()}", branch = "main", version = "{up_req}" }}\n\n[workspace]\n')
+
+    def setUp(self):
+        self.parent = Path(tempfile.mkdtemp(prefix="id-move-gitpin-"))
+        self.up = self.parent / "ALICE-Up"
+        (self.up / "src").mkdir(parents=True)
+        (self.up / "src" / "lib.rs").write_text("pub fn f() {}\n")
+        self.git(self.up, "init", "-q", "-b", "main")
+        self.git(self.up, "config", "maintenance.auto", "false")
+        self.v1 = self.up_version("1.0.0", "2026-01-01T00:00:00+00:00")
+        self.d = self.parent / "ALICE-Probe"
+        (self.d / "src").mkdir(parents=True)
+        (self.d / "scripts").mkdir()
+        (self.d / "scripts" / "id_move.toml").write_text(
+            'package = "probe-crate"\nmanifest = "Cargo.toml"\ntags = ["v{version}"]\n'
+            '[[id]]\npath = "probe_crate::SEMANTICS_ID"\n')
+        (self.d / "src" / "lib.rs").write_text("pub const SEMANTICS_ID: [u8; 32] = [0x11; 32];\n")
+        (self.d / "CHANGELOG.md").write_text("# Changelog\n")
+        self.consumer("0.3.0", "1.0.0")
+        self.git(self.d, "init", "-q", "-b", "main")
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "release", date="2026-02-01T00:00:00+00:00")
+        self.git(self.d, "tag", "v0.3.0")
+        # the upstream takes a major version after the base, and the working tree follows it
+        self.v2 = self.up_version("2.0.0", "2026-03-01T00:00:00+00:00")
+        self.consumer("0.4.0", "2.0.0")
+
+    def tearDown(self):
+        shutil.rmtree(self.parent, ignore_errors=True)
+
+    def snapshot(self) -> dict[str, bytes]:
+        """every tracked file of both repositories, byte for byte, and each one's tracked status"""
+        out = {}
+        for repo in (self.d, self.up):
+            for name in self.git(repo, "ls-files").splitlines():
+                out[f"{repo.name}/{name}"] = (repo / name).read_bytes()
+            out[f"{repo.name} status"] = self.git(repo, "status", "--porcelain", "--untracked-files=no").encode()
+        return out
+
+    def test_a_lockless_base_pins_the_branch_to_main_as_of_its_date(self):
+        before = self.snapshot()
+        problems, report = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertIn("unchanged (11111111)", report[1])
+        pinned = [line for line in report if " git alice-up at " in line]
+        self.assertEqual(len(pinned), 1, report)
+        self.assertIn(f"alice-up at {self.v1[:12]} (1.0.0", pinned[0])
+        # the pin is written only into the throwaway base tree: every tracked file of the repository and
+        # of the upstream is byte for byte as before
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.git(self.up, "rev-parse", "HEAD"), self.v2)
+        self.assertEqual(sorted(p.name for p in self.parent.iterdir()), ["ALICE-Probe", "ALICE-Up"])
+
+    def test_a_nested_tool_workspace_lock_does_not_count_as_the_base_lock(self):
+        # a tool with its own workspace and Cargo.lock inside the tree (as ALICE-Sync's tools/ has): the base
+        # crate's own workspace still has no lock, so its git branch is pinned all the same
+        tool = self.d / "tools" / "t"
+        (tool / "src").mkdir(parents=True)
+        (tool / "Cargo.toml").write_text('[package]\nname = "t"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n')
+        (tool / "src" / "main.rs").write_text("fn main() {}\n")
+        (tool / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "t"\nversion = "0.0.0"\n')
+        self.consumer("0.3.0", "1.0.0")
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "release with a tool", date="2026-02-04T00:00:00+00:00")
+        self.git(self.d, "tag", "-f", "v0.3.0")
+        self.consumer("0.4.0", "2.0.0")
+        problems, report = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertEqual(len([line for line in report if f" git alice-up at {self.v1[:12]}" in line]), 1, report)
+
+    def test_two_packages_of_one_repository_are_each_pinned(self):
+        # the upstream repository holds two packages (a crate and its core, as ALICE-Physics does) and the base
+        # takes both by git: each is pinned, at the same commit, and each requirement meets its own version
+        core = self.up / "core"
+        (core / "src").mkdir(parents=True)
+        (core / "src" / "lib.rs").write_text("pub fn g() {}\n")
+        for version, date in (("1.0.0", "2026-01-02T00:00:00+00:00"),):
+            (core / "Cargo.toml").write_text(
+                f'[package]\nname = "alice-up-core"\nversion = "{version}"\nedition = "2021"\n')
+            (self.up / "Cargo.toml").write_text(
+                f'[package]\nname = "alice-up"\nversion = "1.0.0"\nedition = "2021"\n\n[workspace]\nmembers = ["core"]\n')
+            self.git(self.up, "add", "-A")
+            self.git(self.up, "commit", "-qm", "core", date=date)
+        v1 = self.git(self.up, "rev-parse", "HEAD")
+        uri = self.up.as_uri()
+        (self.d / "Cargo.toml").write_text(
+            f'[package]\nname = "probe-crate"\nversion = "0.3.0"\nedition = "2021"\n\n[dependencies]\n'
+            f'alice-up = {{ git = "{uri}", branch = "main", version = "1.0.0" }}\n'
+            f'alice-up-core = {{ git = "{uri}", branch = "main", version = "1.0.0" }}\n\n[workspace]\n')
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "two packages", date="2026-02-05T00:00:00+00:00")
+        self.git(self.d, "tag", "-f", "v0.3.0")
+        (core / "Cargo.toml").write_text('[package]\nname = "alice-up-core"\nversion = "2.0.0"\nedition = "2021"\n')
+        (self.up / "Cargo.toml").write_text(
+            '[package]\nname = "alice-up"\nversion = "2.0.0"\nedition = "2021"\n\n[workspace]\nmembers = ["core"]\n')
+        self.git(self.up, "add", "-A")
+        self.git(self.up, "commit", "-qm", "both 2.0.0", date="2026-03-02T00:00:00+00:00")
+        self.consumer("0.4.0", "2.0.0")
+        problems, report = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        pinned = sorted(line.split(" git ", 1)[1].split(" (")[0] for line in report if " git alice-up" in line)
+        self.assertEqual(pinned, [f"alice-up at {v1[:12]}", f"alice-up-core at {v1[:12]}"], report)
+
+    def base_copy(self) -> Path:
+        tree = self.parent / "base-copy"
+        tree.mkdir()
+        self.git(self.d, "archive", "-o", str(self.parent / "b.tar"), "v0.3.0")
+        subprocess.run(["tar", "-xf", str(self.parent / "b.tar"), "-C", str(tree)], check=True)
+        return tree
+
+    def stray(self, name: str, version: str) -> Path:
+        stray = self.parent / f"stray-{name}"
+        (stray / "src").mkdir(parents=True)
+        (stray / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "{version}"\nedition = "2021"\n')
+        (stray / "src" / "lib.rs").write_text("pub fn f() {}\n")
+        return stray
+
+    def test_a_pin_cargo_drops_is_refused(self):
+        # a pin whose version does not meet the requirement is dropped by cargo with only a warning, and the
+        # branch then resolves at today's head (2.0.0 meets `>=1`): the probe's lock shows it and is refused
+        tree = self.base_copy()
+        (tree / "Cargo.toml").write_text((tree / "Cargo.toml").read_text().replace('version = "1.0.0" }', 'version = ">=1" }'))
+        patches = f'\n[patch."{self.up.as_uri()}"]\nalice-up = {{ path = "{self.stray("alice-up", "0.9.0")}" }}\n'
+        cfg = imc.load_config(self.d)
+        with self.assertRaises(imc.CheckError) as e:
+            imc.read_ids(tree, cfg, self.target, with_previous=False, is_base=True, patches=patches)
+        self.assertIn("alice-up 2.0.0", str(e.exception))
+        self.assertIn("from git instead of the pinned commit", str(e.exception))
+
+    def test_a_pin_outside_the_graph_is_accepted(self):
+        # cargo warns that a patch "was not used" also when the pinned package is not in the graph at all
+        # (an optional dependency the probe does not enable, as ALICE-Sync's are): that base is read
+        tree = self.base_copy()
+        patches, _ = imc.pin_lockless_git_main(tree, "Cargo.toml", self.parent, "2026-02-01T00:00:00+00:00")
+        patches += f'\n[patch."https://example.invalid/none"]\nalice-none = {{ path = "{self.stray("alice-none", "9.0.0")}" }}\n'
+        cfg = imc.load_config(self.d)
+        ids = imc.read_ids(tree, cfg, self.target, with_previous=False, is_base=True, patches=patches)
+        self.assertEqual(ids["probe_crate::SEMANTICS_ID"]["id"], "11" * 32, ids)
+
+    def test_a_lockless_repository_is_left_without_an_untracked_lock(self):
+        # cargo on the working tree writes a Cargo.lock where the crate workspace has none; the check removes it
+        before = self.git(self.d, "status", "--porcelain", "--untracked-files=all")
+        problems, _ = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertFalse((self.d / "Cargo.lock").exists())
+        self.assertEqual(self.git(self.d, "status", "--porcelain", "--untracked-files=all"), before)
+
+    def test_without_the_pin_the_base_does_not_resolve(self):
+        # the failure the pin removes: the probe resolves branch main at today's 2.0.0 against "1.0.0"
+        tree = self.parent / "base-copy"
+        tree.mkdir()
+        self.git(self.d, "archive", "-o", str(self.parent / "b.tar"), "v0.3.0")
+        subprocess.run(["tar", "-xf", str(self.parent / "b.tar"), "-C", str(tree)], check=True)
+        cfg = imc.load_config(self.d)
+        with self.assertRaises(imc.CheckError) as e:
+            imc.read_ids(tree, cfg, self.target, with_previous=False, is_base=True)
+        self.assertIn("failed to select a version", str(e.exception))
+
+    def test_a_base_with_its_own_lock_uses_it_and_pins_nothing(self):
+        # the base commit carries a Cargo.lock that resolved branch main at the 1.0.0 commit (made with a
+        # rev dependency, since main is at 2.0.0 now, then written in the branch form the base takes)
+        (self.d / "Cargo.toml").write_text(
+            f'[package]\nname = "probe-crate"\nversion = "0.3.0"\nedition = "2021"\n\n[dependencies]\n'
+            f'alice-up = {{ git = "{self.up.as_uri()}", rev = "{self.v1}", version = "1.0.0" }}\n\n[workspace]\n')
+        subprocess.run(["cargo", "generate-lockfile", "--manifest-path", str(self.d / "Cargo.toml")],
+                       check=True, capture_output=True, env=dict(self.ENV, CARGO_TARGET_DIR=str(self.target)))
+        lock = (self.d / "Cargo.lock").read_text()
+        self.assertIn(f"?rev={self.v1}#{self.v1}", lock)
+        (self.d / "Cargo.lock").write_text(lock.replace(f"?rev={self.v1}#", "?branch=main#"))
+        self.consumer("0.3.0", "1.0.0")
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "release with lock", date="2026-02-02T00:00:00+00:00")
+        self.git(self.d, "tag", "-f", "v0.3.0")
+        self.consumer("0.4.0", "2.0.0")
+        (self.d / "Cargo.lock").unlink()
+        problems, report = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertEqual([line for line in report if " git alice-up at " in line], [])
+
+    def test_a_requirement_main_did_not_meet_at_the_base_date_is_refused(self):
+        self.consumer("0.3.0", "5.0.0")
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "bad requirement", date="2026-02-03T00:00:00+00:00")
+        self.git(self.d, "tag", "-f", "v0.3.0")
+        self.consumer("0.4.0", "2.0.0")
+        with self.assertRaises(imc.CheckError) as e:
+            imc.check(self.d, None, "tag")
+        self.assertIn("requires alice-up 5.0.0", str(e.exception))
+        self.assertIn("no commit to pin", str(e.exception))
 
 
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
@@ -1454,6 +1735,27 @@ class GitRevPreviousList(unittest.TestCase):
         self.assertEqual(passed, [])
         self.assertTrue(any("fetching ALICE-Zz failed" in p for p in problems), problems)
 
+    def test_a_branch_dependency_is_read_at_the_commit_its_lock_names(self):
+        # no `rev`: the checker reads the dependency at the commit Cargo.lock resolved the branch to,
+        # here the first commit while the branch has moved on to a list without the old value
+        branch = self.git(self.up, "branch", "--show-current")
+        (self.d / "Cargo.toml").write_text((self.d / "Cargo.toml").read_text().replace(
+            f'rev = "{self.rev}"', f'branch = "{branch}"'))
+        imc.rustdoc_json(self.d, self.cfg)  # resolves and writes Cargo.lock at the branch's head
+        lock = (self.d / "Cargo.lock").read_text()
+        self.assertIn(f"#{self.rev}", lock)
+        self.upstream_list("")
+        self.git(self.up, "add", "-A")
+        self.git(self.up, "commit", "-qm", "list emptied")
+        self.git(self.up, "pu" + "sh", "-q", "origin", f"HEAD:refs/heads/{branch}")
+        self.git(self.up, "fetch", "-q", "origin")
+        self.git(self.d, "add", "-A")
+        self.git(self.d, "commit", "-qm", "branch dependency")
+        passed, problems = self.verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(passed, [self.REF])
+        self.assertEqual((self.d / "Cargo.lock").read_text(), lock, "the lock was not re-resolved")
+
     def test_a_rev_not_on_an_origin_branch_fails(self):
         (self.up / "NOTES").write_text("local only\n")
         self.git(self.up, "add", "-A")
@@ -1468,6 +1770,82 @@ class GitRevPreviousList(unittest.TestCase):
         passed, problems = self.verify()
         self.assertEqual(passed, [])
         self.assertTrue(any("still passes" in p for p in problems), problems)
+
+
+class GitDependencyCommit(unittest.TestCase):
+    """The commit a re-exported list's git dependency is read at: the manifest's 40-hex `rev`, or,
+    without one, the commit Cargo.lock resolved it to; any other case is a reason, never a guess"""
+
+    URL = "https://example.invalid/ext/ALICE-Zz"
+    COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="id-move-lockrev-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def manifest(self, dep: str):
+        (self.d / "Cargo.toml").write_text(
+            '[package]\nname = "probe-crate"\nversion = "0.6.0"\nedition = "2021"\n\n[dependencies]\n' + dep + "\n")
+
+    def lock(self, source: str | None, name: str = "alice-zz"):
+        body = '[[package]]\nname = "probe-crate"\nversion = "0.6.0"\n'
+        if source is not None:
+            body += f'\n[[package]]\nname = "{name}"\nversion = "0.11.0"\nsource = "{source}"\n'
+        (self.d / "Cargo.lock").write_text("version = 4\n\n" + body)
+
+    def dep(self):
+        return imc.git_rev_dependency(self.d, self.d, "alice_zz")
+
+    def test_a_branch_dependency_is_read_at_the_locked_commit(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", branch = "main", version = "0.11" }}')
+        self.lock(f"git+{self.URL}?branch=main#{self.COMMIT}")
+        self.assertEqual(self.dep(), {"url": self.URL, "rev": self.COMMIT, "package": "alice-zz"})
+
+    def test_a_dependency_with_no_branch_named_is_read_at_the_locked_commit(self):
+        self.manifest(f'zz = {{ package = "alice-zz", git = "{self.URL}.git", version = "0.11" }}')
+        self.lock(f"git+{self.URL}#{self.COMMIT}")
+        self.assertEqual(self.dep()["rev"], self.COMMIT)
+
+    def test_a_rev_dependency_is_read_at_its_rev_and_not_the_lock(self):
+        rev = "f" * 40
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", rev = "{rev}", version = "0.11" }}')
+        self.lock(f"git+{self.URL}?rev={rev}#{self.COMMIT}")
+        self.assertEqual(self.dep()["rev"], rev)
+
+    def test_a_short_rev_is_refused(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", rev = "0123abc", version = "0.11" }}')
+        self.lock(f"git+{self.URL}?rev=0123abc#{self.COMMIT}")
+        self.assertIn("not 40 hex digits", self.dep())
+
+    def test_without_a_lock_a_branch_dependency_is_refused(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", branch = "main", version = "0.11" }}')
+        self.assertIn("no Cargo.lock", self.dep())
+
+    def test_a_branch_dependency_not_in_the_lock_is_refused(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", branch = "main", version = "0.11" }}')
+        for source, name in ((None, "alice-zz"), (f"git+{self.URL}?branch=main#{self.COMMIT}", "alice-yy"),
+                             (f"git+https://example.invalid/other/ALICE-Zz?branch=main#{self.COMMIT}", "alice-zz"),
+                             ("registry+https://github.com/rust-lang/crates.io-index", "alice-zz")):
+            with self.subTest(source=source, name=name):
+                self.lock(source, name)
+                self.assertIn("is not in it", self.dep())
+
+    def test_a_locked_source_without_a_40_hex_commit_is_refused(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", branch = "main", version = "0.11" }}')
+        for source in (f"git+{self.URL}?branch=main#0123abc", f"git+{self.URL}?branch=main",
+                       f"git+{self.URL}?branch=main#{self.COMMIT.upper()}"):
+            with self.subTest(source=source):
+                self.lock(source)
+                self.assertIn("not a 40-hex commit", self.dep())
+
+    def test_two_locked_commits_are_refused(self):
+        self.manifest(f'alice-zz = {{ git = "{self.URL}", branch = "main", version = "0.11" }}')
+        self.lock(f"git+{self.URL}?branch=main#{self.COMMIT}")
+        with (self.d / "Cargo.lock").open("a") as f:
+            f.write(f'\n[[package]]\nname = "alice-zz"\nversion = "0.10.0"\nsource = "git+{self.URL}?branch=old#{"e" * 40}"\n')
+        self.assertIn("resolves to 2 commits", self.dep())
 
 
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
@@ -1546,6 +1924,51 @@ class BaseBeforePins(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.parent, ignore_errors=True)
+
+    def drop_path_deps(self, version: str):
+        (self.d / "Cargo.toml").write_text(
+            f'[package]\nname = "probe-crate"\nversion = "{version}"\nedition = "2021"\n\n[workspace]\n')
+
+    def remove_pins_history(self, keep_path_dep: bool) -> None:
+        """pins added, then removed in a later commit (with the path dependency, or not), then a release"""
+        (self.d / ".github" / "alice-siblings").write_text(f"ALICE-Up {self.v1}\n")
+        self.git(self.d, "add", "-A", date="2026-02-15T00:00:00Z")
+        self.git(self.d, "commit", "-qm", "pins", date="2026-02-15T00:00:00Z")
+        (self.d / ".github" / "alice-siblings").unlink()
+        if keep_path_dep:
+            self.probe("0.3.0", "^1")
+        else:
+            self.drop_path_deps("0.3.0")
+        self.git(self.d, "add", "-A", date="2026-02-20T00:00:00Z")
+        self.git(self.d, "commit", "-qm", "path deps and pins removed", date="2026-02-20T00:00:00Z")
+        (self.d / "CHANGELOG.md").write_text("# Changelog\n\n## 0.3.0\n")
+        self.release("2026-03-02T00:00:00Z")
+        self.drop_path_deps("0.4.0")
+
+    def test_a_base_whose_history_removed_the_pins_with_the_path_deps_is_accepted(self):
+        # the repository dropped its path dependencies and .github/alice-siblings with them: the
+        # base has no siblings, so there is nothing to build against and nothing is broken
+        self.remove_pins_history(keep_path_dep=False)
+        removed = self.git(self.d, "rev-parse", "v0.3.0~1")
+        self.assertEqual(imc.siblings_file_removed(self.d, "v0.3.0"), removed)
+        self.assertEqual(imc.base_sibling_pins(self.d, ["v0.3.0"]), [])
+        problems, report = imc.check(self.d, None, "tag")
+        self.assertEqual(problems, [])
+        self.assertFalse(any("ALICE-Up" in r for r in report), report)
+
+    def test_a_base_whose_history_removed_the_pins_but_still_reaches_a_sibling_is_broken(self):
+        self.remove_pins_history(keep_path_dep=True)
+        with self.assertRaises(imc.CheckError) as e:
+            imc.base_sibling_pins(self.d, ["v0.3.0"])
+        self.assertIn("broken base", str(e.exception))
+        self.assertIn("was removed in", str(e.exception))
+        with self.assertRaises(imc.CheckError) as e:
+            imc.check(self.d, None, "tag")
+        self.assertIn("broken base", str(e.exception))
+        self.assertIn("../ALICE-Up", str(e.exception))
+
+    def test_a_base_from_before_any_pin_file_is_no_removal(self):
+        self.assertIsNone(imc.siblings_file_removed(self.d, "v0.3.0"))
 
     def test_each_sibling_is_taken_at_its_main_as_of_the_base_commit(self):
         problems, report = imc.check(self.d, None, "tag")
