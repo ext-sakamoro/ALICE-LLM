@@ -8,7 +8,12 @@ when its first path segment is std, core, alloc or a primitive type, or names
 an external crate the canary crate can depend on as the repository's Cargo.lock
 resolves it (a registry or git source, or a path the root Cargo.toml declares;
 '-' and '_' are equivalent). Every other entry becomes a skip row with the reason
-it cannot be planted.
+it cannot be planted. Without a Cargo.lock no external crate can be decided, so
+an entry outside std, core, alloc, the primitive types and the repository's own
+crate fails the run (exit 1, nothing written) instead of becoming a skip row; so
+does a Cargo.lock that lists no package, and an unreadable one always fails: a
+table made without the lock (an untracked lock, a fresh checkout) would look
+valid with every external plant gone.
 
 A method is planted as a bare path reference (`let _ = <path>;`), which clippy
 flags once whatever the method's arity. A generic function cannot be named
@@ -78,6 +83,12 @@ def skip_reason(path: str, lock: dict, own: set[str], paths: dict[str, str] | No
     return f"{crate} is not in Cargo.lock: the canary crate cannot depend on it"
 
 
+def undecidable_without_lock(entries: dict[str, list[str]], own: set[str]) -> list[str]:
+    """The entries whose plantability depends on Cargo.lock, in clippy.toml order."""
+    return [path for key in cc.KEYS for path in entries.get(key, [])
+            if cc.first_segment(path) not in cc.BUILTIN_ROOTS and cc.norm(cc.first_segment(path)) not in own]
+
+
 # generic functions: a plant that compiles (type arguments given, lifetimes
 # only where they are early-bound); each was checked to draw exactly one
 # disallowed_methods diagnostic naming the path
@@ -134,8 +145,25 @@ def main(argv: list[str] | None = None) -> int:
 
     entries = cc.clippy_toml_entries((args.root / "clippy.toml").read_text(encoding="utf-8"))
     lock_file = args.root / "Cargo.lock"
-    lock = cc.lock_packages(lock_file.read_text(encoding="utf-8")) if lock_file.exists() else {}
-    text, planted, skipped = render(entries, lock, own_crates(args.root), cc.path_dependencies(args.root))
+    own = own_crates(args.root)
+    lock: dict = {}
+    if lock_file.exists():
+        try:
+            lock = cc.lock_packages(lock_file.read_text(encoding="utf-8"))
+        except (tomllib.TOMLDecodeError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as e:
+            print(f"gen_clippy_canary_calls: Cargo.lock is not readable ({type(e).__name__}: {e}): "
+                  "cannot decide which entries are plantable; regenerate it (cargo generate-lockfile)",
+                  file=sys.stderr)
+            return 1
+    if not lock:
+        need = undecidable_without_lock(entries, own)
+        if need:
+            what = "no Cargo.lock" if not lock_file.exists() else "Cargo.lock lists no package"
+            print(f"gen_clippy_canary_calls: {what}: cannot decide which entries are plantable "
+                  f"({len(need)} outside std / core / alloc / primitives / own crate, first {need[0]}); "
+                  "generate the lock (cargo generate-lockfile) or track it", file=sys.stderr)
+            return 1
+    text, planted, skipped = render(entries, lock, own, cc.path_dependencies(args.root))
     if planted == 0:
         print(f"gen_clippy_canary_calls: compared nothing: no plantable entry among {skipped} "
               "disallowed-methods / disallowed-types entries of clippy.toml", file=sys.stderr)
